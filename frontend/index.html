@@ -1,0 +1,1515 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="architectos-token" content="">
+    <title>ArchitectOS</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary">
+        <div class="brand"><div class="brand-mark">AO</div><div><h1>ArchitectOS</h1><p>Developer memory OS</p></div></div>
+        <nav class="sidebar-nav">
+          <div class="nav-group" data-nav-group="work">
+            <div class="nav-group-label" data-i18n="nav.work">Work</div>
+            <button class="nav-item active" data-view="workspace">Workspace</button>
+            <button class="nav-item" data-view="memory">Memory</button>
+            <button class="nav-item" data-view="tasks">Tasks</button>
+          </div>
+          <div class="nav-group" data-nav-group="ai">
+            <div class="nav-group-label" data-i18n="nav.ai">AI</div>
+            <button class="nav-item" data-view="chat">Ask</button>
+          </div>
+          <div class="nav-group nav-group-setup" data-nav-group="setup">
+            <button type="button" class="nav-setup-toggle" id="nav-setup-toggle" aria-expanded="false">
+              <span data-i18n="nav.setup">Setup</span>
+              <svg class="nav-setup-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+            </button>
+            <div class="nav-setup-items" id="nav-setup-items" hidden>
+              <button class="nav-item" data-view="providers">Providers</button>
+              <button class="nav-item" data-view="mcp">MCP</button>
+              <button class="nav-item" data-view="code">Code</button>
+              <button class="nav-item" data-view="terminal">Terminal</button>
+              <button class="nav-item" data-view="settings">Settings</button>
+            </div>
+          </div>
+        </nav>
+      </aside>
+      <main>
+        <header class="topbar"><h2 id="view-title">Workspace</h2><div class="topbar-controls"><button id="open-search-palette" class="search-trigger-btn" aria-label="Search Memory" title="Search Memory (⌘K)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg></button><button id="open-project-folder-modal" class="icon-btn" type="button" aria-label="Project Folder" title="Project Folder"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></button><div class="language-dropdown"><button id="language-btn" class="icon-btn" aria-label="Language" title="Language" aria-haspopup="menu" aria-expanded="false"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg><span id="language-current-flag" class="language-current-flag">🇺🇸</span></button><div id="language-menu" class="language-menu" role="menu" aria-label="Language"><button type="button" role="menuitemradio" data-language-option="en"><span class="language-flag">🇺🇸</span><span>English</span></button><button type="button" role="menuitemradio" data-language-option="ru"><span class="language-flag">🇷🇺</span><span>Русский</span></button><button type="button" role="menuitemradio" data-language-option="uk"><span class="language-flag">🇺🇦</span><span>Українська</span></button><button type="button" role="menuitemradio" data-language-option="he"><span class="language-flag">🇮🇱</span><span>עברית</span></button></div></div><select id="project-select" aria-label="Select project" class="project-select project-switcher"></select></div></header>
+        <span id="project-select-label" hidden>Project</span>
+        <section class="view active" id="workspace-view">
+  <div class="workspace-with-chat-layout" data-surface="split" id="workspace-layout">
+
+    
+    <div class="workspace-main-area">
+
+      
+      <aside class="workspace-sidebar">
+        <div class="workspace-sidebar-header">
+          <h3 id="workspace-files-title">Workspace Tree</h3>
+          <div class="workspace-actions">
+            <button id="project-settings-btn" class="icon-btn-sm" title="Project Settings" aria-label="Project Settings">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M12 1v6m0 6v6m9-9h-6m-6 0H3"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="project-info">
+          <div class="project-name-display" id="project-name-display">
+            <span class="project-icon">📁</span>
+            <span id="current-project-name">No project selected</span>
+          </div>
+          <button id="new-project-btn" class="new-project-btn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+            New Project
+          </button>
+        </div>
+
+        <div class="file-tree-toolbar">
+          <button id="open-find-file" class="icon-btn-sm" type="button" title="Find File (⌘⇧O)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <circle cx="11.5" cy="14.5" r="2.5"></circle>
+              <path d="m16 19-1.5-1.5"></path>
+            </svg>
+          </button>
+          <button id="open-find-in-files" class="icon-btn-sm" type="button" title="Find in Files (⌘⇧F)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"></circle>
+              <path d="m21 21-4.35-4.35"></path>
+            </svg>
+          </button>
+          <button id="new-file-btn" class="icon-btn-sm" title="New File">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line x1="12" y1="18" x2="12" y2="12"></line>
+              <line x1="9" y1="15" x2="15" y2="15"></line>
+            </svg>
+          </button>
+          <button id="new-folder-btn" class="icon-btn-sm" title="New Folder">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+              <line x1="12" y1="11" x2="12" y2="17"></line>
+              <line x1="9" y1="14" x2="15" y2="14"></line>
+            </svg>
+          </button>
+          <button id="refresh-files" class="icon-btn-sm" title="Refresh">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"></polyline>
+              <polyline points="1 20 1 14 7 14"></polyline>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+            </svg>
+          </button>
+        </div>
+
+        <div id="file-list" class="file-tree-container"></div>
+      </aside>
+      <div class="workspace-resizer" id="workspace-resizer"></div>
+
+      
+      <div class="workspace-stage">
+        <div class="workspace-surface-bar">
+          <div class="workspace-surface-toggle" role="tablist" aria-label="Workspace surface">
+            <button type="button" class="workspace-surface-btn" role="tab" data-workspace-surface="editor" aria-selected="false">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+              </svg>
+              <span data-i18n="workspace.surface.editor">Editor</span>
+            </button>
+            <button type="button" class="workspace-surface-btn" role="tab" data-workspace-surface="ask" aria-selected="false">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+              </svg>
+              <span data-i18n="workspace.surface.ask">Ask</span>
+            </button>
+            <button type="button" class="workspace-surface-btn is-active" role="tab" data-workspace-surface="split" aria-selected="true">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                <line x1="12" y1="3" x2="12" y2="21"></line>
+              </svg>
+              <span data-i18n="workspace.surface.split">Split</span>
+            </button>
+          </div>
+          <div class="workspace-surface-meta">
+            <button type="button" id="workspace-ask-focus-file" class="workspace-file-chip" hidden title="Open current file in Editor"></button>
+            <span class="chat-status-indicator" id="chat-status">Ready</span>
+          </div>
+        </div>
+
+        <div class="workspace-stage-body">
+          <div class="workspace-editor-main" id="workspace-editor-surface">
+            <div class="editor-tabs" id="editor-tabs">
+              <div class="editor-tab-placeholder">
+                <span id="editor-tab-empty-hint">No files open — click a file to start</span>
+              </div>
+            </div>
+
+            <div class="editor-toolbar">
+              <div class="editor-file-info">
+                <span id="editor-file-path" class="editor-path">Select a file to edit</span>
+                <span id="editor-file-status" class="editor-status"></span>
+              </div>
+              <div class="editor-actions">
+                <button id="editor-save" class="editor-btn" disabled title="Save (Ctrl+S)">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                    <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                    <polyline points="7 3 7 8 15 8"></polyline>
+                  </svg>
+                  Save
+                </button>
+                <button id="editor-close" class="editor-btn" disabled title="Close">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <textarea id="file-editor" class="file-editor-textarea" placeholder="Click a file in the tree to edit"></textarea>
+          </div>
+
+          <div class="workspace-ask-resizer" id="workspace-ask-resizer" title="Drag to resize Ask"></div>
+
+          <div class="workspace-ask-surface" id="workspace-chat-panel">
+            <div class="chat-panel-header">
+              <div class="chat-panel-title">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+                <h3 id="workspace-ask-title">Ask</h3>
+              </div>
+              <div class="chat-panel-actions">
+                <button id="workspace-open-ask" class="icon-btn-sm" title="Open full Ask view" aria-label="Open full Ask view">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="15 3 21 3 21 9"></polyline>
+                    <polyline points="9 21 3 21 3 15"></polyline>
+                    <line x1="21" y1="3" x2="14" y2="10"></line>
+                    <line x1="3" y1="21" x2="10" y2="14"></line>
+                  </svg>
+                </button>
+                <button id="chat-clear-btn" class="icon-btn-sm" title="New Ask thread">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"></polyline>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="chat-panel-content">
+              <div id="workspace-chat-thread" class="chat-thread-compact"></div>
+              <form id="workspace-chat-form" class="chat-composer-compact">
+                <div class="chat-input-wrapper">
+                  <textarea
+                    id="workspace-chat-input"
+                    rows="2"
+                    placeholder="Ask about this project, the open file, or architecture…"
+                    class="chat-input-compact"
+                  ></textarea>
+                </div>
+                <div class="chat-toolbar-compact">
+                  <div class="chat-options">
+                    <div class="chat-menu-wrap">
+                      <button id="workspace-chat-plus" class="icon-btn-sm" type="button" title="More options">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <line x1="12" y1="5" x2="12" y2="19"></line>
+                          <line x1="5" y1="12" x2="19" y2="12"></line>
+                        </svg>
+                      </button>
+                      <div id="workspace-chat-menu" class="chat-dropdown-menu" hidden>
+                        <button type="button" class="menu-item" data-action="attach">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 12.5 12.5 21a4.5 4.5 0 0 1-6.36-6.36l8.49-8.49a3 3 0 0 1 4.24 4.24l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"/>
+                          </svg>
+                          Add files
+                        </button>
+                        <button type="button" class="menu-item menu-item-special" data-action="council">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <circle cx="19" cy="5" r="2"></circle>
+                            <circle cx="5" cy="19" r="2"></circle>
+                            <circle cx="19" cy="19" r="2"></circle>
+                          </svg>
+                          Open Council in Ask
+                        </button>
+                        <button type="button" class="menu-item" data-action="open-ask">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="15 3 21 3 21 9"></polyline>
+                            <polyline points="9 21 3 21 3 15"></polyline>
+                            <line x1="21" y1="3" x2="14" y2="10"></line>
+                            <line x1="3" y1="21" x2="10" y2="14"></line>
+                          </svg>
+                          Open full Ask view
+                        </button>
+                        <hr class="menu-divider">
+                        <label class="menu-item menu-checkbox">
+                          <input id="workspace-chat-remember" type="checkbox">
+                          <span>Remember answer</span>
+                        </label>
+                        <label class="menu-item menu-checkbox">
+                          <input id="workspace-chat-approve-cli" type="checkbox">
+                          <span>Approve CLI</span>
+                        </label>
+                      </div>
+                    </div>
+                    <button id="workspace-chat-attach" class="icon-btn-sm" type="button" title="Attach files">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 12.5 12.5 21a4.5 4.5 0 0 1-6.36-6.36l8.49-8.49a3 3 0 0 1 4.24 4.24l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"/>
+                      </svg>
+                    </button>
+                    <select id="workspace-chat-provider" class="provider-select-compact">
+                      <option value="auto">Auto route</option>
+                    </select>
+                  </div>
+                  <button type="submit" class="chat-send-btn">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <line x1="22" y1="2" x2="11" y2="13"></line>
+                      <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                    </svg>
+                    Send
+                  </button>
+                </div>
+              </form>
+              <input id="workspace-chat-file-input" type="file" multiple hidden>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+</section>
+
+
+
+
+
+
+
+
+
+<div id="project-settings-modal" class="modal" hidden>
+  <div class="modal-backdrop" data-close-modal></div>
+  <div class="modal-dialog modal-lg">
+    <div class="modal-header">
+      <h3>Project Settings</h3>
+      <button class="modal-close" data-close-modal aria-label="Close">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-section">
+        <h4>Project Info</h4>
+        <div class="form-group">
+          <label>Project Name</label>
+          <input id="settings-project-name" type="text" placeholder="My Project">
+        </div>
+        <div class="form-group">
+          <label>Root Path</label>
+          <input id="settings-project-path" type="text" placeholder="C:/projects/myproject" readonly>
+          <button id="settings-browse-path" type="button" class="btn-secondary">Browse</button>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h4>Actions</h4>
+        <div class="settings-actions">
+          <button id="settings-init-project" type="button" class="btn-primary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="16 18 22 12 16 6"></polyline>
+              <polyline points="8 6 2 12 8 18"></polyline>
+            </svg>
+            Initialize Project
+          </button>
+          <button id="settings-scan-project" type="button" class="btn-secondary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"></circle>
+              <path d="m21 21-4.35-4.35"></path>
+            </svg>
+            Scan Files
+          </button>
+          <button id="settings-reindex-project" type="button" class="btn-secondary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"></polyline>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+            </svg>
+            Reindex
+          </button>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h4>Memory & Context</h4>
+        <div class="form-group">
+          <label>Build Context</label>
+          <div class="input-group">
+            <input id="settings-context-query" type="text" placeholder="Build context for...">
+            <button id="settings-build-context" type="button" class="btn-secondary">Build</button>
+          </div>
+        </div>
+        <div class="settings-toggle">
+          <label>
+            <input id="settings-auto-memory" type="checkbox" checked>
+            <span>Auto-build memory tree</span>
+          </label>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" data-close-modal>Close</button>
+      <button id="settings-save" class="btn-primary">Save Changes</button>
+    </div>
+  </div>
+</div>
+
+
+<div id="graph-expand-overlay" class="graph-expand-overlay" hidden>
+  <div class="graph-expand-shell">
+    <div class="graph-expand-toolbar">
+      <div>
+        <h3 data-i18n="graph.expandTitle">Memory Graph</h3>
+        <p data-i18n="graph.expandHint">Drag nodes, scroll to zoom, double-click to inspect, Esc to close</p>
+      </div>
+      <div class="graph-expand-actions">
+        <button id="graph-fit-expanded" type="button" data-i18n="graph.fit" data-i18n-title="graph.tip.fit" title="Fit the graph into the visible area">Fit</button>
+        <button id="graph-close-expand" type="button" class="btn-secondary" data-i18n="graph.closeExpand">Close</button>
+      </div>
+    </div>
+    <div class="graph-expand-layout">
+      <div class="graph-expand-stage graph-stage"></div>
+    </div>
+  </div>
+</div>
+
+<div id="graph-node-modal" class="modal graph-node-modal" hidden>
+  <div class="modal-backdrop" data-close-graph-node-modal></div>
+  <div class="modal-dialog modal-lg graph-node-dialog" role="dialog" aria-modal="true" aria-labelledby="graph-detail-title">
+    <div class="modal-header">
+      <div class="graph-node-header-copy">
+        <h3 id="graph-detail-title">Select a node</h3>
+        <div id="graph-detail-meta" class="graph-meta"></div>
+      </div>
+      <button type="button" class="modal-close" data-close-graph-node-modal aria-label="Close">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+    <div class="modal-body graph-node-body">
+      <section class="graph-node-section">
+        <h4 class="graph-node-section-title">Overview</h4>
+        <p id="graph-detail-text" class="graph-node-overview">Click a memory node to inspect its text, scope, type, links, and evidence.</p>
+      </section>
+      <section class="graph-node-section">
+        <h4 class="graph-node-section-title">Linked memory</h4>
+        <div id="graph-neighbors" class="result-list graph-node-neighbors"></div>
+      </section>
+      <section class="graph-node-section">
+        <h4 class="graph-node-section-title">Related files</h4>
+        <div id="graph-related-files" class="graph-related-files"></div>
+      </section>
+      <section class="graph-node-section graph-node-actions-section">
+        <h4 class="graph-node-section-title">Actions</h4>
+        <div id="graph-actions" class="stack-form graph-node-actions"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="new-project-wizard" class="modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-dialog modal-wizard wizard-create-dialog">
+    <div class="modal-header">
+      <h3 id="wizard-title" data-i18n="wizard.title">Create project</h3>
+      <button type="button" class="modal-close" data-close-modal aria-label="Close">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <div class="modal-body wizard-body">
+      <p id="wizard-lead" class="wizard-lead" data-i18n="wizard.lead">Choose a folder on this computer. ArchitectOS will load files and build project memory.</p>
+
+      <div class="wizard-folder-card">
+        <div class="form-group">
+          <label for="wizard-folder-path" data-i18n="wizard.folderLabel">Project folder</label>
+          <div class="input-group">
+            <input id="wizard-folder-path" type="text" data-i18n-placeholder="placeholder.projectRoot" placeholder="/Users/you/projects/my-app">
+            <button id="wizard-browse-folder" type="button" class="btn-secondary" data-i18n="wizard.browse">Browse…</button>
+          </div>
+          <p id="wizard-folder-status" class="wizard-inline-status" aria-live="polite"></p>
+        </div>
+
+        <div class="form-group">
+          <label for="wizard-project-name" data-i18n="wizard.nameLabel">Project name</label>
+          <input id="wizard-project-name" type="text" data-i18n-placeholder="placeholder.projectName" placeholder="Project name">
+          <small data-i18n="wizard.nameHint">Filled from the folder name — you can change it</small>
+        </div>
+
+        <label class="settings-toggle wizard-option">
+          <input id="wizard-auto-index" type="checkbox" checked>
+          <span data-i18n="wizard.autoIndex">Index files after creating</span>
+        </label>
+      </div>
+
+      <details class="wizard-advanced">
+        <summary data-i18n="wizard.advanced">Advanced options</summary>
+        <div class="wizard-advanced-body">
+          <div class="form-group">
+            <label for="wizard-code-style" data-i18n="wizard.codeStyle">Code style</label>
+            <select id="wizard-code-style">
+              <option value="" data-i18n="wizard.codeStyle.none">None</option>
+              <option value="standard">Standard</option>
+              <option value="google">Google Style</option>
+              <option value="airbnb">Airbnb</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="wizard-ignore-patterns" data-i18n="wizard.ignorePatterns">Ignore patterns</label>
+            <textarea id="wizard-ignore-patterns" rows="3" placeholder="node_modules/&#10;.git/&#10;dist/"></textarea>
+            <small data-i18n="wizard.ignoreHint">One pattern per line</small>
+          </div>
+          <label class="settings-toggle">
+            <input id="wizard-auto-memory" type="checkbox" checked>
+            <span data-i18n="wizard.autoMemory">Build memory tree automatically</span>
+          </label>
+          <div class="form-group">
+            <label for="wizard-memory-scope" data-i18n="wizard.memoryScope">Memory scope</label>
+            <select id="wizard-memory-scope">
+              <option value="project" data-i18n="wizard.memoryScope.project">Project</option>
+              <option value="shared" data-i18n="wizard.memoryScope.shared">Shared</option>
+              <option value="global" data-i18n="wizard.memoryScope.global">Global</option>
+            </select>
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <div class="modal-footer wizard-footer">
+      <button id="wizard-skip" type="button" class="btn-text" data-i18n="wizard.skip">Skip for now</button>
+      <div class="wizard-footer-actions">
+        <button id="wizard-cancel" type="button" class="btn-secondary" data-i18n="wizard.cancel">Cancel</button>
+        <button id="wizard-finish" type="button" class="btn-primary" data-i18n="wizard.create">Create project</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<div id="file-context-menu" class="context-menu" hidden>
+  <button data-action="open">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+      <polyline points="14 2 14 8 20 8"></polyline>
+    </svg>
+    Open
+  </button>
+  <button data-action="rename">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+    </svg>
+    Rename
+  </button>
+  <button data-action="delete">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <polyline points="3 6 5 6 21 6"></polyline>
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+    </svg>
+    Delete
+  </button>
+  <hr>
+  <button data-action="copy-path">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+    </svg>
+    Copy Path
+  </button>
+</div>
+        <section class="view" id="chat-view"><div class="dashboard-grid"><section class="panel span-2 chat-panel"><div class="panel-header ask-panel-header"><div class="ask-header-left"><h3>Ask</h3><div class="ask-mode-toggle" role="tablist" aria-label="Ask mode"><button type="button" class="ask-mode-btn active" data-ask-mode="quick" role="tab" aria-selected="true">Agent</button><button type="button" class="ask-mode-btn" data-ask-mode="council" role="tab" aria-selected="false">Council</button><button type="button" class="ask-mode-btn" data-ask-mode="memory" role="tab" aria-selected="false">Memory</button><button type="button" class="ask-mode-btn" data-ask-mode="memory-mcp" role="tab" aria-selected="false">Memory + MCP</button></div></div><button id="chat-stop" type="button" disabled>Stop</button></div><div id="ask-mode-hint" class="ask-mode-hint">Agent decides which tools/memory to use and acts on your request.</div>
+<div id="ask-council-options" class="ask-agents-options is-collapsed" hidden>
+  <button type="button" id="ask-council-toggle" class="ask-team-header" aria-expanded="false" aria-controls="ask-council-body">
+    <div class="ask-team-heading">
+      <span class="ask-team-caret" aria-hidden="true">▸</span>
+      <strong class="ask-team-title">Council</strong>
+      <span id="ask-council-count" class="ask-team-count">0 models</span>
+    </div>
+    <p class="ask-team-sub">The same question goes to several models, then a judge merges one grounded answer (second opinion, fewer hallucinations).</p>
+  </button>
+  <div id="ask-council-body" class="ask-team-body" hidden>
+    <div id="ask-council-models" class="agent-role-picker"></div>
+    <div class="ask-agents-checks">
+      <label class="ask-option-chip ask-council-judge"><span>Judge</span><select id="ask-council-judge"><option value="auto">Auto (router)</option></select></label>
+    </div>
+  </div>
+</div><div id="chat-thread" class="chat-thread"></div><form id="chat-form" class="composer"><textarea id="chat-message" rows="1" placeholder="Ask ArchitectOS using project memory"></textarea><div id="chat-attachments" class="composer-attachments" hidden></div><div class="composer-toolbar"><div class="composer-left"><div class="composer-menu-wrap"><button id="chat-plus" class="composer-plus" type="button" aria-label="More actions" aria-expanded="false">+</button><div id="chat-menu" class="composer-menu" hidden><button id="chat-attach-menu" type="button" class="composer-menu-item"><span>Add files</span></button><label class="composer-menu-item"><input id="chat-remember" type="checkbox"><span>Remember answer</span></label><label class="composer-menu-item"><input id="chat-approve-cli" type="checkbox"><span>Approve CLI</span></label></div></div><button id="chat-attach" class="composer-icon-btn" type="button" aria-label="Attach files" title="Attach files"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.5 12.5 21a4.5 4.5 0 0 1-6.36-6.36l8.49-8.49a3 3 0 0 1 4.24 4.24l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"/></svg></button><div class="composer-select"><select id="chat-provider" aria-label="Provider"><option value="auto">Auto route</option></select></div></div><button type="submit" class="composer-send">Send</button></div><input id="chat-file-input" type="file" multiple hidden></form></section><section class="panel"><div class="panel-header"><h3>Dialogs</h3></div><div id="chat-list" class="result-list"></div></section></div></section>
+<section class="view" id="memory-view">
+      <div class="memory-redesign-layout">
+
+        <!-- Left: Memory Graph -->
+        <section class="memory-graph-section">
+          <div class="graph-toolbar">
+            <div>
+              <h3>Memory Graph</h3>
+              <p>Project memory plus shared/global knowledge links.</p>
+            </div>
+            <div class="graph-controls">
+              <input id="graph-search" class="graph-search-input" type="search" placeholder="Search graph..." aria-label="Search graph">
+              <select id="graph-group-filter" aria-label="Memory group">
+                <option value="">All groups</option>
+              </select>
+              <select id="graph-source-filter" aria-label="Memory source">
+                <option value="">All sources</option>
+              </select>
+              <select id="graph-scope-filter" aria-label="Scope">
+                <option value="">All scopes</option>
+                <option>project</option>
+                <option>interface</option>
+                <option>shared</option>
+                <option>global</option>
+              </select>
+              <select id="graph-task-filter" aria-label="Task">
+                <option value="">All tasks</option>
+              </select>
+              <select id="graph-provider-filter" aria-label="Provider">
+                <option value="">All providers</option>
+              </select>
+              <label class="inline-check" title="Show only pinned memory nodes" data-i18n-title="graph.tip.pinned">
+                <input id="graph-pinned-filter" type="checkbox"> pinned
+              </label>
+              <label class="graph-density-control" title="Higher density loads more nodes (default ~200)">
+                <span>density</span>
+                <input id="graph-density-level" type="range" min="1" max="5" step="1" value="2" list="graph-density-ticks">
+                <datalist id="graph-density-ticks"><option value="1"></option><option value="2"></option><option value="3"></option><option value="4"></option><option value="5"></option></datalist>
+                <output id="graph-density-value" class="graph-density-value">2</output>
+              </label>
+            </div>
+          </div>
+          <div class="graph-layout">
+            <div class="graph-stage">
+              <canvas id="graph-canvas" class="graph-canvas" width="800" height="600"></canvas>
+              <div class="graph-stage-actions">
+                <div class="graph-stage-tools" role="toolbar" aria-label="Graph actions">
+                  <button id="graph-fit" type="button" class="graph-stage-tool" title="Fit the graph into the visible area" data-i18n-title="graph.tip.fit">
+                    <svg class="graph-stage-tool-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M8 3H5a2 2 0 0 0-2 2v3"></path>
+                      <path d="M21 8V5a2 2 0 0 0-2-2h-3"></path>
+                      <path d="M3 16v3a2 2 0 0 0 2 2h3"></path>
+                      <path d="M16 21h3a2 2 0 0 0 2-2v-3"></path>
+                    </svg>
+                    <span data-i18n="graph.fit">Fit</span>
+                  </button>
+                  <button id="graph-rebuild-links" type="button" class="graph-stage-tool" title="Rebuild relationships between memory nodes" data-i18n-title="graph.tip.rebuildLinks">
+                    <svg class="graph-stage-tool-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                    </svg>
+                    <span data-i18n="graph.rebuildLinksShort">Links</span>
+                  </button>
+                  <button id="refresh-graph" type="button" class="graph-stage-tool" title="Reload the graph with current filters" data-i18n-title="graph.tip.refresh">
+                    <svg class="graph-stage-tool-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <polyline points="23 4 23 10 17 10"></polyline>
+                      <polyline points="1 20 1 14 7 14"></polyline>
+                      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                    </svg>
+                    <span data-i18n="graph.refresh">Refresh</span>
+                  </button>
+                </div>
+                <button id="graph-expand" type="button" class="graph-stage-expand" title="Open the graph in fullscreen" data-i18n-title="graph.tip.expand" aria-label="Expand">
+                  <svg class="graph-expand-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="15 3 21 3 21 9"></polyline>
+                    <polyline points="9 21 3 21 3 15"></polyline>
+                    <line x1="21" y1="3" x2="14" y2="10"></line>
+                    <line x1="3" y1="21" x2="10" y2="14"></line>
+                  </svg>
+                </button>
+              </div>
+              <span id="graph-density-hint" class="graph-stage-summary graph-density-hint" hidden></span>
+              <span id="graph-link-summary" class="graph-stage-summary" hidden></span>
+              <div id="graph-legend" class="graph-legend" aria-label="Graph groups"></div>
+              <span id="graph-inspect-hint" class="graph-inspect-hint" data-i18n="graph.inspectHint">Double-click a node to inspect</span>
+            </div>
+          </div>
+
+          <!-- Memory Lifecycle at bottom of graph -->
+          <div class="memory-lifecycle-compact">
+            <div class="panel-header">
+              <div class="memory-lifecycle-heading">
+                <h4 data-i18n="lifecycle.title">Memory Lifecycle</h4>
+                <p class="memory-lifecycle-desc" data-i18n="lifecycle.desc">Tracks how project memory ages: fresh → stable → stale → archived. Unused items cool down; useful ones stay long-term.</p>
+              </div>
+              <div class="provider-actions">
+                <button id="run-memory-decay" type="button" data-i18n="lifecycle.runDecay" data-i18n-title="lifecycle.tip.runDecay" title="Apply retention rules now: refresh used memory, archive or delete stale short-term items according to settings">Run Decay</button>
+                <span id="memory-decay-summary" class="provider-test"></span>
+              </div>
+            </div>
+            <div id="memory-lifecycle-dashboard" class="memory-lifecycle-dashboard"></div>
+            <div class="memory-lifecycle-browser">
+              <div class="memory-lifecycle-browser-head">
+                <h4>Lifecycle Items</h4>
+                <div class="memory-lifecycle-filters">
+                  <label>Stage
+                    <select id="memory-lifecycle-state-filter" aria-label="Memory lifecycle stage">
+                      <option value="all">All stages</option>
+                      <option value="fresh">Fresh</option>
+                      <option value="stable">Stable</option>
+                      <option value="fading">Fading</option>
+                      <option value="stale">Stale</option>
+                      <option value="archived">Archived</option>
+                      <option value="deleted">Deleted</option>
+                    </select>
+                  </label>
+                  <label>Tier
+                    <select id="memory-lifecycle-tier-filter" aria-label="Memory lifecycle tier">
+                      <option value="all">All tiers</option>
+                      <option value="long_term">Long-term</option>
+                      <option value="short_term">Short-term</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+              <div id="memory-lifecycle-items" class="memory-lifecycle-items"></div>
+            </div>
+            <div class="memory-stats-strip">
+              <div class="panel-header"><h4>Project Stats</h4></div>
+              <div id="analytics-grid" class="analytics-grid analytics-grid-compact"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Right: Add Memory -->
+        <section class="memory-add-section">
+          <div class="panel-header">
+            <h3>Add Memory</h3>
+          </div>
+
+          <div class="add-memory-tabs">
+            <div class="tab-nav">
+              <button class="tab-button active" data-tab="autoscan">🤖 AutoScan</button>
+              <button class="tab-button" data-tab="manual">✍️ Manual</button>
+              <button class="tab-button" data-tab="files">📁 Files</button>
+              <button class="tab-button" data-tab="voice">🎙️ Voice</button>
+            </div>
+
+            <!-- AutoScan Tab -->
+            <div class="tab-content active" data-tab-content="autoscan">
+              <div class="autoscan-help">
+                <p class="autoscan-help-text">🤖 <strong>AutoScan automatically finds important information</strong> from your project sources and creates memory candidates for review. Select sources below, set a limit, and click Ingest to start.</p>
+              </div>
+
+              <div class="autoscan-container">
+                <div class="autoscan-section">
+                  <div class="autoscan-sources-header">
+                    <h4 class="autoscan-section-title">📊 Select Sources</h4>
+                    <div class="autoscan-source-actions">
+                      <button id="ingest-select-all" type="button" class="btn-text" data-i18n="autoscan.selectAll">Select all</button>
+                      <button id="ingest-unselect-all" type="button" class="btn-text" data-i18n="autoscan.unselectAll">Unselect all</button>
+                    </div>
+                  </div>
+                  <div class="source-grid">
+                    <label class="source-checkbox" title="Local repository documentation: README, markdown, wiki files in the project tree">
+                      <input class="ingest-source" value="docs" type="checkbox" checked>
+                      <span class="source-icon">📚</span>
+                      <span class="source-label">Repo docs</span>
+                    </label>
+                    <label class="source-checkbox" title="Source code: comments, docstrings, important functions">
+                      <input class="ingest-source" value="code" type="checkbox" checked>
+                      <span class="source-icon">💻</span>
+                      <span class="source-label">code</span>
+                    </label>
+                    <label class="source-checkbox" title="ArchitectOS chat history (not Microsoft Teams)">
+                      <input class="ingest-source" value="chat" type="checkbox" checked>
+                      <span class="source-icon">💬</span>
+                      <span class="source-label">App chat</span>
+                    </label>
+                    <label class="source-checkbox" title="Git commits: important commit messages, change descriptions">
+                      <input class="ingest-source" value="git" type="checkbox" checked>
+                      <span class="source-icon">🔀</span>
+                      <span class="source-label">git</span>
+                    </label>
+                    <label class="source-checkbox" title="Architecture Decision Records: technical decisions, rationale">
+                      <input class="ingest-source" value="adr" type="checkbox" checked>
+                      <span class="source-icon">📝</span>
+                      <span class="source-label">ADRs</span>
+                    </label>
+                    <label class="source-checkbox" title="Local issue notes and bug markdown files in the repo (not Azure Boards)">
+                      <input class="ingest-source" value="issues" type="checkbox" checked>
+                      <span class="source-icon">🐛</span>
+                      <span class="source-label">Issue files</span>
+                    </label>
+                    <label class="source-checkbox" title="Local PR templates/notes in the repo (not remote pull requests)">
+                      <input class="ingest-source" value="prs" type="checkbox" checked>
+                      <span class="source-icon">🔀</span>
+                      <span class="source-label">PR notes</span>
+                    </label>
+                    <label class="source-checkbox" title="Local meeting note files under /meetings, minutes, etc. Prefer Granola for live meeting notes">
+                      <input class="ingest-source" value="meetings" type="checkbox" checked>
+                      <span class="source-icon">🤝</span>
+                      <span class="source-label">Meeting notes</span>
+                    </label>
+                    <label class="source-checkbox" title="Granola MCP: live meeting summaries, decisions, and action items">
+                      <input class="ingest-source" value="granola" type="checkbox">
+                      <span class="source-icon">G</span>
+                      <span class="source-label">Granola</span>
+                    </label>
+                    <label class="source-checkbox" title="Azure Boards via Azure DevOps MCP: writes Requirements/Features/Tasks/Bugs straight into memory (links + comments)">
+                      <input class="ingest-source" value="azure-boards" type="checkbox">
+                      <span class="source-icon">📋</span>
+                      <span class="source-label">Azure Boards</span>
+                    </label>
+                    <label class="source-checkbox" title="Azure Repos via Azure DevOps MCP: repositories and pull requests → memory">
+                      <input class="ingest-source" value="azure-git" type="checkbox">
+                      <span class="source-icon">🔀</span>
+                      <span class="source-label">Azure Git</span>
+                    </label>
+                    <label class="source-checkbox" title="Azure Wiki via Azure DevOps MCP: writes wiki pages straight into memory">
+                      <input class="ingest-source" value="azure-wiki" type="checkbox">
+                      <span class="source-icon">📚</span>
+                      <span class="source-label">Azure Wiki</span>
+                    </label>
+                    <label class="source-checkbox" title="Microsoft Teams via Graph: meeting AI Insights (Facilitator/Copilot) and transcripts → memory. Needs MS_GRAPH_* in .env">
+                      <input class="ingest-source" value="teams-meetings" type="checkbox">
+                      <span class="source-icon">📞</span>
+                      <span class="source-label">Teams</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="autoscan-controls">
+                  <label class="limit-control">Limit
+                    <input id="ingest-limit" type="number" min="1" max="20000" value="12">
+                  </label>
+                  <label class="limit-control" title="Max seconds for one MCP item (work item, wiki page, meeting, …). Stuck items are skipped.">Item timeout (s)
+                    <input id="ingest-item-timeout" type="number" min="5" max="600" value="25">
+                  </label>
+                  <label class="limit-control" title="Max seconds for a whole source (Boards / Git / Wiki / …). After this the source is aborted and the next source continues.">Source timeout (s)
+                    <input id="ingest-source-timeout" type="number" min="30" max="7200" value="600">
+                  </label>
+                  <label class="ingest-mode-control" title="When enabled, AutoScan writes selected sources straight into memory. When disabled, it creates review candidates.">
+                    <input id="ingest-direct-memory" type="checkbox">
+                    <span>Direct to memory</span>
+                  </label>
+                  <button id="ingest-memory" type="button" class="ingest-btn" data-i18n="autoscan.ingest">🔍 Ingest Sources</button>
+                  <button id="rescan-memory-all" type="button" class="ingest-btn ingest-btn-secondary" data-i18n="autoscan.rescanAll">🔄 Rescan all sources</button>
+                  <div id="candidate-summary" class="provider-test"></div>
+                </div>
+
+                <div id="ingest-boards-options" class="boards-options" hidden>
+                  <label class="boards-all-items" title="If checked, imports all work items from the Azure Boards project instead of only items assigned to you.">
+                    <input id="ingest-boards-all-items" type="checkbox">
+                    <span>Boards: All items</span>
+                  </label>
+                  <details class="boards-type-picker">
+                    <summary>
+                      <span>Work item types</span>
+                      <strong id="boards-type-summary">All types</strong>
+                    </summary>
+                    <div class="boards-type-menu">
+                      <div class="boards-type-actions">
+                        <button id="boards-types-select-all" type="button">Select all</button>
+                        <button id="boards-types-unselect-all" type="button">Unselect all</button>
+                      </div>
+                      <label><input class="boards-type-option" type="checkbox" value="Epic" checked> Epic</label>
+                      <label><input class="boards-type-option" type="checkbox" value="Feature" checked> Feature</label>
+                      <label><input class="boards-type-option" type="checkbox" value="Requirement" checked> Requirement</label>
+                      <label><input class="boards-type-option" type="checkbox" value="User Story" checked> User Story</label>
+                      <label><input class="boards-type-option" type="checkbox" value="Product Backlog Item" checked> Product Backlog Item</label>
+                      <label><input class="boards-type-option" type="checkbox" value="Task" checked> Task</label>
+                      <label><input class="boards-type-option" type="checkbox" value="Bug" checked> Bug</label>
+                    </div>
+                  </details>
+                </div>
+
+                <div id="ingest-progress" class="ingest-agent" hidden>
+                  <div class="ingest-agent-head">
+                    <div class="ingest-agent-persona">
+                      <span class="ingest-agent-avatar" aria-hidden="true">A</span>
+                      <div class="ingest-agent-identity">
+                        <strong>AutoScan agent</strong>
+                        <span id="ingest-agent-status" class="ingest-agent-status">Idle</span>
+                      </div>
+                    </div>
+                    <div class="ingest-agent-meter">
+                      <div class="ingest-agent-bar" aria-hidden="true"><i id="ingest-agent-bar-fill"></i></div>
+                      <span id="ingest-agent-count" class="muted">0 / 0</span>
+                    </div>
+                  </div>
+                  <div id="ingest-agent-steps" class="ingest-agent-steps" role="list"></div>
+                  <p id="ingest-agent-latest" class="ingest-agent-latest muted"></p>
+                  <details class="ingest-agent-details">
+                    <summary>Show technical details</summary>
+                    <div id="ingest-agent-feed" class="ingest-agent-feed" aria-live="polite"></div>
+                  </details>
+                </div>
+
+                <div class="autoscan-section candidates-panel">
+                  <div class="candidates-header">
+                    <div class="candidates-title-row">
+                      <div class="candidates-title-copy">
+                        <h4 class="autoscan-section-title">Review queue</h4>
+                        <p class="candidates-subtitle">Accept what should become project memory. Reject noise and duplicates.</p>
+                      </div>
+                      <div class="candidates-title-meta">
+                        <span id="candidates-count" class="candidates-count">0 items</span>
+                        <button id="refresh-candidates" type="button" class="candidates-icon-btn" title="Refresh list" aria-label="Refresh">
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <polyline points="1 20 1 14 7 14"></polyline>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                    <div id="candidates-status-stats" class="candidates-status-stats" aria-live="polite">
+                      <div class="candidates-stat candidates-stat-pending" data-stat="pending">
+                        <strong id="candidates-stat-pending">0</strong>
+                        <span>Pending</span>
+                      </div>
+                      <div class="candidates-stat candidates-stat-accepted" data-stat="accepted">
+                        <strong id="candidates-stat-accepted">0</strong>
+                        <span>Accepted</span>
+                      </div>
+                      <div class="candidates-stat candidates-stat-rejected" data-stat="rejected">
+                        <strong id="candidates-stat-rejected">0</strong>
+                        <span>Rejected</span>
+                      </div>
+                      <div class="candidates-stat candidates-stat-duplicate" data-stat="duplicate">
+                        <strong id="candidates-stat-duplicate">0</strong>
+                        <span>Duplicates</span>
+                      </div>
+                    </div>
+                    <div class="candidates-toolbar">
+                      <label class="candidate-status-filter">
+                        <span>Show</span>
+                        <select id="candidate-status-filter" aria-label="Candidate status">
+                          <option value="candidate">Needs review</option>
+                          <option value="duplicate">Likely duplicates</option>
+                          <option value="rejected">Rejected</option>
+                          <option value="promoted">Accepted</option>
+                          <option value="all">Everything</option>
+                        </select>
+                      </label>
+                      <div class="candidates-actions" role="group" aria-label="Batch actions">
+                        <button id="candidates-accept-filtered" type="button" class="candidates-btn candidates-btn-accept" title="Accept everything in the current filter">Accept all</button>
+                        <button id="candidates-reject-filtered" type="button" class="candidates-btn candidates-btn-reject" title="Reject everything in the current filter">Reject all</button>
+                        <details class="candidates-more">
+                          <summary class="candidates-btn candidates-btn-ghost">More</summary>
+                          <div class="candidates-more-menu" role="menu">
+                            <button id="candidates-accept-pending" type="button" role="menuitem">Accept all pending</button>
+                            <button id="candidates-accept-non-duplicates" type="button" role="menuitem">Accept non-duplicates only</button>
+                            <button id="candidates-reject-duplicates" type="button" role="menuitem">Reject duplicates only</button>
+                            <button id="candidates-reject-pending" type="button" role="menuitem">Reject all pending</button>
+                          </div>
+                        </details>
+                      </div>
+                    </div>
+                  </div>
+                  <div id="candidate-batch-summary" class="provider-test candidates-batch-summary"></div>
+                  <div id="candidate-list" class="candidate-list"></div>
+                </div>
+              </div>
+            </div>
+
+
+            <!-- Manual Tab -->
+            <div class="tab-content" data-tab-content="manual">
+              <form id="memory-form" class="stack-form">
+                <label>Label
+                  <input id="memory-label" required>
+                </label>
+                <label>Type
+                  <select id="memory-type">
+                    <option>Lesson</option>
+                    <option>Decision</option>
+                    <option>Constraint</option>
+                    <option>Requirement</option>
+                    <option>Feature</option>
+                    <option>Doc</option>
+                    <option>Artifact</option>
+                  </select>
+                </label>
+                <label>Scope
+                  <select id="memory-scope">
+                    <option>project</option>
+                    <option>shared</option>
+                    <option>global</option>
+                    <option>interface</option>
+                  </select>
+                </label>
+                <label>Text
+                  <textarea id="memory-text" required></textarea>
+                </label>
+                <button type="submit">Save Memory</button>
+              </form>
+            </div>
+
+            <!-- Files Tab -->
+            <div class="tab-content" data-tab-content="files">
+              <div class="stack-form">
+                <input id="memory-file-input" type="file" multiple hidden>
+                <div class="file-picker-section">
+                  <button id="memory-file-picker" type="button" class="file-picker-btn">📁 Choose Files</button>
+                  <p class="file-picker-hint">Select text, docs, or code files</p>
+                </div>
+                <div id="memory-file-list" class="result-list"></div>
+                <label>Type
+                  <select id="memory-file-type">
+                    <option>Doc</option>
+                    <option>Artifact</option>
+                    <option>Requirement</option>
+                    <option>Lesson</option>
+                    <option>Decision</option>
+                  </select>
+                </label>
+                <label>Scope
+                  <select id="memory-file-scope">
+                    <option>project</option>
+                    <option>shared</option>
+                    <option>global</option>
+                    <option>interface</option>
+                  </select>
+                </label>
+                <button id="memory-file-import" type="button">Add Files to Memory</button>
+                <div id="memory-file-summary" class="provider-test"></div>
+              </div>
+            </div>
+
+            <!-- Voice Tab -->
+            <div class="tab-content" data-tab-content="voice">
+              <div class="voice-memory-container">
+                <div class="voice-help">
+                  <p class="voice-help-text">🎙️ Speak a note, review the transcript, then save it into project or shared memory.</p>
+                </div>
+                <div class="voice-controls">
+                  <button id="voice-start" type="button" class="voice-record-btn">Start Listening</button>
+                  <button id="voice-stop" type="button" disabled>Stop</button>
+                  <button id="voice-clear" type="button">Clear</button>
+                  <span id="voice-status" class="provider-test">Ready</span>
+                </div>
+                <form id="voice-memory-form" class="stack-form">
+                  <label>Label
+                    <input id="voice-memory-label" placeholder="Generated from transcript if empty">
+                  </label>
+                  <label>Type
+                    <select id="voice-memory-type">
+                      <option>Lesson</option>
+                      <option>Decision</option>
+                      <option>Requirement</option>
+                      <option>Meeting</option>
+                      <option>Doc</option>
+                      <option>Artifact</option>
+                    </select>
+                  </label>
+                  <label>Scope
+                    <select id="voice-memory-scope">
+                      <option>project</option>
+                      <option>shared</option>
+                      <option>global</option>
+                      <option>interface</option>
+                    </select>
+                  </label>
+                  <label>Transcript
+                    <textarea id="voice-memory-text" rows="7" placeholder="Voice transcript appears here. You can edit it before saving." required></textarea>
+                  </label>
+                  <button id="voice-save-memory" type="submit">Save Voice Memory</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </section>        <section class="view" id="tasks-view"><div class="dashboard-grid"><section class="panel span-full"><div class="panel-header"><h3>Task Board</h3><span class="muted" id="task-board-hint">Add tasks inline in TODO</span></div><div id="task-board" class="task-board"></div></section></div></section>
+<section class="view" id="mcp-view">
+  <div class="mcp-master-detail-layout">
+
+    <!-- Left: Server List (Master) -->
+    <aside class="mcp-server-list">
+      <div class="mcp-list-header">
+        <h3>MCP Servers</h3>
+        <button id="add-mcp-server" class="icon-btn" title="Add Server">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+        </button>
+      </div>
+
+      <p class="mcp-hint">Model Context Protocol servers provide tools and resources to AI models.</p>
+
+      <div id="mcp-server-items" class="mcp-server-items">
+        <!-- Server items will be populated here by JS -->
+      </div>
+    </aside>
+
+    <!-- Right: Server Details (Detail) -->
+    <main class="mcp-server-detail">
+      <div class="mcp-detail-empty" id="mcp-detail-empty">
+        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3">
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+          <line x1="8" y1="21" x2="16" y2="21"></line>
+          <line x1="12" y1="17" x2="12" y2="21"></line>
+        </svg>
+        <h3>Select a server</h3>
+        <p>Choose an MCP server from the list to view its configuration and tools.</p>
+      </div>
+
+      <div class="mcp-detail-content" id="mcp-detail-content" style="display: none;">
+        <div class="mcp-detail-header">
+          <div class="mcp-detail-title">
+            <h3 id="mcp-detail-name">Server Name</h3>
+            <span id="mcp-detail-status" class="status-badge">planned</span>
+          </div>
+          <div class="mcp-detail-actions">
+            <button id="mcp-authorize-btn" class="btn-secondary">Authorize</button>
+            <button id="mcp-test-btn" class="btn-secondary">Test</button>
+            <button id="mcp-disable-btn" class="btn-danger">Disable</button>
+          </div>
+        </div>
+
+        <div class="mcp-detail-body">
+          <div class="mcp-detail-section">
+            <h4>Connection</h4>
+            <p id="mcp-detail-description" class="mcp-description"></p>
+
+            <div class="mcp-detail-field">
+              <label>
+                <input type="checkbox" id="mcp-detail-enabled">
+                Enabled
+              </label>
+            </div>
+
+            <div class="mcp-detail-field">
+              <label>Transport</label>
+              <select id="mcp-detail-transport">
+                <option value="stdio">stdio</option>
+                <option value="remote http">remote http</option>
+              </select>
+            </div>
+
+            <div class="mcp-detail-field" id="mcp-field-remote-url">
+              <label>Remote URL</label>
+              <input type="text" id="mcp-detail-remote-url" placeholder="https://mcp.example.com/mcp">
+            </div>
+
+            <div class="mcp-detail-field" id="mcp-field-command">
+              <label>Command</label>
+              <input type="text" id="mcp-detail-command" placeholder="npx @modelcontextprotocol/server">
+            </div>
+
+            <div class="mcp-detail-field" id="mcp-field-env">
+              <label>Env (JSON)</label>
+              <textarea id="mcp-detail-env" rows="3" placeholder='{"ADO_ORG":"myorg","ado_mcp_project":"MyProject"}'></textarea>
+            </div>
+
+            <div class="mcp-detail-field" id="mcp-field-headers">
+              <label>Headers (JSON)</label>
+              <textarea id="mcp-detail-headers" rows="3" placeholder='{"Authorization": "Bearer token"}'></textarea>
+            </div>
+          </div>
+
+          <div class="mcp-detail-section">
+            <div class="mcp-tools-header">
+              <h4>Available Tools</h4>
+              <span id="mcp-tools-count" class="tools-count">0 tools</span>
+            </div>
+
+            <div id="mcp-tools-list" class="mcp-tools-list-detail">
+              <p class="mcp-empty-state">No tools available. Test the server to load tools.</p>
+            </div>
+          </div>
+
+          <div class="mcp-detail-section">
+            <h4>Test Results</h4>
+            <div id="mcp-test-results" class="mcp-test-results">
+              <p class="mcp-empty-state">No test results yet.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="mcp-detail-footer">
+          <button id="mcp-save-btn" class="btn-primary">Save Changes</button>
+          <button id="mcp-reset-btn" class="btn-secondary">Reset</button>
+        </div>
+      </div>
+    </main>
+
+  </div>
+</section>
+
+<div id="add-mcp-modal" class="modal" hidden>
+  <div class="modal-backdrop" data-close-add-mcp></div>
+  <div class="modal-dialog">
+    <div class="modal-header">
+      <h3>Add MCP Server</h3>
+      <button class="modal-close" type="button" data-close-add-mcp aria-label="Close">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Name</label>
+        <input id="add-mcp-label" type="text" placeholder="My MCP server" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label>Server ID</label>
+        <input id="add-mcp-id" type="text" placeholder="my-mcp-server" autocomplete="off">
+        <p class="mcp-hint">Unique lowercase id. Auto-filled from the name.</p>
+      </div>
+      <div class="form-group">
+        <label>Transport</label>
+        <select id="add-mcp-transport">
+          <option value="stdio">stdio (local command)</option>
+          <option value="http">remote http</option>
+        </select>
+      </div>
+      <div class="form-group" id="add-mcp-command-group">
+        <label>Command</label>
+        <input id="add-mcp-command" type="text" placeholder="npx -y @modelcontextprotocol/server-filesystem /path" autocomplete="off">
+      </div>
+      <div class="form-group" id="add-mcp-url-group" style="display:none">
+        <label>Remote URL</label>
+        <input id="add-mcp-url" type="text" placeholder="https://mcp.example.com/mcp" autocomplete="off">
+      </div>
+      <div class="form-group" id="add-mcp-env-group">
+        <label>Env (JSON, optional)</label>
+        <textarea id="add-mcp-env" rows="3" placeholder='{"TOKEN":"..."}'></textarea>
+      </div>
+      <div class="form-group" id="add-mcp-headers-group" style="display:none">
+        <label>Headers (JSON, optional)</label>
+        <textarea id="add-mcp-headers" rows="3" placeholder='{"Authorization":"Bearer ..."}'></textarea>
+      </div>
+      <label class="inline-check"><input type="checkbox" id="add-mcp-enabled" checked> Enabled</label>
+      <p id="add-mcp-error" class="mcp-form-error" hidden></p>
+    </div>
+    <div class="modal-footer">
+      <button id="add-mcp-cancel" type="button" class="btn-secondary" data-close-add-mcp>Cancel</button>
+      <button id="add-mcp-create" type="button" class="btn-primary">Add Server</button>
+    </div>
+  </div>
+</div>
+
+                <section class="view" id="code-view">
+          <div class="code-page">
+            <section class="panel code-status-hero">
+              <div class="code-status-main">
+                <div>
+                  <p class="code-eyebrow" data-i18n="code.eyebrow">Setup</p>
+                  <h3 id="code-status-title" data-i18n="code.status.title">Code context</h3>
+                  <p id="code-status-message" class="code-status-message" data-i18n="code.status.noProject">Connect a project folder to analyze code and power AI suggestions.</p>
+                </div>
+                <div id="code-status-badge" class="code-readiness-badge" data-tone="idle">—</div>
+              </div>
+              <div id="code-status-pills" class="code-status-pills"></div>
+              <div class="code-status-actions">
+                <button id="code-connect-folder" type="button" class="btn-primary" data-i18n="action.connectFolder">Connect folder</button>
+                <button id="code-analyze-project" type="button" class="btn-secondary" data-i18n="code.action.analyze">Analyze project</button>
+              </div>
+            </section>
+
+            <section class="panel code-explore-panel">
+              <div class="panel-header">
+                <div>
+                  <h3 data-i18n="code.explore.title">Explore file</h3>
+                  <p class="provider-hint code-explore-hint" data-i18n="code.explore.hint">Inspect symbols, diagnostics, and references for a file in your project.</p>
+                </div>
+              </div>
+
+              <div class="code-file-bar">
+                <label class="code-file-label" for="code-file-path" data-i18n="code.fileLabel">File</label>
+                <div class="code-file-input-row">
+                  <input id="code-file-path" type="text" data-i18n-placeholder="code.filePlaceholder" placeholder="src/main.py">
+                  <button id="code-use-selected-file" type="button" class="btn-secondary" data-i18n="code.fromWorkspace">From Workspace</button>
+                </div>
+                <p id="code-selected-file-hint" class="code-file-hint">Select a file in Workspace, then click Analyze.</p>
+              </div>
+
+              <div class="code-insight-toolbar">
+                <div class="code-insight-tabs" role="tablist" aria-label="Code insight">
+                  <button id="code-tab-symbols" type="button" class="code-insight-tab active" role="tab" data-code-tab="symbols" aria-selected="true" data-i18n="code.tab.symbols">Symbols</button>
+                  <button id="code-tab-diagnostics" type="button" class="code-insight-tab" role="tab" data-code-tab="diagnostics" aria-selected="false" data-i18n="code.tab.diagnostics">Diagnostics</button>
+                  <button id="code-tab-hover" type="button" class="code-insight-tab" role="tab" data-code-tab="hover" aria-selected="false" data-i18n="code.tab.hover">Hover</button>
+                  <button id="code-tab-references" type="button" class="code-insight-tab" role="tab" data-code-tab="references" aria-selected="false" data-i18n="code.tab.references">References</button>
+                </div>
+                <button id="code-run-insight" type="button" class="btn-primary" data-i18n="code.action.analyzeFile">Analyze file</button>
+              </div>
+
+              <div id="code-position-controls" class="code-position-controls" hidden>
+                <label>
+                  <span data-i18n="code.line">Line</span>
+                  <input id="code-line" type="number" min="0" value="0" aria-label="Line">
+                </label>
+                <label>
+                  <span data-i18n="code.column">Column</span>
+                  <input id="code-character" type="number" min="0" value="0" aria-label="Character">
+                </label>
+                <label class="code-reference-query">
+                  <span data-i18n="code.referenceQuery">Reference query</span>
+                  <input id="code-reference-query" type="text" data-i18n-placeholder="code.referencePlaceholder" placeholder="Optional symbol name">
+                </label>
+              </div>
+
+              <div id="code-symbols" class="code-insight-results result-list"></div>
+              <div id="code-insight" class="code-insight-results result-list" hidden></div>
+              <div id="code-explore-empty" class="code-explore-empty">
+                <p data-i18n="code.explore.empty">Choose a file and run an analysis to see results here.</p>
+              </div>
+            </section>
+
+            <details class="panel code-setup-panel">
+              <summary class="code-setup-summary-row">
+                <span data-i18n="code.setup.title">Language support</span>
+                <span id="code-setup-badge" class="code-setup-badge"></span>
+              </summary>
+              <p class="provider-hint" data-i18n="code.setup.hint">ArchitectOS uses language servers when installed, with built-in fallbacks for Python, JavaScript/TypeScript, and Java.</p>
+              <div id="code-language-support" class="code-support-grid"></div>
+              <details class="code-lsp-advanced">
+                <summary data-i18n="code.lspAdvanced">LSP configuration (advanced)</summary>
+                <div id="code-server-list" class="provider-list code-server-list-advanced"></div>
+              </details>
+            </details>
+          </div>
+        </section>
+
+<section class="view" id="terminal-view"><div class="dashboard-grid"><section class="panel span-2"><div class="panel-header"><h3 id="terminal-panel-title">Run command</h3><div class="provider-actions"><button id="terminal-open" type="button">Open external shell</button></div></div><p id="terminal-panel-hint" class="provider-hint">Run a one-shot command in the project folder. Risky commands are blocked unless destructive commands are explicitly enabled.</p><div class="terminal-controls"><select id="terminal-shell" aria-label="Shell"><option value="auto">Auto shell</option><option value="powershell">PowerShell</option><option value="cmd">cmd</option><option value="bash">bash</option><option value="sh">sh</option></select><input id="terminal-timeout" type="number" min="1" max="120" value="20" aria-label="Timeout seconds"><label class="inline-check"><input id="terminal-allow-destructive" type="checkbox"> allow destructive commands</label></div><form id="terminal-form" class="terminal-form"><input id="terminal-command" placeholder="git status"><button type="submit">Run</button></form><div id="terminal-status" class="provider-test"></div><pre id="terminal-output" class="terminal-output"></pre></section><section class="panel"><div class="panel-header"><h3>History</h3><button id="terminal-clear" type="button">Clear</button></div><div id="terminal-history" class="result-list"></div></section></div></section>
+                <section class="view" id="providers-view">
+          <div class="providers-page">
+            <section class="panel providers-status-hero">
+              <div class="providers-status-main">
+                <div>
+                  <p class="providers-eyebrow" data-i18n="providers.eyebrow">AI routing</p>
+                  <h3 data-i18n="providers.title">Providers</h3>
+                  <p id="providers-status-message" class="providers-status-message" data-i18n="providers.status.empty">Connect and test AI backends to power Ask and agents.</p>
+                </div>
+                <div id="providers-status-badge" class="providers-readiness-badge" data-tone="idle">—</div>
+              </div>
+              <div class="providers-status-actions">
+                <button id="connect-env-providers" type="button" class="btn-secondary" data-i18n="providers.connectEnv">Connect from env</button>
+                <button id="test-all-providers" type="button" class="btn-primary" data-i18n="providers.testAll">Test all</button>
+                <span id="provider-summary" class="provider-test"></span>
+              </div>
+            </section>
+
+            <div class="providers-main-grid">
+              <section class="panel providers-list-panel">
+                <div class="panel-header">
+                  <h3 data-i18n="providers.backendsTitle">Connected backends</h3>
+                  <p class="providers-panel-hint" data-i18n="providers.backendsHint">Enable providers for auto-routing. Open configuration for API keys and CLI paths.</p>
+                </div>
+                <div id="provider-list" class="provider-list providers-card-grid"></div>
+              </section>
+
+              <aside class="providers-sidebar">
+                <section class="panel providers-router-panel">
+                  <div class="panel-header">
+                    <h3 data-i18n="providers.routerTitle">Smart Router</h3>
+                    <p class="providers-panel-hint" data-i18n="providers.routerHint">Choose how ArchitectOS balances quality, cost, and speed.</p>
+                  </div>
+                  <form id="router-form" class="stack-form router-form-modern">
+                    <label data-i18n="providers.strategy">Strategy
+                      <select id="router-strategy">
+                        <option value="balanced">balanced</option>
+                        <option value="quality">quality first</option>
+                        <option value="cost">cost first</option>
+                        <option value="speed">speed first</option>
+                      </select>
+                    </label>
+                    <div class="router-presets" role="group" aria-label="Router presets">
+                      <button type="button" class="router-preset-btn" data-router-preset="cheap" data-i18n="providers.preset.cheap">Cheap</button>
+                      <button type="button" class="router-preset-btn" data-router-preset="fast" data-i18n="providers.preset.fast">Fast</button>
+                      <button type="button" class="router-preset-btn" data-router-preset="quality" data-i18n="providers.preset.quality">Quality</button>
+                      <button type="button" class="router-preset-btn" data-router-preset="balanced" data-i18n="providers.preset.balanced">Balanced</button>
+                    </div>
+                    <details class="router-advanced">
+                      <summary data-i18n="providers.advancedWeights">Advanced weights</summary>
+                      <div class="router-sliders">
+                        <label class="router-slider-row"><span>Quality <strong id="router-w-quality-val">0.40</strong></span><input id="router-w-quality" type="range" min="0" max="100" step="5" value="40"></label>
+                        <label class="router-slider-row"><span>Cost <strong id="router-w-cost-val">0.30</strong></span><input id="router-w-cost" type="range" min="0" max="100" step="5" value="30"></label>
+                        <label class="router-slider-row"><span>Speed <strong id="router-w-speed-val">0.20</strong></span><input id="router-w-speed" type="range" min="0" max="100" step="5" value="20"></label>
+                        <label class="router-slider-row"><span>Availability <strong id="router-w-availability-val">0.10</strong></span><input id="router-w-availability" type="range" min="0" max="100" step="5" value="10"></label>
+                        <p class="router-weight-sum muted">Weights auto-normalize to 1.0 · current sum <span id="router-weight-sum">1.00</span></p>
+                      </div>
+                    </details>
+                    <button type="submit" class="btn-secondary" data-i18n="providers.saveRouter">Save router</button>
+                  </form>
+                </section>
+
+                <section class="panel providers-preview-panel">
+                  <div class="panel-header">
+                    <h4 data-i18n="providers.previewTitle">Routing preview</h4>
+                  </div>
+                  <form id="router-preview-form" class="prompt-row">
+                    <input id="router-preview-query" data-i18n-placeholder="providers.previewPlaceholder" placeholder="Describe a task to preview routing">
+                    <button type="submit" data-i18n="providers.preview">Preview</button>
+                  </form>
+                  <div id="router-preview" class="result-list providers-preview-results"></div>
+                </section>
+
+                <details class="panel providers-runs-panel">
+                  <summary data-i18n="providers.runsTitle">Recent runs</summary>
+                  <div id="provider-run-list" class="result-list"></div>
+                </details>
+              </aside>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="analytics-view"><section class="panel"><div class="panel-header"><h3>Analytics</h3></div><div id="analytics-view-grid" class="analytics-grid"></div></section></section>
+        <section class="view" id="settings-view"><div class="dashboard-grid"><section class="panel"><div class="panel-header"><h3>Profile Bundle</h3></div><button id="export-bundle">Export Bundle</button><textarea id="bundle-box" class="bundle-box" placeholder="Exported profile bundle appears here. Paste a bundle and import it."></textarea><button id="import-bundle">Import Bundle</button></section><section class="panel"><div class="panel-header"><h3>UI Settings</h3></div><form id="settings-form" class="stack-form"><label>Theme<select id="theme-select"><option>system</option><option>light</option><option>dark</option></select></label><label>Density<select id="density-select"><option>comfortable</option><option>compact</option></select></label><label>Language<select id="settings-language-select"><option value="en">English</option><option value="ru">Русский</option><option value="uk">Українська</option><option value="he">עברית</option></select></label><label class="inline-check"><input id="memory-enabled" type="checkbox" checked> Memory enabled</label><label class="inline-check"><input id="lifecycle-enabled" type="checkbox" checked> Lifecycle enabled</label><label class="inline-check"><input id="refresh-on-access" type="checkbox" checked> Refresh on access</label><label class="inline-check"><input id="auto-rescan-on-startup" type="checkbox" checked> Rescan sources on startup</label><label>Chat memory mode<select id="chat-memory-mode"><option value="off">Off (★ only)</option><option value="strict" selected>Strict (facts only)</option><option value="aggressive">Aggressive</option></select></label><label>Chat candidate TTL days<input id="chat-candidate-ttl" type="number" min="0" value="7"></label><label class="inline-check"><input id="chat-store-facts-only" type="checkbox" checked> Store chat facts only (not full turns)</label><label>Short-term TTL<input id="short-term-ttl" type="number" min="0" value="14"></label><label>Archive after days<input id="archive-after" type="number" min="0" value="30"></label><label>Delete after days<input id="delete-after" type="number" min="0" value="0"></label><label>Promote after hits<input id="promote-after-hits" type="number" min="1" value="5"></label><button type="submit">Save Settings</button></form></section><section class="panel"><div class="panel-header"><h3 data-i18n="settings.embeddings">Memory Embeddings</h3></div><p id="embeddings-status" class="muted-note">Loading…</p><form id="embeddings-form" class="stack-form"><label class="inline-check"><input id="embeddings-enabled" type="checkbox" checked> Embeddings enabled</label><label>Provider<select id="embedding-provider"><option value="auto">auto</option><option value="cloudflare">cloudflare</option><option value="gemini">gemini</option><option value="openai">openai</option><option value="azure-openai">azure-openai</option><option value="ollama">ollama</option><option value="hash">hash (offline)</option></select></label><label>Model<select id="embedding-model"></select></label><label>Dimensions<input id="embedding-dimensions" type="number" min="128" max="3072" step="1" value="1024"></label><label>Vector pool<input id="vector-pool" type="number" min="8" max="200" value="64"></label><label>Min score<input id="vector-min-score" type="number" min="0" max="1" step="0.01" value="0.22"></label><label>Query timeout (ms)<input id="vector-query-timeout" type="number" min="50" max="5000" step="50" value="2500"></label><label class="inline-check"><input id="reindex-on-startup" type="checkbox"> Reindex on startup</label><div class="settings-actions" style="display:flex;gap:8px;flex-wrap:wrap"><button type="submit">Save Embeddings</button><button id="embeddings-rebuild" type="button" class="btn-secondary">Rebuild Index</button></div></form></section><section class="panel"><div class="panel-header"><h3>Security Preview</h3><button id="security-preview-run" type="button">Preview</button></div><textarea id="security-preview-input" class="bundle-box" placeholder="Paste prompt, result, or config text"></textarea><div id="security-preview-result" class="result-list"></div></section></div></section>
+      </main>
+    </div>
+
+    <div class="project-folder-modal" id="projectFolderModal" aria-hidden="true">
+      <div class="project-folder-backdrop" data-close-project-folder></div>
+      <section class="project-folder-dialog" role="dialog" aria-modal="true" aria-labelledby="project-folder-title">
+        <div class="project-folder-dialog-header">
+          <div>
+            <h3 id="project-folder-title">Connect project folder</h3>
+            <p id="project-folder-subtitle">Choose a folder on this computer to load files and build project memory.</p>
+          </div>
+          <button id="close-project-folder-modal" type="button" aria-label="Close">Close</button>
+        </div>
+        <div class="project-folder-summary">
+          <div>
+            <span class="project-folder-kicker">Current</span>
+            <strong id="project-folder-summary-name">No workspace</strong>
+            <p id="project-folder-summary-path">No folder selected</p>
+          </div>
+        </div>
+        <div class="project-folder-form">
+          <label for="project-name">Project name</label>
+          <input id="project-name" placeholder="Project name">
+          <label for="project-root-path">Folder path</label>
+          <div class="project-root-picker">
+            <input id="project-root-path" placeholder="Project folder path">
+            <button id="browse-project-folder" type="button">Browse...</button>
+          </div>
+        </div>
+        <div class="project-folder-primary-actions">
+          <button id="save-project" type="button" class="btn-primary">Connect folder</button>
+          <button id="init-project" type="button" class="btn-secondary">Connect &amp; index</button>
+        </div>
+        <p id="project-folder-more-hint" class="project-folder-more-hint">Analyze and reindex are available in Project Settings.</p>
+        <div id="project-folder-picker-status" class="provider-test"></div>
+      </section>
+    </div>
+
+    <!-- Find File / Find in Files (IntelliJ-style) -->
+    <div class="file-find" id="fileFindModal" aria-hidden="true">
+      <div class="file-find-backdrop" data-close-file-find></div>
+      <div class="file-find-dialog" role="dialog" aria-modal="true" aria-labelledby="file-find-title">
+        <div class="file-find-header">
+          <div class="file-find-title-row">
+            <h3 id="file-find-title">Find File</h3>
+            <div class="file-find-modes" role="tablist" aria-label="Search mode">
+              <button type="button" class="file-find-mode active" data-file-find-mode="name">File name</button>
+              <button type="button" class="file-find-mode" data-file-find-mode="content">In files</button>
+            </div>
+          </div>
+          <button type="button" class="close-palette-btn" data-close-file-find aria-label="Close">
+            <span>Close</span>
+            <kbd>Esc</kbd>
+          </button>
+        </div>
+
+        <div class="file-find-fields">
+          <label class="file-find-field file-find-query-field">
+            <span class="file-find-label" id="file-find-query-label">Name</span>
+            <input id="file-find-query" type="text" placeholder="Enter file name…" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="file-find-field file-find-mask-field">
+            <span class="file-find-label">File mask</span>
+            <input id="file-find-mask" type="text" placeholder="*.java, *.kt" autocomplete="off" spellcheck="false" title="Comma-separated globs, e.g. *.java, **/test/**">
+          </label>
+        </div>
+
+        <div class="file-find-meta" id="file-find-meta">Type to search. Use ↑↓ and Enter.</div>
+        <div class="file-find-results" id="file-find-results" role="listbox" aria-label="Search results"></div>
+        <div class="file-find-footer">
+          <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+          <span><kbd>Enter</kbd> open</span>
+          <span><kbd>⌘⇧O</kbd> file · <kbd>⌘⇧F</kbd> text</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Search Palette Modal -->
+    <div class="search-palette" id="searchPalette">
+      <div class="search-palette-backdrop" data-close-palette></div>
+      <div class="search-palette-modal">
+        <div class="search-palette-header">
+          <h3>Search Memory</h3>
+          <button class="close-palette-btn" data-close-palette aria-label="Close">
+            <span>Close</span>
+            <kbd>Esc</kbd>
+          </button>
+        </div>
+
+        <div class="search-palette-input">
+          <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <path d="m21 21-4.35-4.35"></path>
+          </svg>
+          <input
+            id="paletteSearchInput"
+            type="text"
+            placeholder="Type to search memory..."
+            autocomplete="off"
+          />
+          <kbd class="shortcut-hint">⌘K</kbd>
+        </div>
+
+        <div class="search-palette-filters">
+          <button class="filter-pill" data-filter-type="favorite">⭐ Favorites</button>
+          <button class="filter-pill" data-filter-type="Decision">🎯 Decisions</button>
+          <button class="filter-pill" data-filter-type="Lesson">💡 Lessons</button>
+          <button class="filter-pill" data-filter-type="Doc">📚 Docs</button>
+          <button class="filter-pill" data-filter-type="Constraint">⚠️ Constraints</button>
+        </div>
+
+        <div class="search-palette-content">
+          <div id="paletteRecentSearches" class="palette-section">
+            <h4>Recent Searches</h4>
+            <div id="recentSearchesList" class="recent-list"></div>
+          </div>
+
+          <div id="paletteResults" class="palette-section" style="display: none;">
+            <h4>Results <span class="result-count" id="paletteResultCount"></span></h4>
+            <div id="paletteResultList" class="palette-result-list"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/mcp_master_detail.js"></script>
+    <script src="/workspace_resizer.js"></script>
+    <script src="/rich-response.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

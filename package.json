@@ -1,0 +1,17 @@
+{
+  "name": "architectos",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-first AI operating system prototype for software engineers.",
+  "scripts": {
+    "start": "python run_architectos.py",
+    "test": "python -m unittest discover -s tests -v",
+    "dev": "python backend/app.py",
+    "check": "python -m py_compile backend/app.py backend/architectos/config.py backend/architectos/models.py backend/architectos/search.py backend/architectos/server.py backend/architectos/service.py backend/architectos/storage.py backend/architectos/security.py backend/architectos/adapters.py backend/architectos/routing.py backend/architectos/mcp.py backend/architectos/mcp_server.py backend/architectos/lsp.py backend/architectos/files.py backend/architectos/launcher.py backend/architectos/release.py scripts/build_release.py run_architectos.py mcp_memory_server.py",
+    "mcp": "python mcp_memory_server.py",
+    "release": "python scripts/build_release.py",
+    "release:check": "python scripts/build_release.py --check-only",
+    "prod:check": "python scripts/build_release.py --check-only",
+    "app": "python run_architectos.py --app-window"
+  }
+}
