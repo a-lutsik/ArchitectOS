@@ -87,4 +87,13 @@ python .\scripts\build_release.py
 
 The archive is written under `dist\` and excludes runtime data, local memory evidence, cache files, and previous release packages.
 
+To share a **binary Full** package that registers **server autostart at OS login** (macOS LaunchAgent / Windows Scheduled Task):
+
+```bash
+python3 scripts/build_share_package.py
+# recipient: unpack → ./install.sh  or  install.bat
+```
+
+Russian guide: `docs/GUIDE_RU.md`. Details: `docs/INSTALLERS.md`.
+
 See `docs/PRODUCTION.md` for production operations, readiness, backups, and security headers.

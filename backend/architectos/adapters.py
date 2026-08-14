@@ -48,6 +48,8 @@ class ProviderRequest:
     role: str = ""
     cancel_requested: Callable[[], bool] | None = None
     images: list[dict[str, Any]] = field(default_factory=list)
+    # Tool schemas ({name, description, parameters}) for providers with native tool calling.
+    tools: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _image_data_url(image: dict[str, Any]) -> str:
@@ -83,7 +85,13 @@ class ProviderAdapter:
     def build_prompt(self, request: ProviderRequest) -> str:
         return (
             "You are ArchitectOS, a local-first AI workspace for software engineers.\n"
-            "Use the provided project context. If context is insufficient, say what to scan or add to memory.\n\n"
+            "Work autonomously. Use the provided project context; when it is not enough and tools are listed, "
+            "read the project files and memory nodes yourself instead of asking the user for permission.\n"
+            "Never ask to confirm read-only lookups and never defer work to a later turn — do it now, then answer. "
+            "Ask a question only when the user must make a product decision you cannot make.\n"
+            "If no tools are available and context is missing, say briefly which files or sources are needed.\n"
+            "Describe your actions in plain language (\"reading PrimaryEnergyChartRefBuilder.java\"); "
+            "never mention internal tool names in the answer.\n\n"
             f"{request.context}\n\n"
             f"User request:\n{request.message}\n"
         )
@@ -183,6 +191,10 @@ class OpenAIResponsesAdapter(ProviderAdapter):
             "model": self._model(provider),
             "input": self._openai_input(request),
         }
+        tools = _openai_tools_payload(request)
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         endpoint = self._responses_endpoint(provider)
         req = urllib.request.Request(
             endpoint,
@@ -198,8 +210,9 @@ class OpenAIResponsesAdapter(ProviderAdapter):
             return {"provider_id": self.provider_id, "status": "error", "text": self._http_error_text(exc.code, body), "raw": body}
         except OSError as exc:
             return {"provider_id": self.provider_id, "status": "error", "text": f"{self.service_name} request failed: {exc}", "raw": None}
+        text = _merge_native_tool_calls(_extract_openai_text(data), _extract_openai_tool_calls(data))
         return _result_with_usage(
-            {"provider_id": self.provider_id, "status": "ok", "text": _extract_openai_text(data), "raw": data},
+            {"provider_id": self.provider_id, "status": "ok", "text": text, "raw": data},
             model=self._model(provider),
             usage_payload=data,
         )
@@ -1108,7 +1121,8 @@ class ProviderRouter:
     ) -> dict[str, Any]:
         resolved_role = role or self._role(request)
         last_result: dict[str, Any] | None = None
-        for provider, decision in self._iter_provider_attempts(providers, provider_id, resolved_role):
+        approved = bool(getattr(request, "approved", False))
+        for provider, decision in self._iter_provider_attempts(providers, provider_id, resolved_role, approved):
             adapter = self.adapters.get(provider["id"], self.adapters["local-memory"])
             result = adapter.run(provider, request, self.project_root)
             if not self._is_provider_failure(result):
@@ -1116,6 +1130,8 @@ class ProviderRouter:
                 result["selected_provider"] = provider
                 result["routing"] = decision
                 return result
+            result.setdefault("selected_provider", provider)
+            result.setdefault("routing", decision)
             last_result = result
         result = dict(last_result or {"provider_id": provider_id or "auto", "status": "error", "text": "No provider could respond.", "raw": None})
         result["requested_provider_id"] = provider_id or "auto"
@@ -1169,7 +1185,8 @@ class ProviderRouter:
     ) -> Iterator[dict[str, Any]]:
         resolved_role = role or self._role(request)
         last_result: dict[str, Any] | None = None
-        for provider, decision in self._iter_provider_attempts(providers, provider_id, resolved_role):
+        approved = bool(getattr(request, "approved", False))
+        for provider, decision in self._iter_provider_attempts(providers, provider_id, resolved_role, approved):
             adapter = self.adapters.get(provider["id"], self.adapters["local-memory"])
             buffered: list[dict[str, Any]] = []
             failed = False
@@ -1177,6 +1194,8 @@ class ProviderRouter:
                 if event.get("type") == "done":
                     result = dict(event.get("result") or {})
                     if self._is_provider_failure(result):
+                        result.setdefault("selected_provider", provider)
+                        result.setdefault("routing", decision)
                         last_result = result
                         failed = True
                         break
@@ -1213,13 +1232,23 @@ class ProviderRouter:
         return getattr(request, "role", "") or classify_role(getattr(request, "message", "") or "")
 
     def _is_provider_failure(self, result: dict[str, Any]) -> bool:
-        return str(result.get("status") or "").lower() == "error"
+        # approval_required counts as a failure so auto-routing can fall back to an API provider
+        # instead of stalling the turn with an approval notice.
+        return str(result.get("status") or "").lower() in {"error", "approval_required"}
+
+    def _needs_cli_approval(self, provider: dict[str, Any], approved: bool) -> bool:
+        if approved:
+            return False
+        if str(provider.get("provider_type") or "").lower() != "cli":
+            return False
+        return bool(provider.get("approval_required", True))
 
     def _iter_provider_attempts(
         self,
         providers: list[dict[str, Any]],
         provider_id: str | None,
         role: str | None,
+        approved: bool = True,
     ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
         policy = self.policy()
         plan = policy.select(providers, provider_id, role)
@@ -1241,11 +1270,16 @@ class ProviderRouter:
                 decision["requested_mode"] = plan["decision"].get("mode")
             return decision
 
+        explicit = plan["decision"].get("mode") == "explicit"
+        skipped_for_approval = False
         if initial_id:
             tried.add(initial_id)
-            yield initial_provider, plan["decision"]
+            if explicit or not self._needs_cli_approval(initial_provider, approved):
+                yield initial_provider, plan["decision"]
+            else:
+                skipped_for_approval = True
 
-        if plan["decision"].get("mode") == "explicit":
+        if explicit:
             return
 
         ranked = policy.rank(providers, role)
@@ -1258,9 +1292,14 @@ class ProviderRouter:
             provider = by_id.get(candidate_id)
             if not provider:
                 continue
+            if self._needs_cli_approval(provider, approved):
+                continue
             tried.add(candidate_id)
             label = provider.get("label") or candidate_id
-            reason = f"Falling back to {label} after {initial_id or 'previous provider'} failed."
+            if skipped_for_approval:
+                reason = f"Using {label} because {initial_id or 'the preferred provider'} needs CLI approval."
+            else:
+                reason = f"Falling back to {label} after {initial_id or 'previous provider'} failed."
             yield provider, build_decision(provider, "fallback", reason, initial_id or None)
 
         if "local-memory" not in tried:
@@ -1618,3 +1657,54 @@ def _extract_openai_text(data: dict[str, Any]) -> str:
             if "text" in content:
                 chunks.append(str(content["text"]))
     return "\n".join(chunks).strip()
+
+
+def _openai_tools_payload(request: ProviderRequest) -> list[dict[str, Any]]:
+    """Convert ArchitectOS tool specs into Responses API function tools."""
+    tools: list[dict[str, Any]] = []
+    for spec in request.tools or []:
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            continue
+        tools.append({
+            "type": "function",
+            "name": name,
+            "description": str(spec.get("description") or ""),
+            "parameters": spec.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return tools
+
+
+def _extract_openai_tool_calls(data: Any) -> list[dict[str, Any]]:
+    """Collect function_call items from a Responses API payload."""
+    if not isinstance(data, dict):
+        return []
+    calls: list[dict[str, Any]] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict) or str(item.get("type") or "") != "function_call":
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        raw_args = item.get("arguments")
+        arguments: dict[str, Any] = {}
+        if isinstance(raw_args, dict):
+            arguments = raw_args
+        elif isinstance(raw_args, str) and raw_args.strip():
+            try:
+                parsed = json.loads(raw_args)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                arguments = parsed
+        calls.append({"name": name, "arguments": arguments})
+    return calls
+
+
+def _merge_native_tool_calls(text: str, calls: list[dict[str, Any]]) -> str:
+    """Re-emit native tool calls in the JSON protocol the tool loop already parses."""
+    if not calls:
+        return text
+    protocol = json.dumps({"tool_calls": calls}, ensure_ascii=False)
+    body = str(text or "").strip()
+    return f"{body}\n{protocol}" if body else protocol

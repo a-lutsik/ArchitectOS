@@ -1,0 +1,20 @@
+[
+  {"query": "к чему пришли на созвоне про data uploader", "expect": "Data uploader", "note": "meeting recall, cross-lingual"},
+  {"query": "market participant agreement design billing structure", "expect": "Market participant", "note": "meeting recall"},
+  {"query": "что решили по billing architecture для Power Gen", "expect": "billing architecture", "note": "meeting recall, cross-lingual"},
+  {"query": "code review device ID priority transaction logic", "expect": "device ID priority", "note": "meeting recall"},
+  {"query": "pipeline refactor UI design standards", "expect": "Pipeline refactor", "note": "meeting recall"},
+  {"query": "IPM project request flow billing residential", "expect": "IPM", "note": "meeting recall"},
+  {"query": "weather by location chart ref builder", "expect": "weather by location chart", "note": "PR decision"},
+  {"query": "column-level audit change history energy_records_summary", "expect": "Column-level audit", "note": "PR decision"},
+  {"query": "аудит изменений по колонкам energy_records", "expect": "Column-level audit", "note": "cross-lingual semantic"},
+  {"query": "wazuh install ansible playbook", "expect": "wazuh", "note": "PR decision"},
+  {"query": "плейбук установки wazuh на devops", "expect": "wazuh", "note": "cross-lingual semantic"},
+  {"query": "regression TIGO June 2026 installations", "expect": "Regression TIGO", "note": "requirement"},
+  {"query": "download manager for tables charts and bills", "expect": "Download manager", "note": "requirement"},
+  {"query": "add Upload Data button to Summary page", "expect": "Upload Data button", "note": "requirement"},
+  {"query": "select meters from Meter Accuracy table", "expect": "Meter Accuracy", "note": "requirement"},
+  {"query": "keep only last 2 versions status_job", "expect": "status_job", "note": "requirement"},
+  {"query": "FNAP phase 2", "expect": "FNAP", "note": "requirement"},
+  {"query": "какие задачи на версию 6.8.0", "expect": "6.8.0", "note": "version planning, cross-lingual"}
+]

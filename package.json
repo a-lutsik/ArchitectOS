@@ -12,6 +12,12 @@
     "release": "python scripts/build_release.py",
     "release:check": "python scripts/build_release.py --check-only",
     "prod:check": "python scripts/build_release.py --check-only",
-    "app": "python run_architectos.py --app-window"
+    "app": "python run_architectos.py --app-window",
+    "dist:desktop": "python scripts/build_all_installers.py --target desktop",
+    "dist:mcp": "python scripts/build_all_installers.py --target mcp",
+    "dist:ide": "python scripts/build_all_installers.py --target ide",
+    "dist:share": "python scripts/build_share_package.py",
+    "dist:share:all": "python scripts/build_share_package.py --with-mcp --with-ide",
+    "dist:all": "python scripts/build_all_installers.py --target all"
   }
 }

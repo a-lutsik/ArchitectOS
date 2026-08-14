@@ -18,7 +18,10 @@ RESPONSE_FORMAT_POLICY = """Response format (final user answer):
 ```
 Supported action types: open_work_item, boards_get_item, boards_search, memory_get, ask.
 5) Do not put tool_calls JSON in the final answer. Keep the architectos block valid JSON.
-6) If there are no actions, omit the architectos fence."""
+6) If there are no actions, omit the architectos fence.
+7) Actions must offer new work the user may want next. Never use them to ask for permission to read files or memory,
+   to “continue the scan”, or to confirm a plan — do that work before answering.
+8) Write action labels in plain language, without internal tool names."""
 
 
 def split_rich_response(text: str) -> tuple[str, dict[str, Any]]:

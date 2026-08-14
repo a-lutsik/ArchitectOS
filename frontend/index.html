@@ -16,7 +16,7 @@
           <div class="nav-group" data-nav-group="work">
             <div class="nav-group-label" data-i18n="nav.work">Work</div>
             <button class="nav-item active" data-view="workspace">Workspace</button>
-            <button class="nav-item" data-view="memory">Memory</button>
+            <button class="nav-item" data-view="memory"><span class="nav-item-label">Memory</span> <span id="nav-memory-review-badge" class="nav-badge" hidden></span></button>
             <button class="nav-item" data-view="tasks">Tasks</button>
           </div>
           <div class="nav-group" data-nav-group="ai">
@@ -103,6 +103,12 @@
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
               <line x1="12" y1="11" x2="12" y2="17"></line>
               <line x1="9" y1="14" x2="15" y2="14"></line>
+            </svg>
+          </button>
+          <button id="toggle-dotfiles" class="icon-btn-sm" type="button" title="Show hidden (dot) files" aria-pressed="false">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
             </svg>
           </button>
           <button id="refresh-files" class="icon-btn-sm" title="Refresh">
@@ -418,7 +424,7 @@
     <div class="modal-body graph-node-body">
       <section class="graph-node-section">
         <h4 class="graph-node-section-title">Overview</h4>
-        <p id="graph-detail-text" class="graph-node-overview">Click a memory node to inspect its text, scope, type, links, and evidence.</p>
+        <div id="graph-detail-text" class="graph-node-overview">Click a memory node to inspect its text, scope, type, links, and evidence.</div>
       </section>
       <section class="graph-node-section">
         <h4 class="graph-node-section-title">Linked memory</h4>
@@ -549,7 +555,7 @@
     Copy Path
   </button>
 </div>
-        <section class="view" id="chat-view"><div class="dashboard-grid"><section class="panel span-2 chat-panel"><div class="panel-header ask-panel-header"><div class="ask-header-left"><h3>Ask</h3><div class="ask-mode-toggle" role="tablist" aria-label="Ask mode"><button type="button" class="ask-mode-btn active" data-ask-mode="quick" role="tab" aria-selected="true">Agent</button><button type="button" class="ask-mode-btn" data-ask-mode="council" role="tab" aria-selected="false">Council</button><button type="button" class="ask-mode-btn" data-ask-mode="memory" role="tab" aria-selected="false">Memory</button><button type="button" class="ask-mode-btn" data-ask-mode="memory-mcp" role="tab" aria-selected="false">Memory + MCP</button></div></div><button id="chat-stop" type="button" disabled>Stop</button></div><div id="ask-mode-hint" class="ask-mode-hint">Agent decides which tools/memory to use and acts on your request.</div>
+        <section class="view" id="chat-view"><div class="dashboard-grid"><section class="panel span-2 chat-panel"><div class="panel-header ask-panel-header"><div class="ask-header-left"><h3>Ask</h3><div class="ask-mode-toggle" role="tablist" aria-label="Ask mode"><button type="button" class="ask-mode-btn active" data-ask-mode="quick" role="tab" aria-selected="true">Agent</button><button type="button" class="ask-mode-btn" data-ask-mode="council" role="tab" aria-selected="false">Council</button><button type="button" class="ask-mode-btn" data-ask-mode="memory" role="tab" aria-selected="false">Memory</button><button type="button" class="ask-mode-btn" data-ask-mode="memory-mcp" role="tab" aria-selected="false">Memory + MCP</button></div></div><div class="ask-header-actions"><button id="chat-new" class="icon-btn-sm" type="button" title="New chat" aria-label="New chat"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path><line x1="12" y1="7" x2="12" y2="13"></line><line x1="9" y1="10" x2="15" y2="10"></line></svg></button><button id="chat-end-session" class="icon-btn-sm" type="button" title="End session and summarize it into memory" aria-label="End session" disabled><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v12H3V8"></path><rect x="2" y="3" width="20" height="5" rx="1"></rect><line x1="10" y1="13" x2="14" y2="13"></line></svg></button><button id="chat-stop" type="button" disabled>Stop</button></div></div><div id="ask-mode-hint" class="ask-mode-hint">Agent decides which tools/memory to use and acts on your request.</div>
 <div id="ask-council-options" class="ask-agents-options is-collapsed" hidden>
   <button type="button" id="ask-council-toggle" class="ask-team-header" aria-expanded="false" aria-controls="ask-council-body">
     <div class="ask-team-heading">
@@ -576,10 +582,18 @@
               <h3>Memory Graph</h3>
               <p>Project memory plus shared/global knowledge links.</p>
             </div>
+            <div class="memory-view-tabs" role="tablist" aria-label="Memory view mode">
+              <button id="memory-tab-graph" type="button" class="memory-view-tab active" role="tab" aria-selected="true">Graph</button>
+              <button id="memory-tab-list" type="button" class="memory-view-tab" role="tab" aria-selected="false">List</button>
+            </div>
             <div class="graph-controls">
               <input id="graph-search" class="graph-search-input" type="search" placeholder="Search graph..." aria-label="Search graph">
               <select id="graph-group-filter" aria-label="Memory group">
                 <option value="">All groups</option>
+              </select>
+              <select id="graph-color-mode" aria-label="Color nodes by" title="Color nodes by detected themes (communities) or by group">
+                <option value="community">Color: themes</option>
+                <option value="group">Color: group</option>
               </select>
               <select id="graph-source-filter" aria-label="Memory source">
                 <option value="">All sources</option>
@@ -629,6 +643,16 @@
                     </svg>
                     <span data-i18n="graph.rebuildLinksShort">Links</span>
                   </button>
+                  <button id="graph-suggest-links" type="button" class="graph-stage-tool" title="Ask the AI to find contextually related but unlinked memory nodes" data-i18n-title="graph.tip.suggestLinks">
+                    <svg class="graph-stage-tool-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M12 3v3"></path>
+                      <path d="M12 18v3"></path>
+                      <path d="M3 12h3"></path>
+                      <path d="M18 12h3"></path>
+                      <circle cx="12" cy="12" r="4"></circle>
+                    </svg>
+                    <span data-i18n="graph.suggestLinksShort">Suggest</span>
+                  </button>
                   <button id="refresh-graph" type="button" class="graph-stage-tool" title="Reload the graph with current filters" data-i18n-title="graph.tip.refresh">
                     <svg class="graph-stage-tool-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <polyline points="23 4 23 10 17 10"></polyline>
@@ -649,9 +673,41 @@
               </div>
               <span id="graph-density-hint" class="graph-stage-summary graph-density-hint" hidden></span>
               <span id="graph-link-summary" class="graph-stage-summary" hidden></span>
+              <div id="graph-suggest-panel" class="graph-suggest-panel" hidden>
+                <div class="graph-suggest-header">
+                  <span id="graph-suggest-status" class="graph-suggest-status"></span>
+                  <div class="graph-suggest-actions">
+                    <button id="graph-suggest-apply" type="button" class="btn-secondary" disabled>Apply selected</button>
+                    <button id="graph-suggest-close" type="button" class="btn-text" title="Close suggestions">✕</button>
+                  </div>
+                </div>
+                <div id="graph-suggest-list" class="graph-suggest-list"></div>
+              </div>
               <div id="graph-legend" class="graph-legend" aria-label="Graph groups"></div>
               <span id="graph-inspect-hint" class="graph-inspect-hint" data-i18n="graph.inspectHint">Double-click a node to inspect</span>
             </div>
+          </div>
+
+          <!-- List view (alternative to the graph canvas) -->
+          <div id="memory-list-panel" class="memory-list-panel" hidden>
+            <div class="memory-list-filters">
+              <input id="memory-list-search" type="search" placeholder="Filter by label or text…" aria-label="Filter memory list">
+              <select id="memory-list-tier" aria-label="Tier">
+                <option value="all">All tiers</option>
+                <option value="long_term">Long-term</option>
+                <option value="short_term">Short-term</option>
+              </select>
+              <select id="memory-list-state" aria-label="Stage">
+                <option value="all">All stages</option>
+                <option value="fresh">Fresh</option>
+                <option value="stable">Stable</option>
+                <option value="fading">Fading</option>
+                <option value="stale">Stale</option>
+                <option value="archived">Archived</option>
+              </select>
+              <span id="memory-list-count" class="memory-list-count muted"></span>
+            </div>
+            <div id="memory-list-items" class="memory-list-items"></div>
           </div>
 
           <!-- Memory Lifecycle at bottom of graph -->
@@ -818,9 +874,9 @@
                 </div>
 
                 <div id="ingest-boards-options" class="boards-options" hidden>
-                  <label class="boards-all-items" title="If checked, imports all work items from the Azure Boards project instead of only items assigned to you.">
-                    <input id="ingest-boards-all-items" type="checkbox">
-                    <span>Boards: All items</span>
+                  <label class="boards-scope-toggle" title="By default every work item in the Azure Boards project is scanned. Check this to import only items assigned to you.">
+                    <input id="ingest-boards-mine-only" type="checkbox">
+                    <span>Boards: only my items</span>
                   </label>
                   <details class="boards-type-picker">
                     <summary>
@@ -1381,7 +1437,114 @@
         </section>
 
         <section class="view" id="analytics-view"><section class="panel"><div class="panel-header"><h3>Analytics</h3></div><div id="analytics-view-grid" class="analytics-grid"></div></section></section>
-        <section class="view" id="settings-view"><div class="dashboard-grid"><section class="panel"><div class="panel-header"><h3>Profile Bundle</h3></div><button id="export-bundle">Export Bundle</button><textarea id="bundle-box" class="bundle-box" placeholder="Exported profile bundle appears here. Paste a bundle and import it."></textarea><button id="import-bundle">Import Bundle</button></section><section class="panel"><div class="panel-header"><h3>UI Settings</h3></div><form id="settings-form" class="stack-form"><label>Theme<select id="theme-select"><option>system</option><option>light</option><option>dark</option></select></label><label>Density<select id="density-select"><option>comfortable</option><option>compact</option></select></label><label>Language<select id="settings-language-select"><option value="en">English</option><option value="ru">Русский</option><option value="uk">Українська</option><option value="he">עברית</option></select></label><label class="inline-check"><input id="memory-enabled" type="checkbox" checked> Memory enabled</label><label class="inline-check"><input id="lifecycle-enabled" type="checkbox" checked> Lifecycle enabled</label><label class="inline-check"><input id="refresh-on-access" type="checkbox" checked> Refresh on access</label><label class="inline-check"><input id="auto-rescan-on-startup" type="checkbox" checked> Rescan sources on startup</label><label>Chat memory mode<select id="chat-memory-mode"><option value="off">Off (★ only)</option><option value="strict" selected>Strict (facts only)</option><option value="aggressive">Aggressive</option></select></label><label>Chat candidate TTL days<input id="chat-candidate-ttl" type="number" min="0" value="7"></label><label class="inline-check"><input id="chat-store-facts-only" type="checkbox" checked> Store chat facts only (not full turns)</label><label>Short-term TTL<input id="short-term-ttl" type="number" min="0" value="14"></label><label>Archive after days<input id="archive-after" type="number" min="0" value="30"></label><label>Delete after days<input id="delete-after" type="number" min="0" value="0"></label><label>Promote after hits<input id="promote-after-hits" type="number" min="1" value="5"></label><button type="submit">Save Settings</button></form></section><section class="panel"><div class="panel-header"><h3 data-i18n="settings.embeddings">Memory Embeddings</h3></div><p id="embeddings-status" class="muted-note">Loading…</p><form id="embeddings-form" class="stack-form"><label class="inline-check"><input id="embeddings-enabled" type="checkbox" checked> Embeddings enabled</label><label>Provider<select id="embedding-provider"><option value="auto">auto</option><option value="cloudflare">cloudflare</option><option value="gemini">gemini</option><option value="openai">openai</option><option value="azure-openai">azure-openai</option><option value="ollama">ollama</option><option value="hash">hash (offline)</option></select></label><label>Model<select id="embedding-model"></select></label><label>Dimensions<input id="embedding-dimensions" type="number" min="128" max="3072" step="1" value="1024"></label><label>Vector pool<input id="vector-pool" type="number" min="8" max="200" value="64"></label><label>Min score<input id="vector-min-score" type="number" min="0" max="1" step="0.01" value="0.22"></label><label>Query timeout (ms)<input id="vector-query-timeout" type="number" min="50" max="5000" step="50" value="2500"></label><label class="inline-check"><input id="reindex-on-startup" type="checkbox"> Reindex on startup</label><div class="settings-actions" style="display:flex;gap:8px;flex-wrap:wrap"><button type="submit">Save Embeddings</button><button id="embeddings-rebuild" type="button" class="btn-secondary">Rebuild Index</button></div></form></section><section class="panel"><div class="panel-header"><h3>Security Preview</h3><button id="security-preview-run" type="button">Preview</button></div><textarea id="security-preview-input" class="bundle-box" placeholder="Paste prompt, result, or config text"></textarea><div id="security-preview-result" class="result-list"></div></section></div></section>
+        <section class="view" id="settings-view">
+          <header class="settings-page-header">
+            <h2 class="settings-page-title">Settings</h2>
+            <p class="settings-page-subtitle">Interface, memory behaviour, retrieval tuning, and data tools.</p>
+          </header>
+          <div class="dashboard-grid settings-layout">
+
+            <section class="panel settings-card">
+              <div class="panel-header"><h3>Profile Bundle</h3></div>
+              <p class="settings-card-desc">Move your full profile between machines: export a bundle, or paste one to import.</p>
+              <div class="settings-bundle-actions">
+                <button id="export-bundle" type="button" class="btn-secondary">Export Bundle</button>
+                <button id="import-bundle" type="button" class="btn-primary">Import Bundle</button>
+              </div>
+              <textarea id="bundle-box" class="bundle-box" placeholder="Exported profile bundle appears here. Paste a bundle and import it."></textarea>
+            </section>
+
+            <section class="panel settings-card">
+              <div class="panel-header"><h3>UI Settings</h3></div>
+              <form id="settings-form" class="stack-form settings-form">
+                <fieldset class="settings-section">
+                  <legend class="settings-group-title">Interface</legend>
+                  <p class="settings-section-desc">Appearance and language of the app.</p>
+                  <div class="settings-grid">
+                    <label>Theme<select id="theme-select"><option>system</option><option>light</option><option>dark</option></select></label>
+                    <label>Density<select id="density-select"><option>comfortable</option><option>compact</option></select></label>
+                    <label>Language<select id="settings-language-select"><option value="en">English</option><option value="ru">Русский</option><option value="uk">Українська</option><option value="he">עברית</option></select></label>
+                  </div>
+                </fieldset>
+
+                <fieldset class="settings-section">
+                  <legend class="settings-group-title">Memory &amp; lifecycle</legend>
+                  <p class="settings-section-desc">Whether knowledge is captured and kept fresh as you work.</p>
+                  <div class="settings-toggles">
+                    <label class="inline-check setting-toggle"><input id="memory-enabled" type="checkbox" checked> Memory enabled</label>
+                    <label class="inline-check setting-toggle"><input id="lifecycle-enabled" type="checkbox" checked> Lifecycle enabled</label>
+                    <label class="inline-check setting-toggle"><input id="refresh-on-access" type="checkbox" checked> Refresh on access</label>
+                    <label class="inline-check setting-toggle"><input id="auto-rescan-on-startup" type="checkbox" checked> Rescan sources on startup</label>
+                  </div>
+                </fieldset>
+
+                <fieldset class="settings-section">
+                  <legend class="settings-group-title">Chat memory</legend>
+                  <p class="settings-section-desc">How conversations are distilled into durable memory.</p>
+                  <div class="settings-grid">
+                    <label>Chat memory mode<select id="chat-memory-mode"><option value="off">Off (★ / Remember only)</option><option value="strict" selected>Strict (session summary)</option><option value="aggressive">Aggressive</option></select></label>
+                    <label>Chat candidate TTL <span class="field-unit">days</span><input id="chat-candidate-ttl" type="number" min="0" value="7"></label>
+                    <label>End idle session after <span class="field-unit">min</span><input id="chat-session-idle" type="number" min="0" value="30"><small class="field-hint">0 disables idle finalization.</small></label>
+                  </div>
+                  <label class="inline-check setting-toggle"><input id="chat-store-facts-only" type="checkbox" checked> Prefer facts in session summaries</label>
+                </fieldset>
+
+                <fieldset class="settings-section">
+                  <legend class="settings-group-title">Retention</legend>
+                  <p class="settings-section-desc">When memories fade, get archived, or are removed.</p>
+                  <div class="settings-grid">
+                    <label>Short-term TTL<input id="short-term-ttl" type="number" min="0" value="14"></label>
+                    <label>Archive after days<input id="archive-after" type="number" min="0" value="30"></label>
+                    <label>Delete after days<input id="delete-after" type="number" min="0" value="0"><small class="field-hint">0 = never delete.</small></label>
+                    <label>Promote after hits<input id="promote-after-hits" type="number" min="1" value="5"></label>
+                  </div>
+                </fieldset>
+
+                <div class="settings-form-actions">
+                  <button type="submit" class="btn-primary">Save Settings</button>
+                </div>
+              </form>
+            </section>
+
+            <section class="panel settings-card">
+              <div class="panel-header"><h3 data-i18n="settings.embeddings">Memory Embeddings</h3></div>
+              <p id="embeddings-status" class="muted-note settings-status">Loading…</p>
+              <form id="embeddings-form" class="stack-form settings-form">
+                <label class="inline-check setting-toggle"><input id="embeddings-enabled" type="checkbox" checked> Embeddings enabled</label>
+                <fieldset class="settings-section">
+                  <legend class="settings-group-title">Provider</legend>
+                  <div class="settings-grid">
+                    <label>Provider<select id="embedding-provider"><option value="auto">auto</option><option value="cloudflare">cloudflare</option><option value="gemini">gemini</option><option value="openai">openai</option><option value="azure-openai">azure-openai</option><option value="ollama">ollama</option><option value="local">local (on-device)</option><option value="hash">hash (offline)</option></select></label>
+                    <label>Model<select id="embedding-model"></select></label>
+                    <label>Dimensions<input id="embedding-dimensions" type="number" min="128" max="3072" step="1" value="1024"></label>
+                  </div>
+                </fieldset>
+                <fieldset class="settings-section">
+                  <legend class="settings-group-title">Retrieval tuning</legend>
+                  <div class="settings-grid">
+                    <label>Vector pool<input id="vector-pool" type="number" min="8" max="200" value="64"></label>
+                    <label>Min score<input id="vector-min-score" type="number" min="0" max="1" step="0.01" value="0.22"><small class="field-hint">Cosine cutoff (0–1) for vector prefilter.</small></label>
+                    <label>Relevance floor<input id="search-relevance-floor" type="number" min="0" max="0.9" step="0.01" value="0.28"><small class="field-hint">Drop hits below this × the top hit's score.</small></label>
+                    <label>Query timeout (ms)<input id="vector-query-timeout" type="number" min="50" max="5000" step="50" value="2500"></label>
+                  </div>
+                </fieldset>
+                <label class="inline-check setting-toggle"><input id="reindex-on-startup" type="checkbox"> Reindex on startup</label>
+                <div class="settings-form-actions">
+                  <button type="submit" class="btn-primary">Save Embeddings</button>
+                  <button id="embeddings-rebuild" type="button" class="btn-secondary">Rebuild Index</button>
+                </div>
+              </form>
+            </section>
+
+            <section class="panel settings-card">
+              <div class="panel-header"><h3>Security Preview</h3><button id="security-preview-run" type="button" class="btn-secondary">Preview</button></div>
+              <p class="settings-card-desc">Scan any prompt, tool result, or config text for secrets and risky patterns before sharing.</p>
+              <textarea id="security-preview-input" class="bundle-box" placeholder="Paste prompt, result, or config text"></textarea>
+              <div id="security-preview-result" class="result-list"></div>
+            </section>
+
+          </div>
+        </section>
       </main>
     </div>
 
@@ -1507,9 +1670,32 @@
       </div>
     </div>
 
+    <script src="/i18n.js"></script>
+    <script src="/state.js"></script>
+    <script src="/dom-utils.js"></script>
+    <script src="/api-client.js"></script>
+    <script src="/ui.js"></script>
     <script src="/mcp_master_detail.js"></script>
     <script src="/workspace_resizer.js"></script>
     <script src="/rich-response.js"></script>
+    <script src="/file-find.js"></script>
+    <script src="/search-palette.js"></script>
+    <script src="/file-editor.js"></script>
+    <script src="/project-wizard.js"></script>
+    <script src="/workspace-chat.js"></script>
+    <script src="/voice-memory.js"></script>
+    <script src="/terminal.js"></script>
+    <script src="/code-intel.js"></script>
+    <script src="/memory-panel.js"></script>
+    <script src="/memory-ingest.js"></script>
+    <script src="/providers.js"></script>
+    <script src="/settings.js"></script>
+    <script src="/agent-activity.js"></script>
+    <script src="/chat.js"></script>
+    <script src="/graph.js"></script>
+    <script src="/projects.js"></script>
+    <script src="/ask-ui.js"></script>
+    <script src="/file-tree.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

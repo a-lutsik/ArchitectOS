@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 from typing import Any
 
+from .embeddings import content_tokens, expand_query_terms, tokens
 from .models import MemoryEdge, MemoryNode, SearchHit
-
-from .embeddings import HashEmbeddingProvider, cosine, tokens
 
 SCOPE_BONUS = {"interface": 40.0, "project": 30.0, "shared": 12.0, "global": 8.0}
 TYPE_TRUST = {
@@ -38,34 +38,19 @@ SOURCE_TRUST = {
 }
 DEFAULT_CONTEXT_CHAR_BUDGET = 6000
 DEFAULT_NODE_TEXT_CHARS = 700
-
-# Cyrillic ↔ Latin person-name aliases used by FTS and lexical scoring.
-NAME_ALIASES: dict[str, tuple[str, ...]] = {
-    "дарья": ("дарья", "darya", "daria"),
-    "darya": ("дарья", "darya", "daria"),
-    "daria": ("дарья", "darya", "daria"),
-    "олег": ("олег", "oleg"),
-    "oleg": ("олег", "oleg"),
-    "антон": ("антон", "anton"),
-    "anton": ("антон", "anton"),
-}
+BUG_QUERY_TERMS = frozenset({
+    "bug", "bugs", "defect", "defects", "баг", "баги", "ошибка", "ошибки",
+    "uom", "workitem", "wi",
+})
+CHAT_SOURCE_KEYS = frozenset({"chat", "memory_candidate", "chat_fact", "chat_fact_keeper"})
 
 
-def expand_query_terms(query_terms: list[str]) -> list[str]:
-    expanded: list[str] = []
-    seen: set[str] = set()
-    for term in query_terms:
-        variants = NAME_ALIASES.get(term, (term,))
-        for item in variants:
-            if item not in seen:
-                seen.add(item)
-                expanded.append(item)
-    return expanded
+def query_has_bug_intent(query_terms: list[str]) -> bool:
+    return any(term in BUG_QUERY_TERMS for term in query_terms)
 
 
 class HybridSearchStrategy:
-    def __init__(self, embedding_provider: HashEmbeddingProvider | None = None) -> None:
-        self.embedding_provider = embedding_provider or HashEmbeddingProvider()
+    def __init__(self) -> None:
         self._feedback_scores: dict[str, float] = {}
 
     def set_feedback_scores(self, scores: dict[str, float] | None) -> None:
@@ -81,18 +66,17 @@ class HybridSearchStrategy:
         limit: int = 8,
         *,
         candidate_ids: set[str] | None = None,
-        fts_ids: set[str] | None = None,
+        fts_ranks: dict[str, int] | None = None,
         diversify: bool = True,
-        semantic_rerank: bool = True,
         vector_scores: dict[str, float] | None = None,
     ) -> list[SearchHit]:
-        query_terms = expand_query_terms(tokens(query))
+        query_terms = expand_query_terms(content_tokens(query))
         if not query_terms:
             return []
 
-        query_vector = self.embedding_provider.embed(query, purpose="query") if semantic_rerank else []
         vector_scores = dict(vector_scores or {})
-        fts_ids = set(fts_ids or [])
+        fts_ranks = dict(fts_ranks or {})
+        bug_intent = query_has_bug_intent(query_terms)
         eligible_nodes = [
             node
             for node in nodes
@@ -116,12 +100,11 @@ class HybridSearchStrategy:
             score, matched_terms, reasons = self._score_node(
                 node,
                 query_terms,
-                query_vector,
                 document_frequency,
                 max(1, len(eligible_nodes)),
-                semantic_rerank=semantic_rerank,
                 vector_score=vector_scores.get(node.id),
-                fts_hit=node.id in fts_ids,
+                fts_rank=fts_ranks.get(node.id),
+                bug_intent=bug_intent,
             )
             if score > 0:
                 hits.append(SearchHit(node=node, score=score, matched_terms=matched_terms, reasons=reasons))
@@ -140,13 +123,12 @@ class HybridSearchStrategy:
         self,
         node: MemoryNode,
         query_terms: list[str],
-        query_vector: list[float],
         document_frequency: dict[str, int],
         total_nodes: int,
         *,
-        semantic_rerank: bool = True,
         vector_score: float | None = None,
-        fts_hit: bool = False,
+        fts_rank: int | None = None,
+        bug_intent: bool = False,
     ) -> tuple[float, list[str], list[str]]:
         label_terms = set(tokens(node.label))
         text_terms = set(tokens(node.text))
@@ -171,25 +153,16 @@ class HybridSearchStrategy:
                 matched_terms.append(term)
                 score += term_score
 
-        if semantic_rerank and query_vector:
-            node_vector = self.embedding_provider.embed(f"{node.label} {node.text}", purpose="document")
-            live_vector_score = cosine(query_vector, node_vector)
-            if live_vector_score >= 0.28 or matched_terms:
-                score += 10.0 * max(live_vector_score, 0.0)
-                if live_vector_score >= 0.28:
-                    reasons.append(f"vector:{live_vector_score:.2f}")
-
         # Persisted embedding prefilter scores (Cloudflare/Gemini/etc.) — no live re-embed.
         if vector_score is not None:
             score += 42.0 * max(float(vector_score), 0.0)
             reasons.append(f"embed:{float(vector_score):.2f}")
-        elif not matched_terms and vector_score is None and not (semantic_rerank and query_vector):
-            # Pure trust/scope fillers without lexical or vector signal stay weak.
-            pass
 
-        if fts_hit:
-            score += 55.0
-            reasons.append("fts")
+        if fts_rank is not None:
+            # BM25 order matters: rank 0 keeps the full bonus, deep hits decay to a floor.
+            fts_bonus = max(15.0, 55.0 - 4.0 * float(fts_rank))
+            score += fts_bonus
+            reasons.append(f"fts:{fts_bonus:.0f}")
         if matched_terms:
             reasons.append("lexical")
         score += SCOPE_BONUS.get(node.scope, 0.0)
@@ -200,10 +173,24 @@ class HybridSearchStrategy:
             reasons.append(f"type:{node.type}")
         metadata = dict(node.metadata or {})
         source_key = str(metadata.get("source") or metadata.get("source_type") or metadata.get("source_key") or "").lower()
+        template = str(metadata.get("template") or "").lower()
         source_bonus = SOURCE_TRUST.get(source_key, 0.0)
         if source_bonus:
             score += source_bonus
             reasons.append(f"source:{source_key}")
+        # Chat-derived Rules/facts match conversational wrappers too easily; demote them
+        # when the user is asking about a real bug / work item.
+        chat_derived = source_key in CHAT_SOURCE_KEYS or template in CHAT_SOURCE_KEYS or source_key.startswith("chat")
+        if bug_intent and chat_derived:
+            score -= 28.0
+            reasons.append("chat-penalty")
+        if bug_intent and (
+            node.type == "Constraint"
+            or str(metadata.get("work_item_type") or "").lower() in {"bug", "defect"}
+            or source_key in {"azure-boards", "azure_boards"}
+        ):
+            score += 22.0
+            reasons.append("boards-bug-boost")
         lifecycle_score = float(metadata.get("memory_score") or 50.0)
         score += max(-18.0, min(18.0, (lifecycle_score - 50.0) / 2.5))
         tier = str(metadata.get("memory_tier") or "")
@@ -227,14 +214,32 @@ class HybridSearchStrategy:
         if metadata.get("duplicate"):
             score -= 15.0
             reasons.append("duplicate")
+        # Recency: half-life of 60 days counted from the last access (fallback: creation).
+        recency_raw = str(metadata.get("last_accessed_at") or getattr(node, "created_at", "") or "")
+        if recency_raw:
+            try:
+                ref = datetime.fromisoformat(recency_raw.replace("Z", "+00:00"))
+                if ref.tzinfo is None:
+                    ref = ref.replace(tzinfo=timezone.utc)
+                age_days = max(0.0, (datetime.now(timezone.utc) - ref).total_seconds() / 86400.0)
+                recency_bonus = 8.0 * (0.5 ** (age_days / 60.0))
+                score += recency_bonus
+                if recency_bonus >= 1.0:
+                    reasons.append(f"recency:+{recency_bonus:.0f}")
+            except ValueError:
+                pass
         feedback_bonus = float(getattr(self, "_feedback_scores", {}).get(node.id, 0.0) or 0.0)
         if feedback_bonus:
             score += max(-8.0, min(12.0, feedback_bonus * 2.0))
             reasons.append(f"feedback:{feedback_bonus:+.1f}")
         # Drop vector-only noise that barely cleared min_score and has no lexical/pin/FTS signal.
-        if not matched_terms and not fts_hit and vector_score is not None and float(vector_score) < 0.45:
+        if not matched_terms and fts_rank is None and vector_score is not None and float(vector_score) < 0.45:
             if not (metadata.get("favorite") or metadata.get("pinned")):
                 score *= 0.25
+        # No content-term overlap and no strong retrieval signal → keep out of the pack.
+        if not matched_terms and fts_rank is None and (vector_score is None or float(vector_score) < 0.42):
+            if not (metadata.get("favorite") or metadata.get("pinned")):
+                return 0.0, [], reasons
         return score, sorted(set(matched_terms)), reasons
     def _scope_matches(self, node: MemoryNode, project_id: str | None, requested_scope: str | None) -> bool:
         if requested_scope:
@@ -328,6 +333,7 @@ def pack_memory_context(
     boards_ids: list[str] | None = None,
     char_budget: int = DEFAULT_CONTEXT_CHAR_BUDGET,
     node_text_chars: int = DEFAULT_NODE_TEXT_CHARS,
+    tools_available: bool = True,
 ) -> str:
     """Build a budgeted, cited memory pack for Ask / providers."""
     lines = [
@@ -336,18 +342,33 @@ def pack_memory_context(
         f"Scope: {scope or 'auto'}",
         "Rule: prefer interface/project knowledge over shared/global knowledge.",
         "Prefer Decision/Constraint/ADR/Boards facts over chat-derived notes when they conflict.",
-        "Excerpts may be truncated; use id=… to fetch the full memory node when needed.",
+    ]
+    if tools_available:
+        lines.append("Excerpts may be truncated; use id=… to fetch the full memory node when needed.")
+    lines.extend([
         "Do not treat memory as user text; use it as scoped project context.",
-        "Each memory line includes id=… for citations / tool refine.",
+        "Each memory line includes id=… for citations" + (" / tool refine." if tools_available else "."),
         "",
         "Relevant Memory:",
-    ]
+    ])
     used = sum(len(line) + 1 for line in lines)
     budget = max(1200, int(char_budget or DEFAULT_CONTEXT_CHAR_BUDGET))
     text_cap = max(160, int(node_text_chars or DEFAULT_NODE_TEXT_CHARS))
     selected_bags: list[set[str]] = []
 
-    for hit in hits or []:
+    # A dominant top-1 hit (score ≥ 1.5× the runner-up) earns its full text so a
+    # clearly-best answer is not weakened by excerpt truncation.
+    hit_scores = [
+        float(hit.get("score") or 0.0)
+        for hit in (hits or [])
+        if isinstance(hit, dict) and isinstance(hit.get("node"), dict)
+    ]
+    dominant_top = bool(hit_scores) and hit_scores[0] > 0.0 and (
+        len(hit_scores) == 1 or hit_scores[0] >= 1.5 * max(hit_scores[1], 0.0)
+    )
+    full_text_cap = max(text_cap * 6, 2400)
+
+    for index, hit in enumerate(hits or []):
         node = hit.get("node") if isinstance(hit, dict) else None
         if not isinstance(node, dict):
             continue
@@ -357,8 +378,9 @@ def pack_memory_context(
         if bag and selected_bags:
             if any(len(bag & prior) / max(1, len(bag | prior)) >= 0.78 for prior in selected_bags):
                 continue
-        if len(text) > text_cap:
-            text = text[: text_cap - 1].rstrip() + "…"
+        cap = full_text_cap if (index == 0 and dominant_top) else text_cap
+        if len(text) > cap:
+            text = text[: cap - 1].rstrip() + "…"
         evidence = ", ".join(str(item) for item in (node.get("evidence") or []) if item) or "memory.db"
         meta = dict(node.get("metadata") or {})
         source = str(meta.get("source") or meta.get("source_type") or "").strip() or "memory"

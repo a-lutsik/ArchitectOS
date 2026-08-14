@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ArchitectOS</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f1418;
+        --fg: #e8eef2;
+        --muted: #8a9aa6;
+        --accent: #1a6b6b;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(1200px 600px at 10% -10%, rgba(26, 107, 107, 0.35), transparent 55%),
+          linear-gradient(160deg, #0f1418, #162028 55%, #0f1418);
+        color: var(--fg);
+      }
+      main {
+        min-height: 100%;
+        display: grid;
+        place-content: center;
+        gap: 0.75rem;
+        text-align: center;
+        padding: 2rem;
+      }
+      h1 {
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .pulse {
+        width: 2.5rem;
+        height: 2.5rem;
+        margin: 0 auto 0.5rem;
+        border-radius: 999px;
+        border: 3px solid rgba(232, 238, 242, 0.15);
+        border-top-color: var(--accent);
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="pulse" aria-hidden="true"></div>
+      <h1>ArchitectOS</h1>
+      <p>Starting local server…</p>
+    </main>
+  </body>
+</html>

@@ -5,6 +5,10 @@ __pycache__/
 .env.*
 .playwright-mcp/
 dist/
+build/
+.ruff_cache/
+*.egg-info/
+.intellijPlatform/
 /*.png
 index.html.backup*
 *_COMPLETE.md

@@ -74,52 +74,66 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertIn("Strongest memory matches", chat["response"])
             self.assertEqual(len(chat["chat"]["messages"]), 2)
 
-    def test_chat_turn_creates_review_candidate_after_response(self) -> None:
+    def test_chat_turn_does_not_create_candidate_until_session_ends(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
-            service.post_chat_message({
+            result = service.post_chat_message({
                 "project_id": "architectos",
                 "message": "Architecture decision: useful chat turns should become reviewable memory candidates.",
                 "provider_id": "local-memory",
             })
+            self.assertEqual(service.list_memory_candidates("architectos")["candidates"], [])
+            chat_id = result["chat"]["id"]
+            finalized = service.finalize_chat_session(chat_id, force=True, trigger="manual")
             candidates = service.list_memory_candidates("architectos")["candidates"]
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["source_type"], "chat")
-            self.assertEqual(candidates[0]["metadata"]["template"], "chat_fact_keeper")
+            self.assertEqual(candidates[0]["metadata"]["template"], "chat_session_summary")
+            self.assertEqual(finalized["chat"]["session_status"], "complete")
             self.assertIn("Architecture decision", candidates[0]["text"])
 
-    def test_chitchat_does_not_create_memory_candidate(self) -> None:
+    def test_chitchat_session_skips_candidate_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            chat_id = None
             for message in ("привет!", "как дела?", "hello", "thanks"):
-                service.post_chat_message({
+                result = service.post_chat_message({
                     "project_id": "architectos",
                     "message": message,
                     "provider_id": "local-memory",
+                    "chat_id": chat_id,
                 })
-            candidates = service.list_memory_candidates("architectos")["candidates"]
-            self.assertEqual(candidates, [])
+                chat_id = result["chat"]["id"]
+            finalized = service.finalize_chat_session(chat_id, force=True, trigger="manual")
+            self.assertTrue(finalized.get("skipped"))
+            self.assertEqual(service.list_memory_candidates("architectos")["candidates"], [])
 
     def test_chat_memory_mode_off_skips_auto_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
             service.update_settings({"memory_lifecycle": {"chat_memory_mode": "off"}})
-            service.post_chat_message({
+            result = service.post_chat_message({
                 "project_id": "architectos",
                 "message": "Architecture decision: this should not auto-save when mode is off.",
                 "provider_id": "local-memory",
             })
+            idle = service._finalize_idle_chat_sessions()
+            self.assertTrue(idle.get("disabled"))
             self.assertEqual(service.list_memory_candidates("architectos")["candidates"], [])
+            # Manual finalize still allowed with force.
+            finalized = service.finalize_chat_session(result["chat"]["id"], force=True, trigger="manual")
+            self.assertEqual(finalized["chat"]["session_status"], "complete")
 
     def test_stale_chat_candidates_expire_by_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
             service.update_settings({"memory_lifecycle": {"chat_candidate_ttl_days": 1}})
-            service.post_chat_message({
+            result = service.post_chat_message({
                 "project_id": "architectos",
                 "message": "Architecture decision: expire stale chat candidates after TTL.",
                 "provider_id": "local-memory",
             })
+            service.finalize_chat_session(result["chat"]["id"], force=True, trigger="manual")
             candidates = service.list_memory_candidates("architectos")["candidates"]
             self.assertEqual(len(candidates), 1)
             candidate = candidates[0]
@@ -129,6 +143,100 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             result = service.memory_lifecycle.expire_stale_chat_candidates("architectos")
             self.assertGreaterEqual(result["chat_candidates_expired"], 1)
             self.assertEqual(service.list_memory_candidates("architectos")["candidates"], [])
+
+    def test_idle_finalize_creates_session_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_lifecycle": {"chat_session_idle_minutes": 1}})
+            created = service.post_chat_message({
+                "project_id": "architectos",
+                "message": "Architecture decision: idle sessions should summarize into candidates.",
+                "provider_id": "local-memory",
+            })
+            chat = service.repository.get_chat(created["chat"]["id"])
+            chat["last_activity_at"] = "2020-01-01T00:00:00Z"
+            chat["updated_at"] = "2020-01-01T00:00:00Z"
+            service.repository.upsert_chat(chat)
+            sweep = service._finalize_idle_chat_sessions()
+            self.assertGreaterEqual(sweep["finalized"], 1)
+            candidates = service.list_memory_candidates("architectos")["candidates"]
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["metadata"]["template"], "chat_session_summary")
+            closed = service.repository.get_chat(created["chat"]["id"])
+            self.assertEqual(closed["session_status"], "complete")
+
+            # Continuing the chat reopens the session and bumps revision.
+            continued = service.post_chat_message({
+                "project_id": "architectos",
+                "chat_id": created["chat"]["id"],
+                "message": "Architecture decision: reopen after idle finalize.",
+                "provider_id": "local-memory",
+            })
+            self.assertEqual(continued["chat"]["session_status"], "active")
+            self.assertGreaterEqual(int(continued["chat"]["session_revision"] or 1), 2)
+            self.assertEqual(service.list_memory_candidates("architectos")["candidates"], candidates)
+
+    def test_continued_chat_summarizes_only_delta_and_links_promoted_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            summarized_segments: list[list[str]] = []
+
+            def fake_summary(chat, *, session_messages=None):
+                texts = [str(item.get("text") or "") for item in (session_messages or [])]
+                summarized_segments.append(texts)
+                revision = int(chat.get("session_revision") or 1)
+                return {
+                    "text": f"Session {revision} standalone fact: {texts[0]}",
+                    "has_facts": True,
+                    "facts": [{"text": texts[0], "type": "Decision"}],
+                    "type": "Decision",
+                    "confidence": 0.8,
+                }
+
+            service._summarize_chat_session = fake_summary
+            first = service.post_chat_message({
+                "project_id": "architectos",
+                "message": "Decision: first session fact.",
+                "provider_id": "local-memory",
+            })
+            chat_id = first["chat"]["id"]
+            service.finalize_chat_session(chat_id, force=True, trigger="manual")
+
+            second = service.post_chat_message({
+                "project_id": "architectos",
+                "chat_id": chat_id,
+                "message": "Decision: second session fact.",
+                "provider_id": "local-memory",
+            })
+            service.finalize_chat_session(chat_id, force=True, trigger="manual")
+
+            self.assertEqual(len(summarized_segments), 2)
+            self.assertEqual(len(summarized_segments[0]), 2)
+            self.assertEqual(len(summarized_segments[1]), 2)
+            self.assertIn("first session fact", summarized_segments[0][0])
+            self.assertIn("second session fact", summarized_segments[1][0])
+            self.assertNotIn("first session fact", " ".join(summarized_segments[1]))
+
+            candidates = service.list_memory_candidates("architectos", "all")["candidates"]
+            session_candidates = sorted(
+                [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_summary"],
+                key=lambda item: int((item.get("metadata") or {}).get("session_revision") or 0),
+            )
+            self.assertEqual([int(item["metadata"]["session_revision"]) for item in session_candidates], [1, 2])
+            self.assertTrue(all(item["source_ref"] == chat_id for item in session_candidates))
+            self.assertEqual(session_candidates[1]["metadata"]["session_start_message_index"], 2)
+            self.assertEqual(session_candidates[1]["metadata"]["session_end_message_index"], 4)
+
+            first_promoted = service.promote_memory_candidate(session_candidates[0]["id"])
+            second_promoted = service.promote_memory_candidate(session_candidates[1]["id"])
+            edges = [edge for edge in service.repository.list_edges() if edge.type == "NEXT_SESSION"]
+            self.assertTrue(any(
+                edge.source == first_promoted["memory"]["id"] and edge.target == second_promoted["memory"]["id"]
+                for edge in edges
+            ))
+            second_node = service.repository.get_node(second_promoted["memory"]["id"])
+            self.assertEqual(second_node.metadata.get("chat_id"), chat_id)
+            self.assertEqual(int(second_node.metadata.get("session_revision") or 0), 2)
 
     def test_chat_list_is_lightweight_and_single_chat_has_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,7 +270,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             nodes = [node for node in service.repository.list_nodes() if dict(node.metadata or {}).get("source") == "chat"]
             self.assertEqual(len(nodes), 1)
 
-    def test_council_turn_persists_chat_and_creates_review_candidate(self) -> None:
+    def test_council_turn_persists_chat_without_per_turn_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
 
@@ -182,11 +290,14 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             done = events[-1]["result"]
             self.assertTrue(done["chat"]["id"])
             self.assertEqual(len(done["chat"]["messages"]), 2)
+            self.assertEqual(service.list_memory_candidates("architectos")["candidates"], [])
+            finalized = service.finalize_chat_session(done["chat"]["id"], force=True, trigger="manual")
             candidates = service.list_memory_candidates("architectos")["candidates"]
             self.assertEqual(len(candidates), 1)
-            self.assertEqual(candidates[0]["metadata"]["source"], "council_keeper")
+            self.assertEqual(candidates[0]["metadata"]["template"], "chat_session_summary")
+            self.assertEqual(finalized["chat"]["session_status"], "complete")
 
-    def test_chat_context_pack_summaries_rules_and_favorite_candidate(self) -> None:
+    def test_chat_context_pack_session_summary_and_favorite_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
             result = service.post_chat_message({
@@ -195,12 +306,11 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 "provider_id": "local-memory",
             })
             chat_id = result["chat"]["id"]
+            finalized = service.finalize_chat_session(chat_id, force=True, trigger="manual")
+            self.assertEqual(finalized["chat"]["session_status"], "complete")
             pack = service.chat_context_pack(chat_id, "architecture decision")
-            self.assertTrue(pack["rolling_summary"]["summary_text"])
-            self.assertIn("Rule:", pack["decision_log"]["summary_text"])
-
-            candidates = service.list_memory_candidates("architectos", "all")["candidates"]
-            self.assertTrue(any(candidate["source_type"] == "rules_keeper" for candidate in candidates))
+            session = next((s for s in pack["summaries"] if s.get("summary_type") == "session_summary"), None)
+            self.assertTrue(session and session.get("summary_text"))
 
             favorite = service.favorite_chat_message(chat_id, {"message_index": 1, "favorite": True})
             self.assertTrue(favorite["candidate"]["id"])
@@ -209,7 +319,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             retry = service.retry_chat_keeper(chat_id)
             self.assertEqual(retry["chat"]["id"], chat_id)
             events = service.repository.list_keeper_events("architectos", chat_id, 20)
-            self.assertTrue(any(event["status"] == "candidate_created" for event in events))
+            self.assertTrue(any(event["kind"] == "session_keeper" for event in events))
 
     def test_graph_commands_rename_relink_delete_and_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +363,157 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             exported = service.export_bundle("architectos")
             self.assertIn("memory_candidates", exported)
 
+    def test_inbox_ingestion_from_drop_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            inbox = service.repository.data_dir / "inbox"
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / "meeting-notes.md").write_text("# Sync notes\n\nDecision: discount applies after tax removal.\n", encoding="utf-8")
+            (inbox / "todo.txt").write_text("Remember: review queue SLA is 2 days.", encoding="utf-8")
+            (inbox / "image.png").write_bytes(b"\x89PNG\r\n")  # non-text: skipped
+            result = service.ingest_memory({"project_id": "architectos", "sources": ["inbox"], "limit": 10})
+            inbox_candidates = [c for c in result["candidates"] if c["source_type"] == "inbox"]
+            self.assertEqual(len(inbox_candidates), 2)
+            labels = {c["label"] for c in inbox_candidates}
+            self.assertIn("Inbox: meeting-notes.md", labels)
+            self.assertIn("Inbox: todo.txt", labels)
+            pending = service.list_memory_candidates("architectos")["candidates"]
+            self.assertGreaterEqual(len(pending), 2)
+            status = service.memory_ingest_status()
+            self.assertEqual(status["inbox_dir"], str(inbox))
+
+    def test_inbox_dir_setting_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            drop = root / "drop"
+            drop.mkdir()
+            (drop / "adr.md").write_text("# ADR\n\nConstraint: stdlib only backend.\n", encoding="utf-8")
+            service = ArchitectOSService(root)
+            service.update_settings({"memory_ingest": {"inbox_dir": str(drop)}})
+            self.assertEqual(service._inbox_dir(), drop)
+            result = service.ingest_memory({"project_id": "architectos", "sources": ["folder"], "limit": 5})
+            inbox_candidates = [c for c in result["candidates"] if c["source_type"] == "inbox"]
+            self.assertEqual(len(inbox_candidates), 1)
+            self.assertEqual(inbox_candidates[0]["label"], "Inbox: adr.md")
+
+    def test_suggest_memory_links_llm_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            a = service.add_memory({"label": "Discount computed before tax", "text": "Discount was applied to the gross amount before removing tax, which overstated it.", "type": "Lesson", "scope": "project", "project_id": "architectos"})
+            b = service.add_memory({"label": "Discount rounding bug analysis", "text": "Root cause: discount must apply to the net amount after tax removal; see tax rounding in invoice module.", "type": "Decision", "scope": "project", "project_id": "architectos"})
+            service.add_memory({"label": "UI theme tokens", "text": "Color palette uses CSS custom properties for dark mode.", "type": "Concept", "scope": "project", "project_id": "architectos"})
+
+            def fake_judge(left, right, project_id, provider_id, providers=None):
+                if "discount" in (left.label + right.label).lower() and "tax" in (left.text + right.text).lower():
+                    return {"related": True, "edge_type": "SUPPORTS", "reason": "both explain the discount-after-tax rule", "confidence": 0.9}
+                return {"related": False, "reason": "unrelated topics", "confidence": 0.4}
+
+            service._judge_link_with_llm = fake_judge
+
+            dry = service.suggest_memory_links({"project_id": "architectos", "limit": 10, "pair_limit": 6, "min_similarity": 0.15})
+            self.assertFalse(dry["applied"])
+            self.assertGreaterEqual(dry["pool_size"], 3)
+            related = [s for s in dry["suggestions"] if s["related"]]
+            self.assertEqual(len(related), 1)
+            self.assertEqual({related[0]["source_id"], related[0]["target_id"]}, {a["id"], b["id"]})
+            self.assertEqual(related[0]["edge_type"], "SUPPORTS")
+            self.assertEqual(dry["created"], [])
+
+            applied = service.suggest_memory_links({"project_id": "architectos", "limit": 10, "pair_limit": 6, "min_similarity": 0.15, "apply": True})
+            self.assertTrue(applied["applied"])
+            self.assertEqual(len(applied["created"]), 1)
+            self.assertEqual(applied["created"][0]["type"], "SUPPORTS")
+
+            # Already-linked pair is not suggested again.
+            again = service.suggest_memory_links({"project_id": "architectos", "limit": 10, "pair_limit": 6, "min_similarity": 0.15})
+            self.assertFalse(any(s["related"] for s in again["suggestions"]))
+
+    def test_parse_link_verdict(self) -> None:
+        verdict = ArchitectOSService._parse_link_verdict('Sure! {"related": true, "edge_type": "depends_on", "reason": "A explains B", "confidence": 0.83}')
+        self.assertTrue(verdict["related"])
+        self.assertEqual(verdict["edge_type"], "DEPENDS_ON")
+        self.assertAlmostEqual(verdict["confidence"], 0.83)
+        bad = ArchitectOSService._parse_link_verdict("no json here")
+        self.assertFalse(bad["related"])
+        self.assertIn("error", bad)
+        weird = ArchitectOSService._parse_link_verdict('{"related": true, "edge_type": "HATES", "confidence": 5}')
+        self.assertEqual(weird["edge_type"], "RELATED_TO")
+        self.assertEqual(weird["confidence"], 1.0)
+
+    def test_suggest_consolidations_merge_and_contradicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            a = service.add_memory({"label": "Discount applies after tax removal", "text": "Discount applies to the net amount after tax removal from the gross invoice total.", "type": "Decision", "scope": "project", "project_id": "architectos"})
+            b = service.add_memory({"label": "Discount after tax removal rule", "text": "The discount is computed on the net amount after tax removal, per finance policy.", "type": "Decision", "scope": "project", "project_id": "architectos"})
+            c = service.add_memory({"label": "Discount applies before tax removal", "text": "Discount applies to the gross amount before tax removal from the invoice total.", "type": "Decision", "scope": "project", "project_id": "architectos"})
+
+            def fake_judge(left, right, project_id, provider_id, providers=None):
+                labels = (left.label + right.label).lower()
+                if "before" in labels and "after" in labels:
+                    return {"action": "contradicts", "reason": "before vs after tax conflict", "confidence": 0.9}
+                return {"action": "merge", "keep": "A", "reason": "same rule stated twice", "confidence": 0.95}
+
+            service._judge_consolidation_with_llm = fake_judge
+
+            dry = service.suggest_consolidations({"project_id": "architectos", "limit": 10, "pair_limit": 8, "min_similarity": 0.2})
+            self.assertFalse(dry["applied"])
+            actions = {(s["source_id"], s["target_id"]): s["action"] for s in dry["suggestions"]}
+            self.assertIn("merge", actions.values())
+            self.assertEqual(dry["merged"], [])
+
+            applied = service.suggest_consolidations({"project_id": "architectos", "limit": 10, "pair_limit": 8, "min_similarity": 0.2, "apply": True})
+            self.assertTrue(applied["applied"])
+            # Merge: exactly one pair merged, keeper is A (source side).
+            self.assertEqual(len(applied["merged"]), 1)
+            merge_record = applied["merged"][0]
+            kept_node = service.repository.get_node(merge_record["kept"])
+            merged_node = service.repository.get_node(merge_record["merged"])
+            self.assertEqual(kept_node.status, "active")
+            self.assertEqual(merged_node.status, "merged")
+            # Contradiction: CONTRADICTS edge created for the conflicting pair.
+            self.assertEqual(len(applied["contradictions"]), 1)
+            self.assertEqual(applied["contradictions"][0]["type"], "CONTRADICTS")
+            # A repeated run does not re-suggest the same CONTRADICTS pair.
+            again = service.suggest_consolidations({"project_id": "architectos", "limit": 10, "pair_limit": 8, "min_similarity": 0.2})
+            self.assertFalse(any(s["action"] == "contradicts" for s in again["suggestions"]))
+
+    def test_parse_consolidation_verdict(self) -> None:
+        verdict = ArchitectOSService._parse_consolidation_verdict('{"action": "merge", "keep": "B", "reason": "B is fuller", "confidence": 0.9}')
+        self.assertEqual(verdict["action"], "merge")
+        self.assertEqual(verdict["keep"], "B")
+        fallback = ArchitectOSService._parse_consolidation_verdict('{"action": "squash", "confidence": 2}')
+        self.assertEqual(fallback["action"], "keep")
+        self.assertEqual(fallback["confidence"], 1.0)
+        merge_default_keep = ArchitectOSService._parse_consolidation_verdict('{"action": "merge"}')
+        self.assertEqual(merge_default_keep["keep"], "A")
+        bad = ArchitectOSService._parse_consolidation_verdict("not json")
+        self.assertEqual(bad["action"], "keep")
+        self.assertIn("error", bad)
+
+    def test_search_memory_as_of_temporal_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            old = service.add_memory({"label": "Old pricing rule", "text": "Legacy pricing: flat 10 percent margin on all items.", "type": "Decision", "scope": "project", "project_id": "architectos"})
+            new = service.add_memory({"label": "New pricing rule", "text": "Current pricing: tiered margin by category, replacing the flat 10 percent.", "type": "Decision", "scope": "project", "project_id": "architectos"})
+            # Backdate the "old" node.
+            old_node = service.repository.get_node(old["id"])
+            old_node.created_at = "2025-01-01T00:00:00+00:00"
+            service.repository.upsert_node(old_node)
+            new_node = service.repository.get_node(new["id"])
+            new_node.created_at = "2026-06-01T00:00:00+00:00"
+            service.repository.upsert_node(new_node)
+
+            all_hits = service.search_memory("pricing margin", project_id="architectos", limit=8)["hits"]
+            all_ids = {h["node"]["id"] for h in all_hits}
+            self.assertIn(old["id"], all_ids)
+            self.assertIn(new["id"], all_ids)
+
+            as_of_hits = service.search_memory("pricing margin", project_id="architectos", limit=8, as_of="2025-06-01")["hits"]
+            as_of_ids = {h["node"]["id"] for h in as_of_hits}
+            self.assertIn(old["id"], as_of_ids)
+            self.assertNotIn(new["id"], as_of_ids)
+
     def test_rescan_memory_sources_schedules_and_ingests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -288,6 +549,9 @@ class ArchitectOSMemoryTests(unittest.TestCase):
     def test_batch_update_memory_candidates_by_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            # The batch promote catch-up spawns an embedding backfill thread;
+            # keep it off so it cannot race tempdir cleanup.
+            service.memory_embeddings.enabled = lambda: False
             service.repository.upsert_memory_candidate({
                 "id": "cand-pending-1",
                 "project_id": "architectos",
@@ -569,13 +833,15 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 self.calls.append((server_id, tool, arguments))
                 if server_id != "azure-devops":
                     raise MCPError("unexpected server")
-                if tool == "wit_my_work_items":
+                # Mirrors @azure-devops/mcp: wit_work_item / wit_query dispatch on "action".
+                action = str(arguments.get("action") or "")
+                if tool == "wit_work_item" and action == "my":
                     return {"result": {"content": [{"type": "text", "text": json.dumps({"workItems": [{"id": 78167}]})}]}}
-                if tool == "wit_query_by_wiql":
+                if tool == "wit_query" and action == "wiql":
                     return {"result": {"workItems": [{"id": 78167}]}}
                 if tool == "search_workitem":
                     return {"result": {"results": []}}
-                if tool == "wit_get_work_item":
+                if tool == "wit_work_item" and action == "get":
                     return {"result": {"content": [{"type": "text", "text": json.dumps({
                         "id": 78167,
                         "fields": {
@@ -603,11 +869,11 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                         ],
                         "url": "https://dev.azure.com/Fsight1/E-AI/_workitems/edit/78167",
                     })}]}}
-                if tool == "wit_list_work_item_comments":
+                if tool == "wit_work_item" and action == "list_comments":
                     return {"result": {"comments": [
                         {"id": 1, "text": "Need FixVersion 7.7 filter", "createdBy": {"displayName": "Debbie"}, "createdDate": "2026-07-01T10:00:00Z"},
                     ]}}
-                raise MCPError(f"unexpected tool {tool}")
+                raise MCPError(f"unexpected tool {tool} ({action or 'no action'})")
 
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
@@ -663,11 +929,36 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 "all_items": True,
                 "work_item_types": ["Epic", "Task"],
             })
-            wiql_call = next(arguments for _server, tool, arguments in fake.calls if tool == "wit_query_by_wiql")
+            wiql_call = next(arguments for _server, tool, arguments in fake.calls if tool == "wit_query")
             self.assertIn("[System.WorkItemType] IN ('Epic', 'Task')", wiql_call["wiql"])
             search_call = next(arguments for _server, tool, arguments in fake.calls if tool == "search_workitem")
             self.assertEqual(search_call["workItemType"], ["Epic"])
             self.assertEqual(typed["boards_count"], 1)
+
+            # Default scope is the whole project: the id sweep must use WIQL, not "assigned to me".
+            fake.calls.clear()
+            service.ingest_memory({
+                "project_id": "architectos",
+                "sources": ["azure-boards"],
+                "limit": 5,
+                "ado_project": "E-AI",
+            })
+            actions = [(tool, arguments.get("action")) for _server, tool, arguments in fake.calls]
+            self.assertIn(("wit_query", "wiql"), actions)
+            self.assertNotIn(("wit_work_item", "my"), actions)
+
+            # Only an explicit opt-in narrows the scan to the current user.
+            fake.calls.clear()
+            service.ingest_memory({
+                "project_id": "architectos",
+                "sources": ["azure-boards"],
+                "limit": 5,
+                "ado_project": "E-AI",
+                "mine_only": True,
+            })
+            actions = [(tool, arguments.get("action")) for _server, tool, arguments in fake.calls]
+            self.assertIn(("wit_work_item", "my"), actions)
+            self.assertNotIn(("wit_query", "wiql"), actions)
 
     def test_azure_git_ingest_writes_repos_and_pull_requests(self) -> None:
         class FakeAzureGitMCP:
@@ -684,12 +975,12 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 })
 
             def call_tool(self, server_id, tool, arguments, timeout=None):
-                if tool == "repo_list_repos_by_project":
+                if tool == "repo_repository" and arguments.get("action") == "list":
                     return {"result": {"content": [{"type": "text", "text": json.dumps([
                         {"id": "repo-1", "name": "E-AI", "webUrl": "https://dev.azure.com/Fsight1/E-AI/_git/E-AI", "isDisabled": False},
                         {"id": "repo-2", "name": "DevOps", "webUrl": "https://dev.azure.com/Fsight1/E-AI/_git/DevOps", "isDisabled": False},
                     ])}]}}
-                if tool == "repo_list_pull_requests_by_repo_or_project":
+                if tool == "repo_pull_request" and arguments.get("action") == "list":
                     return {"result": {"content": [{"type": "text", "text": json.dumps([
                         {
                             "pullRequestId": 15232,
@@ -747,11 +1038,11 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 })
 
             def call_tool(self, server_id, tool, arguments, timeout=None):
-                if tool == "repo_list_repos_by_project":
+                if tool == "repo_repository" and arguments.get("action") == "list":
                     return {"result": {"content": [{"type": "text", "text": json.dumps([
                         {"id": "repo-1", "name": "E-AI", "webUrl": "https://dev.azure.com/Fsight1/E-AI/_git/E-AI", "isDisabled": False},
                     ])}]}}
-                if tool == "repo_list_pull_requests_by_repo_or_project":
+                if tool == "repo_pull_request" and arguments.get("action") == "list":
                     return {"result": {"content": [{"type": "text", "text": json.dumps([
                         {
                             "pullRequestId": 15299,
@@ -839,7 +1130,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 })
 
             def call_tool(self, server_id, tool, arguments, timeout=None):
-                if tool == "wit_get_work_item":
+                if tool == "wit_work_item" and str(arguments.get("action") or "") == "get":
                     # Simulate a wedged MCP that ignores item_timeout — source budget must still win
                     # without blocking on ThreadPoolExecutor shutdown(wait=True).
                     if not self._stop.wait(60.0):
@@ -903,7 +1194,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 })
 
             def call_tool(self, server_id, tool, arguments, timeout=None):
-                if tool != "wit_get_work_item":
+                if tool != "wit_work_item" or str(arguments.get("action") or "") != "get":
                     raise MCPError(f"unexpected {tool}")
                 self._calls += 1
                 work_item_id = int(arguments.get("id") or 0)
@@ -962,16 +1253,16 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 })
 
             def call_tool(self, server_id, tool, arguments, timeout=None):
-                if tool == "wiki_list_wikis":
+                if tool == "wiki" and arguments.get("action") == "list_wikis":
                     return {"result": {"content": [{"type": "text", "text": json.dumps([
                         {"id": "wiki-1", "name": "E-AI Wiki"},
                     ])}]}}
-                if tool == "wiki_list_pages":
+                if tool == "wiki" and arguments.get("action") == "list_pages":
                     return {"result": {"value": [
                         {"id": 11, "path": "/Architecture/Overview"},
                         {"id": 12, "path": "/Sprint/Dev-v7.7"},
                     ]}}
-                if tool == "wiki_get_page_content":
+                if tool == "wiki" and arguments.get("action") == "get_page_content":
                     path = arguments.get("path") or "/"
                     return {"result": {"content": [{"type": "text", "text": f"# Page {path}\n\nSprint planning notes for {path}."}]}}
                 raise MCPError(f"unexpected tool {tool}")

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "architectos"
+version = "1.0.0"
+description = "Local-first AI workspace for software engineers: persistent memory, context packs, provider routing."
+readme = "README.md"
+requires-python = ">=3.12"
+# Runtime is intentionally stdlib-only. The extras below enable optional
+# accelerations that the code auto-detects when present.
+dependencies = []
+
+[project.optional-dependencies]
+# Faster cosine index for memory embeddings (embeddings.py falls back to pure Python).
+vectors = ["numpy>=1.26"]
+# On-device real embedding model (no API keys). fastembed is lightweight (ONNX,
+# no torch); LocalEmbeddingProvider also uses sentence-transformers if present.
+# With this installed, a fresh setup gets real vectors instead of the hash fallback.
+embeddings = ["fastembed>=0.3"]
+# Mozilla CA bundle for HTTPS on systems without a system store (ssl_util.py falls back to the platform default).
+tls = ["certifi>=2024.2.2"]
+dev = ["ruff>=0.6"]
+# One-file MCP binary (scripts/build_mcp.sh / .ps1). Not required at runtime.
+packaging = ["pyinstaller>=6.0"]
+
+[project.scripts]
+# MCP memory server for external agents (Cursor, Copilot, Claude, Junie, ...).
+# After `pip install -e .` run `architectos-mcp`; set ARCHITECTOS_ROOT to point
+# at the checkout whose data/architectos.db should be shared.
+architectos-mcp = "architectos.mcp_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "backend"}
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 200
+
+[tool.ruff.lint]
+# The codebase predates a linter; start with high-value rules only.
+select = ["E9", "F"]
+ignore = [
+    # Many intentionally unused loop/unpack variables.
+    "F841",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["F401"]

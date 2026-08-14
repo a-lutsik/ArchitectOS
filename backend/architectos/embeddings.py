@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import math
@@ -7,8 +8,10 @@ import os
 import re
 import struct
 import threading
+import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from hashlib import sha1
 from typing import Any, Protocol
 
@@ -23,12 +26,44 @@ except ImportError:  # pragma: no cover - optional accel
     np = None  # type: ignore[assignment]
 # Unicode-aware: ASCII-only tokenization dropped Cyrillic/other scripts from search.
 TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# Shared by lexical scoring and FTS so conversational wrappers do not drown
+# the rare content terms that actually identify the answer.
+QUERY_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "about", "from", "by",
+    "is", "are", "was", "were", "be", "been", "being", "do", "does", "did", "have", "has", "had",
+    "what", "who", "when", "where", "why", "how", "which", "that", "this", "these", "those",
+    "my", "me", "our", "your", "their", "its", "it", "as", "at", "into", "over", "under",
+    "there", "here", "any", "some", "all", "just", "only", "also", "please", "can", "could",
+    "would", "should", "will", "shall", "may", "might", "need", "needs", "want", "show", "tell",
+    "find", "get", "give", "pull", "fetch", "open", "look", "see", "check", "list",
+    "memory", "context", "note", "notes", "data", "details", "info", "information",
+    "в", "во", "на", "по", "из", "от", "за", "к", "ко", "у", "о", "об", "обо", "со", "до", "при",
+    "и", "а", "но", "или", "если", "что", "как", "кто", "где", "когда", "почему", "зачем",
+    "какой", "какие", "какая", "какое", "это", "эта", "этот", "эти", "она", "он", "они", "мы", "вы",
+    "про", "есть", "было", "были", "быть", "можно", "нужно", "только", "ещё", "еще", "уже", "ли",
+    "мне", "мой", "моя", "мои", "наш", "ваш", "свой", "там", "тут", "здесь", "всё", "все",
+    "говорила", "говорил", "говорили", "сказать", "сказал", "сказала",
+    "памяти", "память", "памятью", "контекст", "контексте", "данные", "детали", "информацию",
+    "подтяни", "подтянуть", "открой", "покажи", "найди", "дай", "скажи", "проверь",
+})
+# Small closed synonym bridges for retrieval only (not injected into prompts).
+QUERY_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "uom": ("unit", "units", "power", "energy", "kwh", "mw", "conversion", "convert", "converted"),
+    "баг": ("bug", "defect"),
+    "баги": ("bug", "defect", "bugs"),
+    "bug": ("defect", "баг"),
+    "bugs": ("bug", "defect"),
+    "defect": ("bug", "баг"),
+}
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_OLLAMA_EMBED_MODEL = "nomic-embed-text"
 DEFAULT_GEMINI_EMBED_MODEL = "gemini-embedding-001"
 DEFAULT_GEMINI_EMBED_DIMS = 768
 DEFAULT_CLOUDFLARE_EMBED_MODEL = "@cf/baai/bge-m3"
 DEFAULT_CLOUDFLARE_EMBED_DIMS = 1024
+# On-device model used by LocalEmbeddingProvider (fastembed/sentence-transformers).
+# Small, reliable, and downloaded once on first use; override via embedding_model.
+DEFAULT_LOCAL_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_TEXT_CHAR_CAP = 12_000
 GEMINI_EMBED_BASE = "https://generativelanguage.googleapis.com/v1beta"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4"
@@ -117,6 +152,18 @@ EMBEDDING_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
             {"id": "mxbai-embed-large", "label": "mxbai-embed-large", "dims": [1024], "default_dims": 1024},
         ],
     },
+    "local": {
+        "label": "Local model (on-device, no keys)",
+        "multilingual": True,
+        "free_tier": True,
+        "env_keys": [],
+        "requires_extra": "embeddings",
+        "models": [
+            {"id": "BAAI/bge-small-en-v1.5", "label": "bge-small-en-v1.5", "dims": [384], "default_dims": 384, "notes": "Small English; ~130MB one-time download."},
+            {"id": "intfloat/multilingual-e5-small", "label": "multilingual-e5-small", "dims": [384], "default_dims": 384, "notes": "Multilingual (incl. Russian); use for cross-lingual code/notes."},
+            {"id": "BAAI/bge-base-en-v1.5", "label": "bge-base-en-v1.5", "dims": [768], "default_dims": 768, "notes": "Stronger English; larger download."},
+        ],
+    },
     "hash": {
         "label": "Hash (offline fallback)",
         "multilingual": False,
@@ -129,6 +176,30 @@ EMBEDDING_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
 
 def tokens(text: str) -> list[str]:
     return [token.lower() for token in TOKEN_RE.findall(text or "")]
+
+
+def content_tokens(text: str) -> list[str]:
+    """Tokenize a query and drop conversational stopwords."""
+    return [token for token in tokens(text) if token not in QUERY_STOPWORDS and len(token) >= 2]
+
+
+def expand_query_terms(query_terms: list[str]) -> list[str]:
+    """Dedupe query terms and attach closed synonym bridges used by retrieval."""
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for term in query_terms:
+        key = str(term or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        expanded.append(key)
+        for synonym in QUERY_SYNONYMS.get(key, ()):
+            syn = str(synonym or "").strip().lower()
+            if not syn or syn in seen:
+                continue
+            seen.add(syn)
+            expanded.append(syn)
+    return expanded
 
 
 def cosine(left: list[float], right: list[float]) -> float:
@@ -289,6 +360,76 @@ class OllamaEmbeddingProvider:
         return vector
 
 
+def local_embeddings_available() -> bool:
+    """True when an on-device embedding backend can be imported (no download)."""
+    return (
+        importlib.util.find_spec("fastembed") is not None
+        or importlib.util.find_spec("sentence_transformers") is not None
+    )
+
+
+class LocalEmbeddingProvider:
+    """On-device embeddings via fastembed (preferred) or sentence-transformers.
+
+    Zero-config real vectors: install the optional ``[embeddings]`` extra and the
+    model is selected automatically instead of the weak hash fallback. The model
+    is downloaded once on first use and cached; construction stays cheap so
+    provider selection never blocks or hits the network.
+    """
+
+    provider_id = "local"
+
+    def __init__(self, model: str = "") -> None:
+        self.model = (model or "").strip() or DEFAULT_LOCAL_EMBED_MODEL
+        self.dimensions = 0  # set after first embed
+        self._backend = ""  # "fastembed" | "sentence-transformers"
+        self._encoder: Any = None
+        self._lock = threading.Lock()
+
+    def _ensure_encoder(self) -> None:
+        if self._encoder is not None:
+            return
+        with self._lock:
+            if self._encoder is not None:
+                return
+            # Prefer fastembed (ONNX, no torch); fall back to sentence-transformers.
+            if importlib.util.find_spec("fastembed") is not None:
+                try:
+                    from fastembed import TextEmbedding
+
+                    self._encoder = TextEmbedding(model_name=self.model)
+                    self._backend = "fastembed"
+                    return
+                except Exception as exc:  # noqa: BLE001 - try the other backend
+                    LOGGER.warning("fastembed init failed for %s: %s", self.model, exc)
+            if importlib.util.find_spec("sentence_transformers") is not None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+
+                    self._encoder = SentenceTransformer(self.model)
+                    self._backend = "sentence-transformers"
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("sentence-transformers init failed for %s: %s", self.model, exc)
+            raise RuntimeError("No local embedding backend available (install the 'embeddings' extra).")
+
+    def embed(self, text: str, *, purpose: str = "document") -> list[float]:
+        del purpose
+        self._ensure_encoder()
+        clean = (text or "")[:EMBED_TEXT_CHAR_CAP]
+        if self._backend == "fastembed":
+            vectors = list(self._encoder.embed([clean]))
+            raw = vectors[0] if vectors else []
+        else:
+            raw = self._encoder.encode(clean, normalize_embeddings=True)
+        vector = [float(value) for value in (raw.tolist() if hasattr(raw, "tolist") else list(raw))]
+        if not vector:
+            raise RuntimeError("Local embedding produced an empty vector.")
+        self.dimensions = len(vector)
+        # Normalize so cosine over the persisted matrix is consistent across backends.
+        return l2_normalize(vector)
+
+
 class GeminiEmbeddingProvider:
     """Google AI Studio / Gemini API embeddings (free tier, multilingual)."""
 
@@ -405,7 +546,9 @@ class CloudflareEmbeddingProvider:
                 self.model = f"@cf/{self.model.lstrip('/')}"
             else:
                 self.model = f"@cf/baai/{self.model}"
-        self.dimensions = 0
+        # Known dims for the default model so provider_info and the vector cache
+        # can filter mixed legacy rows; 0 for custom models (dims learned on load).
+        self.dimensions = DEFAULT_CLOUDFLARE_EMBED_DIMS if self.model == DEFAULT_CLOUDFLARE_EMBED_MODEL else 0
 
     def embed(self, text: str, *, purpose: str = "document") -> list[float]:
         del purpose
@@ -465,13 +608,26 @@ def default_memory_retrieval_settings() -> dict[str, Any]:
         "vector_pool": 64,
         "vector_min_score": 0.22,
         "vector_query_timeout_ms": 2500,
+        # Relevance floor for ranked search: a hit is dropped when its score falls
+        # below this fraction of the best real hit's score. Trims the weak tail on
+        # noise/near-empty queries (where static scope/type/source bonuses inflate
+        # otherwise-irrelevant nodes) without touching strong, well-matched hits.
+        "search_relevance_floor": 0.28,
         "reindex_on_startup": True,
     }
 
 
 def build_embedding_provider(settings: dict[str, Any] | None = None) -> EmbeddingProvider:
     settings = dict(settings or {})
-    mode = str(settings.get("embedding_provider") or os.environ.get("MEMORY_EMBEDDING_PROVIDER") or "auto").strip().lower()
+    # An explicit saved provider (non-auto) always wins. Otherwise a
+    # MEMORY_EMBEDDING_PROVIDER env override takes precedence over the "auto"
+    # default so operators/CI can pin a backend without editing settings.
+    configured_mode = str(settings.get("embedding_provider") or "").strip().lower()
+    env_mode = str(os.environ.get("MEMORY_EMBEDDING_PROVIDER") or "").strip().lower()
+    if configured_mode and configured_mode != "auto":
+        mode = configured_mode
+    else:
+        mode = env_mode or configured_mode or "auto"
     model = str(settings.get("embedding_model") or os.environ.get("MEMORY_EMBEDDING_MODEL") or "").strip()
     try:
         dims = int(settings.get("embedding_dimensions") or os.environ.get("MEMORY_EMBEDDING_DIMENSIONS") or DEFAULT_CLOUDFLARE_EMBED_DIMS)
@@ -536,9 +692,18 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
             model=model or str(os.environ.get("OLLAMA_EMBED_MODEL") or DEFAULT_OLLAMA_EMBED_MODEL),
         )
 
+    def _local() -> LocalEmbeddingProvider | None:
+        # On-device real vectors when the optional extra is installed. Selected in
+        # `auto` ahead of the hash fallback so a fresh install gets real quality
+        # without any API keys. Construction is cheap; the model loads lazily.
+        if not local_embeddings_available():
+            return None
+        return LocalEmbeddingProvider(model=model or str(os.environ.get("MEMORY_LOCAL_EMBED_MODEL") or ""))
+
     if mode in {"", "auto"}:
-        # Prefer free multilingual cloud, then paid, then local.
-        return _cloudflare() or _gemini() or _azure() or _openai() or _ollama() or HashEmbeddingProvider()
+        # Prefer free multilingual cloud, then paid, then a local model, then the
+        # offline hash fallback (weak — only when nothing else is available).
+        return _cloudflare() or _gemini() or _azure() or _openai() or _ollama() or _local() or HashEmbeddingProvider()
 
     if mode == "hash":
         return HashEmbeddingProvider()
@@ -556,6 +721,8 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
         if not host.startswith("http"):
             host = f"http://{host}"
         return OllamaEmbeddingProvider(host=host, model=model or DEFAULT_OLLAMA_EMBED_MODEL)
+    if mode in {"local", "fastembed", "sentence-transformers", "st", "onnx"}:
+        return _local() or HashEmbeddingProvider()
     return HashEmbeddingProvider()
 
 
@@ -597,6 +764,27 @@ class MemoryEmbeddingEngine:
         self.provider = provider or HashEmbeddingProvider()
         self._cache_lock = threading.Lock()
         self._vector_cache: _VectorIndex | None = None
+        # Short-lived LRU for query embeddings: repeated chat/search queries
+        # must not hit the embedding API every time.
+        self._query_cache: OrderedDict[str, tuple[float, list[float]]] = OrderedDict()
+
+    def _embed_query_cached(self, query: str, *, ttl_s: float = 300.0, maxsize: int = 32) -> list[float]:
+        key = sha1(
+            f"{getattr(self.provider, 'provider_id', '')}|{getattr(self.provider, 'model', '')}|{query}".encode("utf-8")
+        ).hexdigest()
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._query_cache.get(key)
+            if entry and now - entry[0] < ttl_s:
+                self._query_cache.move_to_end(key)
+                return list(entry[1])
+        vector = self.provider.embed(query, purpose="query")
+        with self._cache_lock:
+            self._query_cache[key] = (now, list(vector))
+            self._query_cache.move_to_end(key)
+            while len(self._query_cache) > maxsize:
+                self._query_cache.popitem(last=False)
+        return vector
 
     def settings(self) -> dict[str, Any]:
         configured = dict(self.repository.get_setting("memory_retrieval") or {})
@@ -605,6 +793,10 @@ class MemoryEmbeddingEngine:
         merged["embeddings_enabled"] = bool(merged.get("embeddings_enabled", True))
         merged["vector_pool"] = max(8, min(int(merged.get("vector_pool") or 64), 200))
         merged["vector_min_score"] = float(merged.get("vector_min_score") or 0.22)
+        try:
+            merged["search_relevance_floor"] = max(0.0, min(float(merged.get("search_relevance_floor")), 0.9))
+        except (TypeError, ValueError):
+            merged["search_relevance_floor"] = 0.28
         try:
             merged["vector_query_timeout_ms"] = max(50, min(int(merged.get("vector_query_timeout_ms") or 2500), 5000))
         except (TypeError, ValueError):
@@ -654,6 +846,30 @@ class MemoryEmbeddingEngine:
     def invalidate_vector_cache(self) -> None:
         with self._cache_lock:
             self._vector_cache = None
+
+    def _update_vector_cache(self, *, node_id: str, scope: str, project_id: str, vector: list[float]) -> bool:
+        """Apply one freshly indexed row to the live cache. False → caller must invalidate."""
+        with self._cache_lock:
+            index = self._vector_cache
+            if index is None or index.dims != len(vector):
+                return False
+            if node_id in index.node_ids:
+                position = index.node_ids.index(node_id)
+                index.scopes[position] = scope
+                index.projects[position] = project_id
+                if index.matrix is not None and np is not None:
+                    index.matrix[position] = np.asarray(vector, dtype=np.float32)
+                else:
+                    index.vectors[position] = tuple(vector)
+                return True
+            index.node_ids.append(node_id)
+            index.scopes.append(scope)
+            index.projects.append(project_id)
+            if index.matrix is not None and np is not None:
+                index.matrix = np.vstack([index.matrix, np.asarray(vector, dtype=np.float32)])
+            else:
+                index.vectors.append(tuple(vector))
+            return True
 
     def _load_vector_cache(self) -> _VectorIndex:
         with self._cache_lock:
@@ -730,7 +946,14 @@ class MemoryEmbeddingEngine:
             vector=vector,
         )
         if invalidate:
-            self.invalidate_vector_cache()
+            # Cheap path: patch the live in-RAM index instead of reloading every vector.
+            if not self._update_vector_cache(
+                node_id=node.id,
+                scope=node.scope or "",
+                project_id=str(node.project_id or ""),
+                vector=vector,
+            ):
+                self.invalidate_vector_cache()
         return True
 
     def search(
@@ -785,7 +1008,7 @@ class MemoryEmbeddingEngine:
             return []
         settings = self.settings()
         try:
-            query_vector = self.provider.embed(query, purpose="query")
+            query_vector = self._embed_query_cached(query)
         except Exception as exc:
             LOGGER.warning("memory embedding query failed: %s", exc)
             return []

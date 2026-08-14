@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -126,6 +124,21 @@ class ProductionOpsTests(unittest.TestCase):
                 server.shutdown()
                 thread.join(timeout=2)
                 server.server_close()
+
+    def test_project_file_save_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            project_root = root / "proj"
+            project_root.mkdir()
+            project = service.create_project({"name": "Proj", "root_path": str(project_root)})
+            project_id = project["id"]
+            with self.assertRaises(ValueError):
+                service.save_project_file({"project_id": project_id, "path": "../escape.txt", "text": "x"})
+            self.assertFalse((root / "escape.txt").exists())
+            saved = service.save_project_file({"project_id": project_id, "path": "ok/nested.txt", "text": "hello"})
+            self.assertTrue(saved["success"])
+            self.assertEqual((project_root / "ok" / "nested.txt").read_text(encoding="utf-8"), "hello")
 
     def test_export_bundle_strips_mcp_oauth_secrets(self) -> None:
         from backend.architectos.models import Project

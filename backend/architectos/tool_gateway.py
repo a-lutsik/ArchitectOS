@@ -9,28 +9,48 @@ from .mcp import MCPError, MCPManager
 from .rich_response import RESPONSE_FORMAT_POLICY
 
 TOOL_RESULT_CHAR_CAP = 6000
-MAX_TOOL_ROUNDS = 3
+# File reads are the payload, not a wrapper around it: give them room so a full
+# read window survives instead of losing the continuation hint to truncation.
+FILE_TOOL_RESULT_CHAR_CAP = 16_000
+MAX_TOOL_ROUNDS = 6
 
-MEMORY_FIRST_POLICY = """Memory-first:
+AUTONOMY_POLICY = """Autonomy (overrides everything else):
+- Read-only lookups (memory, files, work items, meetings) run without user approval. Never ask “may I scan?”, “разрешаешь?”, “shall I continue?” — just call the tools.
+- Never promise work for a later turn and never answer with a plan of what you are about to read. Either emit tool_calls now or give the final answer.
+- Batch related lookups in one round (up to 5 calls) instead of one file per turn.
+- A partial result is not a dead end: when a result reports truncated / next_start_line / hasMore / more pages, call the tool again for the next window before answering. Keep going until you have what the answer needs or the round budget runs out.
+- Never ask the user to paste content you can read yourself, and never end a turn with a list of sources you still need — fetch them now and answer with what you found.
+- Only ask the user something when it is a product decision you cannot make, or when a write/CLI action needs approval.
+- Answer in plain language and never name the tools listed below — write “read the file …”, “searched the project …”, “opened the work item …”."""
+
+MEMORY_FIRST_POLICY = f"""{AUTONOMY_POLICY}
+
+Memory-first:
 1) Prefer project memory / context already provided.
-2) If a memory line is truncated or you need the full node, call memory_get with that id=… value.
+2) If a memory line is truncated or you need the full node, call memory_get with that id=… value immediately — do not describe what you would open.
 3) Work-item comments and long description parts live as linked child memory nodes — memory_get or graph neighbors after the main card.
 4) If memory has Azure Boards work item IDs or thin summaries, call boards_get_item / boards_list_comments for those IDs to refresh live details.
-5) If memory has nothing useful for the question, call boards_search or boards_my_work, then boards_get_item as needed.
-6) Prefer fs_* tools when the question needs files under the project folder.
-7) For meetings / “what did X say” / call notes: if memory Meeting hits are missing or thin, call granola_list_meetings, then granola_get_meetings (and granola_get_transcript when notes are incomplete).
-8) Do not call tools when memory already answers the question fully.
-9) Emit tool_calls JSON only when a tool is needed; otherwise answer normally."""
+5) If memory has nothing useful for the question, call memory_search with a sharper query, then boards_search (or boards_query_wiql for structured filters), then boards_get_item as needed. Boards lookups cover every work item in the project by default — never narrow them to the current user unless the user explicitly asked for their own items ("my tasks", "мои задачи", "assigned to me"); only then call boards_my_work.
+6) Prefer fs_* tools when the question needs files under the project folder. For git history — a commit hash, "which change broke this", "what did that fix touch" — use repo_* tools: repo_pull_requests_for_commit or repo_search_commits to locate the change, repo_get_pull_request for its changed files and linked work items, repo_read_file_at to see a file as of that commit, then compare with fs_read on the working copy.
+7) For meetings / “what did X say” / call notes: if memory Meeting hits are missing or thin, call granola_list_meetings, then granola_get_meetings (and granola_get_transcript when notes are incomplete). Do not answer about meeting tools when the user asked about something else (a work item, a file, or a cited memory node).
+8) Do not call tools when memory already answers the question fully. When memory is truncated, thin, off-topic, or the question is about source code behaviour, fetch/search now instead of guessing.
+9) For code questions (bugs, root cause, how X works) follow the call chain end-to-end: locate files, read them, then read their dependencies. Do not stop at search hits or file names.
+10) Only cite a work item, file, or memory node when the context or a tool result clearly supports it. If the pack is chat noise or unrelated, call memory_search / boards_search / fs_search for the user’s topic now. Short follow-ups (“подтяни данные”, “open it”, “fetch”) mean continue the prior topic with memory_get / search — never switch topics.
+11) Emit tool_calls JSON only when a tool is needed; otherwise answer normally."""
 
-MEMORY_ONLY_POLICY = """Memory-first:
+MEMORY_ONLY_POLICY = f"""{AUTONOMY_POLICY}
+
+Memory-first:
 1) Prefer project memory / context already provided.
-2) If a memory line is truncated or you need the full node, call memory_get with that id=… value.
+2) If a memory line is truncated or you need the full node, call memory_get with that id=… value immediately.
 3) Work-item comments and long description parts live as linked child memory nodes — memory_get after the main card.
-4) Do not call tools when memory already answers the question fully.
-5) Emit tool_calls JSON only when a tool is needed; otherwise answer normally."""
+4) If the pack is thin or off-topic for the question, call memory_search with a sharper query before answering.
+5) Do not call tools when memory already answers the question fully.
+6) Emit tool_calls JSON only when a tool is needed; otherwise answer normally.
+7) File access is off in this mode: if the answer needs source files, say so in one line instead of asking for approval."""
 
 TOOL_PROTOCOL = """You may request tools by emitting a single JSON object (optionally in a ```json fence):
-{"tool_calls":[{"name":"memory_get","arguments":{"id":"node_abc"}}]}
+{"tool_calls":[{"name":"memory_search","arguments":{"query":"auth token expiry"}},{"name":"memory_get","arguments":{"id":"node_abc"}}]}
 If no tool is needed, answer normally without that JSON.
 After tool results are provided, answer the user; do not invent tool results."""
 
@@ -46,16 +66,357 @@ class ToolSpec:
     write: bool = False
 
 
+# @azure-devops/mcp folded the split wit_* tools into dispatchers driven by an "action"
+# argument. Older releases still expose the split names, so every operation below keeps the
+# legacy call as a fallback; mcp_tool names the current tool.
+BOARDS_EXPAND_LEVELS = {
+    "none": "None",
+    "fields": "Fields",
+    "relations": "Relations",
+    "links": "Links",
+    "all": "All",
+}
+
+_MISSING_TOOL_RE = re.compile(
+    r"tool\s+\S+\s+(?:is\s+)?(?:not found|unknown|not supported|does not exist)"
+    r"|unknown tool|no such tool|method not found",
+    re.I,
+)
+
+
+_COMMIT_HASH_RE = re.compile(r"^[0-9a-f]{7,40}$", re.I)
+
+
+def _as_str_list(value: Any) -> list[str]:
+    """Accept a scalar or a list and return a clean list of strings."""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple, set)) else [value]
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+_PR_STATUS_NAMES = {1: "Active", 2: "Abandoned", 3: "Completed"}
+_CHANGE_TYPE_NAMES = {1: "add", 2: "edit", 8: "rename", 16: "delete", 18: "delete"}
+
+
+def _pull_request_summary(item: dict[str, Any]) -> str:
+    """One pull request as a few lines: identity, branches, changed files, linked work items."""
+    status = item.get("status")
+    status_text = _PR_STATUS_NAMES.get(status, str(status)) if not isinstance(status, str) else status
+    repo = item.get("repository") if isinstance(item.get("repository"), dict) else {}
+    author = item.get("createdBy") if isinstance(item.get("createdBy"), dict) else {}
+    source = str(item.get("sourceRefName") or "").replace("refs/heads/", "")
+    target = str(item.get("targetRefName") or "").replace("refs/heads/", "")
+    merge = item.get("lastMergeCommit") if isinstance(item.get("lastMergeCommit"), dict) else {}
+    lines = [
+        f"- PR !{item.get('pullRequestId')} [{status_text}] {item.get('title') or ''}".rstrip(),
+        f"  repo={repo.get('name') or ''} {source} -> {target} by {author.get('displayName') or ''}".rstrip(),
+    ]
+    if merge.get("commitId"):
+        lines.append(f"  merge commit {str(merge['commitId'])[:12]} at {item.get('closedDate') or ''}".rstrip())
+    refs = item.get("workItemRefs") if isinstance(item.get("workItemRefs"), list) else []
+    ids = [str(ref.get("id")) for ref in refs if isinstance(ref, dict) and ref.get("id")]
+    if ids:
+        lines.append(f"  work items: {', '.join(ids[:20])}")
+    summary = item.get("changedFilesSummary") if isinstance(item.get("changedFilesSummary"), dict) else {}
+    entries = summary.get("changeEntries") if isinstance(summary.get("changeEntries"), list) else []
+    if entries:
+        lines.append(f"  changed files ({summary.get('fileCount') or len(entries)}):")
+        for entry in entries[:40]:
+            if not isinstance(entry, dict):
+                continue
+            file_item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+            change = _CHANGE_TYPE_NAMES.get(entry.get("changeType"), str(entry.get("changeType") or ""))
+            lines.append(f"    {change}: {file_item.get('path') or ''}")
+        if len(entries) > 40:
+            lines.append(f"    (+{len(entries) - 40} more)")
+    return "\n".join(lines)
+
+
+def _normalize_version_type(requested: Any, version: str) -> str:
+    """Azure DevOps expects Branch/Tag/Commit; infer it when the model omits it."""
+    raw = str(requested or "").strip().lower()
+    known = {"branch": "Branch", "tag": "Tag", "commit": "Commit"}
+    if raw in known:
+        return known[raw]
+    return "Commit" if _COMMIT_HASH_RE.match(str(version or "").strip()) else "Branch"
+
+
+def is_empty_mcp_payload(result: Any) -> bool:
+    """True when an MCP tool answered with nothing usable (Azure DevOps does this for a bad project)."""
+    payload = result.get("result") if isinstance(result, dict) and "result" in result else result
+    if payload is None:
+        return True
+    if not isinstance(payload, dict):
+        return not str(payload).strip()
+    content = payload.get("content")
+    if isinstance(content, list) and content:
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if text and text.lower() not in {"null", "none", "[]", "{}"}:
+                return False
+        return True
+    return not any(key for key in payload if key not in {"content", "isError"})
+
+
+def mcp_tool_error_text(result: Any) -> str:
+    """Return the error text when an MCP tool result carries isError, else an empty string."""
+    payload = result.get("result") if isinstance(result, dict) and "result" in result else result
+    if not isinstance(payload, dict) or not payload.get("isError"):
+        return ""
+    content = payload.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and str(item.get("type") or "") == "text":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    return text
+    return str(payload.get("message") or payload.get("error") or "").strip() or "MCP tool call failed."
+
+
+def ado_call_plan(op: str, args: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Map an Azure DevOps operation to MCP (tool, arguments) candidates, current release first."""
+    data = {key: value for key, value in dict(args or {}).items() if value is not None}
+    project = str(data.get("project") or "").strip()
+
+    def scoped(candidates: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
+        if not project:
+            return candidates
+        return [(tool, {**arguments, "project": project}) for tool, arguments in candidates]
+
+    if op == "get_item":
+        item_id = int(data.get("id") or data.get("workItemId") or 0)
+        if item_id <= 0:
+            raise ValueError("boards get_item requires a work item id")
+        expand = str(data.get("expand") or "relations").lower()
+        return scoped([
+            ("wit_work_item", {"action": "get", "id": item_id, "expand": BOARDS_EXPAND_LEVELS.get(expand, "Relations")}),
+            ("wit_get_work_item", {"id": item_id, "expand": expand}),
+        ])
+    if op == "list_comments":
+        item_id = int(data.get("workItemId") or data.get("id") or 0)
+        if item_id <= 0:
+            raise ValueError("boards list_comments requires a work item id")
+        top = max(1, int(data.get("top") or 20))
+        return scoped([
+            ("wit_work_item", {"action": "list_comments", "workItemId": item_id, "top": top}),
+            ("wit_list_work_item_comments", {"workItemId": item_id, "top": top}),
+        ])
+    if op == "my_work":
+        payload = {
+            "type": str(data.get("type") or "assignedtome"),
+            "top": max(1, int(data.get("top") or 20)),
+            "includeCompleted": bool(data.get("includeCompleted", True)),
+        }
+        return scoped([
+            ("wit_work_item", {"action": "my", **payload}),
+            ("wit_my_work_items", payload),
+        ])
+    if op == "wiql":
+        wiql = str(data.get("wiql") or "").strip()
+        if not wiql:
+            raise ValueError("boards wiql requires a query")
+        modern: dict[str, Any] = {"action": "wiql", "wiql": wiql}
+        if data.get("top"):
+            modern["top"] = int(data["top"])
+        return scoped([
+            ("wit_query", modern),
+            ("wit_query_by_wiql", {"wiql": wiql}),
+        ])
+    if op == "search":
+        search_text = str(data.get("searchText") or data.get("query") or "").strip()
+        if not search_text:
+            raise ValueError("boards search requires searchText")
+        payload: dict[str, Any] = {
+            "searchText": search_text,
+            "top": min(max(1, int(data.get("top") or 25)), 25),
+            "skip": max(0, int(data.get("skip") or 0)),
+        }
+        if project:
+            payload["project"] = [project]
+        work_item_type = data.get("workItemType")
+        if work_item_type:
+            payload["workItemType"] = work_item_type if isinstance(work_item_type, list) else [str(work_item_type)]
+        return [("search_workitem", payload)]
+    if op == "list_repos":
+        legacy: dict[str, Any] = {}
+        modern = {"action": "list"}
+        for key in ("top", "skip", "repoNameFilter"):
+            if data.get(key) is not None:
+                modern[key] = data[key]
+        return scoped([("repo_repository", modern), ("repo_list_repos_by_project", legacy)])
+    if op == "list_pull_requests":
+        shared = {
+            key: data[key]
+            for key in ("top", "skip", "status", "repositoryId", "repository", "targetRefName", "sourceRefName")
+            if data.get(key) is not None
+        }
+        return scoped([
+            ("repo_pull_request", {"action": "list", **shared}),
+            ("repo_list_pull_requests_by_repo_or_project", dict(shared)),
+        ])
+    if op == "search_commits":
+        search_text = str(data.get("searchText") or data.get("query") or "").strip()
+        if not search_text:
+            raise ValueError("commit search requires searchText")
+        payload = {"searchText": search_text, "top": min(max(1, int(data.get("top") or 20)), 50)}
+        # Commit search takes list filters even for a single repository/branch/author.
+        for key in ("repository", "branch", "author"):
+            values = _as_str_list(data.get(key))
+            if values:
+                payload[key] = values
+        for key in ("commitStartDate", "commitEndDate", "skip"):
+            if data.get(key) is not None:
+                payload[key] = data[key]
+        return scoped([("repo_search_commits", payload)])
+    if op == "pull_requests_for_commit":
+        commits = data.get("commits") or data.get("commitId") or data.get("commit")
+        if isinstance(commits, str):
+            commits = [commits.strip()]
+        commits = [str(item).strip() for item in (commits or []) if str(item).strip()]
+        if not commits:
+            raise ValueError("pull_requests_for_commit requires a commit id")
+        repository = str(data.get("repository") or data.get("repositoryId") or "").strip()
+        if not repository:
+            raise ValueError("pull_requests_for_commit requires a repository")
+        # Azure DevOps matches only merge commits unless the query asks for member commits.
+        shared: dict[str, Any] = {
+            "repository": repository,
+            "commits": commits,
+            "queryType": str(data.get("queryType") or "Commit"),
+        }
+        for key in ("top", "skip"):
+            if data.get(key) is not None:
+                shared[key] = data[key]
+        return scoped([
+            ("repo_pull_request", {"action": "list_by_commits", **shared}),
+            ("repo_list_pull_requests_by_commits", dict(shared)),
+        ])
+    if op == "get_pull_request":
+        pull_request_id = data.get("pullRequestId") or data.get("id")
+        if pull_request_id is None or str(pull_request_id).strip() == "":
+            raise ValueError("get_pull_request requires pullRequestId")
+        shared: dict[str, Any] = {
+            "pullRequestId": int(pull_request_id),
+            "includeChangedFiles": bool(data.get("includeChangedFiles", True)),
+            "includeWorkItemRefs": bool(data.get("includeWorkItemRefs", True)),
+        }
+        for key in ("repositoryId", "repository", "includeLabels"):
+            if data.get(key) is not None:
+                shared[key] = data[key]
+        return scoped([
+            ("repo_pull_request", {"action": "get", **shared}),
+            ("repo_get_pull_request_by_id", dict(shared)),
+        ])
+    if op == "pull_request_comments":
+        pull_request_id = data.get("pullRequestId") or data.get("id")
+        if pull_request_id is None or str(pull_request_id).strip() == "":
+            raise ValueError("pull_request_comments requires pullRequestId")
+        repository_id = str(data.get("repositoryId") or data.get("repository") or "").strip()
+        if not repository_id:
+            raise ValueError("pull_request_comments requires repositoryId")
+        shared: dict[str, Any] = {
+            "repositoryId": repository_id,
+            "pullRequestId": int(pull_request_id),
+            "top": max(1, int(data.get("top") or 30)),
+        }
+        thread_id = data.get("threadId")
+        if thread_id is None:
+            # Without a thread id the API can only enumerate threads, which already carry their comments.
+            return scoped([
+                ("repo_pull_request_thread", {"action": "list", **shared}),
+                ("repo_list_pull_request_threads", dict(shared)),
+            ])
+        shared["threadId"] = int(thread_id)
+        return scoped([
+            ("repo_pull_request_thread", {"action": "list_comments", **shared}),
+            ("repo_list_pull_request_thread_comments", dict(shared)),
+        ])
+    if op == "repo_file":
+        path = str(data.get("path") or "").strip()
+        if not path:
+            raise ValueError("repo_file requires path")
+        repository_id = str(data.get("repositoryId") or data.get("repository") or "").strip()
+        if not repository_id:
+            raise ValueError("repo_file requires repositoryId")
+        shared = {"path": path if path.startswith("/") else f"/{path}", "repositoryId": repository_id}
+        version = str(data.get("version") or "").strip()
+        if version:
+            shared["version"] = version
+            shared["versionType"] = _normalize_version_type(data.get("versionType"), version)
+        return scoped([
+            ("repo_file", {"action": "get_content", **shared}),
+            ("repo_get_file_content", dict(shared)),
+        ])
+    if op == "list_wikis":
+        return scoped([("wiki", {"action": "list_wikis"}), ("wiki_list_wikis", {})])
+    if op == "list_wiki_pages":
+        shared = {
+            key: data[key]
+            for key in ("wikiIdentifier", "top", "path", "recursionLevel", "continuationToken")
+            if data.get(key) is not None
+        }
+        return scoped([
+            ("wiki", {"action": "list_pages", **shared}),
+            ("wiki_list_pages", dict(shared)),
+        ])
+    if op == "get_wiki_page_content":
+        shared = {
+            key: data[key]
+            for key in ("wikiIdentifier", "path", "url")
+            if data.get(key) is not None
+        }
+        if not shared:
+            raise ValueError("wiki page content requires url or wikiIdentifier/path")
+        # A direct page url already carries the project, so do not force one in.
+        candidates = [("wiki", {"action": "get_page_content", **shared}), ("wiki_get_page_content", dict(shared))]
+        return candidates if shared.get("url") else scoped(candidates)
+    raise ValueError(f"Unsupported Azure DevOps operation: {op}")
+
+
+def call_ado_tool(
+    mcp_manager: MCPManager,
+    op: str,
+    args: dict[str, Any],
+    *,
+    server_id: str = "azure-devops",
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Run an Azure DevOps operation, retrying with legacy tool names on older MCP releases."""
+    last_error = ""
+    for tool, arguments in ado_call_plan(op, args):
+        try:
+            result = mcp_manager.call_tool(server_id, tool, arguments, timeout=timeout)
+        except MCPError as exc:
+            last_error = str(exc)
+            if not _MISSING_TOOL_RE.search(last_error):
+                raise
+            continue
+        error = mcp_tool_error_text(result)
+        if not error:
+            return result
+        last_error = error
+        # Only a missing tool is worth retrying: anything else is a real Azure DevOps failure.
+        if not _MISSING_TOOL_RE.search(error):
+            raise MCPError(error)
+    raise MCPError(last_error or f"Azure DevOps {op} failed.")
+
+
 BOARDS_TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="boards_my_work",
-        description="List Azure Boards work items assigned to me.",
+        description=(
+            "List Azure Boards work items assigned to the current user. Use only when the user explicitly "
+            "asks for their own items; for any other lookup use boards_search."
+        ),
         server_id="azure-devops",
-        mcp_tool="wit_my_work_items",
+        mcp_tool="wit_work_item",
         parameters_schema={
             "type": "object",
             "properties": {
-                "project": {"type": "string"},
+                "project": {"type": "string", "description": "Azure DevOps project name; omit it to use the configured project"},
                 "top": {"type": "integer"},
                 "type": {"type": "string", "description": "assignedtome | followed | mentioned | etc."},
             },
@@ -63,7 +424,10 @@ BOARDS_TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="boards_search",
-        description="Search Azure Boards work items by text.",
+        description=(
+            "Search Azure Boards work items by text across the whole project, regardless of assignee. "
+            "Default choice for any work-item lookup."
+        ),
         server_id="azure-devops",
         mcp_tool="search_workitem",
         parameters_schema={
@@ -71,7 +435,7 @@ BOARDS_TOOLS: list[ToolSpec] = [
             "properties": {
                 "searchText": {"type": "string"},
                 "query": {"type": "string"},
-                "project": {"type": "string"},
+                "project": {"type": "string", "description": "Azure DevOps project name; omit it to use the configured project"},
                 "top": {"type": "integer"},
             },
             "required": [],
@@ -81,12 +445,12 @@ BOARDS_TOOLS: list[ToolSpec] = [
         name="boards_get_item",
         description="Get one Azure Boards work item by id.",
         server_id="azure-devops",
-        mcp_tool="wit_get_work_item",
+        mcp_tool="wit_work_item",
         parameters_schema={
             "type": "object",
             "properties": {
                 "id": {"type": ["integer", "string"]},
-                "project": {"type": "string"},
+                "project": {"type": "string", "description": "Azure DevOps project name; omit it to use the configured project"},
             },
             "required": ["id"],
         },
@@ -95,13 +459,13 @@ BOARDS_TOOLS: list[ToolSpec] = [
         name="boards_list_comments",
         description="List comments for an Azure Boards work item.",
         server_id="azure-devops",
-        mcp_tool="wit_list_work_item_comments",
+        mcp_tool="wit_work_item",
         parameters_schema={
             "type": "object",
             "properties": {
                 "workItemId": {"type": ["integer", "string"]},
                 "id": {"type": ["integer", "string"]},
-                "project": {"type": "string"},
+                "project": {"type": "string", "description": "Azure DevOps project name; omit it to use the configured project"},
                 "top": {"type": "integer"},
             },
             "required": [],
@@ -109,16 +473,151 @@ BOARDS_TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="boards_query_wiql",
-        description="Run a WIQL query against Azure Boards.",
+        description=(
+            "Run a WIQL query against Azure Boards for structured filters (state, iteration, type, dates). "
+            "Query the whole project; add an assignee clause only when the user asked for it."
+        ),
         server_id="azure-devops",
-        mcp_tool="wit_query_by_wiql",
+        mcp_tool="wit_query",
         parameters_schema={
             "type": "object",
             "properties": {
                 "wiql": {"type": "string"},
-                "project": {"type": "string"},
+                "project": {"type": "string", "description": "Azure DevOps project name; omit it to use the configured project"},
             },
             "required": ["wiql"],
+        },
+    ),
+]
+
+_REPO_ID_PARAM = {
+    "type": "string",
+    "description": "Repository name or id; omit to search across the project",
+}
+_REPO_PROJECT_PARAM = {
+    "type": "string",
+    "description": "Azure DevOps project name; omit it to use the configured project",
+}
+
+REPO_TOOLS: list[ToolSpec] = [
+    ToolSpec(
+        name="repo_list_repositories",
+        description="List Azure Repos git repositories in the project.",
+        server_id="azure-devops",
+        mcp_tool="repo_repository",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "project": _REPO_PROJECT_PARAM,
+                "repoNameFilter": {"type": "string"},
+                "top": {"type": "integer"},
+            },
+        },
+    ),
+    ToolSpec(
+        name="repo_search_commits",
+        description=(
+            "Search Azure Repos commits by message text, author, branch, or date range. "
+            "Use it to locate the commit behind a change before reading its pull request."
+        ),
+        server_id="azure-devops",
+        mcp_tool="repo_search_commits",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "searchText": {"type": "string", "description": "Text from the commit message, e.g. a work item id"},
+                "repository": _REPO_ID_PARAM,
+                "branch": {"type": "string"},
+                "author": {"type": "string"},
+                "commitStartDate": {"type": "string", "description": "ISO date lower bound"},
+                "commitEndDate": {"type": "string", "description": "ISO date upper bound"},
+                "project": _REPO_PROJECT_PARAM,
+                "top": {"type": "integer"},
+            },
+            "required": ["searchText"],
+        },
+    ),
+    ToolSpec(
+        name="repo_pull_requests_for_commit",
+        description=(
+            "Find the pull requests that contain a commit hash. Start here when the user gives "
+            "a commit id: the pull request carries the changed files, reviewers, and linked work items."
+        ),
+        server_id="azure-devops",
+        mcp_tool="repo_pull_request",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "commits": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Commit hashes (full or short)",
+                },
+                "repositoryId": {"type": "string", "description": "Repository name or id"},
+                "project": _REPO_PROJECT_PARAM,
+                "top": {"type": "integer"},
+            },
+            "required": ["commits", "repositoryId"],
+        },
+    ),
+    ToolSpec(
+        name="repo_get_pull_request",
+        description=(
+            "Open one pull request with its changed files and linked work items. "
+            "The changed-file list is the closest thing to a diff summary for a merged change."
+        ),
+        server_id="azure-devops",
+        mcp_tool="repo_pull_request",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "pullRequestId": {"type": "integer"},
+                "repositoryId": _REPO_ID_PARAM,
+                "project": _REPO_PROJECT_PARAM,
+                "includeChangedFiles": {"type": "boolean", "description": "Defaults to true"},
+                "includeWorkItemRefs": {"type": "boolean", "description": "Defaults to true"},
+            },
+            "required": ["pullRequestId"],
+        },
+    ),
+    ToolSpec(
+        name="repo_list_pull_request_comments",
+        description="Read review comments on a pull request (why a change was made or reverted).",
+        server_id="azure-devops",
+        mcp_tool="repo_pull_request_thread",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "pullRequestId": {"type": "integer"},
+                "repositoryId": {"type": "string", "description": "Repository name or id"},
+                "project": _REPO_PROJECT_PARAM,
+                "threadId": {"type": "integer", "description": "Narrow to one thread; omit to list all threads"},
+                "top": {"type": "integer"},
+            },
+            "required": ["pullRequestId", "repositoryId"],
+        },
+    ),
+    ToolSpec(
+        name="repo_read_file_at",
+        description=(
+            "Read a file from Azure Repos at a specific commit, branch, or tag. Use it to compare "
+            "the code as of a commit with the current workspace copy read by fs_read."
+        ),
+        server_id="azure-devops",
+        mcp_tool="repo_file",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Repository-relative file path"},
+                "repositoryId": {"type": "string", "description": "Repository name or id"},
+                "version": {"type": "string", "description": "Commit hash, branch, or tag name"},
+                "versionType": {
+                    "type": "string",
+                    "description": "Commit | Branch | Tag (inferred from version when omitted)",
+                },
+                "project": _REPO_PROJECT_PARAM,
+            },
+            "required": ["path", "repositoryId"],
         },
     ),
 ]
@@ -164,6 +663,28 @@ GRANOLA_TOOLS: list[ToolSpec] = [
 
 MEMORY_TOOLS: list[ToolSpec] = [
     ToolSpec(
+        name="memory_search",
+        description=(
+            "Search ArchitectOS project memory with a sharper query when the provided context pack "
+            "is thin, truncated, or off-topic. Prefer concrete terms from the user's topic "
+            "(ids, titles, class/file names, error text) over conversational fillers."
+        ),
+        server_id="local-memory",
+        mcp_tool="memory_search",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search text using specific terms from the user's topic",
+                },
+                "limit": {"type": "integer", "description": "Max hits (default 8)"},
+            },
+            "required": ["query"],
+        },
+        kind="native",
+    ),
+    ToolSpec(
         name="memory_get",
         description="Fetch the full ArchitectOS memory node by id (use when context shows id=… and the excerpt is truncated or incomplete).",
         server_id="local-memory",
@@ -184,12 +705,23 @@ MEMORY_TOOLS: list[ToolSpec] = [
 FS_TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="fs_read",
-        description="Read a text file under the current project folder.",
+        description=(
+            "Read a text file under the current project folder. Long files come back in windows: "
+            "when the result has truncated=true, call this again with start_line=next_start_line "
+            "until you reach the end instead of reporting a partial read."
+        ),
         server_id="filesystem",
         mcp_tool="read_file",
         parameters_schema={
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Project-relative path, an absolute path inside the project folder, or a fully-qualified class name (com.acme.FooBuilder)",
+                },
+                "start_line": {"type": "integer", "description": "First line to return; defaults to 1"},
+                "end_line": {"type": "integer", "description": "Last line to return"},
+            },
             "required": ["path"],
         },
         kind="native",
@@ -210,7 +742,10 @@ FS_TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="fs_search",
-        description="Search project files by name or content.",
+        description=(
+            "Search project files by name or content. Name mode accepts a class name or a "
+            "fully-qualified name and matches the file that declares it."
+        ),
         server_id="filesystem",
         mcp_tool="search_files",
         parameters_schema={
@@ -243,7 +778,7 @@ FS_TOOLS: list[ToolSpec] = [
     ),
 ]
 
-_ALL_SPECS = {spec.name: spec for spec in [*MEMORY_TOOLS, *BOARDS_TOOLS, *GRANOLA_TOOLS, *FS_TOOLS]}
+_ALL_SPECS = {spec.name: spec for spec in [*MEMORY_TOOLS, *BOARDS_TOOLS, *REPO_TOOLS, *GRANOLA_TOOLS, *FS_TOOLS]}
 
 _TOOL_CALLS_RE = re.compile(
     r"```(?:json)?\s*(\{[\s\S]*?\}\s*)```|(\{[^{}]*\"tool_calls\"[\s\S]*\})",
@@ -283,7 +818,9 @@ class ToolGateway:
         if memory_only:
             return specs
         if self.boards_enabled():
+            # Boards and Repos ride the same Azure DevOps MCP server.
             specs.extend(BOARDS_TOOLS)
+            specs.extend(REPO_TOOLS)
         if self.granola_enabled():
             specs.extend(GRANOLA_TOOLS)
         # Agent filesystem tools follow MCP Filesystem enablement; execution prefers native handlers.
@@ -307,6 +844,13 @@ class ToolGateway:
             write_note = " [write]" if spec.write else ""
             lines.append(f"- {spec.name}{write_note}: {spec.description} params={params}")
         return "\n".join(lines)
+
+    def tool_schemas(self, *, include_writes: bool = False, memory_only: bool = False) -> list[dict[str, Any]]:
+        """Tool definitions for providers that support native tool calling."""
+        return [
+            {"name": spec.name, "description": spec.description, "parameters": spec.parameters_schema}
+            for spec in self.available_specs(include_writes=include_writes, memory_only=memory_only)
+        ]
 
     def tool_prompt_section(self, *, include_writes: bool = False, memory_only: bool = False) -> str:
         catalog = self.catalog_for_prompt(include_writes=include_writes, memory_only=memory_only)
@@ -347,6 +891,8 @@ class ToolGateway:
                 payload = self._execute_native(spec, args)
             elif spec.name.startswith("boards_"):
                 payload = self._execute_boards(spec, args)
+            elif spec.name.startswith("repo_"):
+                payload = self._execute_repo(spec, args)
             elif spec.name.startswith("granola_"):
                 payload = self._execute_granola(spec, args)
             elif spec.name.startswith("fs_"):
@@ -358,7 +904,14 @@ class ToolGateway:
         except Exception as exc:  # noqa: BLE001 — surface to model as tool error
             return {"ok": False, "name": name, "error": str(exc), "summary": ""}
 
-        summary = summarize_tool_payload(payload)
+        # An MCP server reports tool-level failures inside a successful response; without this
+        # the model would read "Tool … not found" as data and conclude the source is offline.
+        tool_error = mcp_tool_error_text(payload)
+        if tool_error:
+            return {"ok": False, "name": name, "error": tool_error, "summary": ""}
+
+        cap = FILE_TOOL_RESULT_CHAR_CAP if name == "fs_read" else TOOL_RESULT_CHAR_CAP
+        summary = summarize_tool_payload(payload, cap=cap)
         return {"ok": True, "name": name, "error": "", "summary": summary, "result": payload}
 
     def _execute_native(self, spec: ToolSpec, args: dict[str, Any]) -> Any:
@@ -367,50 +920,129 @@ class ToolGateway:
             raise ValueError(f"Native handler not registered for {spec.name}")
         return handler(args)
 
+    def _boards_project_for(self, args: dict[str, Any]) -> str:
+        """Pick the Azure DevOps project, ignoring local ids or the org name a model may echo back."""
+        default = str(self._boards_project() or "").strip()
+        requested = str(args.get("project") or "").strip()
+        if not requested:
+            return default
+        rejected = {str(args.get("project_id") or "").strip().lower(), "architectos", "default", "current", "auto"}
+        config = self.mcp_manager.get_server("azure-devops")
+        if config:
+            # The org is the first positional argument of the MCP command, not a project.
+            rejected.update(str(part).strip().lower() for part in (config.command or [])[1:])
+        return default if requested.lower() in rejected else requested
+
     def _execute_boards(self, spec: ToolSpec, args: dict[str, Any]) -> Any:
-        ado_project = str(args.get("project") or self._boards_project()).strip() or self._boards_project()
-        mcp_args: dict[str, Any]
+        ado_project = self._boards_project_for(args)
+        op_args: dict[str, Any] = {"project": ado_project}
         if spec.name == "boards_my_work":
-            mcp_args = {
-                "project": ado_project,
-                "type": str(args.get("type") or "assignedtome"),
-                "top": int(args.get("top") or 20),
-                "includeCompleted": bool(args.get("includeCompleted", True)),
-            }
+            op = "my_work"
+            op_args.update({
+                "type": args.get("type"),
+                "top": args.get("top"),
+                "includeCompleted": args.get("includeCompleted", True),
+            })
         elif spec.name == "boards_search":
+            op = "search"
             search_text = str(args.get("searchText") or args.get("query") or args.get("search_text") or "").strip()
             if not search_text:
                 raise ValueError("boards_search requires searchText or query")
-            mcp_args = {
+            op_args.update({
                 "searchText": search_text,
-                "project": [ado_project],
-                "top": min(int(args.get("top") or 25), 25),
-                "skip": int(args.get("skip") or 0),
-            }
-            if args.get("workItemType") or args.get("work_item_type"):
-                mcp_args["workItemType"] = [str(args.get("workItemType") or args.get("work_item_type"))]
+                "top": args.get("top"),
+                "skip": args.get("skip"),
+                "workItemType": args.get("workItemType") or args.get("work_item_type"),
+            })
         elif spec.name == "boards_get_item":
+            op = "get_item"
             work_id = args.get("id") or args.get("workItemId") or args.get("work_item_id")
             if work_id is None or str(work_id).strip() == "":
                 raise ValueError("boards_get_item requires id")
-            mcp_args = {"id": int(work_id), "project": ado_project, "expand": str(args.get("expand") or "all")}
+            op_args.update({"id": work_id, "expand": args.get("expand") or "all"})
         elif spec.name == "boards_list_comments":
+            op = "list_comments"
             work_id = args.get("workItemId") or args.get("id") or args.get("work_item_id")
             if work_id is None or str(work_id).strip() == "":
                 raise ValueError("boards_list_comments requires workItemId or id")
-            mcp_args = {
-                "project": ado_project,
-                "workItemId": int(work_id),
-                "top": int(args.get("top") or 20),
-            }
+            op_args.update({"workItemId": work_id, "top": args.get("top")})
         elif spec.name == "boards_query_wiql":
+            op = "wiql"
             wiql = str(args.get("wiql") or "").strip()
             if not wiql:
                 raise ValueError("boards_query_wiql requires wiql")
-            mcp_args = {"wiql": wiql, "project": ado_project}
+            op_args.update({"wiql": wiql, "top": args.get("top")})
         else:
             raise ValueError(f"Unsupported boards tool: {spec.name}")
-        return self.mcp_manager.call_tool(spec.server_id, spec.mcp_tool, mcp_args)
+        result = call_ado_tool(self.mcp_manager, op, op_args)
+        if is_empty_mcp_payload(result):
+            raise MCPError(
+                f"Azure Boards returned no data for {op} in project '{ado_project}'. "
+                "Check the work item id, or omit project to use the configured one."
+            )
+        return result
+
+    def _execute_repo(self, spec: ToolSpec, args: dict[str, Any]) -> Any:
+        ado_project = self._boards_project_for(args)
+        op_args: dict[str, Any] = {"project": ado_project}
+        repository = args.get("repositoryId") or args.get("repository") or args.get("repo")
+        if spec.name == "repo_list_repositories":
+            op = "list_repos"
+            op_args.update({"repoNameFilter": args.get("repoNameFilter"), "top": args.get("top")})
+        elif spec.name == "repo_search_commits":
+            op = "search_commits"
+            search_text = str(args.get("searchText") or args.get("query") or "").strip()
+            if not search_text:
+                raise ValueError("repo_search_commits requires searchText")
+            op_args.update({
+                "searchText": search_text,
+                "repository": repository,
+                "branch": args.get("branch"),
+                "author": args.get("author"),
+                "commitStartDate": args.get("commitStartDate"),
+                "commitEndDate": args.get("commitEndDate"),
+                "top": args.get("top"),
+            })
+        elif spec.name == "repo_pull_requests_for_commit":
+            op = "pull_requests_for_commit"
+            op_args.update({
+                "commits": args.get("commits") or args.get("commitId") or args.get("commit"),
+                "repositoryId": repository,
+                "top": args.get("top"),
+            })
+        elif spec.name == "repo_get_pull_request":
+            op = "get_pull_request"
+            op_args.update({
+                "pullRequestId": args.get("pullRequestId") or args.get("id"),
+                "repositoryId": repository,
+                "includeChangedFiles": args.get("includeChangedFiles", True),
+                "includeWorkItemRefs": args.get("includeWorkItemRefs", True),
+            })
+        elif spec.name == "repo_list_pull_request_comments":
+            op = "pull_request_comments"
+            op_args.update({
+                "pullRequestId": args.get("pullRequestId") or args.get("id"),
+                "repositoryId": repository,
+                "threadId": args.get("threadId"),
+                "top": args.get("top"),
+            })
+        elif spec.name == "repo_read_file_at":
+            op = "repo_file"
+            op_args.update({
+                "path": args.get("path"),
+                "repositoryId": repository,
+                "version": args.get("version") or args.get("commit") or args.get("branch"),
+                "versionType": args.get("versionType"),
+            })
+        else:
+            raise ValueError(f"Unsupported repo tool: {spec.name}")
+        result = call_ado_tool(self.mcp_manager, op, op_args)
+        if is_empty_mcp_payload(result):
+            raise MCPError(
+                f"Azure Repos returned no data for {op} in project '{ado_project}'. "
+                "Check the repository, commit id, or pull request id."
+            )
+        return result
 
     def _execute_granola(self, spec: ToolSpec, args: dict[str, Any]) -> Any:
         if not self.granola_enabled():
@@ -507,7 +1139,68 @@ def summarize_tool_payload(payload: Any, *, cap: int = TOOL_RESULT_CHAR_CAP) -> 
     text = text.strip()
     if len(text) <= cap:
         return text
+    if compact is None and isinstance(payload, dict):
+        # Cutting the serialized tail would drop the very fields that tell the model
+        # how to continue (next_start_line, total_lines, …), so trim the body instead.
+        trimmed = _trim_payload_body(payload, cap)
+        if trimmed is not None:
+            return trimmed
     return text[: cap - 20] + "\n…[truncated]"
+
+
+def _trim_payload_body(payload: dict[str, Any], cap: int) -> str | None:
+    """Shrink the largest text field of a structured payload, keeping its metadata."""
+    body_key = ""
+    if isinstance(payload.get("text"), str):
+        body_key = "text"
+    else:
+        longest = 0
+        for key, value in payload.items():
+            if isinstance(value, str) and len(value) > longest:
+                body_key, longest = key, len(value)
+    if not body_key:
+        return None
+    full_body = str(payload.get(body_key) or "")
+    allowance = cap
+    # Escaping makes the rendered size unpredictable, so shrink until it actually fits.
+    for _ in range(6):
+        body = full_body[:allowance]
+        if "\n" in body:
+            # Cut at a line boundary so a numbered code window stays parseable.
+            body = body[: body.rindex("\n")]
+        if not body:
+            return None
+        trimmed = dict(payload)
+        trimmed[body_key] = body
+        last_line = _last_numbered_line(body)
+        if last_line and isinstance(payload.get("total_lines"), int):
+            total = int(payload["total_lines"])
+            trimmed["end_line"] = last_line
+            trimmed["truncated"] = last_line < total
+            trimmed["next_start_line"] = last_line + 1 if last_line < total else 0
+        trimmed["note"] = (
+            "Output trimmed to fit the tool budget. Continue with "
+            f"start_line={trimmed.get('next_start_line') or 'n/a'}."
+        )
+        try:
+            rendered = json.dumps(trimmed, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return None
+        if len(rendered) <= cap:
+            return rendered
+        allowance -= max(200, len(rendered) - cap + 200)
+        if allowance < 400:
+            return None
+    return None
+
+
+def _last_numbered_line(body: str) -> int:
+    """Line number of the last `123| …` row in a read window, else 0."""
+    for row in reversed(body.splitlines()):
+        head = row.split("|", 1)[0].strip()
+        if head.isdigit():
+            return int(head)
+    return 0
 
 
 _UNTRUSTED_WIQL_RE = re.compile(
@@ -522,6 +1215,10 @@ def _compact_mcp_tool_payload(payload: Any) -> str | None:
         return None
     tool = str(payload.get("tool") or "").strip()
     inner = payload.get("result")
+    if inner is None and not isinstance(payload.get("content"), list):
+        # Native payloads (fs_read, memory_get, …) are already structured; compacting
+        # them here would keep only the text body and drop path/line metadata.
+        return None
     text_blob = _mcp_content_text(inner if inner is not None else payload)
     if not text_blob:
         return None
@@ -531,7 +1228,7 @@ def _compact_mcp_tool_payload(payload: Any) -> str | None:
         # Keep raw text but without wrapper noise when possible.
         return cleaned[:TOOL_RESULT_CHAR_CAP] if cleaned else None
 
-    if tool in {"wit_query_by_wiql", "wit_get_query_results_by_id"} or "workItems" in parsed:
+    if tool in {"wit_query", "wit_query_by_wiql", "wit_get_query_results_by_id"} or "workItems" in parsed:
         work_items = parsed.get("workItems")
         if isinstance(work_items, list):
             ids: list[str] = []
@@ -547,6 +1244,47 @@ def _compact_mcp_tool_payload(payload: Any) -> str | None:
                 + (f": {preview}{more}" if ids else " (empty)")
             )
 
+    if tool in {"repo_pull_request", "repo_get_pull_request_by_id", "repo_list_pull_requests_by_commits"}:
+        items = parsed if isinstance(parsed, list) else parsed.get("value") if isinstance(parsed.get("value"), list) else None
+        if items is None and parsed.get("pullRequestId"):
+            items = [parsed]
+        if items is None and isinstance(parsed.get("results"), list):
+            # A commit query answers as [{<commit hash>: [pull requests]}].
+            items = [
+                pull_request
+                for bucket in parsed["results"]
+                if isinstance(bucket, dict)
+                for group in bucket.values()
+                for pull_request in (group if isinstance(group, list) else [])
+            ]
+        if items is not None:
+            if not items:
+                return "Pull requests · none matched"
+            lines = [f"Pull requests · {len(items)}"]
+            for item in items[:10]:
+                if isinstance(item, dict):
+                    lines.append(_pull_request_summary(item))
+            return "\n".join(lines)
+
+    if tool == "repo_search_commits":
+        results = parsed.get("results") if isinstance(parsed.get("results"), list) else []
+        if not results:
+            hint = "" if parsed.get("infoCode") in (None, 0) else " (code search index unavailable for this project)"
+            return (
+                f"Commit search · 0 matches{hint}. "
+                "For a known hash use repo_pull_requests_for_commit; otherwise filter pull requests."
+            )
+        lines = [f"Commit search · {len(results)} match(es)"]
+        for item in results[:20]:
+            if not isinstance(item, dict):
+                continue
+            commit_id = str(item.get("commitId") or "")[:12]
+            author = ((item.get("author") or {}) if isinstance(item.get("author"), dict) else {}).get("name") or ""
+            repo = ((item.get("repository") or {}) if isinstance(item.get("repository"), dict) else {}).get("name") or ""
+            comment = str(item.get("comment") or "").splitlines()[:1]
+            lines.append(f"- {commit_id} {repo} {author}: {comment[0] if comment else ''}".strip())
+        return "\n".join(lines)
+
     if tool == "search_workitem" or ("count" in parsed and "results" in parsed):
         results = parsed.get("results") if isinstance(parsed.get("results"), list) else []
         count = int(parsed.get("count") or len(results) or 0)
@@ -561,7 +1299,8 @@ def _compact_mcp_tool_payload(payload: Any) -> str | None:
             lines.append(f"- {wtype} #{wid}: {title}".strip())
         return "\n".join(lines)
 
-    if tool == "wit_get_work_item" or (parsed.get("id") and isinstance(parsed.get("fields"), dict)):
+    # wit_work_item also serves comments and "my work" lists, so require a field bag here.
+    if isinstance(parsed.get("fields"), dict) and (parsed.get("id") or tool in {"wit_work_item", "wit_get_work_item"}):
         fields = parsed.get("fields") if isinstance(parsed.get("fields"), dict) else {}
         wid = parsed.get("id") or fields.get("System.Id")
         title = fields.get("System.Title") or ""
@@ -764,6 +1503,52 @@ def format_tool_results_for_prompt(trace: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines).strip()
 
 
+_TOOL_ACTION_VERBS: dict[str, str] = {
+    "memory_search": "Searching memory",
+    "memory_get": "Reading memory note",
+    "boards_search": "Searching Azure Boards",
+    "boards_my_work": "Loading my work items",
+    "boards_get_item": "Opening work item",
+    "boards_list_comments": "Reading work item comments",
+    "boards_query_wiql": "Querying Azure Boards",
+    "repo_list_repositories": "Listing repositories",
+    "repo_search_commits": "Searching commits",
+    "repo_pull_requests_for_commit": "Finding pull requests for commit",
+    "repo_get_pull_request": "Opening pull request",
+    "repo_list_pull_request_comments": "Reading pull request comments",
+    "repo_read_file_at": "Reading file at revision",
+    "granola_list_meetings": "Listing meetings",
+    "granola_get_meetings": "Reading meeting notes",
+    "granola_get_transcript": "Reading meeting transcript",
+    "fs_read": "Reading file",
+    "fs_list": "Listing folder",
+    "fs_search": "Searching project files",
+    "fs_write": "Writing file",
+}
+
+_TOOL_ACTION_DETAIL_KEYS: tuple[str, ...] = ("path", "file", "query", "text", "id", "node_id", "work_item_id", "item_id")
+
+
+def tool_action_label(name: str, arguments: dict[str, Any] | None = None) -> str:
+    """Plain-language label for a tool call, safe to show to non-technical users."""
+    tool = str(name or "").strip()
+    verb = _TOOL_ACTION_VERBS.get(tool)
+    if not verb:
+        verb = tool.replace("boards_", "").replace("granola_", "").replace("fs_", "").replace("_", " ").strip() or "Working"
+        verb = verb[:1].upper() + verb[1:]
+    detail = ""
+    args = arguments or {}
+    for key in _TOOL_ACTION_DETAIL_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            detail = value.strip()
+            break
+    if not detail:
+        detail = next((value.strip() for value in args.values() if isinstance(value, str) and value.strip()), "")
+    detail = detail[:80]
+    return f"{verb} {detail}".strip() if detail else verb
+
+
 def compact_tool_trace_label(trace: list[dict[str, Any]]) -> str:
     if not trace:
         return ""
@@ -783,9 +1568,11 @@ def compact_tool_trace_label(trace: list[dict[str, Any]]) -> str:
             bits.append(name.replace("fs_", "fs "))
         elif name == "memory_get":
             bits.append("memory get")
+        elif name == "memory_search":
+            bits.append("memory search")
         else:
-            bits.append(name.replace("boards_", "").replace("_", " "))
+            bits.append(name.replace("boards_", "").replace("repo_", "repo ").replace("_", " "))
     prefix = "Used tools"
-    if any(str(item.get("name") or "").startswith("boards_") for item in trace):
-        prefix = "Used Azure Boards / tools"
+    if any(str(item.get("name") or "").startswith(("boards_", "repo_")) for item in trace):
+        prefix = "Used Azure DevOps / tools"
     return f"{prefix}: " + ", ".join(bits)

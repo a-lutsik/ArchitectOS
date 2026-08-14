@@ -23,6 +23,8 @@ For an application-style window instead of a browser tab:
 
 The app-window launcher uses Edge/Chrome `--app` mode when available and falls back to the default browser if no compatible browser is found. It writes `data\architectos.runtime.json` while the server is alive. For no-browser development runs use `python .\backend\app.py`. See `docs\STARTUP.md` for port conflict handling and app-window startup, `docs\CONFIGURATION.md` for providers/security, `docs\PRODUCTION.md` for operations, and `docs\RELEASE_QA.md` for release packaging.
 
+**Share Full package (OS login autostart):** `python scripts/build_share_package.py` → unpack → `install.sh` / `install.bat`. Russian guide for Full / MCP / IDE: [`docs/GUIDE_RU.md`](docs/GUIDE_RU.md). Installer overview: [`docs/INSTALLERS.md`](docs/INSTALLERS.md).
+
 ## Test
 
 ```powershell

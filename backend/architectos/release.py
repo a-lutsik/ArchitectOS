@@ -36,6 +36,12 @@ REQUIRED_FILES = [
     "docs/PRODUCTION.md",
     "docs/RELEASE_QA.md",
     "docs/ROADMAP_CHECKLIST.md",
+    "docs/GUIDE_RU.md",
+    "scripts/install_autostart.sh",
+    "scripts/install_autostart.ps1",
+    "scripts/uninstall_autostart.sh",
+    "scripts/uninstall_autostart.ps1",
+    "scripts/build_share_package.py",
     "tests/test_memory.py",
     "tests/test_e2e.py",
     "tests/test_fake_adapters.py",
@@ -86,7 +92,10 @@ def visual_qa_checks(root: Path) -> dict[str, bool]:
         }
     css = css_path.read_text(encoding="utf-8")
     html = html_path.read_text(encoding="utf-8")
-    app = app_path.read_text(encoding="utf-8")
+    frontend_js = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((root / "frontend").glob("*.js"))
+    )
     # Normalize whitespace so checks are robust to formatting (expanded vs minified CSS).
     compact = "".join(css.split())
     has_desktop_grid = ".dashboard-grid" in css and (
@@ -99,7 +108,7 @@ def visual_qa_checks(root: Path) -> dict[str, bool]:
         "tablet_breakpoint": "@media(max-width:1100px)" in compact,
         "mobile_breakpoint": "@media(max-width:760px)" in compact,
         "mobile_single_column": ".app-shell{grid-template-columns:1fr" in compact and ".task-board{grid-template-columns:1fr" in compact,
-        "graph_canvas": '<canvas id="graph-canvas"' in html and "resizeGraphCanvas" in app,
+        "graph_canvas": '<canvas id="graph-canvas"' in html and "resizeGraphCanvas" in frontend_js,
         "graph_mobile_layout": ".graph-layout{display:grid" in compact and "grid-auto-rows:640px" in compact,
         "text_overflow_guards": "overflow-wrap:anywhere" in compact and "min-width:0" in compact,
         # Tight heading tracking (≈ -0.02em) is deliberate; flag only aggressive negatives.
@@ -120,6 +129,17 @@ def release_manifest(root: Path) -> dict[str, Any]:
         "no_cache_files": not any("__pycache__" in item or item.endswith(".pyc") for item in files),
         "startup_scripts": all(item in files for item in ["run_architectos.py", "start-architectos.ps1", "start-architectos.bat", "start-architectos-app.ps1", "start-architectos-app.bat"]),
         "configuration_docs": all(item in files for item in ["docs/STARTUP.md", "docs/CONFIGURATION.md", "docs/RELEASE_QA.md"]),
+        "share_autostart": all(
+            item in files
+            for item in [
+                "docs/GUIDE_RU.md",
+                "scripts/install_autostart.sh",
+                "scripts/install_autostart.ps1",
+                "scripts/uninstall_autostart.sh",
+                "scripts/uninstall_autostart.ps1",
+                "scripts/build_share_package.py",
+            ]
+        ),
         "visual_qa": all(visual.values()),
     }
     return {

@@ -49,6 +49,10 @@ def _decode_text(raw: bytes) -> str:
     return ""
 
 
+# Public alias for callers outside this module (e.g. the inbox ingestion source).
+decode_text = _decode_text
+
+
 class FileStore:
     def __init__(self, base_dir: Path) -> None:
         self.base_dir = Path(base_dir)

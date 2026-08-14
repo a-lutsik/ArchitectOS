@@ -1,0 +1,5 @@
+# Place PyInstaller sidecar binaries here for Tauri externalBin:
+#   architectos-server-<target-triple>      (macOS/Linux)
+#   architectos-server-<target-triple>.exe  (Windows)
+#
+# Built automatically by scripts/build_desktop.sh / .ps1

@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 import json
+import logging
 import os
 import re
-import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,7 @@ from .models import MemoryEdge, MemoryNode, Project, stable_id, utc_now
 from .security import SecurityPolicy
 
 _SECURITY_POLICY = SecurityPolicy()
+_LOG = logging.getLogger("architectos.storage")
 
 
 def sanitize_text(value: str) -> tuple[str, bool]:
@@ -77,8 +78,8 @@ class SQLiteMemoryRepository:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as exc:
+            _LOG.debug("SQLite pragma setup failed: %s", exc)
         try:
             yield conn
             conn.commit()
@@ -348,6 +349,7 @@ class SQLiteMemoryRepository:
                 "auto_rescan_all_projects": True,
                 "chat_memory_mode": "strict",
                 "chat_candidate_ttl_days": 7,
+                "chat_session_idle_minutes": 30,
                 "chat_store_facts_only": True,
                 "long_term_types": ["Decision", "Constraint", "Requirement"],
                 "architecture_keywords": ["architecture", "adr", "decision", "constraint", "security", "provider", "routing"],
@@ -390,6 +392,7 @@ class SQLiteMemoryRepository:
             "auto_rescan_all_projects": True,
             "chat_memory_mode": "strict",
             "chat_candidate_ttl_days": 7,
+            "chat_session_idle_minutes": 30,
             "chat_store_facts_only": True,
         }
         for key, value in defaults.items():
@@ -409,12 +412,12 @@ class SQLiteMemoryRepository:
             conn.execute(f"DELETE FROM memory_nodes WHERE id IN ({placeholders})", seed_ids)
             try:
                 conn.execute(f"DELETE FROM memory_nodes_fts WHERE node_id IN ({placeholders})", seed_ids)
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as exc:
+                _LOG.debug("seed cleanup skipped for memory_nodes_fts: %s", exc)
             try:
                 conn.execute(f"DELETE FROM memory_embeddings WHERE node_id IN ({placeholders})", seed_ids)
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as exc:
+                _LOG.debug("seed cleanup skipped for memory_embeddings: %s", exc)
 
     def _delete_empty_non_system_projects(self) -> None:
         stale_ids = [project.id for project in self.list_projects() if project.id != "architectos" and not project.root_path]
@@ -643,7 +646,7 @@ class SQLiteMemoryRepository:
         node.evidence = [self._write_evidence(node)]
         return self.upsert_node(node)
 
-    def upsert_node(self, node: MemoryNode) -> MemoryNode:
+    def upsert_node(self, node: MemoryNode, *, notify: bool = True) -> MemoryNode:
         node.updated_at = utc_now()
         with self._connect() as conn:
             conn.execute(
@@ -651,11 +654,12 @@ class SQLiteMemoryRepository:
                 (node.id, node.type, node.label, node.scope, node.project_id, node.interface_id, node.status, node.confidence, node.created_at, node.updated_at, json.dumps(node.to_dict(), sort_keys=True)),
             )
             self._sync_memory_fts_row(conn, node)
-        for listener in self._node_upsert_listeners:
-            try:
-                listener(node)
-            except Exception:
-                pass
+        if notify:
+            for listener in self._node_upsert_listeners:
+                try:
+                    listener(node)
+                except Exception:
+                    pass
         return node
 
     def get_node(self, node_id: str) -> MemoryNode | None:
@@ -763,7 +767,8 @@ class SQLiteMemoryRepository:
         try:
             with self._connect() as conn:
                 rows = conn.execute(sql, params).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _LOG.warning("memory FTS query failed, returning no hits: %s", exc)
             return []
         return [str(row["node_id"]) for row in rows if row["node_id"]]
 
@@ -824,38 +829,16 @@ class SQLiteMemoryRepository:
     @staticmethod
     def _fts_match_query(query: str, joiner: str = "AND") -> str:
         # Must accept non-ASCII (e.g. Cyrillic); FTS5 uses unicode61 tokenizer.
-        # Expand common person-name script aliases (Дарья ↔ Darya) and drop stopwords
-        # so OR fallback does not flood with ADO noise from "что".
-        stopwords = {
-            "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "about",
-            "what", "who", "when", "where", "why", "how", "did", "does", "was", "were", "said",
-            "что", "как", "кто", "где", "когда", "почему", "зачем", "какой", "какие", "какая",
-            "это", "эта", "этот", "эти", "она", "он", "они", "мы", "вы", "про", "или", "если",
-            "есть", "было", "были", "можно", "нужно", "только", "ещё", "еще", "уже", "ли",
-            "говорила", "говорил", "говорили", "сказать", "сказал", "сказала",
-        }
-        name_aliases = {
-            "дарья": ("дарья", "darya", "daria"),
-            "darya": ("дарья", "darya", "daria"),
-            "daria": ("дарья", "darya", "daria"),
-            "олег": ("олег", "oleg"),
-            "oleg": ("олег", "oleg"),
-            "антон": ("антон", "anton"),
-            "anton": ("антон", "anton"),
-        }
-        terms = [token.lower() for token in re.findall(r"[^\W_]+", query or "", flags=re.UNICODE)]
+        # Drop stopwords so the OR fallback does not flood with ADO noise from "что".
+        from .embeddings import QUERY_STOPWORDS, content_tokens, expand_query_terms
+
+        terms = expand_query_terms(content_tokens(query))
         if not terms:
             return ""
         parts: list[str] = []
-        for term in terms[:12]:
+        for term in terms[:16]:
             safe = term.replace('"', "")
-            if not safe or safe in stopwords or len(safe) < 2:
-                continue
-            aliases = name_aliases.get(safe)
-            if aliases:
-                group = " OR ".join(f'"{alias.replace(chr(34), "")}"*' for alias in aliases if alias)
-                if group:
-                    parts.append(f"({group})")
+            if not safe or safe in QUERY_STOPWORDS or len(safe) < 2:
                 continue
             parts.append(f'"{safe}"*')
         if not parts:
@@ -1052,7 +1035,8 @@ class SQLiteMemoryRepository:
         try:
             with self._connect() as conn:
                 rows = conn.execute(sql, params).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _LOG.warning("memory vector query failed, returning no hits: %s", exc)
             return []
         ranked: list[tuple[str, float]] = []
         for row in rows:
@@ -1142,6 +1126,24 @@ class SQLiteMemoryRepository:
             rows = conn.execute("SELECT id FROM memory_edges").fetchall()
         return {str(row["id"]) for row in rows}
 
+    def list_edges_touching(self, node_ids: list[str] | set[str]) -> list[MemoryEdge]:
+        """Edges with at least one endpoint in ``node_ids`` (graph neighborhood fetch)."""
+        ids = [str(node_id) for node_id in node_ids if str(node_id or "")]
+        if not ids:
+            return []
+        results: list[MemoryEdge] = []
+        # Keep IN clauses well under the SQLite variable limit (999).
+        for offset in range(0, len(ids), 400):
+            chunk = ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT payload FROM memory_edges WHERE source IN ({placeholders}) OR target IN ({placeholders})",
+                    (*chunk, *chunk),
+                ).fetchall()
+            results.extend(MemoryEdge.from_dict(json.loads(row["payload"])) for row in rows)
+        return results
+
     def delete_node_edges(self, node_id: str) -> int:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM memory_edges WHERE source = ? OR target = ?", (node_id, node_id))
@@ -1187,6 +1189,11 @@ class SQLiteMemoryRepository:
         with self._connect() as conn:
             row = conn.execute("SELECT payload FROM memory_candidates WHERE id = ?", (candidate_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
+
+    def delete_memory_candidate(self, candidate_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM memory_candidates WHERE id = ?", (candidate_id,))
+        return cursor.rowcount > 0
 
     def list_memory_candidates(self, project_id: str | None = None, status: str | None = "candidate", limit: int | None = 50) -> list[dict[str, Any]]:
         sql = "SELECT payload FROM memory_candidates"

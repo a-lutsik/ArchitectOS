@@ -1,0 +1,6 @@
+# ArchitectOS desktop (Tauri)
+/node_modules/
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/binaries/architectos-server*
+!/src-tauri/binaries/.gitkeep

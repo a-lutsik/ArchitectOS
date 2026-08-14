@@ -18,20 +18,95 @@
     }[char]));
   }
 
+  function extractBareStructuredJson(source) {
+    // Models sometimes emit the structured payload without an ```architectos fence
+    // (or the stream cuts the fence off). Grab {"actions": …} / {"links": …} via a
+    // balanced-brace scan so raw JSON never leaks into the rendered answer.
+    const startMatch = source.match(/\{\s*"(?:actions|links)"\s*:/);
+    if (!startMatch) return null;
+    const start = startMatch.index;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < source.length; i += 1) {
+      const ch = source[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          const raw = source.slice(start, i + 1);
+          try {
+            const structured = JSON.parse(raw);
+            if (structured && typeof structured === "object") {
+              return { start, end: i + 1, structured, raw };
+            }
+          } catch (_err) {
+            // Looks like the structured payload but does not parse (truncated
+            // label, smart quotes, …) — still hide it rather than show raw JSON.
+            return { start, end: i + 1, structured: null, raw };
+          }
+          return null;
+        }
+      }
+    }
+    // Truncated mid-JSON: hide the tail so partial JSON is never shown.
+    return { start, end: source.length, structured: null, raw: source.slice(start) };
+  }
+
   function extractArchitectosBlock(text) {
     const source = String(text || "");
     const match = source.match(/```architectos\s*([\s\S]*?)```/i);
-    if (!match) {
-      return { displayText: source.trim(), structured: null, rawBlock: "" };
+    if (match) {
+      let structured = null;
+      try {
+        structured = JSON.parse(match[1].trim());
+      } catch (_err) {
+        structured = null;
+      }
+      const displayText = (source.slice(0, match.index) + source.slice(match.index + match[0].length)).trim();
+      return { displayText, structured, rawBlock: match[0] };
     }
-    let structured = null;
-    try {
-      structured = JSON.parse(match[1].trim());
-    } catch (_err) {
-      structured = null;
+    // Unclosed fence (stream still going or cut off): hide the partial block.
+    const open = source.match(/```architectos\s*[\s\S]*$/i);
+    if (open) {
+      return { displayText: source.slice(0, open.index).trim(), structured: null, rawBlock: open[0] };
     }
-    const displayText = (source.slice(0, match.index) + source.slice(match.index + match[0].length)).trim();
-    return { displayText, structured, rawBlock: match[0] };
+    // Plain fenced block (``` or ```json) whose payload is the structured
+    // actions/links JSON — models often drop the `architectos` language tag.
+    const fenceRe = /```[a-z]*\s*\n?([\s\S]*?)```/gi;
+    let fence;
+    while ((fence = fenceRe.exec(source)) !== null) {
+      const body = fence[1].trim();
+      if (!/^\{\s*"(?:actions|links)"/.test(body)) continue;
+      try {
+        const structured = JSON.parse(body);
+        const displayText = (source.slice(0, fence.index) + source.slice(fence.index + fence[0].length)).trim();
+        return { displayText, structured, rawBlock: fence[0] };
+      } catch (_err) {
+        // Payload looks like the structured JSON but does not parse — hide it
+        // anyway; raw model JSON should never reach the rendered answer.
+        const displayText = (source.slice(0, fence.index) + source.slice(fence.index + fence[0].length)).trim();
+        return { displayText, structured: null, rawBlock: fence[0] };
+      }
+    }
+    // Unclosed plain fence whose payload starts like the structured JSON.
+    const openPlain = source.match(/```[a-z]*\s*\n?\s*\{\s*"(?:actions|links)"[\s\S]*$/i);
+    if (openPlain) {
+      return { displayText: source.slice(0, openPlain.index).trim(), structured: null, rawBlock: openPlain[0] };
+    }
+    const bare = extractBareStructuredJson(source);
+    if (bare) {
+      const displayText = (source.slice(0, bare.start) + source.slice(bare.end)).trim();
+      return { displayText, structured: bare.structured, rawBlock: bare.raw };
+    }
+    return { displayText: source.trim(), structured: null, rawBlock: "" };
   }
 
   function normalizeStructured(structured) {
@@ -119,7 +194,14 @@
   function renderMarkdown(text) {
     const source = String(text || "").replace(/\r\n/g, "\n");
     if (!source.trim()) return "";
-    const lines = source.split("\n");
+    // Whitelisted HTML: models emit <details>/<summary> for tool traces. Extract
+    // the blocks before escaping, render their bodies as markdown, re-insert after.
+    const detailsBlocks = [];
+    const preprocessed = source.replace(/<details[^>]*>\s*([\s\S]*?)\s*<\/details>/gi, (_m, inner) => {
+      detailsBlocks.push(inner);
+      return `\n@@AOS_DETAILS_${detailsBlocks.length - 1}@@\n`;
+    });
+    const lines = preprocessed.split("\n");
     const parts = [];
     let i = 0;
     let paragraph = [];
@@ -210,7 +292,16 @@
       i += 1;
     }
     flushParagraph();
-    return parts.join("");
+    let html = parts.join("");
+    html = html.replace(/<p>@@AOS_DETAILS_(\d+)@@<\/p>|@@AOS_DETAILS_(\d+)@@/g, (_m, inParagraph, bare) => {
+      const index = Number(inParagraph ?? bare);
+      const inner = String(detailsBlocks[index] || "");
+      const summaryMatch = inner.match(/<summary[^>]*>([\s\S]*?)<\/summary>/i);
+      const summary = summaryMatch ? summaryMatch[1].trim() : "Details";
+      const body = summaryMatch ? inner.slice(summaryMatch.index + summaryMatch[0].length).trim() : inner.trim();
+      return `<details class="rich-details"><summary>${inlineMarkdown(summary)}</summary><div class="rich-details-body">${renderMarkdown(body)}</div></details>`;
+    });
+    return html;
   }
 
   function actionLabel(action) {

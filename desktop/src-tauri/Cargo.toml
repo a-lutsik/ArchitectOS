@@ -1,0 +1,25 @@
+[package]
+name = "architectos-desktop"
+version = "1.0.0"
+description = "ArchitectOS desktop shell (Tauri 2 + Python sidecar)"
+authors = ["ArchitectOS"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "architectos_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+url = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true

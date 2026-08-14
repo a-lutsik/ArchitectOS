@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import webbrowser
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -13,9 +14,11 @@ from typing import Any
 
 from .config import DEFAULT_HOST, DEFAULT_PORT
 from .models import utc_now
-from .server import ArchitectOSHandler, PROJECT_ROOT
+from .paths import resolve_project_root
+from .server import ArchitectOSHandler
 
 DEFAULT_PORT_ATTEMPTS = 20
+PROJECT_ROOT = resolve_project_root()
 RUNTIME_STATE_PATH = PROJECT_ROOT / "data" / "architectos.runtime.json"
 APP_BROWSER_NAMES = (
     "msedge",
@@ -30,6 +33,11 @@ WINDOWS_APP_BROWSER_PATHS = (
     Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
     Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
     Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+)
+MACOS_APP_BROWSER_PATHS = (
+    Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+    Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
 )
 
 
@@ -68,6 +76,9 @@ def find_app_browser() -> str | None:
     candidates: list[str] = list(APP_BROWSER_NAMES)
     if os.name == "nt":
         candidates.extend(str(path) for path in WINDOWS_APP_BROWSER_PATHS)
+    elif sys.platform == "darwin":
+        # macOS browsers are .app bundles, not PATH entries.
+        candidates.extend(str(path) for path in MACOS_APP_BROWSER_PATHS)
 
     seen: set[str] = set()
     for candidate in candidates:

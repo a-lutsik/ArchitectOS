@@ -34,6 +34,7 @@ Use this as the shared implementation ledger. Statuses should match the in-app t
 - [x] MCP Hub: real MCP stdio JSON-RPC client, registry for Filesystem/GitHub/Azure DevOps/Jira/Slack/Confluence/Granola, test/list-tools/call with approval gating.
 - [x] MCP Memory Server: expose the memory engine over MCP stdio (`mcp_memory_server.py`) for Cursor/Copilot/Claude with search/context/add/list-projects tools.
 - [x] Code Intelligence: real LSP stdio JSON-RPC client for Python/TypeScript/Go/Rust/Java with document symbols and hover.
+- [x] Persistent code graph: `Symbol` nodes + `DEFINES`/`CONTAINS`/`IMPORTS`/`CALLS` edges from `scan_project` (offline AST/regex), with `code_neighbors`/`code_impact` MCP tools, selective symbol embeddings, and code-aware graph rendering (`docs/CODE_GRAPH.md`).
 
 ## In Progress
 
@@ -41,7 +42,8 @@ Use this as the shared implementation ledger. Statuses should match the in-app t
 
 ## Future Options
 
-- [ ] Native Electron/Tauri shell or signed platform installers.
+- [ ] Native installers (in progress): Tauri full desktop + PyInstaller MCP CLI + IntelliJ zip + Full share zip with OS login autostart — see [INSTALLERS.md](INSTALLERS.md) and [GUIDE_RU.md](GUIDE_RU.md). Code signing/notarization and Linux packages still follow-ups.
 - [ ] React/TypeScript migration if the static SPA outgrows dependency-free maintenance.
-- [ ] Persist MCP tool-call results and LSP symbols into project memory automatically.
+- [ ] Persist MCP tool-call results into project memory automatically (LSP symbols now persist via the code graph).
+- [ ] Extend the code graph: cross-file `CALLS` precision via LSP references, method-resolution for typed languages, and language coverage beyond Python/JS/TS.
 - [ ] Streaming multi-agent runs and per-role cost/token analytics.

@@ -1,0 +1,37 @@
+<idea-plugin>
+    <id>com.architectos.memory</id>
+    <name>ArchitectOS Memory</name>
+    <vendor>ArchitectOS</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="com.architectos.memory.ArchitectosSettings"/>
+        <applicationConfigurable
+            instance="com.architectos.memory.ArchitectosSettingsConfigurable"
+            id="architectos.memory"
+            displayName="ArchitectOS Memory"
+            parentId="tools"/>
+        <toolWindow
+            id="ArchitectOS Memory"
+            anchor="right"
+            factoryClass="com.architectos.memory.MemoryToolWindowFactory"/>
+    </extensions>
+
+    <actions>
+        <action
+            id="Architectos.AddSelectionToMemory"
+            class="com.architectos.memory.AddSelectionToMemoryAction"
+            text="Add Selection to ArchitectOS Memory"
+            description="Save the selected code or text as a durable ArchitectOS memory">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+        <action
+            id="Architectos.SearchSelectionInMemory"
+            class="com.architectos.memory.SearchSelectionInMemoryAction"
+            text="Search ArchitectOS Memory for Selection"
+            description="Open the ArchitectOS memory panel and search for the selected text">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

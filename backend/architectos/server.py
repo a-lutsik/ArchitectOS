@@ -4,14 +4,14 @@ import hmac
 import json
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .config import ACCESS_LOG
+from .paths import resolve_frontend_root, resolve_project_root
 from .service import ArchitectOSService
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-FRONTEND_ROOT = PROJECT_ROOT / "frontend"
+PROJECT_ROOT = resolve_project_root()
+FRONTEND_ROOT = resolve_frontend_root()
 
 # The OAuth callback is a top-level browser redirect from the identity
 # provider, so the SPA cannot attach the API token to it.
@@ -103,12 +103,33 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
             elif parsed.path == "/api/memory/search":
                 refresh_raw = (self._first(query, "refresh") or "0").strip().lower()
                 refresh = refresh_raw in {"1", "true", "yes", "on"}
+                filters = None
+                filters_raw = (self._first(query, "filters") or "").strip()
+                if filters_raw:
+                    try:
+                        parsed_filters = json.loads(filters_raw)
+                        filters = parsed_filters if isinstance(parsed_filters, dict) else None
+                    except ValueError:
+                        filters = None
+                def _opt_float(raw: str) -> float | None:
+                    raw = (raw or "").strip()
+                    try:
+                        return float(raw) if raw else None
+                    except ValueError:
+                        return None
+                min_score_raw = self._first(query, "min_score")
+                floor_raw = self._first(query, "relevance_floor")
                 self._json(self.get_service().search_memory(
                     self._first(query, "query"),
                     self._first(query, "project_id") or None,
                     self._first(query, "scope") or None,
                     int(self._first(query, "limit") or "8"),
                     refresh=refresh,
+                    filters=filters,
+                    mode=self._first(query, "mode") or "search",
+                    as_of=self._first(query, "as_of") or None,
+                    min_score=_opt_float(min_score_raw),
+                    relevance_floor=_opt_float(floor_raw),
                 ))
             elif parsed.path == "/api/memory/feedback":
                 self._json(self.get_service().list_retrieval_feedback(self._first(query, "project_id") or None, int(self._first(query, "limit") or "50")))
@@ -227,6 +248,14 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
                 self._json(self.get_service().create_backup(payload), HTTPStatus.CREATED)
             elif parsed.path == "/api/memory/decay/run":
                 self._json(self.get_service().run_memory_decay(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/memory/reclassify":
+                self._json(self.get_service().reclassify_memory(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/memory/purge-noise":
+                self._json(self.get_service().purge_noise_nodes(
+                    project_id=payload.get("project_id") or None,
+                    dry_run=bool(payload.get("dry_run", False)),
+                    hard=bool(payload.get("hard", False)),
+                ), HTTPStatus.CREATED)
             elif parsed.path == "/api/memory/embeddings/rebuild":
                 self._json(self.get_service().rebuild_memory_embeddings(payload), HTTPStatus.ACCEPTED)
             elif parsed.path == "/api/memory/ingest":
@@ -256,6 +285,13 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
                 self._json(self.get_service().post_chat_message(payload), HTTPStatus.CREATED)
             elif parsed.path.startswith("/api/chats/") and parsed.path.endswith("/favorite-message"):
                 self._json(self.get_service().favorite_chat_message(parsed.path.split("/")[3], payload), HTTPStatus.CREATED)
+            elif parsed.path.startswith("/api/chats/") and parsed.path.endswith("/finalize"):
+                self._json(self.get_service().finalize_chat_session(
+                    parsed.path.split("/")[3],
+                    force=bool(payload.get("force", True)),
+                    trigger=str(payload.get("trigger") or "manual"),
+                    project_id=payload.get("project_id"),
+                ), HTTPStatus.CREATED)
             elif parsed.path.startswith("/api/chats/") and parsed.path.endswith("/keeper-retry"):
                 self._json(self.get_service().retry_chat_keeper(parsed.path.split("/")[3]), HTTPStatus.CREATED)
             elif parsed.path == "/api/project/scan":
@@ -270,6 +306,10 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
                 self._json(self.get_service().system_folder_picker(payload), HTTPStatus.CREATED)
             elif parsed.path == "/api/graph/rebuild-links":
                 self._json(self.get_service().rebuild_graph_links(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/graph/suggest-links":
+                self._json(self.get_service().suggest_memory_links(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/graph/suggest-consolidations":
+                self._json(self.get_service().suggest_consolidations(payload), HTTPStatus.CREATED)
             elif parsed.path == "/api/graph/edges":
                 self._json(self.get_service().create_graph_edge(payload), HTTPStatus.CREATED)
             elif parsed.path.startswith("/api/graph/nodes/") and parsed.path.endswith("/pin"):
@@ -358,6 +398,10 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("content-length") or "0")
         if length == 0:
             return {}
+        # Uploads are capped at 2 MB after base64 decode; anything far above
+        # that is abusive — don't read unbounded bodies into memory.
+        if length > 8 * 1024 * 1024:
+            raise ValueError("request body too large")
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def _json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:

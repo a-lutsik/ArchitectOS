@@ -21,21 +21,44 @@ of other MCP servers; this feature makes ArchitectOS a *server* for other agents
 
 | Tool | Purpose | Key arguments |
 | --- | --- | --- |
-| `memory_search` | Return scored memory hits for a query | `query` (required), `project_id?`, `scope?`, `limit?` |
+| `memory_search` | Return scored memory hits for a query | `query`, `project_id?`, `scope?`, `limit?`, `mode?` (`search`/`list`), `filters?` (exact, `!=X`, `a\|b`, lists) |
 | `memory_context` | Build a ready-to-inject briefing (memory + open tasks + providers) | `query` (required), `project_id?`, `scope?`, `limit?` |
 | `memory_add` | Persist a new memory (secrets auto-redacted) | `label` (required), `text` (required), `type?`, `scope?`, `project_id?`, `confidence?` |
+| `memory_get` | Fetch one memory node in full by id (untruncated text, metadata, evidence, neighbors) | `id` (required), `include_neighbors?` |
+| `memory_feedback` | Rate retrieved hits so ranking improves over time | `rating` (1 or -1, required), `hit_ids?`, `query?`, `note?`, `project_id?` |
 | `memory_list_projects` | List projects for scoping | – |
+
+Typical agent loop: `memory_search` → `memory_get` for the full record → answer →
+`memory_feedback` on the hits that were (not) useful → `memory_add` for new lessons.
+
+### Exposed resources (management views)
+
+| URI | Content |
+| --- | --- |
+| `memory://projects` | Projects available for scoping (JSON) |
+| `memory://review` | Memory candidates awaiting review (promote/reject) |
+| `memory://nodes/{id}` | Resource template: full node + evidence + neighbors |
 
 ## Requirements
 
 - Python 3 available on PATH (the same interpreter used to run ArchitectOS).
-- The absolute path to this repository.
+- The absolute path to this repository — **or** an installed package (see below).
 
 Optional environment variable:
 
 - `ARCHITECTOS_ROOT` — override the root whose `data/architectos.db` is used.
-  Defaults to the ArchitectOS repository root, so the MCP server and the desktop
-  app share one memory store by default.
+  Defaults to the ArchitectOS repository root (or the current working directory
+  when running from an installed package), so the MCP server and the desktop app
+  share one memory store by default.
+
+### Install as a package (optional)
+
+```bash
+pip install -e .
+architectos-mcp   # console script; uses $ARCHITECTOS_ROOT or the current directory
+```
+
+This lets MCP clients launch `architectos-mcp` without absolute script paths.
 
 Quick local check:
 
@@ -65,9 +88,43 @@ Use absolute paths.
 }
 ```
 
-Reload Cursor. In Settings → MCP you should see `architectos-memory` with its four
+Reload Cursor. In Settings → MCP you should see `architectos-memory` with its
 tools. In chat the agent can now call e.g. `memory_search` before answering, or
 `memory_add` to remember a decision.
+
+## Register in Claude Code
+
+Add to `.mcp.json` in the project (or `~/.claude.json` for user scope):
+
+```json
+{
+  "mcpServers": {
+    "architectos-memory": {
+      "command": "python3",
+      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"]
+    }
+  }
+}
+```
+
+Or with the installed package: `"command": "architectos-mcp"`, plus
+`"env": {"ARCHITECTOS_ROOT": "/ABSOLUTE/PATH/TO/ArchitectOS"}`.
+
+## Register in Junie / JetBrains AI Assistant (IntelliJ)
+
+Settings → Tools → AI Assistant → Model Context Protocol (MCP) → Add, or edit the
+MCP config XML with the same stdio command/args as above. Once connected, Junie
+can search and write team memory directly from IntelliJ.
+
+## Team setup
+
+- **Shared memory**: point every team member's MCP client at a checkout whose
+  `data/architectos.db` is synced/shared (or run one server per machine against a
+  shared store location via `ARCHITECTOS_ROOT`).
+- **Per-developer memory**: each developer uses their own checkout; merge happens
+  through the desktop app's review queue.
+- SQLite serializes writes, so the desktop app and several IDE agents can share
+  the store concurrently for local use.
 
 ## Register in GitHub Copilot (VS Code, Agent mode)
 
