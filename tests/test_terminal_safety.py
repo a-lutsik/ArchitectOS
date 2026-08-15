@@ -40,6 +40,28 @@ class TerminalSafetyTests(unittest.TestCase):
             })
             self.assertIn(allowed["status"], {"ok", "error", "unavailable"})
 
+    def test_block_response_names_the_matched_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            result = service.terminal_run({
+                "project_id": "architectos",
+                "command": "rm -rf nowhere",
+            })
+            self.assertEqual(result["status"], "blocked")
+            self.assertTrue(result["risk"])
+
+    def test_ui_cannot_supply_the_confirm_phrase_by_itself(self) -> None:
+        """The phrase must reach the client only on a block response.
+
+        If it were a constant in the frontend, the dialog could be satisfied
+        without a human ever typing it, which is the failure mode this gate
+        exists to prevent.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        terminal_js = (repo_root / "frontend" / "terminal.js").read_text(encoding="utf-8")
+        self.assertNotIn(TERMINAL_DESTRUCTIVE_CONFIRM, terminal_js)
+        self.assertIn("requires_confirm", terminal_js)
+
 
 if __name__ == "__main__":
     unittest.main()

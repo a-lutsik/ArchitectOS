@@ -610,6 +610,40 @@ textarea { resize: vertical; line-height: 1.5; }
   overflow-wrap: anywhere;
 }
 
+.terminal-confirm-command {
+  max-height: 160px;
+  overflow: auto;
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: #05070d;
+  color: #dbeafe;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.terminal-confirm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.terminal-confirm-field code {
+  font-family: var(--font-mono);
+  /* Not selectable on purpose: one-click copy-paste would turn the phrase back
+     into a formality instead of a deliberate action. */
+  user-select: none;
+}
+
+.terminal-confirm-field input {
+  width: 100%;
+  font-family: var(--font-mono);
+}
+
 /* Layout ------------------------------------------------------------------ */
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: var(--sidebar-w) 1fr; }
 

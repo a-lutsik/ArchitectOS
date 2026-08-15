@@ -326,6 +326,7 @@ class ToolExecServiceMixin:
                 ),
                 "duration_ms": 0,
                 "redacted": False,
+                "risk": risk,
                 "requires_confirm": TERMINAL_DESTRUCTIVE_CONFIRM,
             }
         shell_id = self._terminal_shell_id(str(payload.get("shell") or "auto"))

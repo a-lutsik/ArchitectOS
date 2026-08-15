@@ -504,6 +504,66 @@ class GraphFetchScopeTests(unittest.TestCase):
             payload = service.graph(project_id="architectos", limit=100, node_type="Risk")
             self.assertIn("rare-risk", {node["id"] for node in payload["nodes"]})
 
+    def test_narrowing_filter_keeps_every_dropdown_option(self) -> None:
+        # Filters are pushed into SQL; the facet lists must still describe the
+        # whole store, or the UI dropdowns collapse to the current selection.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service_with_many_nodes(tmp, count=20)
+            service.repository.upsert_node(
+                MemoryNode(
+                    id="a-risk",
+                    type="Risk",
+                    label="A risk",
+                    scope="global",
+                    text="Risk body.",
+                    project_id="architectos",
+                    metadata={"memory_tier": "short_term"},
+                )
+            )
+            payload = service.graph(project_id="architectos", limit=100, node_type="Risk")
+            self.assertEqual({node["id"] for node in payload["nodes"]}, {"a-risk"})
+            self.assertIn("Decision", payload["types"])
+            self.assertIn("Risk", payload["types"])
+            self.assertIn("project", payload["scopes"])
+
+    def test_non_ascii_search_still_matches(self) -> None:
+        # Payloads are stored with ensure_ascii=True, so a SQL LIKE prefilter can
+        # never match Cyrillic; the query has to fall back to the Python scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service_with_many_nodes(tmp, count=20)
+            service.repository.upsert_node(
+                MemoryNode(
+                    id="cyrillic-node",
+                    type="Decision",
+                    label="Кириллическое решение",
+                    scope="project",
+                    text="Текст на кириллице.",
+                    project_id="architectos",
+                    metadata={"memory_tier": "short_term"},
+                )
+            )
+            payload = service.graph(project_id="architectos", limit=100, search="Кириллическое")
+            self.assertIn("cyrillic-node", {node["id"] for node in payload["nodes"]})
+
+    def test_multi_word_search_spanning_two_fields_still_matches(self) -> None:
+        # "decision zetatronic" spans label -> text only in the joined haystack,
+        # never in the JSON payload, so the prefilter must not be used.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.repository.upsert_node(
+                MemoryNode(
+                    id="spanning",
+                    type="Decision",
+                    label="Rollout decision",
+                    scope="project",
+                    text="zetatronic rollout body",
+                    project_id="architectos",
+                    metadata={"memory_tier": "short_term"},
+                )
+            )
+            payload = service.graph(project_id="architectos", limit=100, search="decision zetatronic")
+            self.assertIn("spanning", {node["id"] for node in payload["nodes"]})
+
 
 if __name__ == "__main__":
     unittest.main()

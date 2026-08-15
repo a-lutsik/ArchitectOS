@@ -29,6 +29,7 @@ from .graph_autolinker import (
     GraphAutoLinker,
 )
 from .models import stable_id, utc_now
+from .storage import like_prefilter_supported
 
 # Re-export for backward-compatible imports (service.py and tests).
 __all__ = [
@@ -403,6 +404,37 @@ class GraphServiceMixin:
             },
         }
 
+    def _graph_filter_facets(
+        self, project_id: str | None
+    ) -> tuple[list[str], list[str], list[dict[str, str]]]:
+        """Filter-dropdown options for the whole store, cached against a revision token.
+
+        Source keys are classified per node in Python, so this is the one part of
+        the graph read that still has to walk every active node. It is recomputed
+        only when nodes are added or touched; a filter interaction reuses the cache.
+        Concurrent requests may each compute it once, which is harmless — the
+        assignment is atomic and the value is derived, not authoritative.
+        """
+        revision = self.repository.nodes_revision(project_id or None, include_shared=bool(project_id))
+        cache_key = (project_id or "", revision)
+        cached = getattr(self, "_graph_facet_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        nodes = self.repository.list_nodes(
+            project_id=project_id or None,
+            status="active",
+            include_shared=bool(project_id),
+        )
+        types = sorted({node.type for node in nodes if node.type})
+        scopes = sorted({node.scope for node in nodes if node.scope})
+        sources = [
+            {"id": key, "label": (SOURCE_HUB_CATALOG.get(key) or {}).get("label") or key}
+            for key in sorted({self.graph_auto_linker._source_key_for_node(node) for node in nodes})
+        ]
+        facets = (types, scopes, sources)
+        self._graph_facet_cache = (cache_key, facets)
+        return facets
+
     def graph(
         self,
         project_id: str | None = None,
@@ -419,33 +451,29 @@ class GraphServiceMixin:
         # Prefer a scoped SQL fetch over a full-table scan. Shared/global nodes
         # stay visible for the selected project; status is filtered in SQL.
         #
-        # Every filter below runs in Python, so a SQL LIMIT would search only the
-        # newest page and silently hide older matches. Cap the fetch only for the
-        # unfiltered view, where truncation is the intended density budget.
+        # type/scope/search are pushed into SQL so a narrowed view reads only the
+        # rows it shows. The Python predicates below still run unchanged: the SQL
+        # text filter is only a superset (see like_prefilter_supported), and any
+        # query it cannot express simply falls through to the full scan.
+        #
+        # A SQL LIMIT would truncate before those Python filters run and silently
+        # hide older matches, so it applies only to the unfiltered view, where
+        # truncation is the intended density budget.
         narrowing = bool(search or node_type or scope or source or pinned or task_id or provider_id)
         fetch_limit = None if (limit is None or narrowing) else max(int(limit) * 8, 500)
-        if project_id:
-            all_nodes = self.repository.list_nodes(
-                limit=fetch_limit,
-                project_id=project_id,
-                status="active",
-                include_shared=True,
-            )
-        else:
-            all_nodes = self.repository.list_nodes(limit=fetch_limit, status="active")
+        # Dropdown options describe the whole store, so they cannot be derived
+        # from the narrowed set.
+        types, scopes, sources = self._graph_filter_facets(project_id)
+        all_nodes = self.repository.list_nodes(
+            limit=fetch_limit,
+            project_id=project_id or None,
+            status="active",
+            include_shared=bool(project_id),
+            node_type=node_type or None,
+            scope=scope or None,
+            text_like=search if (search and like_prefilter_supported(search)) else None,
+        )
 
-        # Unique types/scopes/sources for filter dropdowns (before filtering)
-        types = sorted(list({node.type for node in all_nodes if node.type}))
-        scopes = sorted(list({node.scope for node in all_nodes if node.scope}))
-        source_keys = sorted({self.graph_auto_linker._source_key_for_node(node) for node in all_nodes})
-        sources = [
-            {
-                "id": key,
-                "label": (SOURCE_HUB_CATALOG.get(key) or {}).get("label") or key,
-            }
-            for key in source_keys
-        ]
-        
         if pinned:
             all_nodes = [node for node in all_nodes if bool(node.metadata.get("favorite") or node.metadata.get("pinned"))]
             

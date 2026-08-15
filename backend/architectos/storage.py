@@ -28,6 +28,29 @@ def sanitize_payload(value: Any) -> tuple[Any, bool]:
     return _SECURITY_POLICY.redact_payload(value)
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def like_prefilter_supported(query: str) -> bool:
+    """True when ``payload LIKE '%query%'`` is a safe superset of a Python substring match.
+
+    Two cases where it is not, and the caller must fall back to scanning:
+
+    * Non-ASCII. Payloads are written with ``json.dumps`` default
+      ``ensure_ascii=True``, so "Кириллица" is stored as ``\\u041a...`` and a
+      literal LIKE never matches it.
+    * Whitespace. Callers match against fields joined by spaces, so a
+      multi-word query can straddle two fields in Python while the JSON text
+      has punctuation between them.
+
+    ASCII LIKE is case-insensitive in SQLite, which matches the ``.lower()``
+    comparison callers do.
+    """
+    text = (query or "").strip()
+    return bool(text) and text.isascii() and not any(char.isspace() for char in text)
+
+
 # Keys that hold credential material and must never leave the process via
 # bundle export (OAuth tokens are persisted in the settings table).
 SENSITIVE_SETTING_KEYS = {"access_token", "refresh_token", "client_secret", "code_verifier", "id_token"}
@@ -764,12 +787,27 @@ class SQLiteMemoryRepository:
             cur = conn.execute("DELETE FROM memory_edges WHERE id = ?", (edge_id,))
             return cur.rowcount > 0
 
-    def list_nodes(self, limit: int | None = None, project_id: str | None = None, *, status: str | None = None, include_shared: bool = False) -> list[MemoryNode]:
+    def list_nodes(
+        self,
+        limit: int | None = None,
+        project_id: str | None = None,
+        *,
+        status: str | None = None,
+        include_shared: bool = False,
+        node_type: str | None = None,
+        scope: str | None = None,
+        text_like: str | None = None,
+    ) -> list[MemoryNode]:
         """Load memory nodes with optional project / status filters.
 
         When ``project_id`` is set and ``include_shared`` is True, also returns
         nodes with a null/empty project_id and nodes scoped as shared/global —
         the set the graph view needs without a full-table scan.
+
+        ``text_like`` narrows to rows whose JSON payload contains the substring.
+        It is a *superset* of an in-Python field match, so callers must still
+        apply their exact predicate; see :func:`like_prefilter_supported` for
+        when it may be used at all.
         """
         sql = "SELECT payload FROM memory_nodes"
         params: list[Any] = []
@@ -777,6 +815,15 @@ class SQLiteMemoryRepository:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if node_type:
+            clauses.append("type = ?")
+            params.append(node_type)
+        if scope:
+            clauses.append("scope = ?")
+            params.append(scope)
+        if text_like:
+            clauses.append("payload LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(text_like)}%")
         if project_id and include_shared:
             clauses.append("(project_id = ? OR project_id IS NULL OR project_id = '' OR scope IN ('shared', 'global'))")
             params.append(project_id)
@@ -791,6 +838,47 @@ class SQLiteMemoryRepository:
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [MemoryNode.from_dict(json.loads(row["payload"])) for row in rows]
+
+    def _project_clause(self, project_id: str | None, include_shared: bool) -> tuple[str, list[Any]]:
+        if project_id and include_shared:
+            return (
+                " AND (project_id = ? OR project_id IS NULL OR project_id = '' OR scope IN ('shared', 'global'))",
+                [project_id],
+            )
+        if project_id:
+            return (" AND project_id = ?", [project_id])
+        return ("", [])
+
+    def nodes_revision(self, project_id: str | None = None, *, include_shared: bool = False) -> str:
+        """Cheap change token for the active node set, for caching derived views.
+
+        Count plus newest timestamp, so it misses an in-place edit that keeps the
+        count and reuses the same one-second timestamp. Callers must therefore
+        tolerate a briefly stale value; it exists to avoid rescanning the store on
+        every request, not as a correctness guarantee.
+        """
+        clause, params = self._project_clause(project_id, include_shared)
+        sql = "SELECT count(*), max(updated_at) FROM memory_nodes WHERE status = 'active'" + clause
+        with self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return f"{row[0] or 0}:{row[1] or ''}"
+
+    def list_nodes_missing_lifecycle(
+        self, project_id: str | None = None, *, include_shared: bool = False
+    ) -> list[MemoryNode]:
+        """Nodes with no lifecycle tier seeded yet, in any status.
+
+        The annotate pass is a no-op for nodes that already carry a tier, so
+        selecting them in SQL lets a warmed-up store skip decoding every payload.
+        """
+        clause, params = self._project_clause(project_id, include_shared)
+        sql = (
+            "SELECT payload FROM memory_nodes "
+            "WHERE coalesce(json_extract(payload, '$.metadata.memory_tier'), '') = ''" + clause
+        )
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [MemoryNode.from_dict(json.loads(row["payload"])) for row in rows]

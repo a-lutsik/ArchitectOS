@@ -326,14 +326,13 @@ class MemoryLifecycleEngine:
     def annotate_nodes(self, project_id: str | None = None) -> dict[str, int]:
         count = 0
         # Narrow in SQL first: this runs on every graph/analytics read, and scanning
-        # plus JSON-decoding every node in the store dominated those requests. The
-        # Python guard stays so the annotated set is byte-for-byte what it was.
-        nodes = (
-            self.repository.list_nodes(project_id=project_id, include_shared=True)
-            if project_id
-            else self.repository.list_nodes()
-        )
-        for node in nodes:
+        # plus JSON-decoding every node in the store dominated those requests.
+        # initialize_node() is a no-op once a node has a tier, so restricting the
+        # query to untiered nodes leaves the resulting store identical while a
+        # warmed-up database reads nothing at all.
+        for node in self.repository.list_nodes_missing_lifecycle(
+            project_id, include_shared=bool(project_id)
+        ):
             if project_id and node.project_id not in {project_id, None}:
                 continue
             self.initialize_node(node, "annotate")

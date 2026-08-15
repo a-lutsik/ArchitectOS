@@ -406,6 +406,28 @@
   </div>
 </div>
 
+<div id="terminal-confirm-modal" class="modal" hidden>
+  <div class="modal-backdrop" data-terminal-confirm-cancel></div>
+  <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="terminal-confirm-title" aria-describedby="terminal-confirm-reason">
+    <div class="modal-header">
+      <h3 id="terminal-confirm-title">Confirm a risky command</h3>
+      <button class="modal-close" type="button" data-terminal-confirm-cancel aria-label="Cancel">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p id="terminal-confirm-reason" class="provider-hint"></p>
+      <pre id="terminal-confirm-command" class="terminal-confirm-command"></pre>
+      <div class="terminal-confirm-field">
+        <label for="terminal-confirm-input">Type <code id="terminal-confirm-phrase"></code> to run it anyway:</label>
+        <input id="terminal-confirm-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button type="button" data-terminal-confirm-cancel>Cancel</button>
+      <button id="terminal-confirm-run" type="button" disabled>Run command</button>
+    </div>
+  </div>
+</div>
+
 <div id="graph-node-modal" class="modal graph-node-modal" hidden>
   <div class="modal-backdrop" data-close-graph-node-modal></div>
   <div class="modal-dialog modal-lg graph-node-dialog" role="dialog" aria-modal="true" aria-labelledby="graph-detail-title">
@@ -1353,7 +1375,7 @@
           </div>
         </section>
 
-<section class="view" id="terminal-view"><div class="dashboard-grid"><section class="panel span-2"><div class="panel-header"><h3 id="terminal-panel-title">Run command</h3><div class="provider-actions"><button id="terminal-open" type="button">Open external shell</button></div></div><p id="terminal-panel-hint" class="provider-hint">Run a one-shot command in the project folder. Risky commands are blocked unless destructive commands are explicitly enabled.</p><div class="terminal-controls"><select id="terminal-shell" aria-label="Shell"><option value="auto">Auto shell</option><option value="powershell">PowerShell</option><option value="cmd">cmd</option><option value="bash">bash</option><option value="sh">sh</option></select><input id="terminal-timeout" type="number" min="1" max="120" value="20" aria-label="Timeout seconds"><label class="inline-check"><input id="terminal-allow-destructive" type="checkbox"> allow destructive commands</label></div><form id="terminal-form" class="terminal-form"><input id="terminal-command" placeholder="git status"><button type="submit">Run</button></form><div id="terminal-status" class="provider-test"></div><pre id="terminal-output" class="terminal-output"></pre></section><section class="panel"><div class="panel-header"><h3>History</h3><button id="terminal-clear" type="button">Clear</button></div><div id="terminal-history" class="result-list"></div></section></div></section>
+<section class="view" id="terminal-view"><div class="dashboard-grid"><section class="panel span-2"><div class="panel-header"><h3 id="terminal-panel-title">Run command</h3><div class="provider-actions"><button id="terminal-open" type="button">Open external shell</button></div></div><p id="terminal-panel-hint" class="provider-hint">Run a one-shot command in the project folder. Risky commands are blocked; running one anyway requires typing a confirmation phrase.</p><div class="terminal-controls"><select id="terminal-shell" aria-label="Shell"><option value="auto">Auto shell</option><option value="powershell">PowerShell</option><option value="cmd">cmd</option><option value="bash">bash</option><option value="sh">sh</option></select><input id="terminal-timeout" type="number" min="1" max="120" value="20" aria-label="Timeout seconds"></div><form id="terminal-form" class="terminal-form"><input id="terminal-command" placeholder="git status"><button type="submit">Run</button></form><div id="terminal-status" class="provider-test"></div><pre id="terminal-output" class="terminal-output"></pre></section><section class="panel"><div class="panel-header"><h3>History</h3><button id="terminal-clear" type="button">Clear</button></div><div id="terminal-history" class="result-list"></div></section></div></section>
                 <section class="view" id="providers-view">
           <div class="providers-page">
             <section class="panel providers-status-hero">
