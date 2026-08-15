@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BACKUP_RETENTION
+from .constants import SECRET_MASK
 from .models import MemoryEdge, MemoryNode, Project, stable_id, utc_now
 from .security import SecurityPolicy
 
@@ -37,7 +38,7 @@ def strip_sensitive_settings(value: Any) -> Any:
         clean: dict[str, Any] = {}
         for key, item in value.items():
             name = str(key)
-            if name in SENSITIVE_SETTING_KEYS:
+            if name in SENSITIVE_SETTING_KEYS or name.lower().endswith(("_token", "_secret", "_password")):
                 continue
             if name == "auth" and isinstance(item, dict):
                 # Keep non-secret auth status, drop everything else.
@@ -45,6 +46,11 @@ def strip_sensitive_settings(value: Any) -> Any:
                     "status": item.get("status") or ("authorized" if item.get("access_token") else ""),
                     "expires_at": item.get("expires_at") or 0,
                 }
+                continue
+            if name in ("env", "headers") and isinstance(item, dict):
+                # MCP server env vars / HTTP headers are keyed by user-chosen
+                # names, so keep the keys but mask every value.
+                clean[name] = {str(entry_key): SECRET_MASK for entry_key in item}
                 continue
             clean[name] = strip_sensitive_settings(item)
         return clean
@@ -64,6 +70,12 @@ class SQLiteMemoryRepository:
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self._node_upsert_listeners: list[Any] = []
         self._migrate()
+        try:
+            # The database holds memory and settings data; restrict it to the owner.
+            os.chmod(self.db_path, 0o600)
+        except OSError as exc:
+            # Windows may ignore or reject POSIX modes; keep that harmless.
+            _LOG.debug("could not set 0o600 on database file: %s", exc)
 
     def register_node_upsert_listener(self, listener) -> None:
         if listener not in self._node_upsert_listeners:

@@ -171,6 +171,33 @@ class ProductionOpsTests(unittest.TestCase):
             self.assertEqual(server_auth["status"], "authorized")
             self.assertEqual(server_auth["expires_at"], 4102444800)
 
+    def test_export_bundle_masks_mcp_env_and_headers(self) -> None:
+        from backend.architectos.constants import SECRET_MASK
+        from backend.architectos.models import Project
+        from backend.architectos.storage import SQLiteMemoryRepository
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SQLiteMemoryRepository(Path(tmp))
+            repository.upsert_project(Project(id="architectos", name="ArchitectOS"))
+            repository.set_setting("mcp_servers", {
+                "servers": [
+                    {
+                        "id": "github",
+                        "label": "GitHub",
+                        "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_testsecret123"},
+                        "headers": {"Authorization": "Bearer hdr_testsecret456"},
+                    }
+                ]
+            })
+            bundle = repository.export_bundle("architectos")
+            serialized = json.dumps(bundle)
+            self.assertNotIn("ghp_testsecret123", serialized)
+            self.assertNotIn("hdr_testsecret456", serialized)
+            server = bundle["settings"]["mcp_servers"]["servers"][0]
+            # Key names survive so the config stays editable; values are masked.
+            self.assertEqual(server["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"], SECRET_MASK)
+            self.assertEqual(server["headers"]["Authorization"], SECRET_MASK)
+
     def test_system_folder_picker_macos_uses_osascript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))

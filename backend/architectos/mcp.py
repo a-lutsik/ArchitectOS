@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .constants import SECRET_MASK
+from .netutil import validate_outbound_url
 from .ssl_util import urlopen
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -182,6 +184,7 @@ class MCPServerConfig:
     url: str = ""
     enabled: bool = False
     approval_required: bool = True
+    allow_local: bool = False
     transport: str = "stdio"
     headers: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
@@ -204,6 +207,7 @@ class MCPServerConfig:
             url=str(data.get("url") or ""),
             enabled=bool(data.get("enabled")),
             approval_required=bool(data.get("approval_required", True)),
+            allow_local=bool(data.get("allow_local")),
             transport=transport,
             headers={str(key): str(value) for key, value in dict(data.get("headers") or {}).items()},
             env={str(key): str(value) for key, value in dict(data.get("env") or {}).items()},
@@ -213,6 +217,13 @@ class MCPServerConfig:
         )
 
     def to_dict(self, include_secrets: bool = True) -> dict[str, Any]:
+        if include_secrets:
+            headers = dict(self.headers)
+            env = dict(self.env)
+        else:
+            # Keys stay visible so editors can round-trip the config; values are masked.
+            headers = {key: SECRET_MASK for key in self.headers}
+            env = {key: SECRET_MASK for key in self.env}
         payload = {
             "id": self.id,
             "label": self.label,
@@ -220,9 +231,10 @@ class MCPServerConfig:
             "url": self.url,
             "enabled": self.enabled,
             "approval_required": self.approval_required,
+            "allow_local": self.allow_local,
             "transport": self.transport,
-            "headers": dict(self.headers),
-            "env": dict(self.env),
+            "headers": headers,
+            "env": env,
             "status": self.status,
             "notes": self.notes,
         }
@@ -243,6 +255,20 @@ class MCPServerConfig:
 
 class MCPError(RuntimeError):
     pass
+
+
+def _allow_local_remote_urls(config: MCPServerConfig) -> bool:
+    if config.allow_local:
+        return True
+    return os.environ.get("ARCHITECTOS_MCP_ALLOW_LOCAL", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _validate_remote_url(config: MCPServerConfig) -> None:
+    """SSRF guard: remote MCP URLs must not reach loopback/link-local hosts unless opted in."""
+    try:
+        validate_outbound_url(config.url, allow_local=_allow_local_remote_urls(config))
+    except ValueError as exc:
+        raise MCPError(f"Remote MCP URL is not allowed: {exc}") from exc
 
 
 class MCPClient:
@@ -428,6 +454,8 @@ class MCPRemoteHTTPClient:
         self.config = config
         self.timeout = timeout
         self._next_id = 0
+        if self.config.url:
+            _validate_remote_url(config)
 
     def __enter__(self) -> "MCPRemoteHTTPClient":
         if not self.config.url:
@@ -562,19 +590,44 @@ class MCPManager:
                 return config
         return None
 
+    @staticmethod
+    def _restore_masked_secrets(payload: dict[str, Any], stored: dict[str, Any]) -> None:
+        """Resolve SECRET_MASK placeholders in payload env/headers against the stored record.
+
+        A masked value means "keep the stored secret"; masked entries without a
+        stored counterpart are dropped so the placeholder is never persisted.
+        Keys absent from the payload stay absent (the user deleted them).
+        """
+        for name in ("env", "headers"):
+            incoming = payload.get(name)
+            if not isinstance(incoming, dict):
+                continue
+            existing = dict(stored.get(name) or {})
+            resolved: dict[str, Any] = {}
+            for key, value in incoming.items():
+                if value == SECRET_MASK:
+                    if key in existing:
+                        resolved[key] = existing[key]
+                    continue
+                resolved[key] = value
+            payload[name] = resolved
+
     def upsert_server(self, payload: dict[str, Any]) -> dict[str, Any]:
         server_id = str(payload.get("id") or "").strip()
         if not server_id:
             raise MCPError("MCP server id is required.")
         servers = self._load_servers()
+        payload = dict(payload)
         updated = False
         for index, item in enumerate(servers):
             if str(item.get("id")) == server_id:
+                self._restore_masked_secrets(payload, item)
                 merged = {**item, **payload}
                 servers[index] = MCPServerConfig.from_dict(merged).to_dict()
                 updated = True
                 break
         if not updated:
+            self._restore_masked_secrets(payload, {})
             servers.append(MCPServerConfig.from_dict(payload).to_dict())
         self._save_servers(servers)
         return self.get_server(server_id).to_dict(include_secrets=False)  # type: ignore[union-attr]
@@ -587,6 +640,8 @@ class MCPManager:
             raise MCPError("OAuth is only available for remote MCP servers.")
         if not config.url:
             raise MCPError("MCP remote URL is not configured.")
+        # The OAuth flow dereferences config.url directly, so validate it here too.
+        _validate_remote_url(config)
         redirect_uri = f"{base_url.rstrip('/')}/api/mcp/oauth/callback"
         resource_metadata, auth_metadata = self._discover_oauth_metadata(config)
         client = self._register_oauth_client(config, auth_metadata, redirect_uri)

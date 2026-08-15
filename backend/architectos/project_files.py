@@ -15,9 +15,12 @@ def safe_project_path(root: Path, relative_path: str) -> Path:
     raw = str(relative_path or "").strip()
     if not raw:
         raise ValueError("file path is required")
-    candidate = (root / raw).resolve()
+    # Resolve the root too: a symlinked root (e.g. a project under /tmp on
+    # macOS) must match its resolved candidates instead of rejecting them all.
+    resolved_root = root.resolve()
+    candidate = (resolved_root / raw).resolve()
     try:
-        candidate.relative_to(root)
+        candidate.relative_to(resolved_root)
     except ValueError:
         raise ValueError("file path is outside project root") from None
     return candidate
@@ -27,13 +30,14 @@ def save_project_file(root: Path, project_id: str, relative_path: str, text: str
     """Save or create a project file."""
     if not relative_path:
         raise ValueError("path is required")
+    resolved_root = root.resolve()
     path = safe_project_path(root, relative_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return {
         "success": True,
         "project_id": project_id,
-        "path": str(path.relative_to(root)),
+        "path": str(path.relative_to(resolved_root)),
         "size": path.stat().st_size,
     }
 
@@ -42,6 +46,7 @@ def delete_project_file(root: Path, project_id: str, relative_path: str) -> dict
     """Delete a project file."""
     if not relative_path:
         raise ValueError("path is required")
+    resolved_root = root.resolve()
     path = safe_project_path(root, relative_path)
     if not path.exists():
         raise ValueError("file does not exist")
@@ -49,5 +54,5 @@ def delete_project_file(root: Path, project_id: str, relative_path: str) -> dict
     return {
         "success": True,
         "project_id": project_id,
-        "path": relative_path,
+        "path": str(path.relative_to(resolved_root)),
     }

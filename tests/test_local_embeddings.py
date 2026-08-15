@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
@@ -28,6 +29,13 @@ class _FakeSentenceTransformer:
 
 
 class ProviderSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # CI pins MEMORY_EMBEDDING_PROVIDER=hash for determinism; that operator
+        # override must not leak into these provider-selection tests.
+        patcher = mock.patch.dict(os.environ, {"MEMORY_EMBEDDING_PROVIDER": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_auto_falls_back_to_hash_when_no_local_backend(self) -> None:
         with mock.patch.object(emb, "local_embeddings_available", return_value=False):
             provider = emb.build_embedding_provider({"embedding_provider": "auto"})

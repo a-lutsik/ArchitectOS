@@ -168,6 +168,10 @@ class ProvidersCouncilServiceMixin:
             provider["timeout_seconds"] = max(1, int(payload["timeout_seconds"] or 120))
         if "approval_required" in payload:
             provider["approval_required"] = bool(payload["approval_required"])
+        if "allow_local" in payload:
+            # Opt-in for OpenAI-compatible servers on loopback/LAN (LM Studio,
+            # llama.cpp, LiteLLM) — see netutil.validate_outbound_url.
+            provider["allow_local"] = bool(payload["allow_local"])
         if "enabled" in payload:
             provider["enabled"] = bool(payload["enabled"])
             provider["status"] = "configured" if provider["enabled"] else provider["status"]

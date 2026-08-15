@@ -170,3 +170,8 @@ ADO_BOARD_MEMORY_TYPES = {
     "task": "Artifact",
     "bug": "Constraint",
 }
+
+# Placeholder that replaces secret values (MCP env vars, HTTP headers) in API
+# responses and bundle exports. UIs must treat it as "keep the stored value"
+# when a server configuration round-trips through an editor.
+SECRET_MASK = "********"

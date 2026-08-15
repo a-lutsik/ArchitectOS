@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from backend.architectos.constants import SECRET_MASK
 from backend.architectos.mcp import MCPClient, MCPManager, MCPServerConfig
 
 FAKE_MCP_SERVER = textwrap.dedent(
@@ -127,6 +128,7 @@ class MCPClientTests(unittest.TestCase):
                 "id": "remote",
                 "label": "Remote MCP",
                 "transport": "http",
+                "allow_local": True,
                 "url": f"http://127.0.0.1:{server.server_port}/mcp",
                 "enabled": True,
                 "approval_required": False,
@@ -173,6 +175,7 @@ class MCPClientTests(unittest.TestCase):
                 "id": "remote-sse",
                 "label": "Remote SSE MCP",
                 "transport": "http",
+                "allow_local": True,
                 "url": f"http://127.0.0.1:{server.server_port}/mcp",
                 "enabled": True,
                 "approval_required": False,
@@ -260,6 +263,7 @@ class MCPClientTests(unittest.TestCase):
                 "id": "secure",
                 "label": "Secure MCP",
                 "transport": "http",
+                "allow_local": True,
                 "url": f"http://127.0.0.1:{server.server_port}/mcp",
                 "enabled": True,
                 "approval_required": False,
@@ -282,6 +286,84 @@ class MCPClientTests(unittest.TestCase):
             server.shutdown()
             thread.join(timeout=2)
             server.server_close()
+
+
+class MCPSecretMaskingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _store(self) -> _Store:
+        return _Store([{
+            "id": "secret-env",
+            "label": "Secret MCP",
+            "command": ["echo"],
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_real_token", "PLAIN": "value"},
+            "headers": {"Authorization": "Bearer real_header"},
+        }])
+
+    def test_list_servers_masks_env_and_headers_values(self) -> None:
+        store = self._store()
+        manager = MCPManager(self.root, store.load, store.save)
+        server = manager.list_servers()[0]
+        self.assertEqual(server["env"], {"GITHUB_PERSONAL_ACCESS_TOKEN": SECRET_MASK, "PLAIN": SECRET_MASK})
+        self.assertEqual(server["headers"], {"Authorization": SECRET_MASK})
+        # The stored record keeps the real values.
+        self.assertEqual(store.servers[0]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"], "ghp_real_token")
+        self.assertEqual(store.servers[0]["headers"]["Authorization"], "Bearer real_header")
+
+    def test_upsert_masked_value_keeps_stored_secret(self) -> None:
+        store = self._store()
+        manager = MCPManager(self.root, store.load, store.save)
+        manager.upsert_server({
+            "id": "secret-env",
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": SECRET_MASK, "PLAIN": SECRET_MASK},
+            "headers": {"Authorization": SECRET_MASK},
+        })
+        stored = MCPServerConfig.from_dict(store.servers[0])
+        self.assertEqual(stored.env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_real_token", "PLAIN": "value"})
+        self.assertEqual(stored.headers, {"Authorization": "Bearer real_header"})
+
+    def test_upsert_new_value_overrides_stored_secret(self) -> None:
+        store = self._store()
+        manager = MCPManager(self.root, store.load, store.save)
+        manager.upsert_server({
+            "id": "secret-env",
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_new_token", "PLAIN": "value"},
+            "headers": {"Authorization": "Bearer new_header"},
+        })
+        stored = MCPServerConfig.from_dict(store.servers[0])
+        self.assertEqual(stored.env["GITHUB_PERSONAL_ACCESS_TOKEN"], "ghp_new_token")
+        self.assertEqual(stored.headers["Authorization"], "Bearer new_header")
+
+    def test_upsert_omitted_key_is_removed(self) -> None:
+        store = self._store()
+        manager = MCPManager(self.root, store.load, store.save)
+        manager.upsert_server({
+            "id": "secret-env",
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": SECRET_MASK},
+            "headers": {},
+        })
+        stored = MCPServerConfig.from_dict(store.servers[0])
+        self.assertEqual(stored.env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_real_token"})
+        self.assertEqual(stored.headers, {})
+
+    def test_upsert_new_server_drops_masked_entries(self) -> None:
+        store = _Store([])
+        manager = MCPManager(self.root, store.load, store.save)
+        manager.upsert_server({
+            "id": "fresh",
+            "label": "Fresh MCP",
+            "command": ["echo"],
+            "env": {"TOKEN": SECRET_MASK, "REAL": "kept"},
+            "headers": {"Authorization": SECRET_MASK},
+        })
+        stored = MCPServerConfig.from_dict(store.servers[0])
+        self.assertEqual(stored.env, {"REAL": "kept"})
+        self.assertEqual(stored.headers, {})
 
 
 class AzureDevOpsMCPTests(unittest.TestCase):

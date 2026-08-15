@@ -386,7 +386,7 @@ class NativeToolCallingTests(unittest.TestCase):
                 "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
             }],
         )
-        provider = {"model": "gpt-test", "base_url": "https://example.invalid/openai/v1"}
+        provider = {"model": "gpt-test", "base_url": "https://example.invalid/openai/v1", "allow_local": True}
         with mock.patch.object(adapters_module, "urlopen", fake_urlopen), \
                 mock.patch.dict(os.environ, {"AZURE_OPENAI_API_KEY": "test-key"}):
             result = AzureOpenAIResponsesAdapter().run(provider, request, Path("."))
@@ -427,7 +427,7 @@ class NativeToolCallingTests(unittest.TestCase):
         request = ProviderRequest(message="hi", context="", project_id="architectos")
         with mock.patch.object(adapters_module, "urlopen", fake_urlopen), \
                 mock.patch.dict(os.environ, {"AZURE_OPENAI_API_KEY": "test-key"}):
-            result = AzureOpenAIResponsesAdapter().run({"model": "gpt-test", "base_url": "https://example.invalid/openai/v1"}, request, Path("."))
+            result = AzureOpenAIResponsesAdapter().run({"model": "gpt-test", "base_url": "https://example.invalid/openai/v1", "allow_local": True}, request, Path("."))
 
         self.assertNotIn("tools", captured["payload"])
         self.assertEqual(result["text"], "plain answer")

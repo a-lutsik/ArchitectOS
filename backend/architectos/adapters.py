@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .netutil import validate_outbound_url
 from .routing import RouterPolicy, classify_role
 from .ssl_util import urlopen
 from .usage import enrich_usage, normalize_usage
@@ -151,7 +152,8 @@ class OpenAIResponsesAdapter(ProviderAdapter):
         return str(provider.get("model") or self.default_model)
 
     def _responses_endpoint(self, provider: dict[str, Any]) -> str:
-        return str(provider.get("base_url") or self.default_endpoint).rstrip("/")
+        endpoint = str(provider.get("base_url") or self.default_endpoint).rstrip("/")
+        return validate_outbound_url(endpoint, allow_local=_allow_local_urls(provider))
 
     def _request_headers(self, api_key: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -291,6 +293,7 @@ class AzureOpenAIResponsesAdapter(OpenAIResponsesAdapter):
         base_url = str(provider.get("base_url") or os.environ.get("AZURE_OPENAI_ENDPOINT") or "").rstrip("/")
         if not base_url:
             return ""
+        validate_outbound_url(base_url, allow_local=_allow_local_urls(provider))
         if base_url.endswith("/responses"):
             return base_url
         return f"{base_url}/responses"
@@ -650,7 +653,7 @@ class OllamaAdapter(ProviderAdapter):
     provider_id = "ollama"
 
     def check(self, provider: dict[str, Any], project_root: Path) -> dict[str, Any]:
-        base_url = str(provider.get("base_url") or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+        base_url = _ollama_base_url(provider)
         model = str(provider.get("model") or "")
         req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
         try:
@@ -679,7 +682,7 @@ class OllamaAdapter(ProviderAdapter):
         }
 
     def list_models(self, provider: dict[str, Any], project_root: Path) -> dict[str, Any]:
-        base_url = str(provider.get("base_url") or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+        base_url = _ollama_base_url(provider)
         req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
         try:
             with urlopen(req, timeout=min(5, int(provider.get("timeout_seconds") or 5))) as response:
@@ -719,7 +722,7 @@ class OllamaAdapter(ProviderAdapter):
         }
 
     def run(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> dict[str, Any]:
-        base_url = str(provider.get("base_url") or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+        base_url = _ollama_base_url(provider)
         payload = {
             "model": provider.get("model") or "llama3.1",
             "prompt": self.build_prompt(request),
@@ -746,7 +749,7 @@ class OllamaAdapter(ProviderAdapter):
         )
 
     def stream(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> Iterator[dict[str, Any]]:
-        base_url = str(provider.get("base_url") or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+        base_url = _ollama_base_url(provider)
         model = str(provider.get("model") or "llama3.1")
         payload = {
             "model": model,
@@ -1586,15 +1589,34 @@ def _normalize_cli_command(command: list[str], default_command: list[str]) -> li
     return command
 
 
+def _allow_local_urls(provider: dict[str, Any]) -> bool:
+    """Operator opt-in for loopback provider endpoints (LM Studio, llama.cpp, LiteLLM)."""
+    if provider.get("allow_local"):
+        return True
+    return os.environ.get("ARCHITECTOS_ALLOW_LOCAL_URLS", "").strip().lower() in {"1", "true", "yes"}
+
+
 def _anthropic_messages_endpoint(provider: dict[str, Any]) -> str:
-    base_url = str(provider.get("base_url") or "https://api.anthropic.com").rstrip("/")
+    base_url = validate_outbound_url(
+        str(provider.get("base_url") or "https://api.anthropic.com").rstrip("/"),
+        allow_local=_allow_local_urls(provider),
+    )
     if base_url.endswith("/v1/messages"):
         return base_url
     return f"{base_url}/v1/messages"
 
 
 def _openrouter_base_url(provider: dict[str, Any]) -> str:
-    return str(provider.get("base_url") or "https://openrouter.ai/api/v1").rstrip("/")
+    return validate_outbound_url(
+        str(provider.get("base_url") or "https://openrouter.ai/api/v1").rstrip("/"),
+        allow_local=_allow_local_urls(provider),
+    )
+
+
+def _ollama_base_url(provider: dict[str, Any]) -> str:
+    # Ollama is local by design, so loopback targets are fine; metadata endpoints are not.
+    base_url = str(provider.get("base_url") or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+    return validate_outbound_url(base_url, allow_local=True)
 
 
 def _extract_anthropic_text(data: dict[str, Any]) -> str:

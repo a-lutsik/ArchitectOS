@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -12,6 +13,8 @@ from .service import ArchitectOSService
 
 PROJECT_ROOT = resolve_project_root()
 FRONTEND_ROOT = resolve_frontend_root()
+
+_LOG = logging.getLogger(__name__)
 
 # The OAuth callback is a top-level browser redirect from the identity
 # provider, so the SPA cannot attach the API token to it.
@@ -193,6 +196,7 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
                 label = self._escape_html(result.get("label") or result.get("id") or "MCP server")
                 message = self._escape_html(result.get("message") or "MCP authorization completed.")
                 server_id = self._escape_html(result.get("id") or "")
+                origin = json.dumps(self._request_origin())
                 self._html(
                     "<!doctype html><meta charset='utf-8'>"
                     "<title>ArchitectOS MCP Authorization</title>"
@@ -200,7 +204,7 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
                     f"<h1>{message}</h1>"
                     f"<p><strong>{label}</strong> is authorized. You can close this window and click <em>Test</em> in ArchitectOS.</p>"
                     "<script>"
-                    f"try{{window.opener&&window.opener.postMessage({{type:'mcp-auth-complete',id:{json.dumps(result.get('id') or '')}}},'*');}}catch(e){{}}"
+                    f"try{{window.opener&&window.opener.postMessage({{type:'mcp-auth-complete',id:{json.dumps(result.get('id') or '')}}},{origin});}}catch(e){{}}"
                     "setTimeout(function(){window.close();},1200);"
                     "</script>"
                     "</body>"
@@ -451,7 +455,20 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
             super().log_message(format, *args)
 
     def _error(self, exc: Exception) -> None:
-        self._json({"error": str(exc), "type": exc.__class__.__name__}, HTTPStatus.BAD_REQUEST)
+        body = {"error": str(exc), "type": exc.__class__.__name__}
+        if isinstance(exc, ValueError):
+            self._json(body, HTTPStatus.BAD_REQUEST)
+            return
+        _LOG.exception("Unhandled API error")
+        self._json(body, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _request_origin(self) -> str:
+        """Own origin for postMessage targets — never '*'."""
+        host = (self.headers.get("Host") or "").strip()
+        hostname, _, host_port = host.rpartition(":")
+        if hostname not in ALLOWED_HOSTNAMES or (host_port and host_port != str(self.server.server_port)):
+            host = f"127.0.0.1:{self.server.server_port}"
+        return f"http://{host}"
 
     @staticmethod
     def _first(query: dict[str, list[str]], key: str) -> str:

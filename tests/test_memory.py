@@ -2023,9 +2023,11 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             try:
                 service = ArchitectOSService(root)
                 # Isolate from the developer machine's real Gemini CLI session.
-                with mock.patch("backend.architectos.adapters._gemini_session_auth_state", return_value={"ready": False}):
+                # The example.azure.com endpoint is unresolvable, so opt into allow_local.
+                with mock.patch("backend.architectos.adapters._gemini_session_auth_state", return_value={"ready": False}), \
+                        mock.patch.dict(os.environ, {"ARCHITECTOS_ALLOW_LOCAL_URLS": "1"}):
                     result = service.connect_env_providers()
-                providers = {item["id"]: item for item in service.providers()["providers"]}
+                    providers = {item["id"]: item for item in service.providers()["providers"]}
 
                 self.assertEqual({item["id"] for item in result["connected"]}, {"azure-openai"})
                 self.assertTrue(providers["azure-openai"]["enabled"])
@@ -2109,6 +2111,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         os.environ["ARCHITECTOS_TEST_ANTHROPIC_KEY"] = "test-key"
+        os.environ["ARCHITECTOS_ALLOW_LOCAL_URLS"] = "1"  # loopback fake server
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 service = ArchitectOSService(Path(tmp))
@@ -2121,6 +2124,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 self.assertEqual("".join(event.get("text", "") for event in events if event["type"] == "delta"), "hello claude")
         finally:
             os.environ.pop("ARCHITECTOS_TEST_ANTHROPIC_KEY", None)
+            os.environ.pop("ARCHITECTOS_ALLOW_LOCAL_URLS", None)
             server.shutdown()
             thread.join(timeout=2)
             server.server_close()
@@ -2151,6 +2155,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         os.environ["ARCHITECTOS_TEST_AZURE_KEY"] = "test-key"
+        os.environ["ARCHITECTOS_ALLOW_LOCAL_URLS"] = "1"  # loopback fake server
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 service = ArchitectOSService(Path(tmp))
@@ -2167,6 +2172,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 self.assertEqual(seen, [{"path": "/openai/v1/responses", "api_key": "test-key", "model": "azure-deployment-test"}])
         finally:
             os.environ.pop("ARCHITECTOS_TEST_AZURE_KEY", None)
+            os.environ.pop("ARCHITECTOS_ALLOW_LOCAL_URLS", None)
             server.shutdown()
             thread.join(timeout=2)
             server.server_close()
@@ -2188,6 +2194,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         os.environ["ARCHITECTOS_TEST_AZURE_KEY"] = "test-key"
+        os.environ["ARCHITECTOS_ALLOW_LOCAL_URLS"] = "1"  # loopback fake server
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 service = ArchitectOSService(Path(tmp))
@@ -2203,6 +2210,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 self.assertIn("AZURE_OPENAI_DEPLOYMENT", result["text"])
         finally:
             os.environ.pop("ARCHITECTOS_TEST_AZURE_KEY", None)
+            os.environ.pop("ARCHITECTOS_ALLOW_LOCAL_URLS", None)
             server.shutdown()
             thread.join(timeout=2)
             server.server_close()
@@ -2237,6 +2245,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         os.environ["ARCHITECTOS_TEST_OPENROUTER_KEY"] = "test-key"
+        os.environ["ARCHITECTOS_ALLOW_LOCAL_URLS"] = "1"  # loopback fake server
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 service = ArchitectOSService(Path(tmp))
@@ -2253,6 +2262,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 self.assertEqual(seen_models, ["openai/gpt-test"])
         finally:
             os.environ.pop("ARCHITECTOS_TEST_OPENROUTER_KEY", None)
+            os.environ.pop("ARCHITECTOS_ALLOW_LOCAL_URLS", None)
             server.shutdown()
             thread.join(timeout=2)
             server.server_close()

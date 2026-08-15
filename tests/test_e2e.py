@@ -6,11 +6,13 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
@@ -55,6 +57,35 @@ class ArchitectOSE2ETests(unittest.TestCase):
     def request_text(self, path: str) -> str:
         with urllib.request.urlopen(f"{self.base_url}{path}", timeout=10) as response:
             return response.read().decode("utf-8")
+
+    def request_error(self, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+        """request_json variant that also returns (status, body) for non-2xx."""
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            method=method,
+            headers={"Content-Type": "application/json", "X-ArchitectOS-Token": self.service.auth_token},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def test_validation_error_returns_400(self) -> None:
+        # create_project raises ValueError when root_path is missing.
+        status, body = self.request_error("POST", "/api/projects", {"name": "NoRoot"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["type"], "ValueError")
+        self.assertIn("error", body)
+
+    def test_internal_error_returns_500(self) -> None:
+        with mock.patch.object(self.service, "create_project", side_effect=RuntimeError("boom")):
+            status, body = self.request_error("POST", "/api/projects", {"name": "X", "root_path": "/nonexistent"})
+        self.assertEqual(status, 500)
+        self.assertEqual(body["type"], "RuntimeError")
+        self.assertIn("error", body)
 
     def test_http_end_to_end_local_memory_security_and_bundle_flow(self) -> None:
         index = self.request_text("/")
