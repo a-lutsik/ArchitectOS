@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import socket
 import unittest
+import urllib.request
 from unittest import mock
 
+from backend.architectos import embeddings
 from backend.architectos.adapters import OpenAIResponsesAdapter
-from backend.architectos.netutil import validate_outbound_url
+from backend.architectos.netutil import current_allow_local, is_loopback_url, validate_outbound_url
 
 
 def _addrinfo(*ips: str) -> list[tuple[int, int, int, str, tuple[str, int]]]:
@@ -145,6 +147,66 @@ class RedirectGuardTests(unittest.TestCase):
         secret.shutdown()
         redir.shutdown()
         meta.shutdown()
+
+
+class IsLoopbackUrlTests(unittest.TestCase):
+    def test_recognizes_literal_loopback_hosts(self) -> None:
+        for url in (
+            "http://127.0.0.1:11434/api/embeddings",
+            "http://localhost:1234/v1",
+            "http://lmstudio.localhost/v1",
+            "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]/v1",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(is_loopback_url(url))
+
+    def test_public_hosts_are_not_loopback(self) -> None:
+        for url in ("https://api.openai.com/v1", "http://169.254.169.254/latest", "https://10.0.0.5/v1", "", "not a url"):
+            with self.subTest(url=url):
+                self.assertFalse(is_loopback_url(url))
+
+    def test_public_hostname_cannot_opt_itself_in_via_dns(self) -> None:
+        # A name that resolves to 127.0.0.1 must not be treated as an operator's
+        # deliberate local endpoint, or DNS becomes the policy.
+        with mock.patch("socket.getaddrinfo", return_value=_addrinfo("127.0.0.1")):
+            self.assertFalse(is_loopback_url("https://evil.example.com/v1"))
+
+
+class EmbeddingEndpointPolicyTests(unittest.TestCase):
+    """_embedding_urlopen derives allow_local from the configured endpoint."""
+
+    def test_local_inference_server_is_allowed(self) -> None:
+        captured: dict[str, bool] = {}
+
+        def fake_urlopen(request: object, timeout: float | None = None) -> object:
+            captured["allow_local"] = current_allow_local()
+            return object()
+
+        with mock.patch("backend.architectos.embeddings.urlopen", fake_urlopen):
+            embeddings._embedding_urlopen(
+                "http://127.0.0.1:11434/api/embeddings",
+                mock.Mock(),
+                timeout=5.0,
+            )
+        self.assertTrue(captured["allow_local"])
+
+    def test_remote_endpoint_stays_strict(self) -> None:
+        captured: dict[str, bool] = {}
+
+        def fake_urlopen(request: object, timeout: float | None = None) -> object:
+            captured["allow_local"] = current_allow_local()
+            return object()
+
+        with mock.patch("backend.architectos.embeddings.urlopen", fake_urlopen):
+            embeddings._embedding_urlopen("https://api.openai.com/v1/embeddings", mock.Mock(), timeout=5.0)
+        self.assertFalse(captured["allow_local"])
+
+    def test_remote_endpoint_pointed_at_metadata_is_rejected(self) -> None:
+        # Real ssl_util.urlopen under the derived policy: link-local is never allowed.
+        request = urllib.request.Request("http://169.254.169.254/latest/meta-data")
+        with self.assertRaises(ValueError):
+            embeddings._embedding_urlopen("http://169.254.169.254/latest/meta-data", request, timeout=3.0)
 
 
 if __name__ == "__main__":

@@ -59,6 +59,32 @@ def current_validate_initial() -> bool:
     return bool(_outbound_validate_initial.get())
 
 
+def is_loopback_url(url: str) -> bool:
+    """True when *url* names a loopback host, without consulting DNS.
+
+    Lets a caller derive its own allow_local from an endpoint the operator
+    configured: pointing an integration at a local inference server is a
+    supported setup, whereas a remote endpoint should stay under the strict
+    policy. Only literal loopback names and addresses count, so a public
+    hostname cannot opt itself in by resolving to 127.0.0.1.
+    """
+    try:
+        hostname = urllib.parse.urlparse(url).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return bool(address.is_loopback)
+
+
 def validate_outbound_url(url: str, *, allow_local: bool = False) -> str:
     """Return *url* unchanged when it is safe to call server-side, else raise ValueError.
 

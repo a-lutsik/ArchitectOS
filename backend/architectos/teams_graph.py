@@ -331,7 +331,7 @@ class TeamsGraphClient:
     ) -> str:
         request = urllib.request.Request(url, data=data, method=method, headers=headers or {})
         try:
-            with urlopen(request, timeout=45.0, validate=False) as response:
+            with urlopen(request, timeout=45.0) as response:
                 return response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = ""

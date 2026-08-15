@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import SECRET_MASK
-from .netutil import outbound_policy, validate_outbound_url
+from .netutil import validate_outbound_url
 from .ssl_util import urlopen
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -485,9 +485,10 @@ class MCPRemoteHTTPClient:
         effective_timeout = timeout if timeout and timeout > 0 else self.timeout
         allow_local = _allow_local_remote_urls(self.config)
         try:
-            with outbound_policy(allow_local=allow_local):
-                with urlopen(request, timeout=effective_timeout, allow_local=allow_local, validate=False) as response:
-                    raw = response.read().decode("utf-8", errors="replace")
+            # config.url passed _validate_remote_url in __init__, so skip a second
+            # DNS lookup here; redirect hops are still checked against allow_local.
+            with urlopen(request, timeout=effective_timeout, allow_local=allow_local, validate=False) as response:
+                raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise MCPError(f"Remote MCP HTTP {exc.code}: {detail or exc.reason}") from exc

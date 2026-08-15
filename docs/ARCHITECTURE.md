@@ -40,6 +40,15 @@ The backend is a stdlib-only Python 3.12 package under `backend/architectos`.
 the shared collaborators the mixins rely on: repository, embedding engine, provider
 router, MCP/LSP managers, tool gateway, and the ingestion/lifecycle engines.
 
+Provider adapters are layered so the two adapter families never import each other:
+`adapters_base.py` holds `ProviderRequest`, `ProviderAdapter`, and `LocalMemoryAdapter`;
+`adapters_cli.py` holds `CliAdapter` plus the subprocess and Gemini/Codex session
+plumbing; `adapters.py` holds the HTTP families (OpenAI, Azure, Anthropic, OpenRouter,
+Ollama), `ProviderRouter`, and re-exports the whole surface through `__all__` so
+existing `from .adapters import X` call sites and `mock.patch` targets still resolve.
+`_provider_urlopen` deliberately stays in `adapters.py` next to its callers, because
+patching `adapters.urlopen` is how the tests intercept provider HTTP.
+
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
 verb (`do_GET`/`do_POST`/`do_PATCH`) funnels through it: index shortcut, `/api/*`
@@ -54,7 +63,10 @@ DNS once), and rejects loopback, link-local, unspecified, reserved, and multicas
 targets. Trusted endpoints can opt into loopback via `allow_local` (a per-config
 flag or the `ARCHITECTOS_ALLOW_LOCAL_URLS` / `ARCHITECTOS_MCP_ALLOW_LOCAL` env
 vars); link-local cloud metadata endpoints stay blocked even then. It is enforced
-on provider `base_url` values in `adapters.py` and on remote MCP server URLs in
+on provider `base_url` values in `adapters.py`, on embedding endpoints in
+`embeddings.py` (where `is_loopback_url` derives the policy from the configured
+endpoint, so a local inference server keeps working while a remote one stays
+strict), and on remote MCP server URLs in
 `mcp.py`.
 
 The frontend under `frontend/` is dependency-free vanilla JS shipped as native ES

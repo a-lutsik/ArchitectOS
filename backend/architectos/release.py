@@ -24,6 +24,8 @@ REQUIRED_FILES = [
     "backend/architectos/server.py",
     "backend/architectos/storage.py",
     "backend/architectos/adapters.py",
+    "backend/architectos/adapters_base.py",
+    "backend/architectos/adapters_cli.py",
     "backend/architectos/config.py",
     "backend/architectos/security.py",
     "backend/architectos/launcher.py",

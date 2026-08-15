@@ -15,6 +15,11 @@ from backend.architectos.config import APP_VERSION
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
 
+# These requests hit an in-process server on loopback, so the timeout only guards
+# against a hang. It has to absorb a machine running the whole suite under
+# coverage, where a 10s budget intermittently expired on the readiness check.
+LOCAL_HTTP_TIMEOUT = 60
+
 
 class ProductionOpsTests(unittest.TestCase):
     def test_version_readiness_and_backup_service(self) -> None:
@@ -56,7 +61,7 @@ class ProductionOpsTests(unittest.TestCase):
         base_url = f"http://127.0.0.1:{server.server_port}"
         token_headers = {"X-ArchitectOS-Token": service.auth_token}
         try:
-            ready_response = urllib.request.urlopen(urllib.request.Request(f"{base_url}/api/ready", headers=token_headers), timeout=10)
+            ready_response = urllib.request.urlopen(urllib.request.Request(f"{base_url}/api/ready", headers=token_headers), timeout=LOCAL_HTTP_TIMEOUT)
             ready = json.loads(ready_response.read().decode("utf-8"))
             self.assertTrue(ready["ok"], ready)
             self.assertEqual(ready_response.headers["X-Content-Type-Options"], "nosniff")
@@ -64,7 +69,7 @@ class ProductionOpsTests(unittest.TestCase):
             self.assertEqual(ready_response.headers["Cache-Control"], "no-store, no-cache, must-revalidate, max-age=0")
             self.assertIn("default-src 'self'", ready_response.headers["Content-Security-Policy"])
 
-            index_response = urllib.request.urlopen(base_url, timeout=10)
+            index_response = urllib.request.urlopen(base_url, timeout=LOCAL_HTTP_TIMEOUT)
             index_html = index_response.read().decode("utf-8")
             self.assertEqual(index_response.headers["Cache-Control"], "no-store, no-cache, must-revalidate, max-age=0")
             self.assertNotIn('data-view="graph"', index_html)
@@ -77,9 +82,9 @@ class ProductionOpsTests(unittest.TestCase):
                 method="POST",
                 headers={"Content-Type": "application/json", **token_headers},
             )
-            backup = json.loads(urllib.request.urlopen(request, timeout=10).read().decode("utf-8"))
+            backup = json.loads(urllib.request.urlopen(request, timeout=LOCAL_HTTP_TIMEOUT).read().decode("utf-8"))
             self.assertTrue(Path(backup["path"]).exists())
-            backups = json.loads(urllib.request.urlopen(urllib.request.Request(f"{base_url}/api/ops/backups", headers=token_headers), timeout=10).read().decode("utf-8"))
+            backups = json.loads(urllib.request.urlopen(urllib.request.Request(f"{base_url}/api/ops/backups", headers=token_headers), timeout=LOCAL_HTTP_TIMEOUT).read().decode("utf-8"))
             self.assertGreaterEqual(len(backups["backups"]), 1)
         finally:
             server.shutdown()
@@ -101,7 +106,7 @@ class ProductionOpsTests(unittest.TestCase):
 
             def status_of(request: urllib.request.Request) -> int:
                 try:
-                    with urllib.request.urlopen(request, timeout=10) as response:
+                    with urllib.request.urlopen(request, timeout=LOCAL_HTTP_TIMEOUT) as response:
                         return response.status
                 except urllib.error.HTTPError as exc:
                     return exc.code
@@ -242,7 +247,7 @@ class ProductionOpsTests(unittest.TestCase):
                 try:
                     urllib.request.urlopen(
                         urllib.request.Request(f"{base_url}/api/health", headers=headers),
-                        timeout=10,
+                        timeout=LOCAL_HTTP_TIMEOUT,
                     )
                     self.fail("expected HTTPError")
                 except urllib.error.HTTPError as exc:

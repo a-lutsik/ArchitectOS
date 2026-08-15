@@ -16,9 +16,27 @@ from hashlib import sha1
 from typing import Any, Protocol
 
 from .models import MemoryNode
+from .netutil import is_loopback_url, outbound_policy
 from .ssl_util import urlopen
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _embedding_urlopen(url: str, request: urllib.request.Request, *, timeout: float):
+    """urlopen for an embedding endpoint, under a policy derived from that endpoint.
+
+    These endpoints come from environment variables, and aiming one at a local
+    inference server (Ollama, LM Studio, vLLM) is a supported local-first setup —
+    so a loopback base is trusted, including its redirects, which a strict policy
+    would otherwise break. A remote base is validated before the first request and
+    may not redirect into loopback or a cloud metadata address.
+
+    Kwargs are kept off the ``urlopen`` call so test doubles that accept only
+    ``(request, timeout=...)`` keep working.
+    """
+    with outbound_policy(allow_local=is_loopback_url(url)):
+        return urlopen(request, timeout=timeout)
+
 
 try:
     import numpy as np
@@ -306,7 +324,7 @@ class OpenAICompatibleEmbeddingProvider:
             headers=headers,
         )
         try:
-            with urlopen(request, timeout=20.0, validate=False) as response:
+            with _embedding_urlopen(url, request, timeout=20.0) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -345,7 +363,7 @@ class OllamaEmbeddingProvider:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urlopen(request, timeout=60.0, validate=False) as response:
+            with _embedding_urlopen(url, request, timeout=60.0) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -500,7 +518,7 @@ class GeminiEmbeddingProvider:
             },
         )
         try:
-            with urlopen(request, timeout=30.0, validate=False) as response:
+            with _embedding_urlopen(url, request, timeout=30.0) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -568,7 +586,7 @@ class CloudflareEmbeddingProvider:
             },
         )
         try:
-            with urlopen(request, timeout=30.0, validate=False) as response:
+            with _embedding_urlopen(url, request, timeout=30.0) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
