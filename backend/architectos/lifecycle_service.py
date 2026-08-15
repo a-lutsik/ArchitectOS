@@ -325,7 +325,15 @@ class MemoryLifecycleEngine:
 
     def annotate_nodes(self, project_id: str | None = None) -> dict[str, int]:
         count = 0
-        for node in self.repository.list_nodes():
+        # Narrow in SQL first: this runs on every graph/analytics read, and scanning
+        # plus JSON-decoding every node in the store dominated those requests. The
+        # Python guard stays so the annotated set is byte-for-byte what it was.
+        nodes = (
+            self.repository.list_nodes(project_id=project_id, include_shared=True)
+            if project_id
+            else self.repository.list_nodes()
+        )
+        for node in nodes:
             if project_id and node.project_id not in {project_id, None}:
                 continue
             self.initialize_node(node, "annotate")

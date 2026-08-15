@@ -418,7 +418,12 @@ class GraphServiceMixin:
         self.memory_lifecycle.annotate_nodes(project_id)
         # Prefer a scoped SQL fetch over a full-table scan. Shared/global nodes
         # stay visible for the selected project; status is filtered in SQL.
-        fetch_limit = None if limit is None else max(int(limit) * 8, 500)
+        #
+        # Every filter below runs in Python, so a SQL LIMIT would search only the
+        # newest page and silently hide older matches. Cap the fetch only for the
+        # unfiltered view, where truncation is the intended density budget.
+        narrowing = bool(search or node_type or scope or source or pinned or task_id or provider_id)
+        fetch_limit = None if (limit is None or narrowing) else max(int(limit) * 8, 500)
         if project_id:
             all_nodes = self.repository.list_nodes(
                 limit=fetch_limit,
@@ -428,7 +433,7 @@ class GraphServiceMixin:
             )
         else:
             all_nodes = self.repository.list_nodes(limit=fetch_limit, status="active")
-        
+
         # Unique types/scopes/sources for filter dropdowns (before filtering)
         types = sorted(list({node.type for node in all_nodes if node.type}))
         scopes = sorted(list({node.scope for node in all_nodes if node.scope}))
@@ -675,11 +680,8 @@ class GraphServiceMixin:
             include_shared=bool(project_id),
         ) if project_id else self.repository.list_nodes(status="active")
 
-        def _apply_one(node: Any) -> dict[str, Any]:
-            reason = self._noise_artifact_reason(node)
+        def _apply_one(node: Any, reason: str) -> dict[str, Any]:
             record: dict[str, Any] = {"id": node.id, "label": node.label, "reason": reason, "type": node.type}
-            if dry_run or not reason:
-                return record
             metadata = dict(node.metadata or {})
             deleted_edges = 0
             if hard:
@@ -696,13 +698,13 @@ class GraphServiceMixin:
             record["deleted_edges"] = deleted_edges
             return record
 
-        victims: list[Any] = []
+        victims: list[tuple[Any, str]] = []
         for node in nodes:
             scanned += 1
             reason = self._noise_artifact_reason(node)
             if not reason:
                 continue
-            victims.append(node)
+            victims.append((node, reason))
             if dry_run:
                 items.append({"id": node.id, "label": node.label, "reason": reason, "type": node.type})
 
@@ -712,8 +714,8 @@ class GraphServiceMixin:
         # One transaction for the whole batch so a mid-loop failure cannot leave
         # a half-purged graph (matches apply_graph_command hard-delete semantics).
         with self.repository.transaction():
-            for node in victims:
-                items.append(_apply_one(node))
+            for node, reason in victims:
+                items.append(_apply_one(node, reason))
         return {
             "scanned": scanned,
             "purged": len(items),

@@ -9,6 +9,7 @@ from backend.architectos.graph_analysis import (
     detect_communities,
     personalized_pagerank,
 )
+from backend.architectos.models import MemoryNode
 from backend.architectos.service import ArchitectOSService
 
 TRIANGLES = [
@@ -442,6 +443,66 @@ class RelevanceFloorTests(unittest.TestCase):
             # Absolute floor above every real score keeps only the guaranteed top hit.
             self.assertLessEqual(len(huge["hits"]), 1)
             self.assertEqual(huge["retrieval"].get("min_score"), 100000.0)
+
+
+class GraphFetchScopeTests(unittest.TestCase):
+    """The scoped SQL fetch must not truncate the set a filter searches over."""
+
+    NEEDLE = "zetatronic"
+
+    def _service_with_many_nodes(self, tmp: str, count: int = 900) -> ArchitectOSService:
+        service = ArchitectOSService(Path(tmp))
+        # Written straight to the repository: add_memory() would run the auto-linker
+        # for every node, which is far too slow for a corpus this size.
+        for index in range(count):
+            # Oldest node holds the needle, so any recency-ordered LIMIT hides it.
+            marker = self.NEEDLE if index == 0 else "filler"
+            stamp = f"2026-01-{(index % 28) + 1:02d}T{(index % 24):02d}:00:00+00:00"
+            service.repository.upsert_node(
+                MemoryNode(
+                    id=f"node-{index:04d}",
+                    type="Decision",
+                    label=f"{marker} decision {index}",
+                    scope="project",
+                    text=f"{marker} body text for node {index}",
+                    project_id="architectos",
+                    created_at=stamp,
+                    updated_at=stamp,
+                    # Pre-seeded so annotate_nodes() skips its upsert and leaves the
+                    # timestamps (and therefore the recency ordering) exactly as set.
+                    metadata={"memory_tier": "short_term"},
+                )
+            )
+        return service
+
+    def test_search_finds_old_node_beyond_the_fetch_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service_with_many_nodes(tmp)
+            payload = service.graph(project_id="architectos", limit=100, search=self.NEEDLE)
+            labels = [node["label"] for node in payload["nodes"]]
+            self.assertTrue(
+                any(self.NEEDLE in label for label in labels),
+                "graph search must scan every active node, not just the newest page",
+            )
+
+    def test_type_filter_is_not_starved_by_the_fetch_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service_with_many_nodes(tmp, count=900)
+            service.repository.upsert_node(
+                MemoryNode(
+                    id="rare-risk",
+                    type="Risk",
+                    label="Rare risk node",
+                    scope="project",
+                    text="A single Risk among many Decisions.",
+                    project_id="architectos",
+                    created_at="2025-01-01T00:00:00+00:00",
+                    updated_at="2025-01-01T00:00:00+00:00",
+                    metadata={"memory_tier": "short_term"},
+                )
+            )
+            payload = service.graph(project_id="architectos", limit=100, node_type="Risk")
+            self.assertIn("rare-risk", {node["id"] for node in payload["nodes"]})
 
 
 if __name__ == "__main__":
