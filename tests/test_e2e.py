@@ -84,8 +84,10 @@ class ArchitectOSE2ETests(unittest.TestCase):
         with mock.patch.object(self.service, "create_project", side_effect=RuntimeError("boom")):
             status, body = self.request_error("POST", "/api/projects", {"name": "X", "root_path": "/nonexistent"})
         self.assertEqual(status, 500)
-        self.assertEqual(body["type"], "RuntimeError")
-        self.assertIn("error", body)
+        self.assertEqual(body["error"], "Internal server error")
+        self.assertEqual(body["type"], "InternalError")
+        self.assertIn("error_id", body)
+        self.assertNotIn("boom", json.dumps(body))
 
     def test_http_end_to_end_local_memory_security_and_bundle_flow(self) -> None:
         index = self.request_text("/")

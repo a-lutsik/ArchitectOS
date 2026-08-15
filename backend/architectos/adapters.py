@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
 import base64
 import json
 import os
@@ -13,14 +12,28 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .netutil import validate_outbound_url
+from .netutil import outbound_policy, validate_outbound_url
 from .routing import RouterPolicy, classify_role
 from .ssl_util import urlopen
 from .usage import enrich_usage, normalize_usage
+
+
+def _provider_urlopen(provider: dict[str, Any], req: urllib.request.Request, *, timeout: float | int):
+    """urlopen with redirect policy matching the provider's allow_local setting.
+
+    Endpoints are already SSRF-checked when built; ``validate_initial=False``
+    skips a second DNS lookup on the first hop. Redirect hops are still
+    re-validated. Extra kwargs are avoided so test doubles that patch
+    ``urlopen(req, timeout=...)`` keep working.
+    """
+    allow_local = _allow_local_urls(provider)
+    with outbound_policy(allow_local=allow_local, validate_initial=False):
+        return urlopen(req, timeout=timeout)
 
 
 def _result_with_usage(result: dict[str, Any], *, model: str | None = None, usage_payload: Any = None) -> dict[str, Any]:
@@ -205,7 +218,7 @@ class OpenAIResponsesAdapter(ProviderAdapter):
             method="POST",
         )
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -243,7 +256,7 @@ class OpenAIResponsesAdapter(ProviderAdapter):
         chunks: list[str] = []
         usage_payload: Any = None
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 for raw_line in response:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
@@ -401,7 +414,7 @@ class AnthropicMessagesAdapter(ProviderAdapter):
             method="POST",
         )
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -443,7 +456,7 @@ class AnthropicMessagesAdapter(ProviderAdapter):
         chunks: list[str] = []
         usage_acc: dict[str, Any] = {}
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 for raw_line in response:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
@@ -534,7 +547,7 @@ class OpenRouterAdapter(ProviderAdapter):
             headers["Authorization"] = f"Bearer {api_key}"
         req = urllib.request.Request(f"{_openrouter_base_url(provider)}/models", headers=headers, method="GET")
         try:
-            with urlopen(req, timeout=min(20, int(provider.get("timeout_seconds") or 20))) as response:
+            with _provider_urlopen(provider, req, timeout=min(20, int(provider.get("timeout_seconds") or 20))) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -572,7 +585,7 @@ class OpenRouterAdapter(ProviderAdapter):
             method="POST",
         )
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -610,7 +623,7 @@ class OpenRouterAdapter(ProviderAdapter):
         chunks: list[str] = []
         usage_payload: Any = None
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 for raw_line in response:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
@@ -657,7 +670,7 @@ class OllamaAdapter(ProviderAdapter):
         model = str(provider.get("model") or "")
         req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
         try:
-            with urlopen(req, timeout=min(5, int(provider.get("timeout_seconds") or 5))) as response:
+            with _provider_urlopen(provider, req, timeout=min(5, int(provider.get("timeout_seconds") or 5))) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except OSError as exc:
             return {
@@ -685,7 +698,7 @@ class OllamaAdapter(ProviderAdapter):
         base_url = _ollama_base_url(provider)
         req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
         try:
-            with urlopen(req, timeout=min(5, int(provider.get("timeout_seconds") or 5))) as response:
+            with _provider_urlopen(provider, req, timeout=min(5, int(provider.get("timeout_seconds") or 5))) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except OSError as exc:
             return {
@@ -737,7 +750,7 @@ class OllamaAdapter(ProviderAdapter):
             method="POST",
         )
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except OSError as exc:
             return {"provider_id": self.provider_id, "status": "error", "text": f"Ollama request failed: {exc}", "raw": None}
@@ -767,7 +780,7 @@ class OllamaAdapter(ProviderAdapter):
         chunks: list[str] = []
         usage_payload: Any = None
         try:
-            with urlopen(req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
+            with _provider_urlopen(provider, req, timeout=int(provider.get("timeout_seconds") or 120)) as response:
                 for raw_line in response:
                     if not raw_line.strip():
                         continue

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import re
 
-TEXT_EXTENSIONS = {".md", ".txt", ".rst", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt", ".kts", ".go", ".rs", ".c", ".h", ".cpp", ".cc", ".hpp", ".cs", ".rb", ".php", ".swift", ".scala", ".sql", ".css", ".scss", ".sass", ".less", ".html", ".htm", ".vue", ".svelte", ".xml", ".gradle", ".groovy", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".toml", ".ini", ".properties", ".json", ".yml", ".yaml", ".tf", ".proto", ".dart", ".kt"}
+TEXT_EXTENSIONS = {".md", ".txt", ".rst", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt", ".kts", ".go", ".rs", ".c", ".h", ".cpp", ".cc", ".hpp", ".cs", ".rb", ".php", ".swift", ".scala", ".sql", ".css", ".scss", ".sass", ".less", ".html", ".htm", ".vue", ".svelte", ".xml", ".gradle", ".groovy", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".toml", ".ini", ".properties", ".json", ".yml", ".yaml", ".tf", ".proto", ".dart"}
 DOC_EXTENSIONS = {".md", ".txt", ".rst", ".adoc", ".org"}
 CODE_EXTENSIONS = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt", ".kts", ".go", ".rs",
@@ -64,8 +64,24 @@ TERMINAL_DANGEROUS_PATTERNS = [
         r"\b(format|diskpart|shutdown|restart-computer|stop-computer|taskkill|stop-process)\b",
         r"\bgit\s+(reset\s+--hard|clean)\b",
         r"\bmkfs(?:\.\w+)?\b",
+        # Exfiltration / remote code execution / privilege changes.
+        r"\b(curl|wget|fetch)\b.*\|\s*(sh|bash|zsh|powershell|cmd)\b",
+        r"\b(curl|wget)\b.*\s-o\s",
+        r"\bpython(?:3)?\s+-c\b",
+        r"\bnode\s+-e\b",
+        r"\bperl\s+-e\b",
+        r"\bruby\s+-e\b",
+        r"\bchmod\b",
+        r"\bchown\b",
+        r"\bdd\b",
+        r">\s*/(etc|dev|sys|proc)/",
+        r"\bsudo\b",
+        r"\bpowershell\b.*\b(-enc|-encodedcommand|iex|invoke-expression)\b",
+        r"`[^`]+`|\$\([^)]+\)",  # command substitution
     ]
 ]
+# Client must echo this exact string to override a blocked command (UI checkbox alone is not enough).
+TERMINAL_DESTRUCTIVE_CONFIRM = "I_UNDERSTAND_DESTRUCTIVE"
 INGESTION_SOURCE_ALIASES = {
     "issue": "issues",
     "issues": "issues",

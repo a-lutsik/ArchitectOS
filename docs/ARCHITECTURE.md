@@ -30,9 +30,55 @@ The MCP direction is bidirectional: ArchitectOS is an MCP *client* (connects out
 Filesystem/GitHub/Jira/... servers) and, via `architectos.mcp_server`, an MCP *server*
 that exposes the memory engine so IDE agents can read and write ArchitectOS memory.
 
+The backend is a stdlib-only Python 3.12 package under `backend/architectos`.
+`ArchitectOSService` (`service.py`, ~213 lines) is a thin facade composed from 13
+`*ServiceMixin` modules, one per concern: `ai_runtime_service`,
+`settings_router_service`, `providers_council_service`, `integrations_service`,
+`tool_exec_service`, `project_scan_service`, `azure_sync_service`,
+`ingestion_service`, `chat_session_service`, `chat_service`, `retrieval_service`,
+`graph_service`, and `lifecycle_service` (the newest). The facade `__init__` wires
+the shared collaborators the mixins rely on: repository, embedding engine, provider
+router, MCP/LSP managers, tool gateway, and the ingestion/lifecycle engines.
+
+`server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
+the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
+verb (`do_GET`/`do_POST`/`do_PATCH`) funnels through it: index shortcut, `/api/*`
+authorization, query parsing, JSON body, route match, static-file fallthrough for
+unmatched GETs. `_authorize_api` guards every `/api/*` call with the per-start
+`X-ArchitectOS-Token` plus loopback `Host`/`Origin` checks; `_error` splits failures
+into 400 for `ValueError` (bad input) and 500 for everything else.
+
+User-controlled outbound URLs pass the SSRF guard in `netutil.py`:
+`validate_outbound_url` requires http(s), classifies the host (resolving names via
+DNS once), and rejects loopback, link-local, unspecified, reserved, and multicast
+targets. Trusted endpoints can opt into loopback via `allow_local` (a per-config
+flag or the `ARCHITECTOS_ALLOW_LOCAL_URLS` / `ARCHITECTOS_MCP_ALLOW_LOCAL` env
+vars); link-local cloud metadata endpoints stay blocked even then. It is enforced
+on provider `base_url` values in `adapters.py` and on remote MCP server URLs in
+`mcp.py`.
+
+The frontend under `frontend/` is dependency-free vanilla JS shipped as native ES
+modules: `index.html` loads exactly one `<script type="module" src="/main.js">`
+entry that imports every other module. `scripts/frontend_load_smoke.js` enforces
+that contract without a browser: a single module entry with no leftover classic
+script tags, a static import graph where every relative import resolves and every
+named import matches a named export, no import cycles beyond the known verified
+ones, and a Node import of the whole graph with browser globals stubbed. Long lists
+(file tree, memory panel) render through `virtual-list.js`, a windowed renderer
+that materializes only the rows intersecting the scroll viewport (plus overscan),
+using two spacer divs so the scroll height matches the full row model.
+
 ## Storage
 
 `data/architectos.db` is the source of truth. Memory evidence is also written under `memory/evidence` as markdown. Release packages exclude `data/`, `memory/`, `dist/`, and cache files.
+
+`SQLiteMemoryRepository` (`storage.py`) owns the schema. Multi-step writes go
+through `transaction()`: the connection is pinned to the creating thread via
+thread-local storage (nested calls join the active transaction instead of opening a
+second one), the unit of work opens with `BEGIN IMMEDIATE`, commits on clean exit,
+and rolls back on exception. Schema versioning uses `PRAGMA user_version`:
+`_migrate` applies every idempotent step in `MIGRATIONS` above the database's
+stored version and stamps `SCHEMA_VERSION` (currently 3).
 
 ## Core Tables
 
@@ -40,11 +86,15 @@ that exposes the memory engine so IDE agents can read and write ArchitectOS memo
 - `memory_nodes`
 - `memory_edges`
 - `memory_candidates`
+- `memory_embeddings`
 - `tasks`
 - `chat_sessions`
+- `chat_context_summaries`
 - `providers`
 - `provider_runs`
 - `settings`
+- `keeper_events`
+- `retrieval_feedback`
 
 ## Implemented
 

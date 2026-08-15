@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from backend.architectos.constants import SECRET_MASK
-from backend.architectos.mcp import MCPClient, MCPManager, MCPServerConfig
+from backend.architectos.mcp import MCPClient, MCPError, MCPManager, MCPServerConfig
 
 FAKE_MCP_SERVER = textwrap.dedent(
     """
@@ -364,6 +364,38 @@ class MCPSecretMaskingTests(unittest.TestCase):
         stored = MCPServerConfig.from_dict(store.servers[0])
         self.assertEqual(stored.env, {"REAL": "kept"})
         self.assertEqual(stored.headers, {})
+
+    def test_upsert_ignores_client_supplied_auth(self) -> None:
+        store = _Store([{
+            "id": "secure",
+            "label": "Secure",
+            "command": ["echo"],
+            "auth": {"status": "authorized", "access_token": "keep-me", "refresh_token": "refresh-me"},
+        }])
+        manager = MCPManager(self.root, store.load, store.save)
+        manager.upsert_server({
+            "id": "secure",
+            "label": "Secure",
+            "command": ["echo"],
+            "auth": {"status": "authorized", "access_token": "stolen", "refresh_token": "stolen"},
+            "notes": "updated",
+        })
+        stored = MCPServerConfig.from_dict(store.servers[0])
+        self.assertEqual(stored.notes, "updated")
+        self.assertEqual(stored.auth.get("access_token"), "keep-me")
+        self.assertEqual(stored.auth.get("refresh_token"), "refresh-me")
+
+    def test_oauth_metadata_rejects_link_local(self) -> None:
+        store = _Store([{
+            "id": "remote",
+            "label": "Remote",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "enabled": True,
+        }])
+        manager = MCPManager(self.root, store.load, store.save)
+        with self.assertRaises(MCPError):
+            manager._fetch_json("http://169.254.169.254/latest/meta-data")
 
 
 class AzureDevOpsMCPTests(unittest.TestCase):

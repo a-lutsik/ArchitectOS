@@ -205,7 +205,7 @@ def expand_query_terms(query_terms: list[str]) -> list[str]:
 def cosine(left: list[float], right: list[float]) -> float:
     if not left or not right or len(left) != len(right):
         return 0.0
-    return sum(a * b for a, b in zip(left, right))
+    return sum(a * b for a, b in zip(left, right, strict=True))
 
 
 def l2_normalize(vector: list[float]) -> list[float]:
@@ -306,7 +306,7 @@ class OpenAICompatibleEmbeddingProvider:
             headers=headers,
         )
         try:
-            with urlopen(request, timeout=20.0) as response:
+            with urlopen(request, timeout=20.0, validate=False) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -345,7 +345,7 @@ class OllamaEmbeddingProvider:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urlopen(request, timeout=60.0) as response:
+            with urlopen(request, timeout=60.0, validate=False) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -500,7 +500,7 @@ class GeminiEmbeddingProvider:
             },
         )
         try:
-            with urlopen(request, timeout=30.0) as response:
+            with urlopen(request, timeout=30.0, validate=False) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -568,7 +568,7 @@ class CloudflareEmbeddingProvider:
             },
         )
         try:
-            with urlopen(request, timeout=30.0) as response:
+            with urlopen(request, timeout=30.0, validate=False) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -1029,7 +1029,7 @@ class MemoryEmbeddingEngine:
             # Build eligibility mask without scanning scores twice.
             if scope or project_id:
                 eligible = [
-                    i for i, (node_scope, node_project) in enumerate(zip(index.scopes, index.projects))
+                    i for i, (node_scope, node_project) in enumerate(zip(index.scopes, index.projects, strict=True))
                     if self._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope)
                 ]
                 if not eligible:
@@ -1058,13 +1058,13 @@ class MemoryEmbeddingEngine:
         q_norm = math.sqrt(sum(v * v for v in query_vector)) or 1.0
         ranked: list[tuple[str, float]] = []
         for node_id, node_scope, node_project, vector in zip(
-            index.node_ids, index.scopes, index.projects, index.vectors
+            index.node_ids, index.scopes, index.projects, index.vectors, strict=True
         ):
             if len(vector) != dims:
                 continue
             if not self._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope):
                 continue
-            score = sum(a * b for a, b in zip(query_vector, vector)) / q_norm
+            score = sum(a * b for a, b in zip(query_vector, vector, strict=True)) / q_norm
             if score >= threshold:
                 ranked.append((node_id, float(score)))
         ranked.sort(key=lambda item: item[1], reverse=True)

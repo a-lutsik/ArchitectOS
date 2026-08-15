@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 import json
 import logging
 import os
 import re
 import sqlite3
 import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -764,12 +764,27 @@ class SQLiteMemoryRepository:
             cur = conn.execute("DELETE FROM memory_edges WHERE id = ?", (edge_id,))
             return cur.rowcount > 0
 
-    def list_nodes(self, limit: int | None = None, project_id: str | None = None) -> list[MemoryNode]:
+    def list_nodes(self, limit: int | None = None, project_id: str | None = None, *, status: str | None = None, include_shared: bool = False) -> list[MemoryNode]:
+        """Load memory nodes with optional project / status filters.
+
+        When ``project_id`` is set and ``include_shared`` is True, also returns
+        nodes with a null/empty project_id and nodes scoped as shared/global —
+        the set the graph view needs without a full-table scan.
+        """
         sql = "SELECT payload FROM memory_nodes"
         params: list[Any] = []
-        if project_id:
-            sql += " WHERE project_id = ?"
+        clauses: list[str] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if project_id and include_shared:
+            clauses.append("(project_id = ? OR project_id IS NULL OR project_id = '' OR scope IN ('shared', 'global'))")
             params.append(project_id)
+        elif project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         # Timestamps have second resolution, so ties are common; rowid keeps the
         # order deterministic (insertion order) regardless of the query plan.
         sql += " ORDER BY updated_at DESC, created_at DESC, rowid ASC"

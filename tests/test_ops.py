@@ -225,6 +225,38 @@ class ProductionOpsTests(unittest.TestCase):
             self.assertFalse(result["supported"])
             self.assertIn("zenity", result["message"])
 
+    def test_unhandled_api_error_hides_exception_text(self) -> None:
+        service = ArchitectOSService(Path(__file__).resolve().parents[1])
+
+        class TestHandler(ArchitectOSHandler):
+            pass
+
+        TestHandler.service = service
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        headers = {"X-ArchitectOS-Token": service.auth_token, "Content-Type": "application/json"}
+        try:
+            with mock.patch.object(service, "health", side_effect=RuntimeError("/Users/secret/path boom")):
+                try:
+                    urllib.request.urlopen(
+                        urllib.request.Request(f"{base_url}/api/health", headers=headers),
+                        timeout=10,
+                    )
+                    self.fail("expected HTTPError")
+                except urllib.error.HTTPError as exc:
+                    self.assertEqual(exc.code, 500)
+                    body = json.loads(exc.read().decode("utf-8"))
+                    self.assertEqual(body["error"], "Internal server error")
+                    self.assertIn("error_id", body)
+                    self.assertNotIn("/Users/secret", body["error"])
+                    self.assertNotIn("boom", body["error"])
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

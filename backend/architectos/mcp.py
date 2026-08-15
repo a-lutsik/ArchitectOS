@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import SECRET_MASK
-from .netutil import validate_outbound_url
+from .netutil import outbound_policy, validate_outbound_url
 from .ssl_util import urlopen
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -483,9 +483,11 @@ class MCPRemoteHTTPClient:
             headers["Authorization"] = f"Bearer {access_token}"
         request = urllib.request.Request(self.config.url, data=body, method="POST", headers=headers)
         effective_timeout = timeout if timeout and timeout > 0 else self.timeout
+        allow_local = _allow_local_remote_urls(self.config)
         try:
-            with urlopen(request, timeout=effective_timeout) as response:
-                raw = response.read().decode("utf-8", errors="replace")
+            with outbound_policy(allow_local=allow_local):
+                with urlopen(request, timeout=effective_timeout, allow_local=allow_local, validate=False) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise MCPError(f"Remote MCP HTTP {exc.code}: {detail or exc.reason}") from exc
@@ -572,7 +574,7 @@ class MCPManager:
 
     def close_all_sessions(self) -> None:
         with self._sessions_lock:
-            for server_id, (client, _) in list(self._sessions.items()):
+            for _server_id, (client, _) in list(self._sessions.items()):
                 try:
                     if hasattr(client, "close"):
                         client.close()
@@ -618,16 +620,21 @@ class MCPManager:
             raise MCPError("MCP server id is required.")
         servers = self._load_servers()
         payload = dict(payload)
+        # Auth tokens are written only by the OAuth flow — never accept client-supplied auth.
+        payload.pop("auth", None)
         updated = False
         for index, item in enumerate(servers):
             if str(item.get("id")) == server_id:
                 self._restore_masked_secrets(payload, item)
                 merged = {**item, **payload}
+                # Preserve stored OAuth material even if a stale client field slipped through.
+                merged["auth"] = dict(item.get("auth") or {})
                 servers[index] = MCPServerConfig.from_dict(merged).to_dict()
                 updated = True
                 break
         if not updated:
             self._restore_masked_secrets(payload, {})
+            payload["auth"] = {}
             servers.append(MCPServerConfig.from_dict(payload).to_dict())
         self._save_servers(servers)
         return self.get_server(server_id).to_dict(include_secrets=False)  # type: ignore[union-attr]
@@ -713,7 +720,7 @@ class MCPManager:
             client_secret = str(auth.get("client_secret") or "")
             if client_secret:
                 form["client_secret"] = client_secret
-            token = self._post_form(str(auth.get("token_endpoint") or ""), form)
+            token = self._post_form(str(auth.get("token_endpoint") or ""), form, config=config)
             access_token = str(token.get("access_token") or "")
             if not access_token:
                 raise MCPError("OAuth token response did not include an access_token.")
@@ -843,13 +850,13 @@ class MCPManager:
 
     def _discover_oauth_metadata(self, config: MCPServerConfig) -> tuple[dict[str, Any], dict[str, Any]]:
         metadata_url = self._protected_resource_metadata_url(config)
-        resource_metadata = self._fetch_json(metadata_url)
+        resource_metadata = self._fetch_json(metadata_url, config=config)
         resource_metadata["_metadata_url"] = metadata_url
         auth_servers = resource_metadata.get("authorization_servers") or []
         if not auth_servers:
             raise MCPError("MCP server did not advertise an OAuth authorization server.")
         auth_metadata_url = self._authorization_server_metadata_url(str(auth_servers[0]))
-        return resource_metadata, self._fetch_json(auth_metadata_url)
+        return resource_metadata, self._fetch_json(auth_metadata_url, config=config)
 
     def _protected_resource_metadata_url(self, config: MCPServerConfig) -> str:
         payload = json.dumps({
@@ -870,7 +877,8 @@ class MCPManager:
             },
         )
         try:
-            with urlopen(request, timeout=20.0):
+            allow_local = _allow_local_remote_urls(config)
+            with urlopen(request, timeout=20.0, allow_local=allow_local, validate=False):
                 raise MCPError("MCP server did not request OAuth authorization.")
         except urllib.error.HTTPError as exc:
             header = exc.headers.get("WWW-Authenticate") or ""
@@ -900,18 +908,32 @@ class MCPManager:
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
         }
-        registered = self._post_json(registration_endpoint, payload)
+        registered = self._post_json(registration_endpoint, payload, config=config)
         client_id = str(registered.get("client_id") or "")
         if not client_id:
             raise MCPError("OAuth registration did not return a client_id.")
         return {"client_id": client_id, "client_secret": str(registered.get("client_secret") or "")}
 
-    def _fetch_json(self, url: str) -> dict[str, Any]:
+    def _require_outbound_url(self, url: str, *, context: str, config: MCPServerConfig | None = None) -> str:
+        """SSRF-check OAuth discovery / token / registration URLs from remote metadata.
+
+        Link-local is always rejected. Loopback is allowed only when the MCP
+        server opted into allow_local (local-first OAuth against a loopback MCP).
+        """
         if not url:
-            raise MCPError("OAuth metadata URL is empty.")
-        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+            raise MCPError(f"{context} URL is empty.")
+        allow_local = _allow_local_remote_urls(config) if config is not None else False
         try:
-            with urlopen(request, timeout=20.0) as response:
+            return validate_outbound_url(url, allow_local=allow_local)
+        except ValueError as exc:
+            raise MCPError(f"{context} URL is not allowed: {exc}") from exc
+
+    def _fetch_json(self, url: str, *, config: MCPServerConfig | None = None) -> dict[str, Any]:
+        safe = self._require_outbound_url(url, context="OAuth metadata", config=config)
+        allow_local = _allow_local_remote_urls(config) if config is not None else False
+        request = urllib.request.Request(safe, headers={"Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=20.0, allow_local=allow_local) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -923,19 +945,23 @@ class MCPManager:
         except (TypeError, json.JSONDecodeError) as exc:
             raise MCPError("OAuth metadata response was not valid JSON.") from exc
 
-    def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_json(self, url: str, payload: dict[str, Any], *, config: MCPServerConfig | None = None) -> dict[str, Any]:
+        safe = self._require_outbound_url(url, context="OAuth registration", config=config)
+        allow_local = _allow_local_remote_urls(config) if config is not None else False
         body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json", "Accept": "application/json"})
-        return self._read_json_response(request, "OAuth JSON request")
+        request = urllib.request.Request(safe, data=body, method="POST", headers={"Content-Type": "application/json", "Accept": "application/json"})
+        return self._read_json_response(request, "OAuth JSON request", allow_local=allow_local)
 
-    def _post_form(self, url: str, form: dict[str, str]) -> dict[str, Any]:
+    def _post_form(self, url: str, form: dict[str, str], *, config: MCPServerConfig | None = None) -> dict[str, Any]:
+        safe = self._require_outbound_url(url, context="OAuth token", config=config)
+        allow_local = _allow_local_remote_urls(config) if config is not None else False
         body = urllib.parse.urlencode(form).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
-        return self._read_json_response(request, "OAuth token request")
+        request = urllib.request.Request(safe, data=body, method="POST", headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
+        return self._read_json_response(request, "OAuth token request", allow_local=allow_local)
 
-    def _read_json_response(self, request: urllib.request.Request, context: str) -> dict[str, Any]:
+    def _read_json_response(self, request: urllib.request.Request, context: str, *, allow_local: bool = False) -> dict[str, Any]:
         try:
-            with urlopen(request, timeout=20.0) as response:
+            with urlopen(request, timeout=20.0, allow_local=allow_local, validate=False) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -1140,7 +1166,7 @@ class MCPManager:
         client_secret = str(auth.get("client_secret") or "")
         if client_secret:
             form["client_secret"] = client_secret
-        token = self._post_form(token_endpoint, form)
+        token = self._post_form(token_endpoint, form, config=config)
         access_token = str(token.get("access_token") or "")
         if not access_token:
             raise MCPError("MCP token refresh did not return an access_token. Click Authorize and sign in again.")

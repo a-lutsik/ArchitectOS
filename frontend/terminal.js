@@ -5,12 +5,15 @@ import { escapeHtml, setElementValue } from "./dom-utils.js";
 import { state } from "./state.js";
 
 function terminalPayload(commandOverride = "") {
+  const allowDestructive = Boolean(document.querySelector("#terminal-allow-destructive")?.checked);
   return {
     project_id: state.projectId,
     command: commandOverride || document.querySelector("#terminal-command")?.value || "",
     shell: document.querySelector("#terminal-shell")?.value || "auto",
     timeout_seconds: Number(document.querySelector("#terminal-timeout")?.value || 20),
-    allow_destructive: Boolean(document.querySelector("#terminal-allow-destructive")?.checked),
+    allow_destructive: allowDestructive,
+    // Backend requires this exact confirm string in addition to the checkbox.
+    destructive_confirm: allowDestructive ? "I_UNDERSTAND_DESTRUCTIVE" : "",
   };
 }
 function renderTerminalResult(payload) {

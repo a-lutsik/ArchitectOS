@@ -42,8 +42,9 @@ target-version = "py312"
 line-length = 200
 
 [tool.ruff.lint]
-# The codebase predates a linter; start with high-value rules only.
-select = ["E9", "F"]
+# The codebase predates a linter; keep the ruleset tight: high-value rules
+# plus import sorting (I) and bugbear (B).
+select = ["E9", "F", "I", "B"]
 ignore = [
     # Many intentionally unused loop/unpack variables.
     "F841",

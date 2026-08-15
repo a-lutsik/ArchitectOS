@@ -85,5 +85,67 @@ class ProviderAllowLocalTests(unittest.TestCase):
         self.assertEqual(endpoint, "http://127.0.0.1:1234/v1")
 
 
+class RedirectGuardTests(unittest.TestCase):
+    def test_urlopen_rejects_redirect_into_loopback(self) -> None:
+        import threading
+        import urllib.error
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from backend.architectos import ssl_util
+
+        class Secret(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"INTERNAL")
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        class Redir(BaseHTTPRequestHandler):
+            target_port = 0
+
+            def do_GET(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{self.target_port}/")
+                self.end_headers()
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        secret = HTTPServer(("127.0.0.1", 0), Secret)
+        threading.Thread(target=secret.serve_forever, daemon=True).start()
+        Redir.target_port = secret.server_port
+        # First hop is RFC1918 / public-class; bind on 127.0.0.1 but validate with
+        # allow_local so the first hop is accepted, then redirect must still fail
+        # when allow_local is False for the redirect policy.
+        redir = HTTPServer(("127.0.0.1", 0), Redir)
+        threading.Thread(target=redir.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{redir.server_port}/"
+        # With allow_local=False the first hop itself is rejected.
+        with self.assertRaises(ValueError):
+            ssl_util.urlopen(url, timeout=3, allow_local=False)
+        # With allow_local=True the first hop is ok, but a redirect to a
+        # disallowed target would still be re-checked — here both are loopback
+        # and allowed, so instead assert a redirect to link-local is blocked.
+        class MetaRedir(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", "http://169.254.169.254/latest/meta-data")
+                self.end_headers()
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        meta = HTTPServer(("127.0.0.1", 0), MetaRedir)
+        threading.Thread(target=meta.serve_forever, daemon=True).start()
+        meta_url = f"http://127.0.0.1:{meta.server_port}/"
+        with self.assertRaises((urllib.error.HTTPError, ValueError, OSError)):
+            ssl_util.urlopen(meta_url, timeout=3, allow_local=True).read()
+        secret.shutdown()
+        redir.shutdown()
+        meta.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

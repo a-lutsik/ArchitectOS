@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
-import ast
 import platform
 import re
 import shutil
@@ -123,12 +123,42 @@ def is_runnable_install_command(command: str) -> bool:
     return True
 
 
+# Only package-manager installers are allowed to run via the LSP install path.
+# Custom shell payloads (curl|sh, python -c, …) are rejected even if "runnable".
+_SAFE_INSTALL_PREFIXES = (
+    "npm install -g ",
+    "npm i -g ",
+    "go install ",
+    "rustup component add ",
+    "HOMEBREW_NO_AUTO_UPDATE=1 brew install ",
+    "brew install ",
+    "scoop install ",
+)
+
+
+def is_safe_install_command(command: str, server_id: str = "") -> bool:
+    """True when *command* is the known default for the server or a safe package-manager install."""
+    text = (command or "").strip()
+    if not is_runnable_install_command(text):
+        return False
+    preferred = default_install_command(server_id)
+    if preferred and text == preferred:
+        return True
+    # Reject shell metacharacters / substitution outside the known compound defaults.
+    if re.search(r"[|&`$<>\n]|\$\(|`", text):
+        return False
+    if ";" in text:
+        return False
+    lowered = text.lower()
+    return any(lowered.startswith(prefix.lower()) for prefix in _SAFE_INSTALL_PREFIXES)
+
+
 def resolve_install_command(server_id: str, stored: str = "") -> str:
     stored = (stored or "").strip()
     preferred = default_install_command(server_id)
     if not stored:
         return preferred
-    if not is_runnable_install_command(stored):
+    if not is_safe_install_command(stored, server_id):
         return preferred
     # Drop cross-platform leftovers (e.g. brew command persisted on Windows).
     system = platform.system().lower()
@@ -494,6 +524,21 @@ class CodeIntelligenceManager:
         server_id = str(payload.get("id") or "").strip()
         if not server_id:
             raise LSPError("Language server id is required.")
+        payload = dict(payload)
+        # Never persist arbitrary shell as install_command — resolve to a safe default.
+        if "install_command" in payload:
+            payload["install_command"] = resolve_install_command(server_id, str(payload.get("install_command") or ""))
+            if payload["install_command"] and not is_safe_install_command(payload["install_command"], server_id):
+                raise LSPError("install_command must be a known package-manager install for this language server.")
+        # Command argv only — reject shell strings.
+        if "command" in payload:
+            command = payload.get("command")
+            if isinstance(command, str):
+                command = command.split()
+            command = [str(part) for part in (command or []) if str(part).strip()]
+            if any(re.search(r"[;&|`$<>]", part) for part in command):
+                raise LSPError("Language server command must be an argv list without shell metacharacters.")
+            payload["command"] = command
         servers = self._load_servers()
         updated = False
         for index, item in enumerate(servers):
@@ -548,6 +593,8 @@ class CodeIntelligenceManager:
         if not config:
             raise LSPError("Language server not found.")
         command = resolve_install_command(config.id, config.install_command)
+        if not is_safe_install_command(command, config.id):
+            raise LSPError(f"No safe install command for {server_id}. Refusing to run arbitrary shell.")
         if not is_runnable_install_command(command):
             raise LSPError(f"No runnable install command for {server_id}. {command or 'Configure install_command first.'}")
         prereq = install_prerequisites(config.id)

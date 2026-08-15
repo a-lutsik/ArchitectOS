@@ -11,13 +11,13 @@ access and other service helpers are reached through ``self`` via the MRO on
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import logging
 import os
 import re
 import shlex
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,6 +27,7 @@ from .constants import (
     SOURCE_FILE_SUFFIXES,
     SYSTEM_PROJECT_ID,
     TERMINAL_DANGEROUS_PATTERNS,
+    TERMINAL_DESTRUCTIVE_CONFIRM,
     TERMINAL_SHELLS,
 )
 
@@ -310,7 +311,8 @@ class ToolExecServiceMixin:
             raise ValueError("terminal command is required")
         risk = self._terminal_command_risk(command)
         allow_destructive = bool(payload.get("allow_destructive") or payload.get("approved"))
-        if risk and not allow_destructive:
+        confirm = str(payload.get("destructive_confirm") or "").strip()
+        if risk and not (allow_destructive and confirm == TERMINAL_DESTRUCTIVE_CONFIRM):
             return {
                 "project_id": project_id,
                 "root": str(root),
@@ -318,9 +320,13 @@ class ToolExecServiceMixin:
                 "status": "blocked",
                 "returncode": None,
                 "stdout": "",
-                "stderr": f"Blocked risky command: {risk}. Enable destructive commands to run it.",
+                "stderr": (
+                    f"Blocked risky command: {risk}. "
+                    f"To run it, set allow_destructive=true and destructive_confirm={TERMINAL_DESTRUCTIVE_CONFIRM!r}."
+                ),
                 "duration_ms": 0,
                 "redacted": False,
+                "requires_confirm": TERMINAL_DESTRUCTIVE_CONFIRM,
             }
         shell_id = self._terminal_shell_id(str(payload.get("shell") or "auto"))
         shell = self._terminal_shell_command(shell_id)

@@ -7,16 +7,56 @@ proxy. Every user-controlled outbound HTTP target is validated here before a
 request is made. Operators can explicitly opt a trusted endpoint into loopback
 access via allow_local; link-local cloud metadata endpoints stay blocked even
 then.
+
+Redirect hops are re-validated by ``ssl_util.urlopen`` (see
+``ValidatingHTTPRedirectHandler``) so a public first hop cannot bounce into
+loopback or cloud metadata. OAuth metadata / token / registration URLs from
+remote MCP servers must also pass through ``validate_outbound_url``.
 """
 
 from __future__ import annotations
 
+import contextvars
 import ipaddress
 import socket
+import urllib.error
 import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from typing import Iterator
 
 _ALLOWED_SCHEMES = {"http", "https"}
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+_MAX_REDIRECTS = 5
+
+# Per-request policy for redirect revalidation (adapters/MCP set this when
+# allow_local=True so a trusted local hop may redirect to another local hop).
+_outbound_allow_local: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "architectos_outbound_allow_local", default=False
+)
+_outbound_validate_initial: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "architectos_outbound_validate_initial", default=True
+)
+
+
+@contextmanager
+def outbound_policy(*, allow_local: bool = False, validate_initial: bool = True) -> Iterator[None]:
+    """Scope allow_local / initial-URL validation for subsequent ``ssl_util.urlopen`` calls."""
+    token_local = _outbound_allow_local.set(bool(allow_local))
+    token_validate = _outbound_validate_initial.set(bool(validate_initial))
+    try:
+        yield
+    finally:
+        _outbound_allow_local.reset(token_local)
+        _outbound_validate_initial.reset(token_validate)
+
+
+def current_allow_local() -> bool:
+    return bool(_outbound_allow_local.get())
+
+
+def current_validate_initial() -> bool:
+    return bool(_outbound_validate_initial.get())
 
 
 def validate_outbound_url(url: str, *, allow_local: bool = False) -> str:
@@ -100,3 +140,28 @@ def _rejection_reason(address: ipaddress.IPv4Address | ipaddress.IPv6Address, *,
     if address.is_multicast:
         return f"the multicast address {address}"
     return ""
+
+
+class ValidatingHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect Location against the SSRF policy.
+
+    Standard ``urlopen`` follows 3xx without checking the new host, so a
+    public first hop could bounce into loopback or cloud metadata. Each hop
+    is checked with the same ``allow_local`` policy as the original request.
+    """
+
+    def __init__(self, *, allow_local: bool | None = None, max_hops: int = _MAX_REDIRECTS) -> None:
+        super().__init__()
+        self._allow_local = current_allow_local() if allow_local is None else bool(allow_local)
+        self._max_hops = max(1, int(max_hops))
+        self._hops = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        self._hops += 1
+        if self._hops > self._max_hops:
+            raise urllib.error.HTTPError(req.full_url, 310, "too many redirects", headers, fp)
+        try:
+            validate_outbound_url(str(newurl), allow_local=self._allow_local)
+        except ValueError as exc:
+            raise urllib.error.HTTPError(req.full_url, 403, f"redirect blocked: {exc}", headers, fp) from exc
+        return super().redirect_request(req, fp, code, msg, headers, newurl)

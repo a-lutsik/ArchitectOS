@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import re
+import secrets
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -155,7 +156,9 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(payload)
                 self.wfile.flush()
         except Exception as exc:
-            payload = f"data: {json.dumps({'type': 'error', 'error': str(exc)}, sort_keys=True)}\n\n".encode("utf-8")
+            error_id = secrets.token_hex(4)
+            _LOG.exception("Unhandled SSE error id=%s", error_id)
+            payload = f"data: {json.dumps({'type': 'error', 'error': 'Internal server error', 'error_id': error_id}, sort_keys=True)}\n\n".encode("utf-8")
             self.wfile.write(payload)
             self.wfile.flush()
 
@@ -174,12 +177,20 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
             super().log_message(format, *args)
 
     def _error(self, exc: Exception) -> None:
-        body = {"error": str(exc), "type": exc.__class__.__name__}
         if isinstance(exc, ValueError):
-            self._json(body, HTTPStatus.BAD_REQUEST)
+            self._json({"error": str(exc), "type": exc.__class__.__name__}, HTTPStatus.BAD_REQUEST)
             return
-        _LOG.exception("Unhandled API error")
-        self._json(body, HTTPStatus.INTERNAL_SERVER_ERROR)
+        # Never leak exception text (paths, SQL, network details) to the client.
+        error_id = secrets.token_hex(4)
+        _LOG.exception("Unhandled API error id=%s", error_id)
+        self._json(
+            {
+                "error": "Internal server error",
+                "error_id": error_id,
+                "type": "InternalError",
+            },
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
     def _request_origin(self) -> str:
         """Own origin for postMessage targets — never '*'."""
