@@ -2,23 +2,32 @@
 
 Extracted from ``service.py``. Covers the filesystem/memory tool callbacks
 (``fs_read``/``fs_list``/``fs_search``/``fs_write``, ``memory_search``/``memory_get``),
-project file-reference resolution, and the small Azure Boards id helper. Depends
-only on shared constants and stdlib; repository access and other service helpers
-are reached through ``self`` via the MRO on :class:`ArchitectOSService`.
+project file-reference resolution, the interactive terminal runners
+(``terminal_run``/``terminal_open`` and their shell helpers), and the small
+Azure Boards id helper. Depends only on shared constants and stdlib; repository
+access and other service helpers are reached through ``self`` via the MRO on
+:class:`ArchitectOSService`.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
+import os
 import re
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .constants import (
     FS_READ_MAX_CHARS,
     FS_READ_MAX_LINES,
     SOURCE_FILE_SUFFIXES,
     SYSTEM_PROJECT_ID,
+    TERMINAL_DANGEROUS_PATTERNS,
+    TERMINAL_SHELLS,
 )
 
 _LOG = logging.getLogger("architectos.service")
@@ -290,3 +299,133 @@ class ToolExecServiceMixin:
             text = args.get("content")
         return self.save_project_file({"project_id": project_id, "path": path, "text": str(text if text is not None else "")})
 
+
+    # --- Terminal ----------------------------------------------------------
+
+    def terminal_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "architectos")
+        root = self._project_root(project_id)
+        command = str(payload.get("command") or "").strip()
+        if not command:
+            raise ValueError("terminal command is required")
+        risk = self._terminal_command_risk(command)
+        allow_destructive = bool(payload.get("allow_destructive") or payload.get("approved"))
+        if risk and not allow_destructive:
+            return {
+                "project_id": project_id,
+                "root": str(root),
+                "command": command,
+                "status": "blocked",
+                "returncode": None,
+                "stdout": "",
+                "stderr": f"Blocked risky command: {risk}. Enable destructive commands to run it.",
+                "duration_ms": 0,
+                "redacted": False,
+            }
+        shell_id = self._terminal_shell_id(str(payload.get("shell") or "auto"))
+        shell = self._terminal_shell_command(shell_id)
+        timeout = min(max(int(payload.get("timeout_seconds") or 20), 1), 120)
+        started = datetime.now(timezone.utc)
+        try:
+            proc = subprocess.run([*shell, command], cwd=str(root), text=True, capture_output=True, timeout=timeout, shell=False)
+            duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        except subprocess.TimeoutExpired as exc:
+            stdout, stdout_redacted = self.security_policy.redact_text(cast(str, exc.stdout or "")[:80_000])
+            stderr, stderr_redacted = self.security_policy.redact_text(cast(str, exc.stderr or "")[:20_000])
+            return {
+                "project_id": project_id,
+                "root": str(root),
+                "command": command,
+                "shell": shell_id,
+                "status": "timeout",
+                "returncode": None,
+                "stdout": stdout,
+                "stderr": stderr or f"Command timed out after {timeout}s.",
+                "duration_ms": timeout * 1000,
+                "redacted": stdout_redacted or stderr_redacted,
+            }
+        except OSError as exc:
+            return {
+                "project_id": project_id,
+                "root": str(root),
+                "command": command,
+                "shell": shell_id,
+                "status": "unavailable",
+                "returncode": None,
+                "stdout": "",
+                "stderr": f"Terminal shell failed: {exc}",
+                "duration_ms": 0,
+                "redacted": False,
+            }
+        stdout, stdout_redacted = self.security_policy.redact_text((proc.stdout or "")[:80_000])
+        stderr, stderr_redacted = self.security_policy.redact_text((proc.stderr or "")[:20_000])
+        return {
+            "project_id": project_id,
+            "root": str(root),
+            "command": command,
+            "shell": shell_id,
+            "status": "ok" if proc.returncode == 0 else "error",
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "duration_ms": duration_ms,
+            "redacted": stdout_redacted or stderr_redacted,
+        }
+
+    def terminal_open(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "architectos")
+        root = self._project_root(project_id)
+        commands = self._terminal_open_commands(root)
+        errors = []
+        for command in commands:
+            try:
+                subprocess.Popen(command, cwd=str(root), shell=False)
+                return {"project_id": project_id, "root": str(root), "status": "opened", "command": command}
+            except OSError as exc:
+                errors.append(str(exc))
+        return {"project_id": project_id, "root": str(root), "status": "unavailable", "message": "; ".join(errors[-3:]) or "No terminal launcher found."}
+
+    def _terminal_shell_id(self, requested: str) -> str:
+        requested = requested.lower().strip()
+        if requested in TERMINAL_SHELLS:
+            return requested
+        if os.name == "nt":
+            return "cmd" if shutil.which("cmd.exe") else "powershell"
+        return "bash" if shutil.which("bash") else "sh"
+
+    def _terminal_shell_command(self, shell_id: str) -> list[str]:
+        command = TERMINAL_SHELLS.get(shell_id) or TERMINAL_SHELLS[self._terminal_shell_id("auto")]
+        executable = shutil.which(command[0])
+        if not executable:
+            raise OSError(f"shell executable not found: {command[0]}")
+        return [executable, *command[1:]]
+
+    def _terminal_command_risk(self, command: str) -> str:
+        normalized = command.strip()
+        for pattern in TERMINAL_DANGEROUS_PATTERNS:
+            match = pattern.search(normalized)
+            if match:
+                return match.group(0)
+        return ""
+
+    def _terminal_open_commands(self, root: Path) -> list[list[str]]:
+        if os.name == "nt":
+            commands = []
+            wt = shutil.which("wt.exe") or shutil.which("wt")
+            if wt:
+                commands.append([wt, "-d", str(root)])
+            powershell = shutil.which("powershell.exe")
+            if powershell:
+                literal_root = str(root).replace("'", "''")
+                commands.append([powershell, "-NoLogo", "-NoExit", "-Command", f"Set-Location -LiteralPath '{literal_root}'"])
+            cmd = shutil.which("cmd.exe")
+            if cmd:
+                commands.append([cmd, "/k", f"cd /d {root}"])
+            return commands
+        candidates = [
+            ("x-terminal-emulator", ["-e", "sh", "-lc", f"cd {shlex.quote(str(root))}; exec $SHELL"]),
+            ("gnome-terminal", ["--working-directory", str(root)]),
+            ("konsole", ["--workdir", str(root)]),
+            ("open", ["-a", "Terminal", str(root)]),
+        ]
+        return [[path, *args] for executable, args in candidates if (path := shutil.which(executable))]

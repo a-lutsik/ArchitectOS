@@ -74,6 +74,7 @@ module = [
     "architectos.graph_service",
     "architectos.ingestion_service",
     "architectos.integrations_service",
+    "architectos.lifecycle_service",
     "architectos.project_scan_service",
     "architectos.providers_council_service",
     "architectos.retrieval_service",

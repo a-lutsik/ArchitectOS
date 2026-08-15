@@ -1,4 +1,12 @@
-// File editor module. Classic script loaded before app.js; shares global scope.
+// File editor module. ES module.
+import { api } from "./api-client.js";
+import { on } from "./dom-utils.js";
+import { getFileExtension } from "./file-tree.js";
+import { loadProjectFiles } from "./projects.js";
+import { projectParam, state } from "./state.js";
+import { showError } from "./ui.js";
+import { workspaceChat } from "./workspace-chat.js";
+
 const fileEditor = {
   currentFile: null,
   originalContent: '',
@@ -514,3 +522,5 @@ const fileEditor = {
     return iconMap[ext] || '📄';
   }
 };
+
+export { fileEditor };

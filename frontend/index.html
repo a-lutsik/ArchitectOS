@@ -1670,32 +1670,7 @@
       </div>
     </div>
 
-    <script src="/i18n.js"></script>
-    <script src="/state.js"></script>
-    <script src="/dom-utils.js"></script>
-    <script src="/api-client.js"></script>
-    <script src="/ui.js"></script>
-    <script src="/mcp_master_detail.js"></script>
-    <script src="/workspace_resizer.js"></script>
-    <script src="/rich-response.js"></script>
-    <script src="/file-find.js"></script>
-    <script src="/search-palette.js"></script>
-    <script src="/file-editor.js"></script>
-    <script src="/project-wizard.js"></script>
-    <script src="/workspace-chat.js"></script>
-    <script src="/voice-memory.js"></script>
-    <script src="/terminal.js"></script>
-    <script src="/code-intel.js"></script>
-    <script src="/memory-panel.js"></script>
-    <script src="/memory-ingest.js"></script>
-    <script src="/providers.js"></script>
-    <script src="/settings.js"></script>
-    <script src="/agent-activity.js"></script>
-    <script src="/chat.js"></script>
-    <script src="/graph.js"></script>
-    <script src="/projects.js"></script>
-    <script src="/ask-ui.js"></script>
-    <script src="/file-tree.js"></script>
-    <script src="/app.js"></script>
+    <!-- Single native ES module entry; frontend/main.js imports the rest in dependency order. -->
+    <script type="module" src="/main.js"></script>
   </body>
 </html>

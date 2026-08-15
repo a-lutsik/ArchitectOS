@@ -1,4 +1,9 @@
 /* Settings, embeddings, router — extracted from app.js */
+import { api } from "./api-client.js";
+import { escapeHtml, showSnackbar } from "./dom-utils.js";
+import { state } from "./state.js";
+import { applyDensity, applyLanguage, applyTheme } from "./ui.js";
+
 async function loadSettings() {
   const settings = await api("/api/settings");
   const ui = settings.ui || {};
@@ -248,3 +253,9 @@ async function previewRouting(query) {
   const ranked = (decision.ranked || []).map(item => `<article class="result${item.provider_id === decision.selected ? " selected" : ""}"><div class="row"><strong>${escapeHtml(item.label)}</strong><span class="badge">score ${escapeHtml(String(item.score))}</span></div><span class="badge">quality ${escapeHtml(String(item.quality))}</span><span class="badge">cost ${escapeHtml(String(item.cost))}</span><span class="badge">latency ${escapeHtml(String(item.latency))}</span><span class="badge">${item.availability > 0 ? "available" : "offline"}</span>${item.matches_role ? '<span class="badge">role match</span>' : ""}</article>`).join("");
   container.innerHTML = `<article class="result"><strong>Role: ${escapeHtml(payload.role || "auto")} · Strategy: ${escapeHtml(decision.strategy || "")}</strong><p>${escapeHtml(decision.reason || "")}</p></article>${ranked}`;
 }
+
+export {
+  ROUTER_PRESETS, loadRouterSettings, loadSettings, previewRouting,
+  rebuildEmbeddingsIndex, refreshEmbeddingModelOptions, runSecurityPreview,
+  saveEmbeddingsSettings, saveRouterSettings, setRouterWeights, syncRouterWeightLabels,
+};

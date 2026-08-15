@@ -1,4 +1,11 @@
-// Search command palette. Classic script loaded before app.js; shares global scope.
+// Search command palette. ES module.
+import { api } from "./api-client.js";
+import { switchView } from "./ask-ui.js";
+import { escapeHtml, showSnackbar } from "./dom-utils.js";
+import { graphState, openGraphNodeModal } from "./graph.js";
+import { projectParam, state, t } from "./state.js";
+import { renderResults, showError } from "./ui.js";
+
 const searchPalette = {
   isOpen: false,
   highlightedIndex: -1,
@@ -395,3 +402,5 @@ const searchPalette = {
     });
   }
 };
+
+export { searchPalette };

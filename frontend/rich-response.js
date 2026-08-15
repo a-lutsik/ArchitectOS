@@ -1,5 +1,7 @@
-/* ArchitectOS rich assistant responses: Markdown + Mermaid + action chips. */
-(function (global) {
+/* ArchitectOS rich assistant responses: Markdown + Mermaid + action chips.
+   ES module. The vendored mermaid (/vendor/mermaid.min.js) stays a classic
+   script injected on demand below; it registers window.mermaid. */
+const ArchitectOSRich = (function (global) {
   "use strict";
 
   // Vendored copy (mermaid@10.9.3): the app CSP is script-src 'self', and a
@@ -421,7 +423,7 @@
     element.textContent = text || "";
   }
 
-  global.ArchitectOSRich = {
+  return {
     extractArchitectosBlock,
     parseResponse,
     renderInto,
@@ -429,3 +431,5 @@
     renderMarkdown,
   };
 })(window);
+
+export { ArchitectOSRich };

@@ -2,7 +2,7 @@
 
 ``RetrievalServiceMixin`` owns hybrid search (``search_memory``), context
 packing, bi-temporal visibility, metadata filtering, the PageRank graph
-expansion and the per-source node quota. Pure mixin: every method runs on
+expansion, the per-source node quota, and retrieval feedback recording. Pure mixin: every method runs on
 ``self`` (``repository``, ``memory_embeddings``, ``search_strategy``,
 ``memory_lifecycle``, ``graph_auto_linker``) provided by the concrete
 service, so behavior is unchanged.
@@ -638,3 +638,53 @@ class RetrievalServiceMixin:
             if not progressed:
                 break
         return selected[:limit]
+
+    def record_retrieval_feedback(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = dict(payload or {})
+        project_id = str(payload.get("project_id") or "architectos")
+        chat_id = str(payload.get("chat_id") or "").strip()
+        message_index = payload.get("message_index")
+        hit_ids = [str(item).strip() for item in (payload.get("hit_ids") or []) if str(item).strip()]
+        query = str(payload.get("query") or "").strip()
+        run_id = str(payload.get("run_id") or "").strip()
+
+        if chat_id and message_index is not None:
+            chat = self.repository.get_chat(chat_id)
+            if chat:
+                messages = list(chat.get("messages") or [])
+                try:
+                    idx = int(message_index)
+                except (TypeError, ValueError):
+                    idx = -1
+                if 0 <= idx < len(messages):
+                    msg = dict(messages[idx])
+                    if not hit_ids:
+                        hit_ids = [str(item).strip() for item in (msg.get("memory_hit_ids") or []) if str(item).strip()]
+                    if not query:
+                        # Prefer previous user turn as the retrieval query.
+                        for prior in reversed(messages[:idx]):
+                            if prior.get("role") == "user":
+                                query = str(prior.get("text") or "").strip()
+                                break
+                    if not run_id:
+                        run_id = str(msg.get("run_id") or "").strip()
+                    msg["retrieval_rating"] = int(payload.get("rating") or 0)
+                    messages[idx] = msg
+                    chat["messages"] = messages
+                    self.repository.upsert_chat(chat)
+
+        record = self.repository.add_retrieval_feedback({
+            "project_id": project_id,
+            "chat_id": chat_id,
+            "run_id": run_id,
+            "message_index": message_index,
+            "query": query,
+            "rating": payload.get("rating"),
+            "hit_ids": hit_ids,
+            "note": payload.get("note") or "",
+        })
+        return {"feedback": record, "hit_count": len(hit_ids)}
+
+    def list_retrieval_feedback(self, project_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        items = self.repository.list_retrieval_feedback(project_id, limit)
+        return {"feedback": items, "count": len(items)}

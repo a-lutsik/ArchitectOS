@@ -1,4 +1,18 @@
 /* Projects, onboarding, workspace files, search/context, tasks — extracted from app.js */
+import { api, ensureServerOnline } from "./api-client.js";
+import { fillCodeFileFromSelection, syncCodeFileHint } from "./code-intel.js";
+import { escapeHtml, setElementValue, setTextContent, showSnackbar } from "./dom-utils.js";
+import { fileEditor } from "./file-editor.js";
+import { fileFind } from "./file-find.js";
+import { renderFileTree } from "./file-tree.js";
+import { graphState, loadGraph, resizeGraphCanvas } from "./graph.js";
+import { projectWizard } from "./project-wizard.js";
+import {
+  currentProject, displayProjectName, isSystemWorkspace, projectParam,
+  state, syncProjectSwitcherLabel, syncProjectTerminology, t,
+} from "./state.js";
+import { renderResults, saveUiSettings, saveWorkspaceSettings, showError } from "./ui.js";
+
 async function loadProjects() {
   const payload = await api("/api/projects");
   state.projects = Array.isArray(payload.projects) ? payload.projects : [];
@@ -393,3 +407,12 @@ async function loadTasks() {
   }
   board.querySelectorAll("[data-task]").forEach(select => select.addEventListener("change", async () => { await api(`/api/tasks/${select.dataset.task}`, { method: "PATCH", body: JSON.stringify({ status: select.value }) }); await loadTasks(); await refreshWorkspace(); }));
 }
+
+export {
+  browseProjectFolder, buildContext, buildSelectedFileContext, closeProjectFolderModal,
+  initProjectFromFolder, loadGitDiff, loadProjectFiles, loadProjects, loadTasks,
+  markOnboardingComplete, maybeShowOnboarding, needsProjectOnboarding, openProjectFile,
+  openProjectFolderModal, pickProjectFolder, projectFolderModal, refreshWorkspace,
+  resetGraphFilters, runSearch, saveProjectFromFolder, scheduleGraphLoad,
+  setProjectFolderStatus, setWizardFolderStatus, syncProjectFields,
+};

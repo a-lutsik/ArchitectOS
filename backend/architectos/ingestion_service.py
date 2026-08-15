@@ -1,14 +1,19 @@
-"""Memory ingestion + rescan/maintenance scheduling for :class:`ArchitectOSService`.
+"""Memory ingestion engine, dedup hygiene, candidate review queue, and rescan scheduling.
 
-Extracted from ``service.py``. Depends only on shared constants and other leaf
-modules (never on ``service`` itself), so importing it introduces no cycle. All
-per-source ingest helpers (``self._ingest_*``) and repositories stay on the
-service and are reached through ``self`` via the MRO.
+Extracted from ``service.py``. ``MemoryIngestionEngine`` is a standalone class
+(instantiated in ``ArchitectOSService.__init__`` as ``self.ingestion_engine``);
+``IngestionServiceMixin`` carries ingest scheduling, per-source timeout budgets,
+rescan maintenance, the manual ``add_memory`` dedup path, and the memory
+candidate review queue (list/promote/reject/batch). Depends only on shared
+constants and other leaf modules (never on ``service`` itself), so importing it
+introduces no cycle. Repositories and cross-domain helpers stay on the service
+and are reached through ``self`` via the MRO.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import Counter
@@ -24,9 +29,196 @@ from .constants import (
 )
 from .mcp import MCPError
 from .models import Project, utc_now
+from .storage import SQLiteMemoryRepository
 from .teams_graph import TeamsGraphError, teams_graph_configured
 
 _LOG = logging.getLogger("architectos.service")
+TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_\-/#.]{2,}", re.IGNORECASE)
+DUPLICATE_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "will", "shall",
+    "should", "memory", "candidate", "architectos", "project", "file", "imported",
+    # Granola / meeting template boilerplate — shared across unrelated meetings.
+    "granola", "meeting", "meetings", "attendees", "attendee", "creator", "note",
+    "notes", "date", "gmt", "utc", "gmail.com", "summary", "action", "items",
+}
+
+
+def _token_set(text: str, stopwords: set[str], *, min_len: int = 1, strip_chars: str = "") -> set[str]:
+    tokens: set[str] = set()
+    for raw in TOKEN_RE.findall(text or ""):
+        token = raw.lower().strip(strip_chars) if strip_chars else raw.lower()
+        if len(token) < min_len or token in stopwords:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _token_similarity(left: set[str], right: set[str], *, containment_weight: float) -> float:
+    if not left or not right:
+        return 0.0
+    overlap = len(left & right)
+    jaccard = overlap / len(left | right)
+    containment = overlap / min(len(left), len(right))
+    return max(jaccard, containment * containment_weight)
+
+
+class MemoryIngestionEngine:
+    def __init__(self, repository: SQLiteMemoryRepository) -> None:
+        self.repository = repository
+
+    def prepare_candidates(self, project_id: str, candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        references = self._reference_items(project_id)
+        by_fingerprint = {
+            str(reference.get("fingerprint") or ""): reference
+            for reference in references
+            if reference.get("fingerprint")
+        }
+        prepared: list[dict[str, Any]] = []
+        seen_fingerprints: set[str] = set()
+        for candidate in candidates:
+            enriched = self._enrich_candidate(candidate)
+            fingerprint = str(enriched["metadata"]["fingerprint"])
+            if fingerprint in seen_fingerprints:
+                enriched["metadata"]["duplicate"] = True
+                enriched["metadata"]["duplicate_reason"] = "same ingestion batch fingerprint"
+            duplicate = self._find_duplicate(enriched, references, by_fingerprint)
+            if duplicate:
+                enriched["metadata"].update(duplicate)
+                enriched["confidence"] = min(float(enriched.get("confidence") or 0.62), 0.45)
+            prepared.append(enriched)
+            seen_fingerprints.add(fingerprint)
+            reference = self._reference_from_candidate(enriched)
+            references.append(reference)
+            by_fingerprint.setdefault(fingerprint, reference)
+            if len(prepared) >= limit:
+                break
+        return prepared
+
+    def _reference_items(self, project_id: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for node in self.repository.list_nodes():
+            if node.status != "active" or node.project_id not in {project_id, None}:
+                continue
+            meta = dict(node.metadata or {})
+            items.append({
+                "id": node.id,
+                "label": node.label,
+                "kind": "memory",
+                "tokens": self._tokens(f"{node.label} {node.text}"),
+                "fingerprint": self._fingerprint(f"{node.label} {node.text}"),
+                "meeting_id": str(meta.get("meeting_id") or ""),
+                "work_item_id": str(meta.get("work_item_id") or ""),
+                "source_type": str(meta.get("source") or meta.get("source_type") or ""),
+                "source_ref": str(meta.get("source_ref") or meta.get("granola_url") or ""),
+            })
+        for candidate in self.repository.list_memory_candidates(project_id, status=None, limit=500):
+            if candidate.get("status") not in {"candidate", "duplicate"}:
+                continue
+            items.append(self._reference_from_candidate(candidate))
+        return items
+
+    def _reference_from_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        metadata = dict(candidate.get("metadata") or {})
+        return {
+            "id": str(candidate.get("id") or ""),
+            "label": str(candidate.get("label") or ""),
+            "kind": "candidate",
+            "tokens": set(metadata.get("tokens") or self._tokens(f"{candidate.get('label', '')} {candidate.get('text', '')}")),
+            "fingerprint": str(metadata.get("fingerprint") or self._fingerprint(f"{candidate.get('label', '')} {candidate.get('text', '')}")),
+            "meeting_id": str(metadata.get("meeting_id") or ""),
+            "work_item_id": str(metadata.get("work_item_id") or ""),
+            "source_type": str(candidate.get("source_type") or metadata.get("source") or ""),
+            "source_ref": str(candidate.get("source_ref") or metadata.get("granola_url") or ""),
+        }
+
+    def _enrich_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(candidate)
+        metadata = dict(enriched.get("metadata") or {})
+        text = f"{enriched.get('label', '')} {enriched.get('text', '')}"
+        tokens = sorted(self._tokens(text))
+        meeting_id = str(metadata.get("meeting_id") or "").strip()
+        work_item_id = str(metadata.get("work_item_id") or "").strip()
+        fingerprint = self._fingerprint(text)
+        if meeting_id:
+            # Meeting identity must dominate fingerprint so distinct Granola notes never collide.
+            fingerprint = f"meeting:{meeting_id}|{fingerprint}"
+        if work_item_id:
+            fingerprint = f"ado:{work_item_id}|{fingerprint}"
+        metadata.setdefault("fingerprint", fingerprint)
+        metadata.setdefault("tokens", tokens[:24])
+        metadata.setdefault("duplicate", False)
+        enriched["metadata"] = metadata
+        return enriched
+
+    def _find_duplicate(
+        self,
+        candidate: dict[str, Any],
+        references: list[dict[str, Any]],
+        by_fingerprint: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        metadata = dict(candidate.get("metadata") or {})
+        candidate_tokens = set(metadata.get("tokens") or [])
+        candidate_fingerprint = str(metadata.get("fingerprint") or "")
+        candidate_meeting_id = str(metadata.get("meeting_id") or "").strip()
+        candidate_work_item_id = str(metadata.get("work_item_id") or "").strip()
+        candidate_source = str(candidate.get("source_type") or metadata.get("source") or "")
+        if by_fingerprint is not None and candidate_fingerprint:
+            # Fast path: exact fingerprint match without scanning every reference.
+            exact = by_fingerprint.get(candidate_fingerprint)
+            if exact and str(exact.get("id") or "") != str(candidate.get("id") or ""):
+                return {
+                    "duplicate": True,
+                    "duplicate_score": 1.0,
+                    "duplicate_of": exact.get("id"),
+                    "duplicate_label": exact.get("label"),
+                    "duplicate_kind": exact.get("kind"),
+                }
+        best: dict[str, Any] | None = None
+        for reference in references:
+            if reference.get("id") == candidate.get("id"):
+                continue
+            ref_meeting_id = str(reference.get("meeting_id") or "").strip()
+            ref_work_item_id = str(reference.get("work_item_id") or "").strip()
+            # Distinct Granola/meeting identities are never textual duplicates of each other.
+            if candidate_meeting_id and ref_meeting_id and candidate_meeting_id != ref_meeting_id:
+                continue
+            if candidate_work_item_id and ref_work_item_id and candidate_work_item_id != ref_work_item_id:
+                continue
+            if candidate_work_item_id and ref_work_item_id and candidate_work_item_id == ref_work_item_id:
+                return {
+                    "duplicate": True,
+                    "duplicate_score": 1.0,
+                    "duplicate_of": reference.get("id"),
+                    "duplicate_label": reference.get("label"),
+                    "duplicate_kind": reference.get("kind"),
+                    "duplicate_reason": "same Azure Boards work item id",
+                }
+            if by_fingerprint is None and reference.get("fingerprint") == candidate_fingerprint:
+                score = 1.0
+            else:
+                score = self._similarity(candidate_tokens, set(reference.get("tokens") or []))
+            # Short Granola stubs are mostly metadata; demand a stricter match.
+            threshold = 0.82 if candidate_source == "granola" and len(candidate_tokens) < 16 else 0.68
+            if score >= threshold and (not best or score > float(best["duplicate_score"])):
+                best = {
+                    "duplicate": True,
+                    "duplicate_score": round(score, 3),
+                    "duplicate_of": reference.get("id"),
+                    "duplicate_label": reference.get("label"),
+                    "duplicate_kind": reference.get("kind"),
+                }
+        return best
+    def _tokens(self, text: str) -> set[str]:
+        return _token_set(text, DUPLICATE_STOPWORDS)
+
+    def _fingerprint(self, text: str) -> str:
+        counts = Counter(self._tokens(text))
+        return "|".join(token for token, _count in counts.most_common(18))
+
+    def _similarity(self, left: set[str], right: set[str]) -> float:
+        return _token_similarity(left, right, containment_weight=0.85)
+
+
 
 
 class IngestionServiceMixin:
@@ -817,3 +1009,431 @@ class IngestionServiceMixin:
 
         threading.Thread(target=worker, name=f"architectos-memory-rescan-{trigger}", daemon=True).start()
         return {"scheduled": True, "trigger": trigger, **self.memory_rescan_status()}
+
+    # Ingest-time hygiene: an exact restatement of an existing fact updates it in
+    # place instead of spawning a duplicate; a close-but-not-identical fact is
+    # flagged (never silently merged) so a value change like "cap 5k -> 9k" stays a
+    # distinct fact the consolidation/supersede path can reason about.
+    NEAR_DUPLICATE_SIMILARITY = 0.72
+
+    def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        label = str(payload.get("label") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        scope = str(payload.get("scope") or "project")
+        if not label:
+            raise ValueError("memory label is required")
+        if not text:
+            raise ValueError("memory text is required")
+        node_type = str(payload.get("type") or "Lesson")
+        project_id = self._memory_project_id_for_scope(scope, payload.get("project_id") or "architectos")
+
+        dedup_enabled = payload.get("dedup", True) is not False
+        exact, near_id, near_score = (
+            self._ingest_dedup_scan(label, text, node_type, scope, project_id)
+            if dedup_enabled
+            else (None, "", 0.0)
+        )
+        if exact is not None:
+            return self._register_duplicate_add(exact, payload)
+
+        node = self.repository.add_node(
+            node_type,
+            label,
+            scope,
+            text,
+            project_id,
+            payload.get("interface_id"),
+            float(payload.get("confidence") or 0.8),
+            {"source": str(payload.get("source") or "ui"), "source_type": str(payload.get("source_type") or payload.get("source") or "manual")},
+        )
+        node = self.memory_lifecycle.initialize_node(node, "ui")
+        if near_id and near_score >= self.NEAR_DUPLICATE_SIMILARITY:
+            node.metadata["possible_duplicate_of"] = near_id
+            node.metadata["possible_duplicate_score"] = round(near_score, 3)
+            node = self.repository.upsert_node(node)
+        self.graph_auto_linker.link_node(node, payload.get("project_id") or "architectos")
+        return node.to_dict()
+
+    def _ingest_dedup_scan(
+        self, label: str, text: str, node_type: str, scope: str, project_id: str | None
+    ) -> tuple[Any | None, str, float]:
+        """Scan existing facts for an exact restatement or a near-duplicate.
+
+        Returns ``(exact_node, best_near_id, best_near_score)``. "Exact" means the
+        same fingerprint (top content tokens) within the same type/scope/project —
+        deterministic and dependency-free. Near-duplicate is the best token
+        similarity among same-type facts, surfaced for flagging only.
+        """
+        engine = self.ingestion_engine
+        incoming_tokens = engine._tokens(f"{label} {text}")
+        incoming_key = (self._normalize_fact_text(label), self._normalize_fact_text(text))
+        best_near_id, best_near_score = "", 0.0
+        for node in self.repository.list_nodes():
+            if node.status != "active":
+                continue
+            meta = dict(node.metadata or {})
+            if meta.get("structural") or meta.get("hub") or meta.get("scope_root"):
+                continue
+            if node.scope != scope or node.project_id != project_id:
+                continue
+            if node.type != node_type:
+                continue
+            # Exact = identical normalized label + text. Deliberately NOT the token
+            # fingerprint: the fingerprint tokenizer drops digits, so facts that
+            # differ only by a number ("cap 5000" vs "cap 9000", "node 0" vs
+            # "node 1") share a fingerprint and must never be auto-merged.
+            if (self._normalize_fact_text(node.label), self._normalize_fact_text(node.text)) == incoming_key:
+                return node, node.id, 1.0
+            node_tokens = set(meta.get("tokens") or []) or engine._tokens(f"{node.label} {node.text}")
+            score = engine._similarity(incoming_tokens, node_tokens)
+            if score > best_near_score:
+                best_near_id, best_near_score = node.id, score
+        return None, best_near_id, best_near_score
+
+    @staticmethod
+    def _normalize_fact_text(value: str) -> str:
+        return " ".join(str(value or "").split()).strip().lower()
+
+    def _register_duplicate_add(self, existing: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        """Fold a re-added identical fact into the node it duplicates.
+
+        Non-destructive update: bump confidence toward the incoming value, record
+        a dedup hit, refresh lifecycle access, and return the surviving node marked
+        ``dedup_merged`` so callers can tell no new node was created.
+        """
+        meta = dict(existing.metadata or {})
+        meta["dedup_hits"] = int(meta.get("dedup_hits") or 0) + 1
+        meta["last_dedup_at"] = utc_now()
+        existing.metadata = meta
+        try:
+            existing.confidence = max(float(existing.confidence or 0.0), float(payload.get("confidence") or 0.0))
+        except (TypeError, ValueError):
+            pass
+        existing = self.repository.upsert_node(existing)
+        try:
+            self.memory_lifecycle.refresh_nodes([existing.id], "dedup")
+        except Exception as exc:  # lifecycle bump is best-effort
+            _LOG.warning("dedup refresh skipped: %s", exc)
+        result = existing.to_dict()
+        result["dedup_merged"] = True
+        return result
+
+    def _memory_project_id_for_scope(self, scope: str, project_id: str | None) -> str | None:
+        normalized = str(scope or "project")
+        if normalized in {"shared", "global"}:
+            return None
+        return project_id or "architectos"
+
+    def list_memory_candidates(self, project_id: str | None = None, status: str | None = "candidate", limit: int = 50) -> dict[str, Any]:
+        normalized = str(status or "").strip().lower()
+        if normalized in {"", "all", "*"}:
+            status = None
+        elif normalized in {"pending"}:
+            status = "candidate"
+        counts = self.repository.count_memory_candidates_by_status(project_id)
+        return {
+            "candidates": self.repository.list_memory_candidates(project_id, status, limit),
+            "counts": counts,
+            "pending": counts.get("pending", 0),
+            "accepted": counts.get("accepted", 0),
+            "rejected": counts.get("rejected", 0),
+        }
+
+    def promote_memory_candidate(
+        self,
+        candidate_id: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        by_work_item: dict[str, Any] | None = None,
+        hub_cache: dict[tuple[str, str | None, str], Any] | None = None,
+        existing_edge_ids: set[str] | None = None,
+        nodes_snapshot: list[Any] | None = None,
+        project_root_cache: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        candidate = self.repository.get_memory_candidate(candidate_id)
+        if not candidate:
+            raise ValueError("memory candidate not found")
+        payload = payload or {}
+        if candidate.get("status") == "promoted" and candidate.get("promoted_node_id"):
+            node = self.repository.get_node(str(candidate["promoted_node_id"]))
+            return {"candidate": candidate, "memory": node.to_dict() if node else None}
+        node_type = str(payload.get("type") or candidate.get("type") or "Lesson")
+        created_at = utc_now()
+        metadata = self.memory_lifecycle.seed_metadata(
+            node_type=node_type,
+            created_at=created_at,
+            metadata=self._promoted_candidate_metadata(candidate),
+            source="promoted_candidate",
+            label=str(payload.get("label") or candidate.get("label") or ""),
+        )
+        node = self.repository.add_node(
+            node_type,
+            str(payload.get("label") or candidate.get("label") or "Memory candidate"),
+            str(payload.get("scope") or candidate.get("scope") or "project"),
+            str(payload.get("text") or candidate.get("text") or ""),
+            self._memory_project_id_for_scope(
+                str(payload.get("scope") or candidate.get("scope") or "project"),
+                str(candidate.get("project_id") or "architectos"),
+            ),
+            payload.get("interface_id"),
+            float(payload.get("confidence") or candidate.get("confidence") or 0.72),
+            metadata,
+        )
+        # Lifecycle already seeded — initialize_node is a no-op write skip.
+        node = self.memory_lifecycle.initialize_node(node, "promoted_candidate")
+        if nodes_snapshot is not None:
+            nodes_snapshot.append(node)
+        self.graph_auto_linker.link_node(
+            node,
+            str(candidate.get("project_id") or "architectos"),
+            hub_cache=hub_cache,
+            existing_edge_ids=existing_edge_ids,
+            nodes_snapshot=nodes_snapshot,
+            project_root_cache=project_root_cache,
+        )
+        self._link_azure_boards_relations(node, candidate, by_work_item=by_work_item)
+        self._link_chat_session_relations(node, candidate)
+        candidate["status"] = "promoted"
+        candidate["promoted_node_id"] = node.id
+        candidate["promoted_at"] = utc_now()
+        candidate = self.repository.update_memory_candidate(candidate)
+        return {"candidate": candidate, "memory": node.to_dict()}
+
+    def _promoted_candidate_metadata(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        meta = dict(candidate.get("metadata") or {})
+        payload = {
+            "source": "memory_candidate",
+            "candidate_id": candidate["id"],
+            "source_type": candidate.get("source_type"),
+            "source_ref": candidate.get("source_ref"),
+        }
+        for key in (
+            "work_item_id",
+            "work_item_type",
+            "work_item_state",
+            "work_item_url",
+            "assigned_to",
+            "iteration_path",
+            "area_path",
+            "tags",
+            "relations",
+            "comments",
+            "parent_id",
+            "ado_project",
+            "template",
+            "auto_accepted",
+            "chat_id",
+            "session_revision",
+            "session_start_message_index",
+            "session_end_message_index",
+        ):
+            if meta.get(key) not in (None, "", [], {}):
+                payload[key] = meta[key]
+        return payload
+
+    def _link_chat_session_relations(self, node, candidate: dict[str, Any]) -> None:
+        """Link promoted summaries from the same chat in revision order."""
+        metadata = dict(candidate.get("metadata") or {})
+        if str(metadata.get("template") or "") != "chat_session_summary":
+            return
+        chat_id = str(metadata.get("chat_id") or candidate.get("source_ref") or "").strip()
+        revision = int(metadata.get("session_revision") or 0)
+        if not chat_id or revision <= 1:
+            return
+        previous: tuple[int, str] | None = None
+        for item in self.repository.list_memory_candidates(str(candidate.get("project_id") or "architectos"), status=None, limit=500):
+            item_meta = dict(item.get("metadata") or {})
+            if str(item_meta.get("template") or "") != "chat_session_summary":
+                continue
+            if str(item_meta.get("chat_id") or item.get("source_ref") or "") != chat_id:
+                continue
+            item_revision = int(item_meta.get("session_revision") or 0)
+            node_id = str(item.get("promoted_node_id") or "")
+            if not node_id or item_revision >= revision:
+                continue
+            if previous is None or item_revision > previous[0]:
+                previous = (item_revision, node_id)
+        if previous:
+            self.repository.add_edge(previous[1], node.id, "NEXT_SESSION", str(candidate.get("scope") or "project"), 0.95)
+
+    def _link_azure_boards_relations(self, node, candidate: dict[str, Any], by_work_item: dict[str, Any] | None = None) -> None:
+        metadata = dict(candidate.get("metadata") or {})
+        relations = list(metadata.get("relations") or [])
+        if not relations:
+            return
+        project_id = str(candidate.get("project_id") or "architectos")
+        if by_work_item is None:
+            by_work_item = {}
+            for existing in self.repository.list_nodes():
+                if existing.status != "active":
+                    continue
+                if existing.project_id not in {project_id, None}:
+                    continue
+                work_item_id = str(dict(existing.metadata or {}).get("work_item_id") or "").strip()
+                if work_item_id:
+                    by_work_item[work_item_id] = existing
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+            related_id = str(relation.get("work_item_id") or "").strip()
+            target = by_work_item.get(related_id)
+            if not target or target.id == node.id:
+                continue
+            edge_type = str(relation.get("link_type") or "related").replace(" ", "_")[:48] or "related"
+            try:
+                self.repository.add_edge(node.id, target.id, edge_type, "project", 0.86)
+            except Exception:  # noqa: BLE001 - linking is best-effort
+                continue
+
+    def reject_memory_candidate(self, candidate_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        candidate = self.repository.get_memory_candidate(candidate_id)
+        if not candidate:
+            raise ValueError("memory candidate not found")
+        candidate["status"] = "rejected"
+        candidate["rejected_at"] = utc_now()
+        candidate["reject_reason"] = str((payload or {}).get("reason") or "")
+        return {"candidate": self.repository.update_memory_candidate(candidate)}
+
+    def batch_update_memory_candidates(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        project_id = str(payload.get("project_id") or "architectos")
+        action = str(payload.get("action") or "").strip().lower()
+        if action in {"accept", "approve", "promote"}:
+            action = "promote"
+        elif action in {"reject", "decline"}:
+            action = "reject"
+        else:
+            raise ValueError("action must be promote/accept or reject")
+
+        status_filter = self._normalize_candidate_batch_status(payload.get("status") or payload.get("filter"))
+        duplicate_only = bool(payload.get("duplicate_only") or payload.get("duplicates_only") or status_filter == "duplicate")
+        exclude_duplicates = bool(payload.get("exclude_duplicates") or False)
+        if status_filter == "duplicate":
+            status_filter = "candidate"
+            duplicate_only = True
+        process_all = bool(payload.get("all") or payload.get("process_all") or payload.get("entire_queue"))
+        # Default page-sized batches stay modest; Accept/Reject all processes the full matching set.
+        if process_all:
+            limit = None
+        else:
+            limit = max(1, min(int(payload.get("limit") or 500), 5000))
+        reason = str(payload.get("reason") or ("Batch rejected in Memory UI" if action == "reject" else ""))
+
+        listed_status = None if status_filter in {None, "all"} else status_filter
+        candidates = self.repository.list_memory_candidates(project_id, listed_status, limit)
+        selected: list[dict[str, Any]] = []
+        for candidate in candidates:
+            meta = dict(candidate.get("metadata") or {})
+            is_duplicate = bool(meta.get("duplicate"))
+            if duplicate_only and not is_duplicate:
+                continue
+            if exclude_duplicates and is_duplicate:
+                continue
+            selected.append(candidate)
+
+        promoted = 0
+        rejected = 0
+        skipped = 0
+        errors: list[str] = []
+        results: list[dict[str, Any]] = []
+
+        # Accept-all used to re-scan all memory nodes/edges per candidate (O(n²)).
+        # Share indexes for the batch; embedding indexing is queued asynchronously
+        # by the node-upsert listener, so no listener pausing is needed.
+        by_work_item: dict[str, Any] | None = None
+        hub_cache: dict[tuple[str, str | None, str], Any] | None = None
+        existing_edge_ids: set[str] | None = None
+        nodes_snapshot: list[Any] | None = None
+        project_root_cache: dict[str, Any] | None = None
+        if action == "promote" and selected:
+            nodes_snapshot = list(self.repository.list_nodes())
+            by_work_item = {}
+            for existing in nodes_snapshot:
+                if existing.status != "active":
+                    continue
+                if existing.project_id not in {project_id, None}:
+                    continue
+                work_item_id = str(dict(existing.metadata or {}).get("work_item_id") or "").strip()
+                if work_item_id:
+                    by_work_item[work_item_id] = existing
+            hub_cache = {}
+            project_root_cache = {}
+            existing_edge_ids = {edge.id for edge in self.repository.list_edges()}
+
+        for candidate in selected:
+            candidate_id = str(candidate.get("id") or "")
+            status = str(candidate.get("status") or "")
+            try:
+                if action == "promote":
+                    if status == "promoted" and candidate.get("promoted_node_id"):
+                        skipped += 1
+                        continue
+                    result = self.promote_memory_candidate(
+                        candidate_id,
+                        {},
+                        by_work_item=by_work_item,
+                        hub_cache=hub_cache,
+                        existing_edge_ids=existing_edge_ids,
+                        nodes_snapshot=nodes_snapshot,
+                        project_root_cache=project_root_cache,
+                    )
+                    memory = result.get("memory") or {}
+                    memory_id = memory.get("id")
+                    if memory_id and by_work_item is not None:
+                        work_item_id = str((memory.get("metadata") or {}).get("work_item_id") or "").strip()
+                        if work_item_id and nodes_snapshot is not None:
+                            # Prefer the node already appended to the snapshot.
+                            node = next((item for item in reversed(nodes_snapshot) if item.id == memory_id), None)
+                            if node is None:
+                                node = self.repository.get_node(str(memory_id))
+                            if node:
+                                by_work_item[work_item_id] = node
+                    promoted += 1
+                    results.append({"id": candidate_id, "status": "promoted", "memory_id": memory_id})
+                else:
+                    if status == "rejected":
+                        skipped += 1
+                        continue
+                    if status == "promoted":
+                        # Do not delete durable memory on batch reject; only skip already promoted.
+                        skipped += 1
+                        continue
+                    self.reject_memory_candidate(candidate_id, {"reason": reason})
+                    rejected += 1
+                    results.append({"id": candidate_id, "status": "rejected"})
+            except Exception as exc:  # noqa: BLE001 - continue batch on single failures
+                errors.append(f"{candidate_id}: {exc}")
+
+        counts = self.repository.count_memory_candidates_by_status(project_id)
+        return {
+            "project_id": project_id,
+            "action": action,
+            "status": listed_status or "all",
+            "duplicate_only": duplicate_only,
+            "exclude_duplicates": exclude_duplicates,
+            "process_all": process_all,
+            "matched": len(selected),
+            "promoted": promoted,
+            "rejected": rejected,
+            "skipped": skipped,
+            "errors": errors[:50],
+            "error_count": len(errors),
+            "results": results[:100],
+            "pending": counts.get("pending", 0),
+            "accepted": counts.get("accepted", 0),
+            "counts": counts,
+        }
+
+    def _normalize_candidate_batch_status(self, value: Any) -> str | None:
+        raw = str(value or "").strip().lower()
+        if not raw or raw in {"pending", "candidate", "all_pending"}:
+            return "candidate"
+        if raw in {"rejected", "reject"}:
+            return "rejected"
+        if raw in {"promoted", "promote", "accepted"}:
+            return "promoted"
+        if raw in {"duplicate", "duplicates"}:
+            return "duplicate"
+        if raw in {"all", "*"}:
+            return "all"
+        raise ValueError("status/filter must be pending, duplicate, rejected, promoted, or all")

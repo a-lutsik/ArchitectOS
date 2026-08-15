@@ -1,4 +1,11 @@
 /* Providers status/cards/runs + analytics — extracted from app.js */
+import { api } from "./api-client.js";
+import { loadCouncil, syncAskMode } from "./ask-ui.js";
+import { formatTokenCount, formatUsageCost, formatUsageLabel } from "./chat.js";
+import { escapeHtml, showSnackbar } from "./dom-utils.js";
+import { projectParam, t } from "./state.js";
+import { providerHint, providerLoginLabel, providerStatusClass } from "./ui.js";
+
 function providerStatusLabel(status, enabled) {
   const tone = providerStatusClass(status, enabled);
   const labels = {
@@ -232,3 +239,5 @@ async function loadAnalytics() {
   ].join("");
   for (const grid of grids) grid.innerHTML = html;
 }
+
+export { connectEnvProviders, loadAnalytics, loadProviderRuns, loadProviders, testAllProviders };

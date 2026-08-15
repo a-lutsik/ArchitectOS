@@ -1,4 +1,4 @@
-// Workspace Sidebar Resizer
+// Workspace Sidebar Resizer — self-contained ES module (side effects only, no exports).
 
 (function() {
   const MIN_WIDTH = 180;

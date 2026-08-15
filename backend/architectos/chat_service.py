@@ -52,6 +52,9 @@ class ChatServiceMixin:
             raise ValueError("chat not found")
         return self._enrich_chat(chat)
 
+    def chat_keeper_events(self, project_id: str | None, chat_id: str, limit: int = 30) -> list[dict[str, Any]]:
+        return self.repository.list_keeper_events(project_id, chat_id, limit)
+
     def _enrich_chat(self, chat: dict[str, Any]) -> dict[str, Any]:
         chat = dict(chat)
         project_id = str(chat.get("project_id") or "architectos")

@@ -1,4 +1,13 @@
 /* Memory panel: lifecycle, list, candidates, files — extracted from app.js */
+import { api } from "./api-client.js";
+import { formatBytes, readFileAsDataUrl } from "./ask-ui.js";
+import { escapeHtml } from "./dom-utils.js";
+import { refreshMemorySurfaces } from "./memory-ingest.js";
+import { loadAnalytics } from "./providers.js";
+import { refreshWorkspace, runSearch, scheduleGraphLoad } from "./projects.js";
+import { projectParam, state, t } from "./state.js";
+import { showError } from "./ui.js";
+
 async function loadMemoryLifecycle() {
   const container = document.querySelector("#memory-lifecycle-dashboard");
   if (!container) return;
@@ -533,3 +542,9 @@ async function importMemoryFiles() {
   await refreshWorkspace();
   scheduleGraphLoad();
 }
+
+export {
+  batchUpdateCandidates, handleMemoryFileSelect, importMemoryFiles,
+  loadMemoryCandidates, loadMemoryLifecycle, loadMemoryLifecycleItems, loadMemoryList,
+  renderMemoryFiles, switchMemoryTab, syncCandidateBatchActions,
+};

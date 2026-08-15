@@ -1,3 +1,41 @@
+/* App bootstrap: event wiring + startup sequence. ES module, imported last by main.js. */
+import { api } from "./api-client.js";
+import { askAgentInstallCommand, bindChatComposer, copyInstallCommand, switchView } from "./ask-ui.js";
+import { cancelActiveRun, finalizeChatSession, sendChatMessage, startNewAskThread, syncAskHeaderActions } from "./chat.js";
+import { analyzeCodeProject, fillCodeFileFromSelection, installCodeLanguageServer, runCodeInsight, setCodeInsightTab } from "./code-intel.js";
+import { on, onAll, setElementDisabled, showSnackbar } from "./dom-utils.js";
+import { fileEditor } from "./file-editor.js";
+import { loadGraph } from "./graph.js";
+import {
+  ingestMemorySources, rescanAllMemorySources, setIngestSourcesSelected,
+  syncBoardsOptionsVisibility, syncBoardsTypeSummary, syncStartupMemoryRescan,
+} from "./memory-ingest.js";
+import {
+  batchUpdateCandidates, handleMemoryFileSelect, importMemoryFiles,
+  loadMemoryCandidates, loadMemoryLifecycle, loadMemoryLifecycleItems,
+  loadMemoryList, renderMemoryFiles, switchMemoryTab, syncCandidateBatchActions,
+} from "./memory-panel.js";
+import { projectWizard } from "./project-wizard.js";
+import {
+  browseProjectFolder, buildContext, buildSelectedFileContext, closeProjectFolderModal,
+  initProjectFromFolder, loadGitDiff, loadProjectFiles, loadProjects,
+  maybeShowOnboarding, openProjectFolderModal, projectFolderModal, refreshWorkspace,
+  resetGraphFilters, runSearch, saveProjectFromFolder, scheduleGraphLoad,
+  setProjectFolderStatus, syncProjectFields,
+} from "./projects.js";
+import { connectEnvProviders, loadAnalytics, loadProviders, testAllProviders } from "./providers.js";
+import { searchPalette } from "./search-palette.js";
+import {
+  ROUTER_PRESETS, loadSettings, previewRouting, rebuildEmbeddingsIndex,
+  refreshEmbeddingModelOptions, runSecurityPreview, saveEmbeddingsSettings,
+  saveRouterSettings, setRouterWeights, syncRouterWeightLabels,
+} from "./settings.js";
+import { projectParam, state, syncProjectSwitcherLabel, syncProjectTerminology, t } from "./state.js";
+import { openExternalTerminal, renderTerminalHistory, runInstallCommandInTerminal, runTerminalCommand } from "./terminal.js";
+import { applyDensity, applyLanguage, applyTheme, saveUiSettings, saveWorkspaceSettings, showError, syncLanguageMenu } from "./ui.js";
+import { initVoiceMemory } from "./voice-memory.js";
+import { workspaceChat } from "./workspace-chat.js";
+
 function bindEvents() {
   bindChatComposer();
   initVoiceMemory();
@@ -324,8 +362,6 @@ if (document.readyState === 'loading') {
   fileEditor.init();
 }
 
-// Export for use in other modules
-window.fileEditor = fileEditor;
 // ============================================
 // New Project Wizard Logic
 // ============================================
@@ -338,8 +374,6 @@ if (document.readyState === 'loading') {
   projectWizard.init();
 }
 
-// Export for use in other modules
-window.projectWizard = projectWizard;
 // ============================================
 // Workspace Chat Panel Logic
 // ============================================
@@ -350,5 +384,3 @@ if (document.readyState === "loading") {
 } else {
   workspaceChat.init();
 }
-
-window.workspaceChat = workspaceChat;

@@ -1,0 +1,8 @@
+{
+  "type": "module",
+  "private": true,
+  "description": "Marks frontend/*.js as native ES modules so `node --check` parses import/export syntax (see scripts/frontend_load_smoke.js and the CI frontend job). Not a package — no dependencies, nothing is installed from here.",
+  "scripts": {
+    "check": "node ../scripts/frontend_load_smoke.js"
+  }
+}

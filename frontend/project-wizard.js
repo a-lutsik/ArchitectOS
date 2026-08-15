@@ -1,4 +1,10 @@
-// New project wizard. Classic script loaded before app.js; shares global scope.
+// New project wizard. ES module.
+import { api } from "./api-client.js";
+import { showSnackbar } from "./dom-utils.js";
+import { buildContext, loadProjectFiles, loadProjects, markOnboardingComplete, pickProjectFolder, setWizardFolderStatus } from "./projects.js";
+import { currentProject, displayProjectName, state, t } from "./state.js";
+import { saveWorkspaceSettings, showError } from "./ui.js";
+
 const projectWizard = {
   firstRun: false,
   projectData: {},
@@ -363,3 +369,5 @@ const projectWizard = {
     }
   }
 };
+
+export { projectWizard };

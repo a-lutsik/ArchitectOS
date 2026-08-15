@@ -1,5 +1,6 @@
 // ArchitectOS DOM & formatting helpers: escapeHtml, element setters,
-// event binding, and the snackbar. Classic script (shared global scope).
+// event binding, and the snackbar. ES module.
+import { t } from "./state.js";
 
 function escapeHtml(value) { return String(value || "").replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char])); }
 function setText(selector, key) { const el = document.querySelector(selector); if (el) el.textContent = t(key); }
@@ -58,3 +59,8 @@ function labelPrefix(inputSelector, key) {
   }
   label.insertBefore(document.createTextNode(t(key)), control || label.firstChild);
 }
+
+export {
+  escapeHtml, setText, setPlaceholder, setButton, setTextContent,
+  setElementValue, setElementDisabled, on, onAll, showSnackbar, labelPrefix,
+};

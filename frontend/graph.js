@@ -1,4 +1,13 @@
 /* Memory graph engine: state, physics, canvas, detail/actions — extracted from app.js */
+import { api } from "./api-client.js";
+import { switchView } from "./ask-ui.js";
+import { escapeHtml, on, setElementValue } from "./dom-utils.js";
+import { fileEditor } from "./file-editor.js";
+import { switchMemoryTab } from "./memory-panel.js";
+import { runSearch } from "./projects.js";
+import { projectParam, state, t } from "./state.js";
+import { showError } from "./ui.js";
+
 let graphSuggestions = [];
 
 async function suggestGraphLinks() {
@@ -1504,3 +1513,5 @@ function bindGraphActions(container, node) {
     await loadGraph();
   });
 }
+
+export { graphState, loadGraph, openGraphNodeModal, resizeGraphCanvas };

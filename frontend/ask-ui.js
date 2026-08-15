@@ -1,4 +1,21 @@
 /* Ask UI: council, ask mode, switchView, composer, attachments, rich actions — extracted from app.js */
+import { api } from "./api-client.js";
+import { appendChatBubble, finalizeChatSession, loadChats, sendChatMessage } from "./chat.js";
+import { fillCodeFileFromSelection, loadCodeServers, syncCodeFileHint, syncCodeInsightTab } from "./code-intel.js";
+import { escapeHtml, on, setElementValue, setTextContent, showSnackbar } from "./dom-utils.js";
+import { ASK_MODE_HINTS } from "./i18n.js";
+import { initMcpMasterDetail, loadMcpMasterDetail } from "./mcp_master_detail.js";
+import { syncIngestSourcesWithMcp } from "./memory-ingest.js";
+import { loadMemoryCandidates, loadMemoryLifecycle, renderMemoryFiles } from "./memory-panel.js";
+import { loadProjectFiles, loadTasks, refreshWorkspace, runSearch, scheduleGraphLoad } from "./projects.js";
+import { loadAnalytics, loadProviderRuns, loadProviders } from "./providers.js";
+import { searchPalette } from "./search-palette.js";
+import { loadRouterSettings, loadSettings } from "./settings.js";
+import { ASK_MODES, SETUP_VIEWS, projectParam, state, t, titleByView } from "./state.js";
+import { renderTerminalHistory } from "./terminal.js";
+import { showError } from "./ui.js";
+import { workspaceChat } from "./workspace-chat.js";
+
 async function loadCouncil() {
   let config;
   try {
@@ -449,3 +466,9 @@ async function handleRichAction(action) {
   }
   showSnackbar(`Unsupported action: ${type || "unknown"}`, "info");
 }
+
+export {
+  askAgentInstallCommand, autoGrowChatInput, bindChatComposer, closeChatMenu,
+  copyInstallCommand, formatBytes, handleFileSelect, loadCouncil,
+  readFileAsDataUrl, renderAttachments, switchView, syncAskMode,
+};

@@ -1,4 +1,10 @@
-// Code intelligence UI (languages / LSP / symbols / hover / diagnostics / references). Classic script loaded before app.js; shares global scope.
+// Code intelligence UI (languages / LSP / symbols / hover / diagnostics / references). ES module.
+import { api } from "./api-client.js";
+import { escapeHtml, showSnackbar } from "./dom-utils.js";
+import { needsProjectOnboarding } from "./projects.js";
+import { projectParam, state, t } from "./state.js";
+import { showError } from "./ui.js";
+
 function renderCodeLanguages(payload) {
   const languages = payload.languages || [];
   const servers = state.codeServersCache?.servers || [];
@@ -313,3 +319,8 @@ async function loadCodeReferences() {
   const refs = payload.references || [];
   container.innerHTML = `<article class="result code-insight-summary"><strong>References (${escapeHtml(payload.source || "lsp")})</strong><p>${escapeHtml(payload.query || "")} · ${refs.length} result(s)</p></article>` + (refs.length ? refs.map(ref => `<article class="result"><div class="row"><strong>${escapeHtml(ref.path || payload.path)}</strong><span class="badge">line ${escapeHtml(String(ref.line || 1))}</span></div><p>${escapeHtml(ref.preview || "")}</p></article>`).join("") : '<article class="result"><strong>No references</strong></article>');
 }
+
+export {
+  analyzeCodeProject, fillCodeFileFromSelection, installCodeLanguageServer,
+  loadCodeServers, runCodeInsight, setCodeInsightTab, syncCodeFileHint, syncCodeInsightTab,
+};

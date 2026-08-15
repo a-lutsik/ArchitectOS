@@ -1,4 +1,12 @@
 /* Language/theme/density, errors, provider status helpers, result cards — extracted from app.js */
+import { api } from "./api-client.js";
+import { syncAskMode } from "./ask-ui.js";
+import { syncCodeFileHint } from "./code-intel.js";
+import { escapeHtml, labelPrefix, setButton, setPlaceholder, setText, setTextContent, showSnackbar } from "./dom-utils.js";
+import { LANGUAGE_META, RTL_LANGUAGES, translations } from "./i18n.js";
+import { refreshWorkspace, runSearch } from "./projects.js";
+import { state, syncProjectTerminology, t, titleByView } from "./state.js";
+
 function syncLanguageMenu() {
   const current = LANGUAGE_META[state.language] || LANGUAGE_META.en;
   const flag = document.querySelector("#language-current-flag");
@@ -209,3 +217,9 @@ function renderResults(container, hits) {
   container.querySelectorAll("[data-fav]").forEach(button => button.addEventListener("click", async () => { await api(`/api/memory/${button.dataset.fav}/favorite`, { method: "PATCH", body: "{}" }); await refreshWorkspace(); await runSearch(document.querySelector("#search-query").value || "memory"); }));
   container.querySelectorAll("[data-long-term]").forEach(button => button.addEventListener("click", async () => { await api(`/api/memory/${button.dataset.longTerm}/promote-long-term`, { method: "POST", body: JSON.stringify({ reason: "ui" }) }); await refreshWorkspace(); await runSearch(document.querySelector("#search-query").value || "memory"); }));
 }
+
+export {
+  applyDensity, applyLanguage, applyTheme,
+  providerHint, providerLoginLabel, providerStatusClass,
+  renderResults, saveUiSettings, saveWorkspaceSettings, showError, syncLanguageMenu,
+};

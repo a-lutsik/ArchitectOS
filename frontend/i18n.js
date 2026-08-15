@@ -1,6 +1,5 @@
 // ArchitectOS i18n data: language metadata + translation strings.
-// Loaded as a classic script before app.js; these top-level `const`s
-// live in the shared global scope, exactly like the rest of the app.
+// ES module; pure data, no imports. Loaded early via main.js.
 
 const ASK_MODE_HINTS = {
   quick: "Agent decides which tools/memory to use and acts on your request.",
@@ -159,3 +158,5 @@ const translations = {
     "settings.bundle": "חבילת פרופיל", "settings.security": "בדיקת אבטחה", "language.en": "אנגלית", "language.ru": "רוסית", "language.uk": "אוקראינית", "language.he": "עברית"
   }
 };
+
+export { ASK_MODE_HINTS, RTL_LANGUAGES, LANGUAGE_META, translations };

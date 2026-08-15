@@ -1,4 +1,18 @@
 /* Chat/Ask thread: list, bubbles, send, council — extracted from app.js */
+import {
+  beginAgentActivity, finalizeAgentActivity, refreshAgentActivityTitle,
+  stopAgentActivityTimer, updateAgentActivity, updateCouncilActivity,
+} from "./agent-activity.js";
+import { api, authHeaders, readSseEvents } from "./api-client.js";
+import { autoGrowChatInput, closeChatMenu, renderAttachments, switchView, syncAskMode } from "./ask-ui.js";
+import { escapeHtml, setElementDisabled, showSnackbar } from "./dom-utils.js";
+import { loadMemoryCandidates } from "./memory-panel.js";
+import { loadProviderRuns } from "./providers.js";
+import { ArchitectOSRich } from "./rich-response.js";
+import { projectParam, state, t } from "./state.js";
+import { showError } from "./ui.js";
+import { workspaceChat } from "./workspace-chat.js";
+
 async function loadChats(options = {}) {
   const openDefault = options.openDefault !== false;
   const payload = await api(`/api/chats?project_id=${projectParam()}&limit=80`);
@@ -274,8 +288,8 @@ function getMessageTextElement(bubble) {
 function renderAssistantRichContent(bubble, text, structuredHint) {
   const textNode = getMessageTextElement(bubble);
   if (!textNode) return;
-  if (window.ArchitectOSRich && typeof window.ArchitectOSRich.renderInto === "function") {
-    window.ArchitectOSRich.renderInto(textNode, text || "", structuredHint || null);
+  if (ArchitectOSRich && typeof ArchitectOSRich.renderInto === "function") {
+    ArchitectOSRich.renderInto(textNode, text || "", structuredHint || null);
     return;
   }
   textNode.textContent = text || "";
@@ -508,3 +522,12 @@ async function cancelActiveRun() {
   await api(`/api/runs/${state.activeRunId}/cancel`, { method: "POST", body: "{}" });
   setElementDisabled("#chat-stop", true);
 }
+
+export {
+  appendChatBubble, cancelActiveRun, fetchChat, finalizeChatSession,
+  formatTokenCount, formatUsageCost, formatUsageLabel, getMessageTextElement,
+  handleProviderErrorAction, isProviderError, loadChats, providerErrorAction,
+  providerLabel, renderAssistantRichContent, renderProviderErrorBubble,
+  sendChatMessage, setAgentActivityModel, setBubbleProvider, setBubbleUsage,
+  startNewAskThread, syncAskHeaderActions, usedExplicitProvider,
+};

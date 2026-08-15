@@ -1,4 +1,10 @@
-// Voice memory capture (Web Speech API). Classic script loaded before app.js; shares global scope.
+// Voice memory capture (Web Speech API). ES module.
+import { api } from "./api-client.js";
+import { on, setElementValue } from "./dom-utils.js";
+import { refreshWorkspace, runSearch, scheduleGraphLoad } from "./projects.js";
+import { state } from "./state.js";
+import { showError } from "./ui.js";
+
 let voiceRecognition = null;
 let voiceListening = false;
 function voiceRecognitionLanguage() {
@@ -125,3 +131,5 @@ function initVoiceMemory() {
     voiceStatus("Voice input is not supported in this browser.", "error");
   }
 }
+
+export { initVoiceMemory };

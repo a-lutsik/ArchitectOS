@@ -1,4 +1,6 @@
-// MCP Master-Detail Layout JavaScript
+// MCP Master-Detail Layout JavaScript — ES module.
+import { api } from "./api-client.js";
+import { escapeHtml, showSnackbar } from "./dom-utils.js";
 
 let mcpServers = [];
 let selectedServerId = null;
@@ -521,3 +523,5 @@ function initMcpMasterDetail() {
     }
   });
 }
+
+export { initMcpMasterDetail, loadMcpMasterDetail };

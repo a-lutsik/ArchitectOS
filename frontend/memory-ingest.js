@@ -1,4 +1,11 @@
 /* Memory ingest/rescan progress + source selection — extracted from app.js */
+import { api } from "./api-client.js";
+import { escapeHtml } from "./dom-utils.js";
+import { loadMemoryCandidates, loadMemoryLifecycle } from "./memory-panel.js";
+import { loadAnalytics } from "./providers.js";
+import { scheduleGraphLoad } from "./projects.js";
+import { state } from "./state.js";
+
 function ingestTimeoutPayload(sources = []) {
   const itemTimeout = Number(document.querySelector("#ingest-item-timeout")?.value || 25);
   const sourceTimeout = Number(document.querySelector("#ingest-source-timeout")?.value || 600);
@@ -455,3 +462,9 @@ async function syncIngestSourcesWithMcp() {
     syncBoardsOptionsVisibility();
   }
 }
+
+export {
+  ingestMemorySources, refreshMemorySurfaces, rescanAllMemorySources,
+  setIngestSourcesSelected, syncBoardsOptionsVisibility, syncBoardsTypeSummary,
+  syncIngestSourcesWithMcp, syncStartupMemoryRescan,
+};

@@ -1,4 +1,17 @@
-// Workspace Ask/chat panel. Classic script loaded before app.js; shares global scope.
+// Workspace Ask/chat panel. ES module.
+import { beginAgentActivity, finalizeAgentActivity, stopAgentActivityTimer, updateAgentActivity } from "./agent-activity.js";
+import { api } from "./api-client.js";
+import { autoGrowChatInput, handleFileSelect, switchView, syncAskMode } from "./ask-ui.js";
+import {
+  fetchChat, getMessageTextElement, handleProviderErrorAction, isProviderError,
+  providerErrorAction, providerLabel, renderAssistantRichContent, renderProviderErrorBubble,
+  sendChatMessage, setAgentActivityModel, setBubbleProvider, setBubbleUsage,
+  startNewAskThread, usedExplicitProvider,
+} from "./chat.js";
+import { escapeHtml, showSnackbar } from "./dom-utils.js";
+import { projectParam, state, t } from "./state.js";
+import { showError } from "./ui.js";
+
 const workspaceChat = {
   isThinking: false,
   isSending: false,
@@ -578,3 +591,5 @@ const workspaceChat = {
     startNewAskThread();
   },
 };
+
+export { workspaceChat };

@@ -1,6 +1,6 @@
 // ArchitectOS API client: auth headers, fetch wrapper, health probe, SSE reader.
-// Classic script (shared global scope); `api()` is used by app.js and
-// mcp_master_detail.js at call time.
+// ES module; `api()` is imported by nearly every other module.
+import { t } from "./state.js";
 
 const AUTH_TOKEN = (document.querySelector('meta[name="architectos-token"]') || {}).content || "";
 function authHeaders(extra = {}) {
@@ -58,3 +58,5 @@ async function* readSseEvents(response) {
     }
   }
 }
+
+export { api, authHeaders, ensureServerOnline, readSseEvents };

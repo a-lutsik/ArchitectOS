@@ -1,4 +1,11 @@
-// File find (name/content) modal. Classic script loaded before app.js; shares global scope.
+// File find (name/content) modal. ES module.
+import { api } from "./api-client.js";
+import { escapeHtml, on } from "./dom-utils.js";
+import { fileEditor } from "./file-editor.js";
+import { openProjectFile, runSearch } from "./projects.js";
+import { projectParam } from "./state.js";
+import { showError } from "./ui.js";
+
 const fileFind = {
   isOpen: false,
   mode: "name",
@@ -232,3 +239,5 @@ const fileFind = {
     });
   }
 };
+
+export { fileFind };

@@ -1,4 +1,6 @@
 /* Workspace file-tree rendering — extracted from app.js */
+import { state } from "./state.js";
+
 function buildFileTree(files) {
   const tree = { name: 'root', type: 'folder', path: '', children: [], expanded: true };
 
@@ -144,3 +146,5 @@ function renderFileTree(files, container, onSelect) {
   renderFileTreeNode(tree, treeContainer, 0, onSelect);
   container.appendChild(treeContainer);
 }
+
+export { getFileExtension, renderFileTree };

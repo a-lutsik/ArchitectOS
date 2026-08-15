@@ -1,11 +1,12 @@
 """Chat-session finalization, idle handling and per-turn memory capture.
 
 Extracted from ``service.py``. Covers session activation/finalization, the idle
-loop, session summarisation, and the "keeper" candidate-capture helpers that turn
-chat turns into memory candidates. Depends only on leaf modules, never on
-``service`` itself, so it introduces no import cycle. Repository access, providers
-and council orchestration are reached through ``self`` via the MRO on
-:class:`ArchitectOSService`.
+loop, session summarisation, the "keeper" candidate-capture helpers that turn
+chat turns into memory candidates, plus the chat context pack, assistant-message
+favorites, and the keeper retry entry point. Depends only on leaf modules,
+never on ``service`` itself, so it introduces no import cycle. Repository
+access, providers and council orchestration are reached through ``self`` via
+the MRO on :class:`ArchitectOSService`.
 """
 
 from __future__ import annotations
@@ -745,3 +746,53 @@ class ChatSessionServiceMixin:
             if item.get("role") == "user":
                 return str(item.get("text") or "")
         return ""
+
+    def chat_context_pack(self, chat_id: str, query: str = "", project_id: str | None = None) -> dict[str, Any]:
+        chat = self.repository.get_chat(chat_id)
+        if not chat:
+            raise ValueError("chat not found")
+        actual_project_id = str(chat.get("project_id") or project_id or "architectos")
+        q = str(query or "").strip()
+        if not q:
+            messages = [m for m in chat.get("messages") or [] if str(m.get("text") or "").strip()]
+            q = str(messages[-1].get("text") or "") if messages else str(chat.get("title") or "")
+        summaries = self.repository.list_chat_context_summaries(chat_id)
+        candidates = self.repository.list_memory_candidates(actual_project_id, "candidate", 20)
+        relevant = self.search_memory(q or "memory", project_id=actual_project_id, limit=8, refresh=False)["hits"] if q else []
+        events = self.repository.list_keeper_events(actual_project_id, chat_id, 20)
+        return {
+            "chat": chat,
+            "summaries": summaries,
+            "rolling_summary": next((s for s in summaries if s.get("summary_type") == "rolling"), None),
+            "decision_log": next((s for s in summaries if s.get("summary_type") == "decision_log"), None),
+            "relevant_memory": relevant,
+            "pending_candidates": [c for c in candidates if str(c.get("source_ref") or "") == chat_id or str((c.get("metadata") or {}).get("chat_id") or "") == chat_id],
+            "keeper_events": events,
+        }
+
+    def favorite_chat_message(self, chat_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        chat = self.repository.get_chat(chat_id)
+        if not chat:
+            raise ValueError("chat not found")
+        raw_index: Any = payload.get("message_index")
+        index = int(raw_index)
+        messages = list(chat.get("messages") or [])
+        if index < 0 or index >= len(messages):
+            raise ValueError("message_index out of range")
+        message = dict(messages[index])
+        if message.get("role") != "assistant":
+            raise ValueError("only assistant messages can be favorited into memory")
+        favorite = bool(payload.get("favorite", True))
+        message["favorite"] = favorite
+        messages[index] = message
+        chat["messages"] = messages
+        chat = self.repository.upsert_chat(chat)
+        candidate = None
+        if favorite:
+            user_text = self._nearest_user_message_before(messages, index)
+            candidate = self._capture_favorite_message_candidate(str(chat.get("project_id") or "architectos"), chat_id, index, user_text, str(message.get("text") or ""))
+        self._record_keeper_event(str(chat.get("project_id") or "architectos"), chat_id, "favorite", "candidate_created" if candidate else "updated", "Assistant favorite updated.", {"message_index": index, "candidate_id": (candidate or {}).get("id")})
+        return {"chat": chat, "candidate": candidate}
+
+    def retry_chat_keeper(self, chat_id: str) -> dict[str, Any]:
+        return self.finalize_chat_session(chat_id, force=True, trigger="manual_retry")

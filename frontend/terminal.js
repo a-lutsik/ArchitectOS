@@ -1,4 +1,9 @@
-// Terminal run/open UI helpers. Classic script loaded before app.js; shares global scope.
+// Terminal run/open UI helpers. ES module.
+import { api } from "./api-client.js";
+import { switchView } from "./ask-ui.js";
+import { escapeHtml, setElementValue } from "./dom-utils.js";
+import { state } from "./state.js";
+
 function terminalPayload(commandOverride = "") {
   return {
     project_id: state.projectId,
@@ -62,3 +67,5 @@ async function openExternalTerminal() {
   const payload = await api("/api/terminal/open", { method: "POST", body: JSON.stringify({ project_id: state.projectId }) });
   renderTerminalResult({ ...payload, command: (payload.command || []).join(" "), stdout: payload.message || "", stderr: "" });
 }
+
+export { openExternalTerminal, renderTerminalHistory, runInstallCommandInTerminal, runTerminalCommand };

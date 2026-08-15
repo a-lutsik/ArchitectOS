@@ -1,4 +1,6 @@
 /* Agent activity / tool-trace UI — extracted from app.js */
+import { getMessageTextElement, providerLabel, setAgentActivityModel, setBubbleProvider } from "./chat.js";
+
 const TOOL_ACTION_META = {
   memory_get: { icon: "🧠", verb: "Reading memory node" },
   boards_search: { icon: "🔎", verb: "Searching Azure Boards" },
@@ -298,3 +300,8 @@ function finalizeAgentActivity(bubble, trace) {
   panel.querySelector(".agent-activity-header").setAttribute("aria-expanded", "false");
   refreshAgentActivityTitle(panel);
 }
+
+export {
+  beginAgentActivity, finalizeAgentActivity, refreshAgentActivityTitle,
+  stopAgentActivityTimer, updateAgentActivity, updateCouncilActivity,
+};

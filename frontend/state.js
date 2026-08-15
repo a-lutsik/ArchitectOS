@@ -1,4 +1,6 @@
 /* Shared app state + core project/i18n helpers — extracted from app.js */
+import { translations } from "./i18n.js";
+
 const state = { projectId: "architectos", projects: [], chatId: "", activeRunId: "", selectedFile: "", language: "en", theme: "system", density: "comfortable", attachments: [], memoryFiles: [], terminalHistory: [], askMode: "quick", onboardingComplete: false, projectFilesStatus: "", lastFailedMessage: "", codeInsightTab: "symbols", embeddingCatalog: [], showDotfiles: false };
 const titleByView = { workspace: "view.workspace", chat: "view.chat", memory: "view.memory", tasks: "view.tasks", providers: "view.providers", mcp: "view.mcp", code: "view.code", terminal: "view.terminal", analytics: "view.analytics", settings: "view.settings" };
 const SETUP_VIEWS = new Set(["providers", "mcp", "code", "terminal", "settings"]);
@@ -21,3 +23,9 @@ function syncProjectTerminology() {
   if (scanButton) scanButton.textContent = system ? "Scan Workspace" : t("action.scanProject");
 }
 function t(key) { return (translations[state.language] && translations[state.language][key]) || translations.en[key] || key; }
+
+export {
+  state, titleByView, SETUP_VIEWS, ASK_MODES,
+  projectParam, currentProject, isSystemWorkspace, displayProjectName,
+  syncProjectSwitcherLabel, syncProjectTerminology, t,
+};
