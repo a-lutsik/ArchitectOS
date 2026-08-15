@@ -11,7 +11,6 @@ from backend.architectos.graph_analysis import (
 )
 from backend.architectos.service import ArchitectOSService
 
-
 TRIANGLES = [
     ("a", "b"), ("b", "c"), ("a", "c"),  # cluster 1
     ("d", "e"), ("e", "f"), ("d", "f"),  # cluster 2 (disconnected)
@@ -106,7 +105,7 @@ class MultiHopExpansionTests(unittest.TestCase):
             })["id"]
             for label, text in texts
         ]
-        for source, target in zip(ids, ids[1:]):
+        for source, target in zip(ids, ids[1:], strict=False):
             service.repository.add_edge(source, target, "DEPENDS_ON", "project")
         return service, ids
 

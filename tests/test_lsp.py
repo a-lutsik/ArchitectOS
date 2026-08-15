@@ -6,7 +6,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from backend.architectos.lsp import CodeIntelligenceManager, LSPClient, flatten_symbols
+from backend.architectos.lsp import CodeIntelligenceManager, LSPClient, LSPError, flatten_symbols
 
 FAKE_LSP_SERVER = textwrap.dedent(
     """
@@ -115,7 +115,7 @@ class LSPClientTests(unittest.TestCase):
     def test_manager_rejects_unknown_extension(self) -> None:
         store = _Store([{"id": "python", "label": "Python", "language_id": "python", "extensions": [".py"], "command": self._command(), "enabled": True}])
         manager = CodeIntelligenceManager(self.root, store.load, store.save)
-        with self.assertRaises(Exception):
+        with self.assertRaises(LSPError):
             manager.symbols(self.root, "sample.rs", "fn main() {}", ".rs")
 
     def test_manager_check_reports_missing_executable(self) -> None:

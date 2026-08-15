@@ -4,7 +4,6 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-
 SECRET_PATTERNS = [
     ("bearer", re.compile(r"(?i)(authorization\s*[:=]\s*)?bearer\s+[a-z0-9._\-]{12,}")),
     ("assignment", re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*['\"]?[^\s'\",;]+")),

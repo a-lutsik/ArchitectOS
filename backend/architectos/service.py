@@ -9,30 +9,30 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import ProviderRouter
-from .council import CouncilOrchestrator
+from .ai_runtime_service import AiRuntimeServiceMixin
+from .azure_sync_service import AzureSyncServiceMixin
+from .chat_service import ChatServiceMixin
+from .chat_session_service import ChatSessionServiceMixin
 from .code_graph import CodeGraphIngestor
 from .config import APP_ENV, APP_NAME, APP_VERSION, BACKUP_RETENTION
+from .council import CouncilOrchestrator
+from .embeddings import MemoryEmbeddingEngine, build_embedding_provider
 from .files import FileStore
+from .graph_service import GraphAutoLinker, GraphServiceMixin
+from .ingestion_service import IngestionServiceMixin, MemoryIngestionEngine
+from .integrations_service import IntegrationsServiceMixin
+from .lifecycle_service import LifecycleServiceMixin, MemoryLifecycleEngine
 from .lsp import CodeIntelligenceManager
 from .mcp import MCPManager
-from .embeddings import MemoryEmbeddingEngine, build_embedding_provider
-from .graph_service import GraphAutoLinker, GraphServiceMixin
-from .retrieval_service import RetrievalServiceMixin
-from .chat_service import ChatServiceMixin
-from .ingestion_service import IngestionServiceMixin, MemoryIngestionEngine
-from .azure_sync_service import AzureSyncServiceMixin
 from .project_scan_service import ProjectScanServiceMixin
-from .chat_session_service import ChatSessionServiceMixin
-from .tool_exec_service import ToolExecServiceMixin
-from .integrations_service import IntegrationsServiceMixin
 from .providers_council_service import ProvidersCouncilServiceMixin
-from .settings_router_service import SettingsRouterServiceMixin
-from .ai_runtime_service import AiRuntimeServiceMixin
-from .lifecycle_service import LifecycleServiceMixin, MemoryLifecycleEngine
-from .search import HybridSearchStrategy
 from .release import release_manifest
+from .retrieval_service import RetrievalServiceMixin
+from .search import HybridSearchStrategy
 from .security import SecurityPolicy
+from .settings_router_service import SettingsRouterServiceMixin
 from .storage import SQLiteMemoryRepository
+from .tool_exec_service import ToolExecServiceMixin
 from .tool_gateway import (
     ToolGateway,
 )

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from backend.architectos.code_graph import CodeGraphIngestor, parse_python, parse_javascript
+from backend.architectos.code_graph import CodeGraphIngestor, parse_javascript, parse_python
 from backend.architectos.service import ArchitectOSService
 
 

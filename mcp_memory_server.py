@@ -8,6 +8,5 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from architectos.mcp_server import main
 
-
 if __name__ == "__main__":
     raise SystemExit(main())

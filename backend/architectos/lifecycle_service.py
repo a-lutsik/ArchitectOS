@@ -22,7 +22,6 @@ from .chat_memory import (
 from .models import utc_now
 from .storage import SQLiteMemoryRepository
 
-
 DEFAULT_MEMORY_LIFECYCLE = {
     "enabled": True,
     "refresh_on_access": True,

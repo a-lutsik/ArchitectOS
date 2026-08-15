@@ -29,7 +29,7 @@ The app-window launcher uses Edge/Chrome `--app` mode when available and falls b
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile backend\app.py backend\architectos\config.py backend\architectos\models.py backend\architectos\search.py backend\architectos\server.py backend\architectos\service.py backend\architectos\storage.py backend\architectos\security.py backend\architectos\adapters.py backend\architectos\routing.py backend\architectos\mcp.py backend\architectos\mcp_server.py backend\architectos\lsp.py backend\architectos\files.py backend\architectos\launcher.py backend\architectos\release.py scripts\build_release.py run_architectos.py mcp_memory_server.py
+python -m py_compile backend\app.py backend\architectos\__init__.py backend\architectos\adapters.py backend\architectos\ai_runtime_service.py backend\architectos\azure_sync_service.py backend\architectos\chat_memory.py backend\architectos\chat_service.py backend\architectos\chat_session_service.py backend\architectos\chunking.py backend\architectos\code_graph.py backend\architectos\config.py backend\architectos\constants.py backend\architectos\council.py backend\architectos\embeddings.py backend\architectos\files.py backend\architectos\folder_picker.py backend\architectos\graph_analysis.py backend\architectos\graph_service.py backend\architectos\ingestion_service.py backend\architectos\integrations_service.py backend\architectos\launcher.py backend\architectos\lifecycle_service.py backend\architectos\lsp.py backend\architectos\mcp.py backend\architectos\mcp_server.py backend\architectos\models.py backend\architectos\netutil.py backend\architectos\paths.py backend\architectos\project_files.py backend\architectos\project_scan_service.py backend\architectos\providers_council_service.py backend\architectos\release.py backend\architectos\retrieval_service.py backend\architectos\rich_response.py backend\architectos\routing.py backend\architectos\search.py backend\architectos\security.py backend\architectos\server.py backend\architectos\service.py backend\architectos\settings_router_service.py backend\architectos\ssl_util.py backend\architectos\storage.py backend\architectos\teams_graph.py backend\architectos\tool_exec_service.py backend\architectos\tool_gateway.py backend\architectos\usage.py scripts\build_release.py run_architectos.py mcp_memory_server.py
 node --check frontend\app.js
 python .\scripts\build_release.py --check-only
 ```
@@ -66,7 +66,7 @@ python .\scripts\build_release.py --check-only
 ## Architecture Patterns
 
 - Repository: `SQLiteMemoryRepository` owns persistence and bundle serialization.
-- Service/Facade: `ArchitectOSService` exposes app workflows to HTTP handlers.
+- Service/Facade: `ArchitectOSService` — a thin facade composed from 13 `*ServiceMixin` modules under `backend/architectos/` — exposes app workflows to HTTP handlers.
 - Launcher Facade: `architectos.launcher` owns local server lifecycle, port selection, browser launch, and app-window launch.
 - Strategy: `HybridSearchStrategy` owns memory ranking and `RouterPolicy` (`architectos.routing`) owns weighted provider selection; both can be replaced later.
 - Orchestrator: `CouncilOrchestrator` (`architectos.council`) fans one request out to role agents and synthesizes results.

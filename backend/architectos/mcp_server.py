@@ -482,7 +482,7 @@ class MemoryMCPServer:
             raw_rating: Any = args.get("rating")
             rating = int(raw_rating)
         except (TypeError, ValueError):
-            raise _RpcError(INVALID_PARAMS, "rating is required (1 or -1)")
+            raise _RpcError(INVALID_PARAMS, "rating is required (1 or -1)") from None
         if rating not in {1, -1}:
             raise _RpcError(INVALID_PARAMS, "rating must be 1 (useful) or -1 (not useful)")
         result = self.service.record_retrieval_feedback({
@@ -547,7 +547,7 @@ class MemoryMCPServer:
             try:
                 payload = self.service._tool_memory_get({"id": node_id, "include_neighbors": True})
             except ValueError as exc:
-                raise _RpcError(INVALID_PARAMS, str(exc))
+                raise _RpcError(INVALID_PARAMS, str(exc)) from exc
             return _resource_contents(uri, payload)
         raise _RpcError(INVALID_PARAMS, f"Unknown resource: {uri}")
 

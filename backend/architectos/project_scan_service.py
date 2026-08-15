@@ -13,7 +13,6 @@ MCP managers are reached through ``self`` via the MRO on
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import fnmatch
 import json
 import logging
@@ -21,6 +20,7 @@ import os
 import re
 import subprocess
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +41,9 @@ from .constants import (
 from .files import TEXT_LIKE_EXTENSIONS, decode_text
 from .mcp import MCPError
 from .models import Project, stable_id, utc_now
-from .project_files import delete_project_file as project_files_delete, safe_project_path, save_project_file as project_files_save
+from .project_files import delete_project_file as project_files_delete
+from .project_files import safe_project_path
+from .project_files import save_project_file as project_files_save
 from .storage import sanitize_text
 
 _LOG = logging.getLogger("architectos.service")
