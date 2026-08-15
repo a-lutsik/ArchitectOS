@@ -1,7 +1,7 @@
 // Search command palette. ES module.
 import { api } from "./api-client.js";
 import { switchView } from "./ask-ui.js";
-import { escapeHtml, showSnackbar } from "./dom-utils.js";
+import { escapeHtml, showSnackbar, trapFocus } from "./dom-utils.js";
 import { graphState, openGraphNodeModal } from "./graph.js";
 import { projectParam, state, t } from "./state.js";
 import { renderResults, showError } from "./ui.js";
@@ -10,6 +10,7 @@ const searchPalette = {
   isOpen: false,
   highlightedIndex: -1,
   currentResults: [],
+  releaseFocusTrap: null,
 
   getRecentSearches() {
     try {
@@ -36,6 +37,9 @@ const searchPalette = {
     palette.classList.add('active');
     palette.classList.remove('closing');
 
+    // Trap before the deferred input focus so the trigger stays the restore target.
+    if (!this.releaseFocusTrap) this.releaseFocusTrap = trapFocus(palette);
+
     const input = document.getElementById('paletteSearchInput');
     setTimeout(() => {
       input.focus();
@@ -48,6 +52,11 @@ const searchPalette = {
 
   close() {
     this.isOpen = false;
+    if (this.releaseFocusTrap) {
+      const release = this.releaseFocusTrap;
+      this.releaseFocusTrap = null;
+      release();
+    }
     const palette = document.getElementById('searchPalette');
     palette.classList.add('closing');
 

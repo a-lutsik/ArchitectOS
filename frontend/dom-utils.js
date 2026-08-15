@@ -60,7 +60,43 @@ function labelPrefix(inputSelector, key) {
   label.insertBefore(document.createTextNode(t(key)), control || label.firstChild);
 }
 
+const FOCUSABLE_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]';
+
+// Modal focus trap: keeps Tab / Shift+Tab cycling among the focusable elements
+// inside `container`. Returns a release function that removes the trap and
+// restores focus to `restoreTo` (defaults to whatever was focused when the
+// trap was installed — i.e. the element that opened the modal).
+function trapFocus(container, restoreTo = document.activeElement) {
+  if (!container || typeof container.addEventListener !== "function") return () => {};
+  const focusableItems = () => Array.from(container.querySelectorAll(FOCUSABLE_SELECTOR))
+    .filter(el => !el.disabled && el.tabIndex >= 0 && el.getAttribute("aria-hidden") !== "true");
+  const onKeydown = event => {
+    if (event.key !== "Tab") return;
+    const items = focusableItems();
+    if (!items.length) { event.preventDefault(); return; }
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !container.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !container.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  container.addEventListener("keydown", onKeydown);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    container.removeEventListener("keydown", onKeydown);
+    if (restoreTo && typeof restoreTo.focus === "function" && restoreTo.isConnected !== false) restoreTo.focus();
+  };
+}
+
 export {
   escapeHtml, setText, setPlaceholder, setButton, setTextContent,
   setElementValue, setElementDisabled, on, onAll, showSnackbar, labelPrefix,
+  trapFocus,
 };

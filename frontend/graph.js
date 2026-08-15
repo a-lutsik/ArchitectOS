@@ -1,7 +1,7 @@
 /* Memory graph engine: state, physics, canvas, detail/actions — extracted from app.js */
 import { api } from "./api-client.js";
 import { switchView } from "./ask-ui.js";
-import { escapeHtml, on, setElementValue } from "./dom-utils.js";
+import { escapeHtml, on, setElementValue, trapFocus } from "./dom-utils.js";
 import { fileEditor } from "./file-editor.js";
 import { switchMemoryTab } from "./memory-panel.js";
 import { runSearch } from "./projects.js";
@@ -9,6 +9,9 @@ import { projectParam, state, t } from "./state.js";
 import { showError } from "./ui.js";
 
 let graphSuggestions = [];
+// Release functions returned by trapFocus() while a graph overlay is open.
+let releaseGraphNodeModalFocus = null;
+let releaseGraphExpandFocus = null;
 
 async function suggestGraphLinks() {
   const panel = document.querySelector("#graph-suggest-panel");
@@ -25,7 +28,7 @@ async function suggestGraphLinks() {
   panel.hidden = false;
   applyButton.disabled = true;
   list.innerHTML = "";
-  status.textContent = "AI is analyzing unlinked memory nodes — usually 10–30 seconds...";
+  status.textContent = t("graph.suggest.analyzing");
   let payload;
   try {
     payload = await api("/api/graph/suggest-links", {
@@ -33,7 +36,7 @@ async function suggestGraphLinks() {
       body: JSON.stringify({ project_id: state.projectId, limit: 24, pair_limit: 10 }),
     });
   } catch (error) {
-    status.textContent = `Suggest failed: ${error.message || error}`;
+    status.textContent = t("graph.suggest.failed").replace("{message}", String(error.message || error));
     if (suggestButton) suggestButton.disabled = false;
     throw error;
   }
@@ -43,7 +46,7 @@ async function suggestGraphLinks() {
   status.textContent = `pool ${payload.pool_size} · pairs ${payload.pairs_considered} · ${graphSuggestions.length} suggested` +
     (skipped > 0 ? ` · ${skipped} rejected by AI` : "");
   if (!graphSuggestions.length) {
-    list.innerHTML = '<div class="graph-suggest-empty">No contextual links found among the least-linked nodes.</div>';
+    list.innerHTML = `<div class="graph-suggest-empty">${escapeHtml(t("graph.suggest.empty"))}</div>`;
     return;
   }
   list.innerHTML = "";
@@ -93,7 +96,7 @@ async function applySuggestedLinks() {
       console.warn("suggest-links: edge failed", item, error);
     }
   }
-  status.textContent = `Applied ${created} link(s).`;
+  status.textContent = t("graph.suggest.applied").replace("{count}", String(created));
   list.innerHTML = "";
   graphSuggestions = [];
   await loadGraph();
@@ -433,7 +436,7 @@ async function loadGraph() {
   const sourceOptions = Array.isArray(payload.sources) ? payload.sources : [];
   if (sourceFilter) {
     const current = sourceFilter.value;
-    sourceFilter.innerHTML = '<option value="">All sources</option>' + sourceOptions.map(item => {
+    sourceFilter.innerHTML = `<option value="">${escapeHtml(t("graph.filter.allSources"))}</option>` + sourceOptions.map(item => {
       const id = typeof item === "string" ? item : (item.id || "");
       const label = typeof item === "string" ? item : (item.label || item.id || "");
       if (!id) return "";
@@ -618,7 +621,7 @@ function bindGraphOnce() {
     const summary = document.querySelector("#graph-link-summary");
     if (summary) {
       summary.hidden = false;
-      summary.textContent = "linking...";
+      summary.textContent = t("graph.rebuild.linking");
     }
     const payload = await api("/api/graph/rebuild-links", { method: "POST", body: JSON.stringify({ project_id: state.projectId }) });
     if (summary) {
@@ -726,10 +729,15 @@ function toggleGraphExpand(open) {
     expandStage.appendChild(canvas);
     overlay.removeAttribute("hidden");
     document.body.style.overflow = "hidden";
+    releaseGraphExpandFocus = trapFocus(overlay);
   } else {
     normalStage.appendChild(canvas);
     overlay.setAttribute("hidden", "");
     document.body.style.overflow = "";
+    if (releaseGraphExpandFocus) {
+      releaseGraphExpandFocus();
+      releaseGraphExpandFocus = null;
+    }
   }
   resizeGraphCanvas();
   graphState.userZoomed = false;
@@ -1115,7 +1123,7 @@ function renderGraphLegend() {
     const themes = graphState.communities.filter(item => item.size > 1).slice(0, 8);
     legend.innerHTML = themes.length
       ? themes.map(item => `<span class="graph-legend-item"><span class="graph-legend-dot" style="background:${escapeHtml(graphCommunityColor(item.id))}"></span>${escapeHtml(item.label || ("Cluster " + item.id))} <small>(${item.size})</small></span>`).join("")
-      : '<span class="graph-legend-item">No themes yet — link more memory</span>';
+      : `<span class="graph-legend-item">${escapeHtml(t("graph.legend.noThemes"))}</span>`;
   } else {
     legend.innerHTML = groups.map(group => `<span class="graph-legend-item"><span class="graph-legend-dot" style="background:${escapeHtml(graphGroupColor(group))}"></span>${escapeHtml(group)}</span>`).join("");
   }
@@ -1123,7 +1131,7 @@ function renderGraphLegend() {
     const current = graphState.groupFilter || groupFilter.value || "";
     const known = new Set(groups);
     if (current && !known.has(current)) known.add(current);
-    const options = ['<option value="">All groups</option>']
+    const options = [`<option value="">${escapeHtml(t("graph.filter.allGroups"))}</option>`]
       .concat([...known].sort().map(group => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`));
     groupFilter.innerHTML = options.join("");
     if (current && [...groupFilter.options].some(opt => opt.value === current)) {
@@ -1141,8 +1149,8 @@ async function syncGraphFilters() {
   const providerFilter = document.querySelector("#graph-provider-filter");
   if (!taskFilter || !providerFilter || taskFilter.dataset.ready) return;
   const [tasksPayload, providersPayload] = await Promise.all([api(`/api/tasks?project_id=${projectParam()}`), api("/api/providers")]);
-  taskFilter.innerHTML = '<option value="">All tasks</option>' + tasksPayload.tasks.map(task => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}</option>`).join("");
-  providerFilter.innerHTML = '<option value="">All providers</option>' + providersPayload.providers.map(provider => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.label)}</option>`).join("");
+  taskFilter.innerHTML = `<option value="">${escapeHtml(t("graph.filter.allTasks"))}</option>` + tasksPayload.tasks.map(task => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}</option>`).join("");
+  providerFilter.innerHTML = `<option value="">${escapeHtml(t("graph.filter.allProviders"))}</option>` + providersPayload.providers.map(provider => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.label)}</option>`).join("");
   taskFilter.dataset.ready = "1";
 }
 
@@ -1226,6 +1234,9 @@ function openGraphNodeModal(node) {
   const modal = document.querySelector("#graph-node-modal");
   if (!modal) return;
   modal.removeAttribute("hidden");
+  // Install the trap only on a fresh open so re-inspecting a neighbour keeps
+  // the original trigger as the focus-restore target.
+  if (!graphState.modalOpen) releaseGraphNodeModalFocus = trapFocus(modal);
   graphState.modalOpen = true;
   modal.querySelector(".modal-close")?.focus();
 }
@@ -1234,6 +1245,10 @@ function closeGraphNodeModal() {
   const modal = document.querySelector("#graph-node-modal");
   if (modal) modal.setAttribute("hidden", "");
   graphState.modalOpen = false;
+  if (releaseGraphNodeModalFocus) {
+    releaseGraphNodeModalFocus();
+    releaseGraphNodeModalFocus = null;
+  }
 }
 
 function selectGraphNode(node, options = {}) {
@@ -1295,10 +1310,10 @@ function memorySourceLinks(node) {
     links.push({ href: url, label, kind });
   };
   add(azureBoardsUrl(meta), `Azure Boards${meta.work_item_id ? " #" + meta.work_item_id : ""}`, "azure");
-  add(meta.granola_url, "Open in Granola", "granola");
-  add(meta.wiki_url || meta.web_url, "Open page", "source");
-  add(meta.source_ref, "Open source", "source");
-  add(meta.url, "Open link", "source");
+  add(meta.granola_url, t("graph.link.granola"), "granola");
+  add(meta.wiki_url || meta.web_url, t("graph.link.page"), "source");
+  add(meta.source_ref, t("graph.link.source"), "source");
+  add(meta.url, t("graph.link.link"), "source");
   return links;
 }
 
@@ -1342,7 +1357,7 @@ function renderMemoryBodyHtml(node) {
   const linksHtml = links.length
     ? `<div class="mem-source-links">${links.map(link => `<a class="mem-source-link mem-source-${link.kind}" href="${escapeHtml(link.href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)} <span aria-hidden="true">↗</span></a>`).join("")}</div>`
     : "";
-  if (!raw) return linksHtml + '<p class="mem-empty">No description for this memory node.</p>';
+  if (!raw) return linksHtml + `<p class="mem-empty">${escapeHtml(t("graph.node.noDescription"))}</p>`;
   const blocks = [];
   let current = { label: "", lines: [] };
   const flush = () => { if (current.label || current.lines.length) blocks.push(current); current = { label: "", lines: [] }; };
@@ -1389,8 +1404,8 @@ function renderGraphDetail(node) {
   const filesEl = document.querySelector("#graph-related-files");
   if (!title || !text || !meta || !actions || !neighbors) return;
   if (!node) {
-    title.textContent = "No nodes";
-    text.textContent = "Scan or add memory to populate the graph.";
+    title.textContent = t("graph.empty.title");
+    text.textContent = t("graph.empty.hint");
     meta.innerHTML = "";
     actions.innerHTML = "";
     neighbors.innerHTML = "";
@@ -1423,12 +1438,12 @@ function renderGraphDetail(node) {
   meta.innerHTML = `<span class="badge">${escapeHtml(node.type)}</span><span class="badge">${escapeHtml(node.scope)}</span><span class="badge">${linked.length} links</span>${pinned ? '<span class="badge">pinned</span>' : ""}${codeBadges}${abBadges}`;
   const options = graphNodeOptions(node.id);
   actions.innerHTML = synthetic
-    ? '<div class="provider-test">Synthetic filter nodes cannot be edited.</div>'
-    : `<div class="provider-actions graph-node-primary-actions"><button data-graph-open="${escapeHtml(node.id)}" type="button">Open in Search</button><button data-graph-pin="${escapeHtml(node.id)}" type="button">${pinned ? "Unpin" : "Pin"}</button></div><details class="graph-node-advanced"><summary>Advanced edges</summary><label>Target<select data-graph-target><option value="">Select node</option>${options}</select></label><label>Edge<select data-graph-edge-type><option>RELATED_TO</option><option>SUPPORTS</option><option>DEPENDS_ON</option><option>IMPLEMENTS</option><option>DOCUMENTED_IN</option></select></label><div class="provider-actions"><button data-graph-edge="${escapeHtml(node.id)}" type="button">Create Edge</button><button data-graph-path="${escapeHtml(node.id)}" type="button">Explain Path</button><button data-graph-merge="${escapeHtml(node.id)}" type="button">Merge Into Target</button></div></details><div class="provider-test" data-graph-action-result></div>`;
+    ? `<div class="provider-test">${escapeHtml(t("graph.node.synthetic"))}</div>`
+    : `<div class="provider-actions graph-node-primary-actions"><button data-graph-open="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.openInSearch"))}</button><button data-graph-pin="${escapeHtml(node.id)}" type="button">${pinned ? escapeHtml(t("graph.node.unpin")) : escapeHtml(t("graph.node.pin"))}</button></div><details class="graph-node-advanced"><summary>${escapeHtml(t("graph.node.advancedEdges"))}</summary><label>${escapeHtml(t("graph.node.targetLabel"))}<select data-graph-target><option value="">${escapeHtml(t("graph.node.selectNode"))}</option>${options}</select></label><label>${escapeHtml(t("graph.node.edgeLabel"))}<select data-graph-edge-type><option>RELATED_TO</option><option>SUPPORTS</option><option>DEPENDS_ON</option><option>IMPLEMENTS</option><option>DOCUMENTED_IN</option></select></label><div class="provider-actions"><button data-graph-edge="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.createEdge"))}</button><button data-graph-path="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.explainPath"))}</button><button data-graph-merge="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.merge"))}</button></div></details><div class="provider-test" data-graph-action-result></div>`;
   bindGraphActions(actions, node);
   neighbors.innerHTML = linked.length
     ? ""
-    : '<div class="result"><strong>No linked memory</strong><p>Use Rebuild Links or create an edge.</p></div>';
+    : `<div class="result"><strong>${escapeHtml(t("graph.node.noLinks"))}</strong><p>${escapeHtml(t("graph.node.noLinksHint"))}</p></div>`;
   const byId = new Map(nodeSource.map(item => [item.id, item]));
   for (const edge of linked) {
     const other = byId.get(edge.source === node.id ? edge.target : edge.source);
@@ -1453,7 +1468,7 @@ function renderGraphDetail(node) {
   if (filesEl) {
     const files = graphNodeRelatedFiles(node);
     if (!files.length) {
-      filesEl.innerHTML = '<div class="result"><strong>No related files</strong><p>Evidence paths and source refs will show up here when available.</p></div>';
+      filesEl.innerHTML = `<div class="result"><strong>${escapeHtml(t("graph.node.noFiles"))}</strong><p>${escapeHtml(t("graph.node.noFilesHint"))}</p></div>`;
     } else {
       filesEl.innerHTML = files.map(file => {
         const kind = file.kind === "evidence" ? "Evidence" : file.kind === "source" ? "Source" : "File";
@@ -1493,22 +1508,22 @@ function bindGraphActions(container, node) {
   if (pin) pin.addEventListener("click", async () => { await api(`/api/graph/nodes/${node.id}/pin`, { method: "POST", body: "{}" }); await loadGraph(); });
   const createEdge = container.querySelector("[data-graph-edge]");
   if (createEdge) createEdge.addEventListener("click", async () => {
-    if (!targetSelect.value) return setResult("Select a target node.", false);
+    if (!targetSelect.value) return setResult(t("graph.node.selectTarget"), false);
     await api("/api/graph/edges", { method: "POST", body: JSON.stringify({ source: node.id, target: targetSelect.value, type: edgeType.value, scope: node.scope }) });
-    setResult("Edge created.");
+    setResult(t("graph.node.edgeCreated"));
     await loadGraph();
   });
   const explain = container.querySelector("[data-graph-path]");
   if (explain) explain.addEventListener("click", async () => {
-    if (!targetSelect.value) return setResult("Select a target node.", false);
+    if (!targetSelect.value) return setResult(t("graph.node.selectTarget"), false);
     const payload = await api(`/api/graph/path?source=${encodeURIComponent(node.id)}&target=${encodeURIComponent(targetSelect.value)}`);
     setResult(payload.explanation, payload.found);
   });
   const merge = container.querySelector("[data-graph-merge]");
   if (merge) merge.addEventListener("click", async () => {
-    if (!targetSelect.value) return setResult("Select a target node.", false);
+    if (!targetSelect.value) return setResult(t("graph.node.selectTarget"), false);
     await api(`/api/graph/nodes/${node.id}/merge`, { method: "POST", body: JSON.stringify({ target_id: targetSelect.value }) });
-    setResult("Node merged.");
+    setResult(t("graph.node.merged"));
     graphState.selectedId = targetSelect.value;
     await loadGraph();
   });

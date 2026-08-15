@@ -7,6 +7,7 @@ import { loadAnalytics } from "./providers.js";
 import { refreshWorkspace, runSearch, scheduleGraphLoad } from "./projects.js";
 import { projectParam, state, t } from "./state.js";
 import { showError } from "./ui.js";
+import { createVirtualList } from "./virtual-list.js";
 
 async function loadMemoryLifecycle() {
   const container = document.querySelector("#memory-lifecycle-dashboard");
@@ -150,35 +151,75 @@ async function loadMemoryList() {
     }
     if (countEl) countEl.textContent = `${items.length} shown · ${total} matched`;
     if (!items.length) {
+      resetMemoryListView();
       container.innerHTML = '<div class="memory-lifecycle-empty">No memory items match these filters.</div>';
       return;
     }
-    container.innerHTML = items.map(item => {
-      const meta = item.metadata || {};
-      const text = String(item.text || "").trim();
-      const preview = text.length > 200 ? `${text.slice(0, 197)}…` : text;
-      const updated = String(item.updated_at || "").slice(0, 10);
-      return `
-        <article class="memory-list-item" data-node-id="${escapeHtml(item.id || "")}">
-          <div class="memory-list-item-icon">${memoryTypeIcon(item.type)}</div>
-          <div class="memory-list-item-body">
-            <div class="memory-list-item-top">
-              <strong title="${escapeHtml(item.label || "")}">${escapeHtml(item.label || "Memory item")}</strong>
-              <span class="muted">${escapeHtml(updated)}</span>
-            </div>
-            <p>${escapeHtml(preview || "No preview.")}</p>
-            <div class="candidate-card-chips">
-              ${item.type ? `<span class="candidate-chip">${escapeHtml(item.type)}</span>` : ""}
-              <span class="candidate-chip subtle">${escapeHtml(meta.memory_tier || "unknown")}</span>
-              <span class="candidate-chip subtle">${escapeHtml(meta.lifecycle_state || "unknown")}</span>
-              ${meta.favorite || meta.pinned ? '<span class="candidate-chip">★</span>' : ""}
-            </div>
-          </div>
-        </article>`;
-    }).join("");
+    renderMemoryListItems(container, items);
   } catch (error) {
+    resetMemoryListView();
     container.innerHTML = `<div class="memory-lifecycle-empty">${escapeHtml(error.message || "Failed to load memory items")}</div>`;
   }
+}
+
+// The list is windowed (see virtual-list.js): only viewport rows + overscan
+// exist in the DOM instead of one innerHTML for up to 150 cards.
+let memoryListView = null; // { container, vlist }
+
+function memoryListItemHtml(item) {
+  const meta = item.metadata || {};
+  const text = String(item.text || "").trim();
+  const preview = text.length > 200 ? `${text.slice(0, 197)}…` : text;
+  const updated = String(item.updated_at || "").slice(0, 10);
+  return `
+    <article class="memory-list-item" data-node-id="${escapeHtml(item.id || "")}">
+      <div class="memory-list-item-icon">${memoryTypeIcon(item.type)}</div>
+      <div class="memory-list-item-body">
+        <div class="memory-list-item-top">
+          <strong title="${escapeHtml(item.label || "")}">${escapeHtml(item.label || "Memory item")}</strong>
+          <span class="muted">${escapeHtml(updated)}</span>
+        </div>
+        <p>${escapeHtml(preview || "No preview.")}</p>
+        <div class="candidate-card-chips">
+          ${item.type ? `<span class="candidate-chip">${escapeHtml(item.type)}</span>` : ""}
+          <span class="candidate-chip subtle">${escapeHtml(meta.memory_tier || "unknown")}</span>
+          <span class="candidate-chip subtle">${escapeHtml(meta.lifecycle_state || "unknown")}</span>
+          ${meta.favorite || meta.pinned ? '<span class="candidate-chip">★</span>' : ""}
+        </div>
+      </div>
+    </article>`;
+}
+
+function renderMemoryListItems(container, items) {
+  if (!memoryListView || memoryListView.container !== container) {
+    resetMemoryListView();
+    // The 8px row gap moves from the container (now spacing spacers too) to
+    // the window holder, keeping row spacing identical to the old innerHTML.
+    container.style.gap = "0px";
+    memoryListView = {
+      container,
+      vlist: createVirtualList({
+        container,
+        renderRow: item => {
+          const wrap = document.createElement("div");
+          wrap.innerHTML = memoryListItemHtml(item);
+          return wrap.firstElementChild || wrap.firstChild;
+        },
+        estimatedRowHeight: 120, // includes the 8px gap; measured after render
+        overscan: 5,
+        gap: 8, // .memory-list-items { gap: 8px }
+        holderStyle: "display:flex;flex-direction:column;gap:8px;",
+      }),
+    };
+  }
+  memoryListView.vlist.setRows(items);
+}
+
+function resetMemoryListView() {
+  if (!memoryListView) return;
+  memoryListView.vlist.destroy();
+  memoryListView.container.style.gap = "";
+  memoryListView = null;
 }
 
 async function loadMemoryCandidates() {

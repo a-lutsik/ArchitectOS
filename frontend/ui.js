@@ -2,7 +2,7 @@
 import { api } from "./api-client.js";
 import { syncAskMode } from "./ask-ui.js";
 import { syncCodeFileHint } from "./code-intel.js";
-import { escapeHtml, labelPrefix, setButton, setPlaceholder, setText, setTextContent, showSnackbar } from "./dom-utils.js";
+import { escapeHtml, labelPrefix, setButton, setPlaceholder, setText, setTextContent, showSnackbar, trapFocus } from "./dom-utils.js";
 import { LANGUAGE_META, RTL_LANGUAGES, translations } from "./i18n.js";
 import { refreshWorkspace, runSearch } from "./projects.js";
 import { state, syncProjectTerminology, t, titleByView } from "./state.js";
@@ -12,7 +12,7 @@ function syncLanguageMenu() {
   const flag = document.querySelector("#language-current-flag");
   const button = document.querySelector("#language-btn");
   if (flag) flag.textContent = current.flag;
-  if (button) button.title = `Language: ${current.label}`;
+  if (button) button.title = t("language.current").replace("{label}", current.label);
   document.querySelectorAll("[data-language-option]").forEach(option => {
     const active = option.dataset.languageOption === state.language;
     option.classList.toggle("active", active);
@@ -161,7 +161,7 @@ async function saveWorkspaceSettings(partial = {}) {
   await api("/api/settings", { method: "PATCH", body: JSON.stringify({ workspace }) });
 }
 function showError(error) {
-  const message = error && error.message ? error.message : String(error || "Unexpected error");
+  const message = error && error.message ? error.message : String(error || t("error.unexpected"));
   const output = document.querySelector("#context-output");
   if (output) output.textContent = message;
   showSnackbar(message, "error");
@@ -174,33 +174,33 @@ function providerStatusClass(status, enabled) {
 }
 function providerHint(provider) {
   if (provider.last_check && provider.last_check.message) return provider.last_check.message;
-  if (provider.id === "openai") return "Set OPENAI_API_KEY, then test this provider.";
-  if (provider.id === "azure-openai") return "Set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT, then set Model to your Azure deployment name. You can also set AZURE_OPENAI_DEPLOYMENT.";
-  if (provider.id === "anthropic") return "Set ANTHROPIC_API_KEY, choose a Claude model, then test this provider.";
-  if (provider.id === "gemini-cli") return "Antigravity (agy): Sign in with Google, then Test. Gemini CLI is deprecated.";
-  if (provider.id === "codex-cli") return "Sign in with ChatGPT in the terminal (like Codex email login), then Test.";
+  if (provider.id === "openai") return t("providers.hint.openai");
+  if (provider.id === "azure-openai") return t("providers.hint.azureOpenai");
+  if (provider.id === "anthropic") return t("providers.hint.anthropic");
+  if (provider.id === "gemini-cli") return t("providers.hint.geminiCli");
+  if (provider.id === "codex-cli") return t("providers.hint.codexCli");
   if (provider.id === "openrouter") {
-    if (provider.available_models && provider.available_models.length) return `${provider.available_models.length} OpenRouter model(s) discovered.`;
-    return "Set OPENROUTER_API_KEY, refresh models, then choose a model slug.";
+    if (provider.available_models && provider.available_models.length) return t("providers.hint.openrouterDiscovered").replace("{count}", String(provider.available_models.length));
+    return t("providers.hint.openrouter");
   }
   if (provider.id === "ollama") {
-    if (provider.available_models && provider.available_models.length) return `${provider.available_models.length} local model(s) discovered.`;
-    return "Start Ollama, refresh models, then choose one.";
+    if (provider.available_models && provider.available_models.length) return t("providers.hint.ollamaDiscovered").replace("{count}", String(provider.available_models.length));
+    return t("providers.hint.ollama");
   }
-  if (provider.provider_type === "cli") return "Install the CLI, confirm PATH, then test this provider.";
-  return "Configure and test this provider before enabling auto-route.";
+  if (provider.provider_type === "cli") return t("providers.hint.cli");
+  return t("providers.hint.default");
 }
 
 function providerLoginLabel(provider) {
-  if (provider.id === "gemini-cli") return "Sign in with Google";
-  if (provider.id === "codex-cli") return "Sign in with ChatGPT";
+  if (provider.id === "gemini-cli") return t("providers.login.google");
+  if (provider.id === "codex-cli") return t("providers.login.chatgpt");
   return "";
 }
 
 function renderResults(container, hits) {
   if (!container) return;
   container.innerHTML = "";
-  if (!hits.length) { container.innerHTML = '<div class="result"><strong>No matches</strong><p>Scan project or add memory.</p></div>'; return; }
+  if (!hits.length) { container.innerHTML = `<div class="result"><strong>${escapeHtml(t("results.noMatches"))}</strong><p>${escapeHtml(t("results.noMatchesHint"))}</p></div>`; return; }
   for (const hit of hits) {
     const node = hit.node || hit;
     const favorite = Boolean(node.metadata && node.metadata.favorite);
@@ -210,12 +210,70 @@ function renderResults(container, hits) {
     const tier = meta.memory_tier ? `<span class="badge">${escapeHtml(meta.memory_tier)}</span>` : "";
     const lifecycle = meta.lifecycle_state ? `<span class="badge">${escapeHtml(meta.lifecycle_state)}</span>` : "";
     const access = meta.access_count ? `<span class="badge">used ${escapeHtml(String(meta.access_count))}</span>` : "";
-    const longTermButton = meta.memory_tier === "long_term" ? "" : `<button data-long-term="${escapeHtml(node.id)}" type="button">Long-term</button>`;
-    el.innerHTML = `<div class="row"><strong>${escapeHtml(node.label)}</strong><div class="provider-actions"><button data-fav="${escapeHtml(node.id)}">${favorite ? "Starred" : "Star"}</button>${longTermButton}</div></div><p>${escapeHtml(node.text)}</p><span class="badge">${escapeHtml(node.type)}</span><span class="badge">${escapeHtml(node.scope)}</span>${tier}${lifecycle}${access}${meta.memory_score ? `<span class="badge">memory ${escapeHtml(String(meta.memory_score))}</span>` : ""}${hit.score ? `<span class="badge">score ${hit.score}</span>` : ""}`;
+    const longTermButton = meta.memory_tier === "long_term" ? "" : `<button data-long-term="${escapeHtml(node.id)}" type="button">${escapeHtml(t("results.longTerm"))}</button>`;
+    el.innerHTML = `<div class="row"><strong>${escapeHtml(node.label)}</strong><div class="provider-actions"><button data-fav="${escapeHtml(node.id)}">${favorite ? escapeHtml(t("results.starred")) : escapeHtml(t("results.star"))}</button>${longTermButton}</div></div><p>${escapeHtml(node.text)}</p><span class="badge">${escapeHtml(node.type)}</span><span class="badge">${escapeHtml(node.scope)}</span>${tier}${lifecycle}${access}${meta.memory_score ? `<span class="badge">memory ${escapeHtml(String(meta.memory_score))}</span>` : ""}${hit.score ? `<span class="badge">score ${hit.score}</span>` : ""}`;
     container.appendChild(el);
   }
   container.querySelectorAll("[data-fav]").forEach(button => button.addEventListener("click", async () => { await api(`/api/memory/${button.dataset.fav}/favorite`, { method: "PATCH", body: "{}" }); await refreshWorkspace(); await runSearch(document.querySelector("#search-query").value || "memory"); }));
   container.querySelectorAll("[data-long-term]").forEach(button => button.addEventListener("click", async () => { await api(`/api/memory/${button.dataset.longTerm}/promote-long-term`, { method: "POST", body: JSON.stringify({ reason: "ui" }) }); await refreshWorkspace(); await runSearch(document.querySelector("#search-query").value || "memory"); }));
+}
+
+// Generic focus trapping for the modals whose open/close paths live in other
+// modules (project settings, project wizard, MCP add-server, project folder,
+// file find — plus the explicitly trapped graph modal and search palette,
+// which manage their own traps). A MutationObserver watches each modal's
+// open-state attribute: opening installs a trap and moves focus inside,
+// closing releases it and restores focus to the element that opened it.
+const MODAL_FOCUS_SPECS = [
+  { id: "project-settings-modal", attr: "hidden", focus: "#settings-project-name" },
+  { id: "new-project-wizard", attr: "hidden", focus: "#wizard-folder-path" },
+  { id: "add-mcp-modal", attr: "hidden", focus: "#add-mcp-label" },
+  { id: "projectFolderModal", attr: "aria-hidden", focus: "#project-root-path" },
+  { id: "fileFindModal", attr: "aria-hidden", focus: "#file-find-query" },
+];
+const modalFocusReleases = new Map();
+let lastFocusBeforeModal = null;
+
+function watchedModalIsOpen(el, spec) {
+  return spec.attr === "hidden" ? !el.hasAttribute("hidden") : el.getAttribute("aria-hidden") !== "true";
+}
+
+function syncModalFocusTraps() {
+  for (const spec of MODAL_FOCUS_SPECS) {
+    const el = document.getElementById(spec.id);
+    if (!el) continue;
+    const open = watchedModalIsOpen(el, spec);
+    const release = modalFocusReleases.get(spec.id);
+    if (open && !release) {
+      modalFocusReleases.set(spec.id, trapFocus(el, lastFocusBeforeModal || undefined));
+      if (!el.contains(document.activeElement)) {
+        const target = el.querySelector(spec.focus) || el.querySelector("button, input, select, textarea");
+        if (target) target.focus();
+      }
+    } else if (!open && release) {
+      modalFocusReleases.delete(spec.id);
+      release();
+    }
+  }
+}
+
+function initModalFocusWatch() {
+  // Track the last element focused outside any open watched modal — that is
+  // the trigger focus returns to when the modal closes.
+  document.addEventListener("focusin", event => {
+    for (const id of modalFocusReleases.keys()) {
+      const el = document.getElementById(id);
+      if (el && el.contains(event.target)) return;
+    }
+    lastFocusBeforeModal = event.target;
+  });
+  const observer = new MutationObserver(syncModalFocusTraps);
+  observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["hidden", "aria-hidden"] });
+  syncModalFocusTraps();
+}
+
+if (typeof MutationObserver !== "undefined" && typeof document !== "undefined" && document.body) {
+  initModalFocusWatch();
 }
 
 export {

@@ -312,9 +312,9 @@
 
 <div id="project-settings-modal" class="modal" hidden>
   <div class="modal-backdrop" data-close-modal></div>
-  <div class="modal-dialog modal-lg">
+  <div class="modal-dialog modal-lg" role="dialog" aria-modal="true" aria-labelledby="project-settings-title">
     <div class="modal-header">
-      <h3>Project Settings</h3>
+      <h3 id="project-settings-title">Project Settings</h3>
       <button class="modal-close" data-close-modal aria-label="Close">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -389,10 +389,10 @@
 
 
 <div id="graph-expand-overlay" class="graph-expand-overlay" hidden>
-  <div class="graph-expand-shell">
+  <div class="graph-expand-shell" role="dialog" aria-modal="true" aria-labelledby="graph-expand-title">
     <div class="graph-expand-toolbar">
       <div>
-        <h3 data-i18n="graph.expandTitle">Memory Graph</h3>
+        <h3 id="graph-expand-title" data-i18n="graph.expandTitle">Memory Graph</h3>
         <p data-i18n="graph.expandHint">Drag nodes, scroll to zoom, double-click to inspect, Esc to close</p>
       </div>
       <div class="graph-expand-actions">
@@ -444,7 +444,7 @@
 
 <div id="new-project-wizard" class="modal" hidden>
   <div class="modal-backdrop"></div>
-  <div class="modal-dialog modal-wizard wizard-create-dialog">
+  <div class="modal-dialog modal-wizard wizard-create-dialog" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
     <div class="modal-header">
       <h3 id="wizard-title" data-i18n="wizard.title">Create project</h3>
       <button type="button" class="modal-close" data-close-modal aria-label="Close">
@@ -1218,9 +1218,9 @@
 
 <div id="add-mcp-modal" class="modal" hidden>
   <div class="modal-backdrop" data-close-add-mcp></div>
-  <div class="modal-dialog">
+  <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="add-mcp-title">
     <div class="modal-header">
-      <h3>Add MCP Server</h3>
+      <h3 id="add-mcp-title">Add MCP Server</h3>
       <button class="modal-close" type="button" data-close-add-mcp aria-label="Close">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -1625,9 +1625,9 @@
     <!-- Search Palette Modal -->
     <div class="search-palette" id="searchPalette">
       <div class="search-palette-backdrop" data-close-palette></div>
-      <div class="search-palette-modal">
+      <div class="search-palette-modal" role="dialog" aria-modal="true" aria-labelledby="search-palette-title">
         <div class="search-palette-header">
-          <h3>Search Memory</h3>
+          <h3 id="search-palette-title">Search Memory</h3>
           <button class="close-palette-btn" data-close-palette aria-label="Close">
             <span>Close</span>
             <kbd>Esc</kbd>
