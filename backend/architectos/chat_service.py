@@ -67,7 +67,7 @@ class ChatServiceMixin:
     def _chat_summary(self, chat: dict[str, Any], project_id: str | None = None) -> dict[str, Any]:
         chat = dict(chat)
         messages = list(chat.get("messages") or [])
-        last_message = next((message for message in reversed(messages) if str(message.get("text") or "").strip()), {})
+        last_message: dict[str, Any] = next((message for message in reversed(messages) if str(message.get("text") or "").strip()), {})
         summary = {
             "id": chat.get("id"),
             "project_id": chat.get("project_id") or project_id or "architectos",
@@ -105,7 +105,7 @@ class ChatServiceMixin:
             now = utc_now()
             chat = {"id": stable_id("chat", project_id, message[:60], now), "project_id": project_id, "title": message[:60] or "New dialog", "messages": [], "favorite": False, "created_at": now, "last_activity_at": now, "session_status": "active", "session_revision": 1}
         chat = self._activate_chat_session(chat)
-        user_message = {"role": "user", "text": message, "created_at": utc_now()}
+        user_message: dict[str, Any] = {"role": "user", "text": message, "created_at": utc_now()}
         if message_security["redacted"]:
             user_message["security"] = {"redacted": True, "findings": message_security["findings"]}
         chat["messages"].append(user_message)

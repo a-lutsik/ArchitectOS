@@ -1048,9 +1048,11 @@ class CliAdapter(ProviderAdapter):
             assert proc.stdout is not None
             assert proc.stderr is not None
 
+            stdout_stream = proc.stdout
+
             def pump_stdout() -> None:
                 while True:
-                    char = proc.stdout.read(1)
+                    char = stdout_stream.read(1)
                     if not char:
                         break
                     output_queue.put(("stdout", char))

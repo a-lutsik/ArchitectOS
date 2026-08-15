@@ -101,32 +101,40 @@ _CHANGE_TYPE_NAMES = {1: "add", 2: "edit", 8: "rename", 16: "delete", 18: "delet
 
 def _pull_request_summary(item: dict[str, Any]) -> str:
     """One pull request as a few lines: identity, branches, changed files, linked work items."""
-    status = item.get("status")
+    status: Any = item.get("status")
     status_text = _PR_STATUS_NAMES.get(status, str(status)) if not isinstance(status, str) else status
-    repo = item.get("repository") if isinstance(item.get("repository"), dict) else {}
-    author = item.get("createdBy") if isinstance(item.get("createdBy"), dict) else {}
+    raw_repo: Any = item.get("repository")
+    repo = raw_repo if isinstance(raw_repo, dict) else {}
+    raw_author: Any = item.get("createdBy")
+    author = raw_author if isinstance(raw_author, dict) else {}
     source = str(item.get("sourceRefName") or "").replace("refs/heads/", "")
     target = str(item.get("targetRefName") or "").replace("refs/heads/", "")
-    merge = item.get("lastMergeCommit") if isinstance(item.get("lastMergeCommit"), dict) else {}
+    raw_merge: Any = item.get("lastMergeCommit")
+    merge = raw_merge if isinstance(raw_merge, dict) else {}
     lines = [
         f"- PR !{item.get('pullRequestId')} [{status_text}] {item.get('title') or ''}".rstrip(),
         f"  repo={repo.get('name') or ''} {source} -> {target} by {author.get('displayName') or ''}".rstrip(),
     ]
     if merge.get("commitId"):
         lines.append(f"  merge commit {str(merge['commitId'])[:12]} at {item.get('closedDate') or ''}".rstrip())
-    refs = item.get("workItemRefs") if isinstance(item.get("workItemRefs"), list) else []
+    raw_refs: Any = item.get("workItemRefs")
+    refs = raw_refs if isinstance(raw_refs, list) else []
     ids = [str(ref.get("id")) for ref in refs if isinstance(ref, dict) and ref.get("id")]
     if ids:
         lines.append(f"  work items: {', '.join(ids[:20])}")
-    summary = item.get("changedFilesSummary") if isinstance(item.get("changedFilesSummary"), dict) else {}
-    entries = summary.get("changeEntries") if isinstance(summary.get("changeEntries"), list) else []
+    raw_summary: Any = item.get("changedFilesSummary")
+    summary = raw_summary if isinstance(raw_summary, dict) else {}
+    raw_entries: Any = summary.get("changeEntries")
+    entries = raw_entries if isinstance(raw_entries, list) else []
     if entries:
         lines.append(f"  changed files ({summary.get('fileCount') or len(entries)}):")
         for entry in entries[:40]:
             if not isinstance(entry, dict):
                 continue
-            file_item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
-            change = _CHANGE_TYPE_NAMES.get(entry.get("changeType"), str(entry.get("changeType") or ""))
+            raw_file_item: Any = entry.get("item")
+            file_item = raw_file_item if isinstance(raw_file_item, dict) else {}
+            change_type: Any = entry.get("changeType")
+            change = _CHANGE_TYPE_NAMES.get(change_type, str(change_type or ""))
             lines.append(f"    {change}: {file_item.get('path') or ''}")
         if len(entries) > 40:
             lines.append(f"    (+{len(entries) - 40} more)")
@@ -205,7 +213,7 @@ def ado_call_plan(op: str, args: dict[str, Any]) -> list[tuple[str, dict[str, An
             ("wit_list_work_item_comments", {"workItemId": item_id, "top": top}),
         ])
     if op == "my_work":
-        payload = {
+        payload: dict[str, Any] = {
             "type": str(data.get("type") or "assignedtome"),
             "top": max(1, int(data.get("top") or 20)),
             "includeCompleted": bool(data.get("includeCompleted", True)),
@@ -229,7 +237,7 @@ def ado_call_plan(op: str, args: dict[str, Any]) -> list[tuple[str, dict[str, An
         search_text = str(data.get("searchText") or data.get("query") or "").strip()
         if not search_text:
             raise ValueError("boards search requires searchText")
-        payload: dict[str, Any] = {
+        payload = {
             "searchText": search_text,
             "top": min(max(1, int(data.get("top") or 25)), 25),
             "skip": max(0, int(data.get("skip") or 0)),
@@ -248,7 +256,7 @@ def ado_call_plan(op: str, args: dict[str, Any]) -> list[tuple[str, dict[str, An
                 modern[key] = data[key]
         return scoped([("repo_repository", modern), ("repo_list_repos_by_project", legacy)])
     if op == "list_pull_requests":
-        shared = {
+        shared: dict[str, Any] = {
             key: data[key]
             for key in ("top", "skip", "status", "repositoryId", "repository", "targetRefName", "sourceRefName")
             if data.get(key) is not None
@@ -282,7 +290,7 @@ def ado_call_plan(op: str, args: dict[str, Any]) -> list[tuple[str, dict[str, An
         if not repository:
             raise ValueError("pull_requests_for_commit requires a repository")
         # Azure DevOps matches only merge commits unless the query asks for member commits.
-        shared: dict[str, Any] = {
+        shared = {
             "repository": repository,
             "commits": commits,
             "queryType": str(data.get("queryType") or "Commit"),
@@ -298,7 +306,7 @@ def ado_call_plan(op: str, args: dict[str, Any]) -> list[tuple[str, dict[str, An
         pull_request_id = data.get("pullRequestId") or data.get("id")
         if pull_request_id is None or str(pull_request_id).strip() == "":
             raise ValueError("get_pull_request requires pullRequestId")
-        shared: dict[str, Any] = {
+        shared = {
             "pullRequestId": int(pull_request_id),
             "includeChangedFiles": bool(data.get("includeChangedFiles", True)),
             "includeWorkItemRefs": bool(data.get("includeWorkItemRefs", True)),
@@ -317,7 +325,7 @@ def ado_call_plan(op: str, args: dict[str, Any]) -> list[tuple[str, dict[str, An
         repository_id = str(data.get("repositoryId") or data.get("repository") or "").strip()
         if not repository_id:
             raise ValueError("pull_request_comments requires repositoryId")
-        shared: dict[str, Any] = {
+        shared = {
             "repositoryId": repository_id,
             "pullRequestId": int(pull_request_id),
             "top": max(1, int(data.get("top") or 30)),
@@ -1286,13 +1294,15 @@ def _compact_mcp_tool_payload(payload: Any) -> str | None:
         return "\n".join(lines)
 
     if tool == "search_workitem" or ("count" in parsed and "results" in parsed):
-        results = parsed.get("results") if isinstance(parsed.get("results"), list) else []
-        count = int(parsed.get("count") or len(results) or 0)
-        lines: list[str] = [f"search_workitem · count={count}, showing={len(results)}"]
-        for item in results[:20]:
+        raw_results: Any = parsed.get("results")
+        workitem_results = raw_results if isinstance(raw_results, list) else []
+        count = int(parsed.get("count") or len(workitem_results) or 0)
+        lines = [f"search_workitem · count={count}, showing={len(workitem_results)}"]
+        for item in workitem_results[:20]:
             if not isinstance(item, dict):
                 continue
-            fields = item.get("fields") if isinstance(item.get("fields"), dict) else item
+            raw_item_fields: Any = item.get("fields")
+            fields = raw_item_fields if isinstance(raw_item_fields, dict) else item
             wid = fields.get("system.id") or fields.get("System.Id") or fields.get("id") or ""
             title = fields.get("system.title") or fields.get("System.Title") or fields.get("title") or ""
             wtype = fields.get("system.workitemtype") or fields.get("System.WorkItemType") or ""
@@ -1301,7 +1311,8 @@ def _compact_mcp_tool_payload(payload: Any) -> str | None:
 
     # wit_work_item also serves comments and "my work" lists, so require a field bag here.
     if isinstance(parsed.get("fields"), dict) and (parsed.get("id") or tool in {"wit_work_item", "wit_get_work_item"}):
-        fields = parsed.get("fields") if isinstance(parsed.get("fields"), dict) else {}
+        raw_parsed_fields: Any = parsed.get("fields")
+        fields = raw_parsed_fields if isinstance(raw_parsed_fields, dict) else {}
         wid = parsed.get("id") or fields.get("System.Id")
         title = fields.get("System.Title") or ""
         wtype = fields.get("System.WorkItemType") or ""

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import json
 import logging
 import os
 import re
 import sqlite3
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .config import BACKUP_RETENTION
 from .constants import SECRET_MASK
@@ -30,6 +31,11 @@ def sanitize_payload(value: Any) -> tuple[Any, bool]:
 # Keys that hold credential material and must never leave the process via
 # bundle export (OAuth tokens are persisted in the settings table).
 SENSITIVE_SETTING_KEYS = {"access_token", "refresh_token", "client_secret", "code_verifier", "id_token"}
+
+# Current database schema version. MIGRATIONS (bottom of this module) holds one
+# (version, fn) entry per step; _migrate applies every step above the database's
+# PRAGMA user_version (0 for databases predating versioning) and stamps the rest.
+SCHEMA_VERSION = 3
 
 
 def strip_sensitive_settings(value: Any) -> Any:
@@ -69,6 +75,9 @@ class SQLiteMemoryRepository:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self._node_upsert_listeners: list[Any] = []
+        # Thread-local slot for the connection owned by transaction(); must exist
+        # before _migrate() runs its first _connect().
+        self._local = threading.local()
         self._migrate()
         try:
             # The database holds memory and settings data; restrict it to the owner.
@@ -83,6 +92,12 @@ class SQLiteMemoryRepository:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        # Inside transaction() the current thread already owns a connection; join it
+        # without committing or closing (the outer transaction owns the lifecycle).
+        active = getattr(self._local, "transaction_connection", None)
+        if active is not None:
+            yield active
+            return
         # timeout + WAL: embedding backfill writers must not freeze Search palette reads.
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
@@ -96,6 +111,40 @@ class SQLiteMemoryRepository:
             yield conn
             conn.commit()
         finally:
+            conn.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run the wrapped repository calls as one atomic unit (BEGIN IMMEDIATE).
+
+        On clean exit the transaction commits; on exception it rolls back and the
+        exception re-raises. The connection is pinned to the creating thread via
+        ``self._local`` (sqlite3 connections must stay on their creating thread);
+        nested ``transaction()`` calls in the same thread reuse the active one.
+        """
+        active = getattr(self._local, "transaction_connection", None)
+        if active is not None:
+            yield active
+            return
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error as exc:
+            _LOG.debug("SQLite pragma setup failed: %s", exc)
+        self._local.transaction_connection = conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            self._local.transaction_connection = None
             conn.close()
 
     def health_check(self) -> dict[str, Any]:
@@ -164,6 +213,8 @@ class SQLiteMemoryRepository:
 
     def _migrate(self) -> None:
         with self._connect() as conn:
+            current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            # Baseline: idempotent creates, safe for both fresh and existing DBs.
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS projects (
@@ -299,6 +350,11 @@ class SQLiteMemoryRepository:
                     ON retrieval_feedback(project_id, created_at);
                 """
             )
+            for version, migration in MIGRATIONS:
+                if version > current_version:
+                    migration(self, conn)
+            if current_version < SCHEMA_VERSION:
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._ensure_memory_fts()
 
     def seed_if_empty(self) -> None:
@@ -366,8 +422,6 @@ class SQLiteMemoryRepository:
                 "long_term_types": ["Decision", "Constraint", "Requirement"],
                 "architecture_keywords": ["architecture", "adr", "decision", "constraint", "security", "provider", "routing"],
             })
-        else:
-            self._upgrade_memory_lifecycle_defaults()
         if not self.get_setting("memory_retrieval"):
             from .embeddings import default_memory_retrieval_settings
 
@@ -387,8 +441,6 @@ class SQLiteMemoryRepository:
             })
         if not self.get_setting("mcp_servers"):
             self.set_setting("mcp_servers", {"servers": _default_mcp_servers()})
-        else:
-            self._upgrade_mcp_server_defaults()
         if not self.get_setting("code_intel"):
             self.set_setting("code_intel", {"servers": _default_code_intel_servers()})
         if not self.get_setting("workspace"):
@@ -571,8 +623,8 @@ class SQLiteMemoryRepository:
             root = str(project.root_path or "").strip()
             if root:
                 candidates.append(Path(root).expanduser())
-        for root in candidates:
-            detected = detect_azure_devops_from_git(root)
+        for candidate_dir in candidates:
+            detected = detect_azure_devops_from_git(candidate_dir)
             org = str(detected.get("org") or "").strip()
             if org:
                 return org, str(detected.get("project") or "").strip()
@@ -608,7 +660,9 @@ class SQLiteMemoryRepository:
         return Project(**payload)
 
     def get_project(self, project_id: str) -> Project | None:
-        return next((project for project in self.list_projects() if project.id == project_id), None)
+        with self._connect() as conn:
+            row = conn.execute("SELECT payload FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return self._project_from_payload(json.loads(row["payload"])) if row else None
 
     def upsert_project(self, project: Project) -> Project:
         project.updated_at = utc_now()
@@ -671,7 +725,7 @@ class SQLiteMemoryRepository:
                 try:
                     listener(node)
                 except Exception:
-                    pass
+                    _LOG.exception("node upsert listener failed for node %s", node.id)
         return node
 
     def get_node(self, node_id: str) -> MemoryNode | None:
@@ -710,9 +764,20 @@ class SQLiteMemoryRepository:
             cur = conn.execute("DELETE FROM memory_edges WHERE id = ?", (edge_id,))
             return cur.rowcount > 0
 
-    def list_nodes(self) -> list[MemoryNode]:
+    def list_nodes(self, limit: int | None = None, project_id: str | None = None) -> list[MemoryNode]:
+        sql = "SELECT payload FROM memory_nodes"
+        params: list[Any] = []
+        if project_id:
+            sql += " WHERE project_id = ?"
+            params.append(project_id)
+        # Timestamps have second resolution, so ties are common; rowid keeps the
+        # order deterministic (insertion order) regardless of the query plan.
+        sql += " ORDER BY updated_at DESC, created_at DESC, rowid ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         with self._connect() as conn:
-            rows = conn.execute("SELECT payload FROM memory_nodes ORDER BY updated_at DESC, created_at DESC").fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [MemoryNode.from_dict(json.loads(row["payload"])) for row in rows]
 
     def list_nodes_by_ids(self, node_ids: list[str]) -> list[MemoryNode]:
@@ -1128,9 +1193,14 @@ class SQLiteMemoryRepository:
                     scores[key] = scores.get(key, 0.0) + weight
         return scores
 
-    def list_edges(self) -> list[MemoryEdge]:
+    def list_edges(self, limit: int | None = None) -> list[MemoryEdge]:
+        sql = "SELECT payload FROM memory_edges ORDER BY created_at, rowid ASC"
+        params: list[Any] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         with self._connect() as conn:
-            rows = conn.execute("SELECT payload FROM memory_edges ORDER BY created_at").fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [MemoryEdge.from_dict(json.loads(row["payload"])) for row in rows]
 
     def list_edge_ids(self) -> set[str]:
@@ -1516,7 +1586,8 @@ class SQLiteMemoryRepository:
     def export_bundle(self, project_id: str) -> dict[str, Any]:
         nodes = [node.to_dict() for node in self.list_nodes() if node.project_id in {project_id, None}]
         node_ids = {node["id"] for node in nodes}
-        bundle = {"format": "architectos.bundle", "version": "0.2", "exported_at": utc_now(), "project": (self.get_project(project_id) or self.get_project("architectos")).to_dict(), "memory_nodes": nodes, "memory_edges": [edge.to_dict() for edge in self.list_edges() if edge.source in node_ids and edge.target in node_ids], "memory_candidates": self.list_memory_candidates(project_id, status=None, limit=500), "tasks": self.list_tasks(project_id), "chats": self.list_chats(project_id), "providers": self.list_providers(), "settings": strip_sensitive_settings(self.all_settings())}
+        project = cast(Project, self.get_project(project_id) or self.get_project("architectos"))
+        bundle = {"format": "architectos.bundle", "version": "0.2", "exported_at": utc_now(), "project": project.to_dict(), "memory_nodes": nodes, "memory_edges": [edge.to_dict() for edge in self.list_edges() if edge.source in node_ids and edge.target in node_ids], "memory_candidates": self.list_memory_candidates(project_id, status=None, limit=500), "tasks": self.list_tasks(project_id), "chats": self.list_chats(project_id), "providers": self.list_providers(), "settings": strip_sensitive_settings(self.all_settings())}
         clean_bundle, _redacted = sanitize_payload(bundle)
         return clean_bundle
 
@@ -1525,22 +1596,24 @@ class SQLiteMemoryRepository:
             raise ValueError("unsupported bundle format")
         project_payload = payload.get("project") or {}
         project = self._project_from_payload(project_payload)
-        self.upsert_project(project)
-        for node_payload in payload.get("memory_nodes") or []:
-            self.upsert_node(MemoryNode.from_dict(node_payload))
-        for edge_payload in payload.get("memory_edges") or []:
-            edge = MemoryEdge.from_dict(edge_payload)
-            self.add_edge(edge.source, edge.target, edge.type, edge.scope, edge.confidence)
-        for task in payload.get("tasks") or []:
-            self.upsert_task(task)
-        for candidate in payload.get("memory_candidates") or []:
-            self.upsert_memory_candidate(candidate)
-        for chat in payload.get("chats") or []:
-            self.upsert_chat(chat)
-        for provider in payload.get("providers") or []:
-            self.upsert_provider(provider)
-        for key, value in dict(payload.get("settings") or {}).items():
-            self.set_setting(key, value)
+        # One transaction: a mid-import failure must not leave a half-restored bundle.
+        with self.transaction():
+            self.upsert_project(project)
+            for node_payload in payload.get("memory_nodes") or []:
+                self.upsert_node(MemoryNode.from_dict(node_payload))
+            for edge_payload in payload.get("memory_edges") or []:
+                edge = MemoryEdge.from_dict(edge_payload)
+                self.add_edge(edge.source, edge.target, edge.type, edge.scope, edge.confidence)
+            for task in payload.get("tasks") or []:
+                self.upsert_task(task)
+            for candidate in payload.get("memory_candidates") or []:
+                self.upsert_memory_candidate(candidate)
+            for chat in payload.get("chats") or []:
+                self.upsert_chat(chat)
+            for provider in payload.get("providers") or []:
+                self.upsert_provider(provider)
+            for key, value in dict(payload.get("settings") or {}).items():
+                self.set_setting(key, value)
         return {"project_id": project.id, "nodes": len(payload.get("memory_nodes") or []), "tasks": len(payload.get("tasks") or [])}
 
     def _write_evidence(self, node: MemoryNode) -> str:
@@ -1552,6 +1625,39 @@ class SQLiteMemoryRepository:
         path.write_text(f"# Evidence: {node.label}\n\nType: {node.type}\nScope: {node.scope}\nCreated: {node.created_at}\n\n{node.text}\n", encoding="utf-8")
         return relative.as_posix()
 
+
+def _migration_001_memory_nodes_updated_at_index(repository: SQLiteMemoryRepository, conn: sqlite3.Connection) -> None:
+    """Index memory_nodes.updated_at for the hot list_nodes ORDER BY path.
+
+    memory_edges gets no matching index: list_edges orders by created_at, so an
+    updated_at index would never be used there.
+    """
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_nodes_updated_at ON memory_nodes(updated_at)")
+
+
+def _migration_002_memory_lifecycle_defaults(repository: SQLiteMemoryRepository, conn: sqlite3.Connection) -> None:
+    """Backfill memory_lifecycle keys added after the initial schema."""
+    if repository.get_setting("memory_lifecycle") is None:
+        # Fresh database: seed_if_empty writes the full defaults later.
+        return
+    repository._upgrade_memory_lifecycle_defaults()
+
+
+def _migration_003_mcp_server_defaults(repository: SQLiteMemoryRepository, conn: sqlite3.Connection) -> None:
+    """Refresh bundled MCP server entries (remote Granola, Azure DevOps git)."""
+    if repository.get_setting("mcp_servers") is None:
+        # Fresh database: seed_if_empty writes the full defaults later.
+        return
+    repository._upgrade_mcp_server_defaults()
+
+
+# Ordered (version, fn) steps; _migrate applies every step above the database's
+# PRAGMA user_version. Keep ids monotonically increasing and every step idempotent.
+MIGRATIONS: list[tuple[int, Callable[[SQLiteMemoryRepository, sqlite3.Connection], None]]] = [
+    (1, _migration_001_memory_nodes_updated_at_index),
+    (2, _migration_002_memory_lifecycle_defaults),
+    (3, _migration_003_mcp_server_defaults),
+]
 
 
 def _default_mcp_servers() -> list[dict[str, Any]]:

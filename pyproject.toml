@@ -51,3 +51,42 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["backend/architectos"]
+ignore_missing_imports = true
+# Runtime is stdlib-only and the codebase is annotated but not strict-clean:
+# keep mypy's default (lenient) checks and carve out the one systematically
+# noisy error code below instead of scattering hundreds of inline ignores.
+
+# The service layer is split into mixins (composed in service.py's
+# ArchitectOSService) that rely on the host class for shared attributes
+# (repository, security_policy, mcp_manager, ...). mypy cannot see those
+# attributes from the mixin alone, so attr-defined fires hundreds of times
+# with no signal. Disabled per-module; everything else stays on.
+[[tool.mypy.overrides]]
+module = [
+    "architectos.ai_runtime_service",
+    "architectos.azure_sync_service",
+    "architectos.chat_service",
+    "architectos.chat_session_service",
+    "architectos.graph_service",
+    "architectos.ingestion_service",
+    "architectos.integrations_service",
+    "architectos.project_scan_service",
+    "architectos.providers_council_service",
+    "architectos.retrieval_service",
+    "architectos.settings_router_service",
+    "architectos.tool_exec_service",
+]
+disable_error_code = ["attr-defined"]
+
+[tool.coverage.run]
+# Only production modules count; tests/ and scripts/ are excluded by scoping
+# the source to the backend package.
+source = ["backend/architectos"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

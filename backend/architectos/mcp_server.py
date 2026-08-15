@@ -276,7 +276,8 @@ class MemoryMCPServer:
             return {"jsonrpc": "2.0", "id": None, "error": {"code": INVALID_REQUEST, "message": "Expected JSON-RPC 2.0 object."}}
         method = str(message.get("method") or "")
         message_id = message.get("id")
-        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        raw_params: Any = message.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
         is_notification = "id" not in message
 
         try:
@@ -332,7 +333,8 @@ class MemoryMCPServer:
     # -- Tools -------------------------------------------------------------
     def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
         name = str(params.get("name") or "")
-        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        raw_arguments: Any = params.get("arguments")
+        arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
         handler = self._handlers.get(name)
         if handler is None:
             raise _RpcError(METHOD_NOT_FOUND, f"Unknown tool: {name}")
@@ -477,7 +479,8 @@ class MemoryMCPServer:
 
     def _tool_feedback(self, args: dict[str, Any]) -> dict[str, Any]:
         try:
-            rating = int(args.get("rating"))
+            raw_rating: Any = args.get("rating")
+            rating = int(raw_rating)
         except (TypeError, ValueError):
             raise _RpcError(INVALID_PARAMS, "rating is required (1 or -1)")
         if rating not in {1, -1}:
@@ -574,7 +577,8 @@ def _resource_contents(uri: str, data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_hit(hit: dict[str, Any]) -> dict[str, Any]:
-    node = hit.get("node") if isinstance(hit.get("node"), dict) else {}
+    raw_node: Any = hit.get("node")
+    node = raw_node if isinstance(raw_node, dict) else {}
     return {
         "id": node.get("id"),
         "type": node.get("type"),

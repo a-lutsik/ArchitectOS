@@ -120,7 +120,11 @@ def _collect_calls(func_node: ast.AST) -> list[str]:
     walk(func_node)
     # Deduplicate while preserving order; cap to keep the graph tidy.
     seen: set[str] = set()
-    ordered = [n for n in names if not (n in seen or seen.add(n))]
+    ordered: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
     return ordered[:40]
 
 

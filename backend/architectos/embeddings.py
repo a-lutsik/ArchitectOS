@@ -794,7 +794,8 @@ class MemoryEmbeddingEngine:
         merged["vector_pool"] = max(8, min(int(merged.get("vector_pool") or 64), 200))
         merged["vector_min_score"] = float(merged.get("vector_min_score") or 0.22)
         try:
-            merged["search_relevance_floor"] = max(0.0, min(float(merged.get("search_relevance_floor")), 0.9))
+            raw_floor: Any = merged.get("search_relevance_floor")
+            merged["search_relevance_floor"] = max(0.0, min(float(raw_floor), 0.9))
         except (TypeError, ValueError):
             merged["search_relevance_floor"] = 0.28
         try:

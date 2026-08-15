@@ -422,7 +422,7 @@ class AzureSyncServiceMixin:
         }
 
     def _build_azure_git_pr_candidate(self, project_id: str, ado_project: str, pull_request: dict[str, Any]) -> dict[str, Any] | None:
-        pr_id = pull_request.get("pullRequestId") or pull_request.get("pull_request_id")
+        pr_id: Any = pull_request.get("pullRequestId") or pull_request.get("pull_request_id")
         try:
             pr_id_int = int(pr_id)
         except (TypeError, ValueError):
@@ -620,7 +620,7 @@ class AzureSyncServiceMixin:
             selected = [wiki for wiki in wikis if str(wiki.get("id") or wiki.get("name") or "") == preferred]
         if not selected:
             selected = wikis
-        pages: list[dict[str, Any]] = []
+        pages = []
         per_wiki = max(limit, 10)
         for wiki in selected:
             wiki_id = str(wiki.get("id") or wiki.get("name") or "").strip()
@@ -1043,7 +1043,7 @@ class AzureSyncServiceMixin:
                     for future in as_completed(pending, timeout=wait_for):
                         pending.discard(future)
                         completed += 1
-                        work_item_id = futures[future]
+                        work_item_id: int | None = futures[future]
                         status = "done"
                         try:
                             status = future.result(timeout=0) or "done"
@@ -1558,10 +1558,10 @@ class AzureSyncServiceMixin:
             related_id = self._azure_boards_id_from_url(url)
             if not related_id:
                 continue
-            related_id = str(related_id)
-            if related_id in seen_ids:
+            related_id_str = str(related_id)
+            if related_id_str in seen_ids:
                 continue
-            seen_ids.add(related_id)
+            seen_ids.add(related_id_str)
             attributes = dict(relation.get("attributes") or {})
             name = str(attributes.get("name") or attributes.get("comment") or "")
             link_type = rel_type.split(".")[-1].replace("-Forward", "").replace("-Reverse", "")
@@ -1572,7 +1572,7 @@ class AzureSyncServiceMixin:
             elif "Related" in rel_type:
                 link_type = "related"
             relations.append({
-                "work_item_id": related_id,
+                "work_item_id": related_id_str,
                 "link_type": link_type,
                 "rel": rel_type,
                 "name": name,
@@ -1610,7 +1610,16 @@ class AzureSyncServiceMixin:
     def _azure_boards_normalize_comment(self, comment: Any) -> dict[str, Any] | None:
         if not isinstance(comment, dict):
             return None
-        text = self._azure_boards_html_to_text(comment.get("text") or comment.get("body") or comment.get("content") or "")
+        # Comment text is always a string field. An MCP envelope dict carries
+        # "content" as a list of {"type": "text"} parts — that is a transport
+        # wrapper, not a comment, and must not be stringified into one.
+        raw_text = ""
+        for key in ("text", "body", "content"):
+            value = comment.get(key)
+            if isinstance(value, str) and value.strip():
+                raw_text = value
+                break
+        text = self._azure_boards_html_to_text(raw_text)
         if not text:
             return None
         author_raw = comment.get("createdBy") or comment.get("author") or comment.get("user") or {}
@@ -1662,9 +1671,9 @@ class AzureSyncServiceMixin:
                 if value > 0:
                     found.append(value)
             for key in ("ids", "workItemIds", "targetIds"):
-                value = payload.get(key)
-                if isinstance(value, list):
-                    for item in value:
+                list_value = payload.get(key)
+                if isinstance(list_value, list):
+                    for item in list_value:
                         try:
                             number = int(item)
                         except (TypeError, ValueError):

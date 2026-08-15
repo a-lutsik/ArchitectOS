@@ -81,7 +81,10 @@ class GraphServiceMixin:
         counts: Counter[str] = Counter()
         for node in nodes:
             seen = set(content_tokens(f"{node.get('label') or ''} {node.get('text') or ''}"))
-            for token in seen:
+            # Iterate deterministically: Counter.most_common breaks count ties by
+            # insertion order, so raw set iteration would leak PYTHONHASHSEED into
+            # the chosen label keywords.
+            for token in sorted(seen):
                 if len(token) > 2:
                     counts[token] += 1
         if not counts:
@@ -142,7 +145,10 @@ class GraphServiceMixin:
                 continue  # a single note is not a theme
             token_counts: Counter[str] = Counter()
             for node in real:
-                for token in set(content_tokens(f"{node.get('label') or ''} {node.get('text') or ''}")):
+                # Sorted iteration keeps Counter insertion order deterministic:
+                # most_common(8) breaks ties by insertion order, and raw set
+                # iteration order varies with PYTHONHASHSEED (flaky keywords).
+                for token in sorted(set(content_tokens(f"{node.get('label') or ''} {node.get('text') or ''}"))):
                     if len(token) > 2:
                         token_counts[token] += 1
             keywords = [token for token, _count in token_counts.most_common(8)]

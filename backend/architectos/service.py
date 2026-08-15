@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .adapters import ProviderRequest, ProviderRouter
 from .council import CouncilOrchestrator
@@ -280,7 +280,7 @@ class MemoryLifecycleEngine:
 
     def settings(self) -> dict[str, Any]:
         configured = self.repository.get_setting("memory_lifecycle") or {}
-        settings = dict(DEFAULT_MEMORY_LIFECYCLE)
+        settings: dict[str, Any] = dict(DEFAULT_MEMORY_LIFECYCLE)
         settings.update({key: value for key, value in configured.items() if key in settings})
         settings["enabled"] = bool(settings.get("enabled"))
         settings["refresh_on_access"] = bool(settings.get("refresh_on_access"))
@@ -324,7 +324,10 @@ class MemoryLifecycleEngine:
         settings = self.settings()
         # Minimal stand-in so existing helpers can score/classify.
         class _Probe:
-            pass
+            type: str
+            label: str
+            created_at: str
+            metadata: dict[str, Any]
 
         probe = _Probe()
         probe.type = node_type
@@ -1119,7 +1122,7 @@ class GraphAutoLinker:
         existing_edge_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         shared = existing_edge_ids is not None
-        existing = existing_edge_ids if shared else {edge.id for edge in self.repository.list_edges()}
+        existing: set[str] = existing_edge_ids if existing_edge_ids is not None else {edge.id for edge in self.repository.list_edges()}
         created = 0
         linked_nodes: set[str] = set()
         edges: list[dict[str, Any]] = []
@@ -1200,6 +1203,8 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         self.council = CouncilOrchestrator(self.run_ai, self._agent_selectable_providers)
         self.files = FileStore(self.repository.data_dir / "uploads")
         self.cancelled_runs: set[str] = set()
+        # Guards cancelled_runs: request threads add, provider threads poll.
+        self._cancelled_runs_lock = threading.Lock()
         self.repository.seed_if_empty()
         self._memory_rescan_lock = threading.Lock()
         self._memory_rescan_state: dict[str, Any] = {
@@ -1961,12 +1966,14 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
             filtered_nodes = matched
             
         allowed = {node.id for node in filtered_nodes}
-        all_edges = [edge for edge in self.repository.list_edges() if edge.source in allowed and edge.target in allowed]
+        # Fetch the edge table once; the per-view subsets are derived in memory.
+        table_edges = self.repository.list_edges()
+        all_edges = [edge for edge in table_edges if edge.source in allowed and edge.target in allowed]
 
         # Exact ID search: pull in 1-hop neighbors so the hit isn't an isolated dot.
         if exact_id_hits:
             neighbor_ids: set[str] = set()
-            for edge in self.repository.list_edges():
+            for edge in table_edges:
                 if edge.source in exact_id_hits:
                     neighbor_ids.add(edge.target)
                 if edge.target in exact_id_hits:
@@ -1976,14 +1983,14 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
                 for node_id in neighbor_ids:
                     if node_id in allowed:
                         continue
-                    node = by_id.get(node_id)
-                    if node is None:
+                    neighbor = by_id.get(node_id)
+                    if neighbor is None:
                         continue
-                    filtered_nodes.append(node)
+                    filtered_nodes.append(neighbor)
                     allowed.add(node_id)
                 all_edges = [
                     edge
-                    for edge in self.repository.list_edges()
+                    for edge in table_edges
                     if edge.source in allowed and edge.target in allowed
                 ]
         
@@ -2138,7 +2145,7 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
             reason = self._noise_artifact_reason(node)
             if not reason:
                 continue
-            record = {"id": node.id, "label": node.label, "reason": reason, "type": node.type}
+            record: dict[str, Any] = {"id": node.id, "label": node.label, "reason": reason, "type": node.type}
             items.append(record)
             if dry_run:
                 continue
@@ -2231,7 +2238,7 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
 
         edges = self.repository.list_edges()
         degree: Counter[str] = Counter()
-        linked_pairs: set[tuple[str, str]] = set()
+        linked_pairs: set[tuple[str, ...]] = set()
         for edge in edges:
             degree[edge.source] += 1
             degree[edge.target] += 1
@@ -2289,13 +2296,13 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
                     continue
                 edge_type = suggestion["edge_type"] if suggestion["edge_type"] in self.LINK_EDGE_TYPES else "RELATED_TO"
                 try:
-                    edge = self.create_graph_edge({
+                    created_edge = self.create_graph_edge({
                         "source": suggestion["source_id"],
                         "target": suggestion["target_id"],
                         "type": edge_type,
                         "confidence": suggestion["confidence"],
                     })
-                    created.append(edge["edge"])
+                    created.append(created_edge["edge"])
                 except ValueError:
                     continue
         return {
@@ -2380,7 +2387,7 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         nodes.sort(key=lambda n: str(getattr(n, "created_at", "") or ""), reverse=True)
         pool = nodes[:limit]
 
-        contradicts_pairs: set[tuple[str, str]] = set()
+        contradicts_pairs: set[tuple[str, ...]] = set()
         for edge in self.repository.list_edges():
             if edge.type == "CONTRADICTS":
                 contradicts_pairs.add(tuple(sorted((edge.source, edge.target))))
@@ -2448,13 +2455,13 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
                 if suggestion["source_id"] in merged_away or suggestion["target_id"] in merged_away:
                     continue
                 try:
-                    edge = self.create_graph_edge({
+                    created_edge = self.create_graph_edge({
                         "source": suggestion["source_id"],
                         "target": suggestion["target_id"],
                         "type": "CONTRADICTS",
                         "confidence": suggestion["confidence"],
                     })
-                    contradictions.append(edge["edge"])
+                    contradictions.append(created_edge["edge"])
                 except ValueError:
                     continue
         return {
@@ -2521,20 +2528,22 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         target = self.repository.get_node(target_id)
         if not source or not target:
             raise ValueError("source and target graph nodes are required")
-        merged_text = f"{target.text}\n\nMerged from {source.label}:\n{source.text}"
-        target.text = merged_text[:6000]
-        target.metadata["merged_from"] = list(dict.fromkeys([*(target.metadata.get("merged_from") or []), source.id]))
-        target.metadata["pinned"] = bool(target.metadata.get("pinned") or source.metadata.get("pinned") or source.metadata.get("favorite"))
-        for edge in self.repository.list_edges():
-            if edge.source == source.id and edge.target != target.id:
-                self.repository.add_edge(target.id, edge.target, edge.type, edge.scope, edge.confidence)
-            elif edge.target == source.id and edge.source != target.id:
-                self.repository.add_edge(edge.source, target.id, edge.type, edge.scope, edge.confidence)
-        source.status = "merged"
-        source.metadata["merged_into"] = target.id
-        source.metadata["merged_at"] = utc_now()
-        target = self.repository.upsert_node(target)
-        source = self.repository.upsert_node(source)
+        # Edge relinks + node updates must commit as one unit (no half-merged graphs).
+        with self.repository.transaction():
+            merged_text = f"{target.text}\n\nMerged from {source.label}:\n{source.text}"
+            target.text = merged_text[:6000]
+            target.metadata["merged_from"] = list(dict.fromkeys([*(target.metadata.get("merged_from") or []), source.id]))
+            target.metadata["pinned"] = bool(target.metadata.get("pinned") or source.metadata.get("pinned") or source.metadata.get("favorite"))
+            for edge in self.repository.list_edges():
+                if edge.source == source.id and edge.target != target.id:
+                    self.repository.add_edge(target.id, edge.target, edge.type, edge.scope, edge.confidence)
+                elif edge.target == source.id and edge.source != target.id:
+                    self.repository.add_edge(edge.source, target.id, edge.type, edge.scope, edge.confidence)
+            source.status = "merged"
+            source.metadata["merged_into"] = target.id
+            source.metadata["merged_at"] = utc_now()
+            target = self.repository.upsert_node(target)
+            source = self.repository.upsert_node(source)
         return {"target": target.to_dict(), "source": source.to_dict()}
 
     def apply_graph_command(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2569,9 +2578,11 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
                 raise ValueError("source and target graph nodes are required")
             edge_type = str(payload.get("type") or "RELATED_TO")
             scope = str(payload.get("scope") or source.scope or target.scope or "project")
-            if edge_id:
-                self.repository.delete_edge(edge_id)
-            edge = self.repository.add_edge(source_id, target_id, edge_type, scope, float(payload.get("confidence") or 0.72))
+            # Delete + re-add as one unit so a failure cannot drop the old edge alone.
+            with self.repository.transaction():
+                if edge_id:
+                    self.repository.delete_edge(edge_id)
+                edge = self.repository.add_edge(source_id, target_id, edge_type, scope, float(payload.get("confidence") or 0.72))
             return {"action": "relink", "edge": edge.to_dict(), "deleted_edge_id": edge_id}
         if action == "delete":
             node_id = str(payload.get("node_id") or "").strip()
@@ -2585,10 +2596,12 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
             if not node:
                 raise ValueError("graph node not found")
             if hard:
-                edge_count = self.repository.delete_node_edges(node_id)
-                node.status = "deleted"
-                node.metadata["deleted_at"] = utc_now()
-                self.repository.upsert_node(node)
+                # Edge removal + tombstone update as one unit (no half-deleted graphs).
+                with self.repository.transaction():
+                    edge_count = self.repository.delete_node_edges(node_id)
+                    node.status = "deleted"
+                    node.metadata["deleted_at"] = utc_now()
+                    self.repository.upsert_node(node)
                 return {"action": "delete", "node": node.to_dict(), "deleted_edges": edge_count}
             node.status = "archived"
             node.metadata["archived_at"] = utc_now()
@@ -2697,7 +2710,8 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         chat = self.repository.get_chat(chat_id)
         if not chat:
             raise ValueError("chat not found")
-        index = int(payload.get("message_index"))
+        raw_index: Any = payload.get("message_index")
+        index = int(raw_index)
         messages = list(chat.get("messages") or [])
         if index < 0 or index >= len(messages):
             raise ValueError("message_index out of range")
@@ -2735,7 +2749,7 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         scope = str(payload.get("scope") or "project")
         node_type = str(payload.get("type") or "Doc")
         imported = []
-        skipped = []
+        skipped: list[dict[str, Any]] = []
         for file_id in file_ids[:20]:
             meta, text = self.files.get_text(project_id, file_id)
             if not meta:
@@ -3132,8 +3146,8 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
             proc = subprocess.run([*shell, command], cwd=str(root), text=True, capture_output=True, timeout=timeout, shell=False)
             duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         except subprocess.TimeoutExpired as exc:
-            stdout, stdout_redacted = self.security_policy.redact_text((exc.stdout or "")[:80_000])
-            stderr, stderr_redacted = self.security_policy.redact_text((exc.stderr or "")[:20_000])
+            stdout, stdout_redacted = self.security_policy.redact_text(cast(str, exc.stdout or "")[:80_000])
+            stderr, stderr_redacted = self.security_policy.redact_text(cast(str, exc.stderr or "")[:20_000])
             return {
                 "project_id": project_id,
                 "root": str(root),

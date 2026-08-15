@@ -32,6 +32,12 @@ _LOG = logging.getLogger("architectos.service")
 class IngestionServiceMixin:
     """Ingest scheduling, per-source timeout budgets, and rescan maintenance."""
 
+    # Owned by ArchitectOSService.__init__; declared here so mypy can see the
+    # shapes through the mixin (the host class assigns the real values).
+    _memory_ingest_state: dict[str, Any]
+    _memory_rescan_state: dict[str, Any]
+    _embedding_worker_started: bool
+
     def memory_ingest_status(self) -> dict[str, Any]:
         with self._memory_ingest_lock:
             state = dict(self._memory_ingest_state)

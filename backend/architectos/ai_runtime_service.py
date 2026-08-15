@@ -304,13 +304,18 @@ class AiRuntimeServiceMixin:
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         if not run_id:
             raise ValueError("run id is required")
-        self.cancelled_runs.add(run_id)
+        with self._cancelled_runs_lock:
+            self.cancelled_runs.add(run_id)
         existing = next((run for run in self.repository.list_provider_runs(limit=100) if run["id"] == run_id), None)
         if existing:
             existing["status"] = "cancel_requested"
             existing["cancel_requested_at"] = utc_now()
             self.repository.upsert_provider_run(existing)
         return {"run_id": run_id, "cancel_requested": True}
+
+    def _is_run_cancelled(self, run_id: str) -> bool:
+        with self._cancelled_runs_lock:
+            return run_id in self.cancelled_runs
 
     def provider_runs(self, project_id: str | None = None, limit: int = 25) -> dict[str, Any]:
         return {"runs": self.repository.list_provider_runs(project_id, limit)}
@@ -439,7 +444,7 @@ class AiRuntimeServiceMixin:
         run_id = str(payload.get("run_id") or stable_id("run", project_id, message[:80], utc_now()))
         approved = bool(payload.get("allow_cli") or payload.get("cli_approved") or payload.get("approved"))
         role = str(payload.get("role") or "") or classify_role(message)
-        request = ProviderRequest(message=message, context=context["context"], project_id=project_id, run_id=run_id, approved=approved, role=role, images=images, tools=tool_schemas, cancel_requested=lambda: run_id in self.cancelled_runs)
+        request = ProviderRequest(message=message, context=context["context"], project_id=project_id, run_id=run_id, approved=approved, role=role, images=images, tools=tool_schemas, cancel_requested=lambda: self._is_run_cancelled(run_id))
         return project_id, message, context, request
 
     @staticmethod
@@ -761,7 +766,8 @@ class AiRuntimeServiceMixin:
         if not run:
             return None
         raw = dict(result.get("raw") or {}) if isinstance(result.get("raw"), dict) else {}
-        selected = result.get("selected_provider") if isinstance(result.get("selected_provider"), dict) else {}
+        raw_selected: Any = result.get("selected_provider")
+        selected = raw_selected if isinstance(raw_selected, dict) else {}
         usage = usage_from_result(result) or (result.get("usage") if isinstance(result.get("usage"), dict) else None)
         run["status"] = status
         run["finished_at"] = utc_now()

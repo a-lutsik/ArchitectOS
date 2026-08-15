@@ -15,8 +15,12 @@ permissions:
 
 jobs:
   backend:
-    name: Lint & test (Python)
-    runs-on: ubuntu-latest
+    name: Lint & test (Python, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -25,19 +29,30 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install lint tooling
-        # Runtime is stdlib-only; only the linter is needed for CI.
-        run: python -m pip install --upgrade "ruff>=0.6"
+      - name: Install lint + type tooling
+        # Runtime is stdlib-only; only the linter, type checker and coverage
+        # measurement are needed for CI.
+        run: python -m pip install --upgrade "ruff>=0.6" "mypy>=1.10" coverage
 
       - name: Ruff (syntax + pyflakes)
-        run: ruff check .
+        run: python -m ruff check .
 
-      - name: Unit + integration tests
+      - name: mypy (backend package)
+        # Config lives in pyproject.toml ([tool.mypy] scopes checks to
+        # backend/architectos; per-module overrides suppress mixin noise).
+        run: python -m mypy
+
+      - name: Unit + integration tests (with coverage)
         # Pin the offline hash embedder so tests stay deterministic and never
         # download a local model, regardless of what extras land in the image.
         env:
           MEMORY_EMBEDDING_PROVIDER: hash
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
+        run: python -m coverage run -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Coverage gate
+        # RATCHET: this number may only go up. Measured 73% (2026-08-15);
+        # the gate sits ~1pt below so platform-specific lines don't flake it.
+        run: python -m coverage report --fail-under=72
 
   frontend:
     name: Syntax check (JS)

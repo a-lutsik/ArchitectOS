@@ -62,11 +62,11 @@ def normalize_usage(payload: Any) -> dict[str, Any] | None:
     if any(key in payload for key in ("prompt_tokens", "completion_tokens", "total_tokens")) and (
         payload.get("prompt_tokens") is not None or payload.get("completion_tokens") is not None or payload.get("total_tokens") is not None
     ):
-        prompt = _as_int(payload.get("prompt_tokens")) or 0
-        completion = _as_int(payload.get("completion_tokens")) or 0
+        prompt: int | None = _as_int(payload.get("prompt_tokens")) or 0
+        completion: int | None = _as_int(payload.get("completion_tokens")) or 0
         total = _as_int(payload.get("total_tokens"))
         if total is None:
-            total = prompt + completion
+            total = (prompt or 0) + (completion or 0)
         if prompt == 0 and completion == 0 and total == 0:
             return None
         out: dict[str, Any] = {
@@ -206,7 +206,8 @@ def usage_from_result(result: dict[str, Any] | None, *, model: str | None = None
     """Pull usage from an adapter result (usage field or raw payload)."""
     if not isinstance(result, dict):
         return None
-    selected = result.get("selected_provider") if isinstance(result.get("selected_provider"), dict) else {}
+    raw_selected: Any = result.get("selected_provider")
+    selected = raw_selected if isinstance(raw_selected, dict) else {}
     model_name = model or str(selected.get("model") or result.get("model") or "") or None
     direct = normalize_usage(result.get("usage")) if isinstance(result.get("usage"), dict) else None
     if direct is None:

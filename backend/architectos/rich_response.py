@@ -35,8 +35,10 @@ def split_rich_response(text: str) -> tuple[str, dict[str, Any]]:
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
-            actions = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
-            links = parsed.get("links") if isinstance(parsed.get("links"), list) else []
+            raw_actions: Any = parsed.get("actions")
+            actions = raw_actions if isinstance(raw_actions, list) else []
+            raw_links: Any = parsed.get("links")
+            links = raw_links if isinstance(raw_links, list) else []
             structured = {
                 **parsed,
                 "actions": [item for item in actions if isinstance(item, dict)],

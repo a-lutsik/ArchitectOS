@@ -5,6 +5,7 @@ import json
 import logging
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
 from urllib.parse import parse_qs, urlparse
 
 from .config import ACCESS_LOG
@@ -38,6 +39,10 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(FRONTEND_ROOT), **kwargs)
 
+    def _server_port(self) -> int:
+        """Port the server bound to; ``self.server`` is the ThreadingHTTPServer from main()."""
+        return cast(ThreadingHTTPServer, self.server).server_port
+
     def _authorize_api(self, path: str) -> bool:
         """Guard /api/* against cross-site requests and DNS rebinding.
 
@@ -47,13 +52,13 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
             return True
         host = (self.headers.get("Host") or "").strip()
         hostname, _, host_port = host.rpartition(":")
-        if hostname not in ALLOWED_HOSTNAMES or (host_port and host_port != str(self.server.server_port)):
+        if hostname not in ALLOWED_HOSTNAMES or (host_port and host_port != str(self._server_port())):
             self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
             return False
         origin = (self.headers.get("Origin") or "").strip()
         if origin:
             parsed = urlparse(origin)
-            if parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or (parsed.port is not None and parsed.port != self.server.server_port):
+            if parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or (parsed.port is not None and parsed.port != self._server_port()):
                 self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
                 return False
         token = self.headers.get("X-ArchitectOS-Token") or ""
@@ -466,8 +471,8 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
         """Own origin for postMessage targets — never '*'."""
         host = (self.headers.get("Host") or "").strip()
         hostname, _, host_port = host.rpartition(":")
-        if hostname not in ALLOWED_HOSTNAMES or (host_port and host_port != str(self.server.server_port)):
-            host = f"127.0.0.1:{self.server.server_port}"
+        if hostname not in ALLOWED_HOSTNAMES or (host_port and host_port != str(self._server_port())):
+            host = f"127.0.0.1:{self._server_port()}"
         return f"http://{host}"
 
     @staticmethod

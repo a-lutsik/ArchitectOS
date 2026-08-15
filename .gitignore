@@ -9,6 +9,8 @@ build/
 .ruff_cache/
 *.egg-info/
 .intellijPlatform/
+.coverage
+.coverage.*
 /*.png
 index.html.backup*
 *_COMPLETE.md
