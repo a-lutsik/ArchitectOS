@@ -69,7 +69,11 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = [
     "architectos.ai_runtime_service",
+    "architectos.azure_boards_sync",
+    "architectos.azure_git_sync",
+    "architectos.azure_sync_common",
     "architectos.azure_sync_service",
+    "architectos.azure_wiki_sync",
     "architectos.chat_service",
     "architectos.chat_session_service",
     "architectos.graph_service",
@@ -80,6 +84,7 @@ module = [
     "architectos.providers_council_service",
     "architectos.retrieval_service",
     "architectos.settings_router_service",
+    "architectos.teams_sync",
     "architectos.tool_exec_service",
 ]
 disable_error_code = ["attr-defined"]

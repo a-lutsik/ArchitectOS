@@ -55,6 +55,12 @@ planning (`ado_call_plan` / `call_ado_tool`) shared with `azure_sync_service`;
 loop; `tool_gateway.py` keeps `ToolSpec` catalogs, `ToolGateway`, and re-exports
 the split surface through `__all__`.
 
+Azure / Teams ingestion is composed the same way: `azure_sync_common.py` holds
+the shared MCP/project helpers; `azure_boards_sync.py`, `azure_git_sync.py`,
+`azure_wiki_sync.py`, and `teams_sync.py` each own one source domain;
+`azure_sync_service.py` is a thin facade mixin so `ArchitectOSService` still
+lists a single `AzureSyncServiceMixin` in its MRO.
+
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
 verb (`do_GET`/`do_POST`/`do_PATCH`) funnels through it: index shortcut, `/api/*`
