@@ -70,6 +70,7 @@ ignore_missing_imports = true
 module = [
     "architectos.ai_runtime_service",
     "architectos.azure_boards_sync",
+    "architectos.azure_boards_parse",
     "architectos.azure_git_sync",
     "architectos.azure_sync_common",
     "architectos.azure_sync_service",
@@ -77,6 +78,7 @@ module = [
     "architectos.chat_service",
     "architectos.chat_session_service",
     "architectos.graph_service",
+    "architectos.ingestion_candidates",
     "architectos.ingestion_service",
     "architectos.integrations_service",
     "architectos.lifecycle_service",

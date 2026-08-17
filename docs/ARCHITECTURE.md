@@ -56,22 +56,23 @@ loop; `tool_gateway.py` keeps `ToolSpec` catalogs, `ToolGateway`, and re-exports
 the split surface through `__all__`.
 
 Azure / Teams ingestion is composed the same way: `azure_sync_common.py` holds
-the shared MCP/project helpers; `azure_boards_sync.py`, `azure_git_sync.py`,
-`azure_wiki_sync.py`, and `teams_sync.py` each own one source domain;
-`azure_sync_service.py` is a thin facade mixin so `ArchitectOSService` still
-lists a single `AzureSyncServiceMixin` in its MRO.
+the shared MCP/project helpers; `azure_boards_parse.py` owns Boards payload
+normalization (HTML/ids/relations/comments); `azure_boards_sync.py`,
+`azure_git_sync.py`, `azure_wiki_sync.py`, and `teams_sync.py` each own one
+source domain; `azure_sync_service.py` is a thin facade mixin so
+`ArchitectOSService` still lists a single `AzureSyncServiceMixin` in its MRO.
 
 Project scanning follows the same pattern: `project_granola_ingest.py`,
 `project_git_ingest.py`, and `project_files_service.py` own granola candidates,
 local-git candidates, and project file I/O; `project_scan_service.py` keeps
 scan/file/inbox/chat candidate builders and composes the mixins.
 `memory_ingestion.py` owns `MemoryIngestionEngine` and token helpers;
-`ingestion_service.py` keeps the ingest/rescan/candidate-review mixin and
-re-exports the engine for older imports. Schema migrations and bundled
-MCP/LSP/provider seed catalogs live in `storage_defaults.py`, imported by
-`storage.py`. FTS/embedding search and the candidate review queue live in
-`storage_search.py` and `storage_candidates.py`; `SQLiteMemoryRepository`
-composes those mixins.
+`ingestion_candidates.py` owns list/promote/reject/batch; `ingestion_service.py`
+keeps ingest/rescan/add-memory and re-exports the engine for older imports.
+Schema migrations and bundled MCP/LSP/provider seed catalogs live in
+`storage_defaults.py`, imported by `storage.py`. FTS/embedding search and the
+candidate review queue live in `storage_search.py` and `storage_candidates.py`;
+`SQLiteMemoryRepository` composes those mixins.
 
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
