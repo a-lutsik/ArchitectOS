@@ -602,7 +602,7 @@
           <div class="graph-toolbar">
             <div>
               <h3>Memory Graph</h3>
-              <p>Project memory plus shared/global knowledge links.</p>
+              <p>Search and explore linked project memory. Open More filters to refine by source, scope, or density.</p>
             </div>
             <div class="memory-view-tabs" role="tablist" aria-label="Memory view mode">
               <button id="memory-tab-graph" type="button" class="memory-view-tab active" role="tab" aria-selected="true">Graph</button>
@@ -613,35 +613,40 @@
               <select id="graph-group-filter" aria-label="Memory group">
                 <option value="">All groups</option>
               </select>
-              <select id="graph-color-mode" aria-label="Color nodes by" title="Color nodes by detected themes (communities) or by group">
-                <option value="community">Color: themes</option>
-                <option value="group">Color: group</option>
-              </select>
-              <select id="graph-source-filter" aria-label="Memory source">
-                <option value="">All sources</option>
-              </select>
-              <select id="graph-scope-filter" aria-label="Scope">
-                <option value="">All scopes</option>
-                <option>project</option>
-                <option>interface</option>
-                <option>shared</option>
-                <option>global</option>
-              </select>
-              <select id="graph-task-filter" aria-label="Task">
-                <option value="">All tasks</option>
-              </select>
-              <select id="graph-provider-filter" aria-label="Provider">
-                <option value="">All providers</option>
-              </select>
-              <label class="inline-check" title="Show only pinned memory nodes" data-i18n-title="graph.tip.pinned">
-                <input id="graph-pinned-filter" type="checkbox"> pinned
-              </label>
-              <label class="graph-density-control" title="Higher density loads more nodes (default ~200)">
-                <span>density</span>
-                <input id="graph-density-level" type="range" min="1" max="5" step="1" value="2" list="graph-density-ticks">
-                <datalist id="graph-density-ticks"><option value="1"></option><option value="2"></option><option value="3"></option><option value="4"></option><option value="5"></option></datalist>
-                <output id="graph-density-value" class="graph-density-value">2</output>
-              </label>
+              <details class="graph-filters-more">
+                <summary class="graph-filters-summary">More filters</summary>
+                <div class="graph-filters-advanced">
+                  <select id="graph-color-mode" aria-label="Color nodes by" title="Color nodes by detected themes (communities) or by group">
+                    <option value="community">Color: themes</option>
+                    <option value="group">Color: group</option>
+                  </select>
+                  <select id="graph-source-filter" aria-label="Memory source">
+                    <option value="">All sources</option>
+                  </select>
+                  <select id="graph-scope-filter" aria-label="Scope">
+                    <option value="">All scopes</option>
+                    <option>project</option>
+                    <option>interface</option>
+                    <option>shared</option>
+                    <option>global</option>
+                  </select>
+                  <select id="graph-task-filter" aria-label="Task">
+                    <option value="">All tasks</option>
+                  </select>
+                  <select id="graph-provider-filter" aria-label="Provider">
+                    <option value="">All providers</option>
+                  </select>
+                  <label class="inline-check" title="Show only pinned memory nodes" data-i18n-title="graph.tip.pinned">
+                    <input id="graph-pinned-filter" type="checkbox"> pinned
+                  </label>
+                  <label class="graph-density-control" title="Higher density loads more nodes (default ~200)">
+                    <span>density</span>
+                    <input id="graph-density-level" type="range" min="1" max="5" step="1" value="2" list="graph-density-ticks">
+                    <datalist id="graph-density-ticks"><option value="1"></option><option value="2"></option><option value="3"></option><option value="4"></option><option value="5"></option></datalist>
+                    <output id="graph-density-value" class="graph-density-value">2</output>
+                  </label>
+                </div>
+              </details>
             </div>
           </div>
           <div class="graph-layout">
@@ -1144,7 +1149,7 @@
     </aside>
 
     <!-- Right: Server Details (Detail) -->
-    <main class="mcp-server-detail">
+    <section class="mcp-server-detail" aria-label="MCP server details">
       <div class="mcp-detail-empty" id="mcp-detail-empty">
         <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3">
           <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
@@ -1233,7 +1238,7 @@
           <button id="mcp-reset-btn" class="btn-secondary">Reset</button>
         </div>
       </div>
-    </main>
+    </section>
 
   </div>
 </section>

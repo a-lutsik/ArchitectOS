@@ -1,7 +1,7 @@
 /* ArchitectOS design system — modern "developer OS" look, light + dark. */
 
 :root {
-  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
 
   /* Accent */
@@ -101,6 +101,22 @@
 }
 
 * { box-sizing: border-box; }
+
+/* Keyboard focus: restore a visible ring wherever outline was cleared for mouse polish. */
+:where(button, a, input, select, textarea, summary, [role="button"], [role="tab"], [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
 
 body {
   margin: 0;
@@ -5928,8 +5944,14 @@ h4 { margin: 0 0 10px; font-size: 12px; color: var(--muted); text-transform: upp
 
 /* Responsive */
 @media (max-width: 900px) {
-  .workspace-surface-btn span { display: none; }
-  .workspace-surface-btn { padding: 7px 10px; }
+  .workspace-surface-btn {
+    min-height: 36px;
+    padding: 7px 10px;
+  }
+  .workspace-surface-btn span {
+    display: inline;
+    font-size: 12px;
+  }
   .workspace-with-chat-layout[data-surface="split"] .workspace-ask-surface {
     width: min(48vw, 380px);
     min-width: 240px;
@@ -6108,6 +6130,64 @@ h4 { margin: 0 0 10px; font-size: 12px; color: var(--muted); text-transform: upp
   gap: 8px;
   align-items: center;
   justify-content: flex-end;
+}
+
+.graph-filters-more {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.graph-filters-summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 550;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.graph-filters-summary::-webkit-details-marker { display: none; }
+
+.graph-filters-summary::after {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  opacity: 0.7;
+}
+
+.graph-filters-more[open] .graph-filters-summary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.graph-filters-advanced {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  min-width: min(520px, 86vw);
+  max-width: min(640px, 92vw);
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
 }
 
 .graph-search-input {

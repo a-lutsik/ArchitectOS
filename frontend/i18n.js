@@ -2,10 +2,10 @@
 // ES module; pure data, no imports. Loaded early via main.js.
 
 const ASK_MODE_HINTS = {
-  quick: "Agent decides which tools/memory to use and acts on your request.",
-  council: "Same question to several models, then a judge merges one grounded answer.",
-  memory: "Answer only from local project memory — no external provider or MCP tools.",
-  "memory-mcp": "Local memory first, then reads project files and Azure Boards on its own.",
+  quick: "Default: the agent picks tools and memory for your request.",
+  council: "Several models answer; a judge merges one grounded reply.",
+  memory: "Local project memory only — no cloud provider or MCP tools.",
+  "memory-mcp": "Memory first, then may read files / Boards / notes. Writes need approval.",
 };
 const RTL_LANGUAGES = new Set(["he"]);
 const LANGUAGE_META = {
@@ -33,10 +33,10 @@ const translations = {
     "workspace.surface.editor": "Editor", "workspace.surface.ask": "Ask", "workspace.surface.split": "Split",
     "nav.work": "Work", "nav.ai": "AI", "nav.setup": "Setup",
     "ask.mode.quick": "Agent", "ask.mode.council": "Council", "ask.mode.multi": "Multi-agent", "ask.mode.memory": "Memory", "ask.mode.memory-mcp": "Memory + MCP",
-    "ask.hint.quick": "Agent decides which tools/memory to use and acts on your request.",
-    "ask.hint.council": "Same question to several models, then a judge merges one grounded answer.",
-    "ask.hint.memory": "Answer only from local project memory — no external provider or MCP tools.",
-    "ask.hint.memory-mcp": "Local memory first, then reads project files, Azure Boards, and meeting notes on its own. Only saving changes asks you first.",
+    "ask.hint.quick": "Default: the agent picks tools and memory for your request.",
+    "ask.hint.council": "Several models answer; a judge merges one grounded reply.",
+    "ask.hint.memory": "Local project memory only — no cloud provider or MCP tools.",
+    "ask.hint.memory-mcp": "Memory first, then may read files / Boards / notes. Writes need approval.",
     "app.eyebrow": "Local-first developer workspace", "workspace.context": "Context Builder", "workspace.projectFiles": "Project Files", "workspace.selectedFile": "Selected File", "workspace.favorites": "Favorites",
     "action.useFolder": "Use Folder", "action.connectFolder": "Connect folder", "action.connectAndIndex": "Connect & index", "action.scanProject": "Scan Project", "action.build": "Build", "action.refresh": "Refresh", "action.buildContext": "Build Context", "action.gitDiff": "Git Diff", "action.saveSettings": "Save Settings",
     "autoscan.selectAll": "Select all", "autoscan.unselectAll": "Unselect all",

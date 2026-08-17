@@ -537,6 +537,22 @@ function seedGraphParticles() {
   graphState.particles = next;
 }
 
+function syncGraphFiltersDisclosure() {
+  const details = document.querySelector(".graph-filters-more");
+  if (!details) return;
+  const source = document.querySelector("#graph-source-filter")?.value || "";
+  const scope = document.querySelector("#graph-scope-filter")?.value || "";
+  const task = document.querySelector("#graph-task-filter")?.value || "";
+  const provider = document.querySelector("#graph-provider-filter")?.value || "";
+  const pinned = Boolean(document.querySelector("#graph-pinned-filter")?.checked);
+  const colorMode = document.querySelector("#graph-color-mode")?.value || "community";
+  const density = Number(document.querySelector("#graph-density-level")?.value || 2);
+  const active = Boolean(source || scope || task || provider || pinned || colorMode !== "community" || density !== 2);
+  if (active) details.open = true;
+  const summary = details.querySelector(".graph-filters-summary");
+  if (summary) summary.textContent = active ? "More filters · on" : "More filters";
+}
+
 function bindGraphOnce() {
   if (graphState.initialized) return;
   const canvas = document.querySelector("#graph-canvas");
@@ -555,11 +571,34 @@ function bindGraphOnce() {
   const rebuildButton = document.querySelector("#graph-rebuild-links");
   const inspectHint = document.querySelector("#graph-inspect-hint");
   if (inspectHint) inspectHint.textContent = t("graph.inspectHint");
-  on(sourceFilter, "change", () => loadGraph().catch(showError));
-  on(scopeFilter, "change", () => loadGraph().catch(showError));
-  on(taskFilter, "change", () => loadGraph().catch(showError));
-  on(providerFilter, "change", () => loadGraph().catch(showError));
-  on(pinnedFilter, "change", () => loadGraph().catch(showError));
+  const colorModeSelect = document.querySelector("#graph-color-mode");
+  on(colorModeSelect, "change", () => {
+    // Color depends only on data already in the payload — recolor, don't refetch.
+    graphState.colorMode = colorModeSelect.value || "community";
+    renderGraphLegend();
+    wakeGraphAnimation();
+    syncGraphFiltersDisclosure();
+  });
+  on(sourceFilter, "change", () => {
+    syncGraphFiltersDisclosure();
+    loadGraph().catch(showError);
+  });
+  on(scopeFilter, "change", () => {
+    syncGraphFiltersDisclosure();
+    loadGraph().catch(showError);
+  });
+  on(taskFilter, "change", () => {
+    syncGraphFiltersDisclosure();
+    loadGraph().catch(showError);
+  });
+  on(providerFilter, "change", () => {
+    syncGraphFiltersDisclosure();
+    loadGraph().catch(showError);
+  });
+  on(pinnedFilter, "change", () => {
+    syncGraphFiltersDisclosure();
+    loadGraph().catch(showError);
+  });
   on(groupFilter, "change", () => {
     graphState.groupFilter = groupFilter.value || "";
     graphState.physicsTicks = 0;
@@ -567,13 +606,6 @@ function bindGraphOnce() {
     applyGraphVisibility();
     seedGraphParticles();
     fitGraphToView();
-    wakeGraphAnimation();
-  });
-  const colorModeSelect = document.querySelector("#graph-color-mode");
-  on(colorModeSelect, "change", () => {
-    // Color depends only on data already in the payload — recolor, don't refetch.
-    graphState.colorMode = colorModeSelect.value || "community";
-    renderGraphLegend();
     wakeGraphAnimation();
   });
   on(searchInput, "input", () => {
@@ -601,9 +633,17 @@ function bindGraphOnce() {
     const densityValue = document.querySelector("#graph-density-value");
     const syncDensityBadge = () => { if (densityValue) densityValue.textContent = String(densityInput.value || "2"); };
     syncDensityBadge();
-    on(densityInput, "input", syncDensityBadge);
-    on(densityInput, "change", () => { syncDensityBadge(); loadGraph().catch(showError); });
+    on(densityInput, "input", () => {
+      syncDensityBadge();
+      syncGraphFiltersDisclosure();
+    });
+    on(densityInput, "change", () => {
+      syncDensityBadge();
+      syncGraphFiltersDisclosure();
+      loadGraph().catch(showError);
+    });
   }
+  syncGraphFiltersDisclosure();
   on(fitButton, "click", () => {
     graphState.userZoomed = false;
     fitGraphToView();
