@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from .ingestion_service import _token_set, _token_similarity
+from .memory_ingestion import _token_set, _token_similarity
 from .models import stable_id, utc_now
 from .storage import SQLiteMemoryRepository
 

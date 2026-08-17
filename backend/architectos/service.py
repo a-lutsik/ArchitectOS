@@ -19,11 +19,12 @@ from .council import CouncilOrchestrator
 from .embeddings import MemoryEmbeddingEngine, build_embedding_provider
 from .files import FileStore
 from .graph_service import GraphAutoLinker, GraphServiceMixin
-from .ingestion_service import IngestionServiceMixin, MemoryIngestionEngine
+from .ingestion_service import IngestionServiceMixin
 from .integrations_service import IntegrationsServiceMixin
 from .lifecycle_service import LifecycleServiceMixin, MemoryLifecycleEngine
 from .lsp import CodeIntelligenceManager
 from .mcp import MCPManager
+from .memory_ingestion import MemoryIngestionEngine
 from .project_scan_service import ProjectScanServiceMixin
 from .providers_council_service import ProvidersCouncilServiceMixin
 from .release import release_manifest
