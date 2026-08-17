@@ -80,6 +80,8 @@ module = [
     "architectos.ingestion_service",
     "architectos.integrations_service",
     "architectos.lifecycle_service",
+    "architectos.project_git_ingest",
+    "architectos.project_granola_ingest",
     "architectos.project_scan_service",
     "architectos.providers_council_service",
     "architectos.retrieval_service",

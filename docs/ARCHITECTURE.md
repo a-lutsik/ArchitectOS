@@ -61,6 +61,12 @@ the shared MCP/project helpers; `azure_boards_sync.py`, `azure_git_sync.py`,
 `azure_sync_service.py` is a thin facade mixin so `ArchitectOSService` still
 lists a single `AzureSyncServiceMixin` in its MRO.
 
+Project scanning follows the same pattern: `project_granola_ingest.py` and
+`project_git_ingest.py` own those candidate sources; `project_scan_service.py`
+keeps scan/file/inbox/chat candidates plus project file browsing and composes
+the mixins. Schema migrations and bundled MCP/LSP/provider seed catalogs live
+in `storage_defaults.py`, imported by `storage.py`.
+
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
 verb (`do_GET`/`do_POST`/`do_PATCH`) funnels through it: index shortcut, `/api/*`
@@ -101,7 +107,8 @@ through `transaction()`: the connection is pinned to the creating thread via
 thread-local storage (nested calls join the active transaction instead of opening a
 second one), the unit of work opens with `BEGIN IMMEDIATE`, commits on clean exit,
 and rolls back on exception. Schema versioning uses `PRAGMA user_version`:
-`_migrate` applies every idempotent step in `MIGRATIONS` above the database's
+`_migrate` applies every idempotent step in `MIGRATIONS` (defined in
+`storage_defaults.py`) above the database's
 stored version and stamps `SCHEMA_VERSION` (currently 3).
 
 ## Core Tables
