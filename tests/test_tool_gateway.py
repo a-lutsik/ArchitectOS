@@ -11,6 +11,11 @@ from backend.architectos.models import Project
 from backend.architectos.service import ArchitectOSService
 from backend.architectos.tool_gateway import (
     ToolGateway,
+    ado_call_plan,
+    compact_tool_trace_label,
+    format_tool_results_for_prompt,
+    is_empty_mcp_payload,
+    mcp_tool_error_text,
     parse_tool_calls,
     strip_tool_call_json,
     summarize_tool_payload,
@@ -654,6 +659,250 @@ class ToolLoopIntegrationTests(unittest.TestCase):
                 MCPServerConfig.from_dict(servers["filesystem"])
             )
             self.assertEqual(command[-1], str(project_dir.resolve()))
+
+
+class McpPayloadHelperTests(unittest.TestCase):
+    def test_empty_and_error_payload_detection(self) -> None:
+        self.assertTrue(is_empty_mcp_payload(None))
+        self.assertTrue(is_empty_mcp_payload({"result": {"content": [{"type": "text", "text": "null"}]}}))
+        self.assertFalse(is_empty_mcp_payload({"result": {"content": [{"type": "text", "text": "hello"}]}}))
+        self.assertEqual(
+            mcp_tool_error_text({"result": {"isError": True, "content": [{"type": "text", "text": "boom"}]}}),
+            "boom",
+        )
+        self.assertEqual(mcp_tool_error_text({"result": {"ok": True}}), "")
+
+    def test_ado_call_plan_covers_core_ops(self) -> None:
+        get_item = ado_call_plan("get_item", {"id": 12, "project": "E-AI"})
+        self.assertEqual(get_item[0][0], "wit_work_item")
+        self.assertEqual(get_item[0][1]["project"], "E-AI")
+        comments = ado_call_plan("list_comments", {"id": 12, "project": "E-AI"})
+        self.assertEqual(comments[0][1]["action"], "list_comments")
+        mine = ado_call_plan("my_work", {"project": "E-AI", "top": 5})
+        self.assertEqual(mine[0][1]["action"], "my")
+        search = ado_call_plan("search", {"searchText": "chart", "project": "E-AI", "workItemType": "Bug"})
+        self.assertTrue(search)
+        wiql = ado_call_plan("wiql", {"wiql": "SELECT [System.Id] FROM WorkItems", "project": "E-AI", "top": 10})
+        self.assertEqual(wiql[0][0], "wit_query")
+        with self.assertRaises(ValueError):
+            ado_call_plan("get_item", {})
+        with self.assertRaises(ValueError):
+            ado_call_plan("search", {})
+        with self.assertRaises(ValueError):
+            ado_call_plan("wiql", {"project": "E-AI"})
+        repos = ado_call_plan("list_repos", {"project": "E-AI", "top": 5})
+        self.assertEqual(repos[0][0], "repo_repository")
+        pulls = ado_call_plan("list_pull_requests", {"project": "E-AI", "status": "active"})
+        self.assertEqual(pulls[0][1]["action"], "list")
+        commits = ado_call_plan("search_commits", {"searchText": "fix chart", "repository": "app"})
+        self.assertEqual(commits[0][0], "repo_search_commits")
+        by_commit = ado_call_plan(
+            "pull_requests_for_commit",
+            {"commitId": "abc123", "repository": "app", "project": "E-AI"},
+        )
+        self.assertEqual(by_commit[0][1]["action"], "list_by_commits")
+        get_pr = ado_call_plan("get_pull_request", {"pullRequestId": 9, "project": "E-AI"})
+        self.assertEqual(get_pr[0][1]["action"], "get")
+        with self.assertRaises(ValueError):
+            ado_call_plan("search_commits", {})
+        with self.assertRaises(ValueError):
+            ado_call_plan("pull_requests_for_commit", {"commitId": "abc"})
+
+    def test_native_memory_execute_and_tool_errors(self) -> None:
+        mcp = _FakeMCP()
+        gateway = ToolGateway(
+            mcp,
+            native_handlers={
+                "memory_search": lambda args: {"query": args.get("query"), "hits": []},
+            },
+        )
+        ok = gateway.execute("memory_search", {"query": "chart"}, memory_only=True)
+        self.assertTrue(ok["ok"])
+        self.assertIn("hits", ok["summary"] or ok.get("result") and "hits" or "")
+        missing = gateway.execute("memory_get", {"id": "x"}, memory_only=True)
+        self.assertFalse(missing["ok"])
+        # MCP error text inside an otherwise successful wrapper.
+        class ErrMCP(_FakeMCP):
+            def call_tool(self, server_id, tool, arguments=None, timeout=None):
+                return {
+                    "id": server_id,
+                    "tool": tool,
+                    "result": {"isError": True, "content": [{"type": "text", "text": "Tool not found"}]},
+                }
+
+        boards = ToolGateway(ErrMCP({"azure-devops"}), boards_project=lambda: "E-AI")
+        failed = boards.execute("boards_get_item", {"id": 1})
+        self.assertFalse(failed["ok"])
+        self.assertIn("not found", failed["error"])
+
+    def test_parse_tool_calls_accepts_string_arguments_and_trailing_noise(self) -> None:
+        text = 'Working.\n{"tool_calls":[{"name":"fs_read","arguments":"{\\"path\\":\\"a.py\\"}"}]}\nextra'
+        calls = parse_tool_calls(text)
+        self.assertEqual(calls[0]["name"], "fs_read")
+        self.assertEqual(calls[0]["arguments"]["path"], "a.py")
+        self.assertEqual(strip_tool_call_json(text).startswith("Working"), True)
+
+    def test_format_and_compact_trace_labels(self) -> None:
+        trace = [
+            {"name": "boards_get_item", "ok": True, "summary": "item 1"},
+            {"name": "fs_read", "ok": False, "error": "missing"},
+        ]
+        prompt = format_tool_results_for_prompt(trace)
+        self.assertIn("### boards_get_item", prompt)
+        self.assertIn("ERROR: missing", prompt)
+        label = compact_tool_trace_label(trace)
+        self.assertIn("get item", label)
+        self.assertIn("fs_read (failed)", label)
+
+    def test_summarize_wiql_and_pull_request_payloads(self) -> None:
+        wiql = summarize_tool_payload({
+            "tool": "wit_query",
+            "result": {"content": [{"type": "text", "text": json.dumps({"workItems": [{"id": 1}, {"id": 2}]})}]},
+        })
+        self.assertIn("2 work item", wiql)
+        prs = summarize_tool_payload({
+            "tool": "repo_get_pull_request_by_id",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"value": [{"pullRequestId": 9, "title": "Fix chart", "status": "active"}]}),
+                }],
+            },
+        })
+        self.assertIn("Pull requests", prs)
+        self.assertIn("Fix chart", prs)
+
+    def test_trim_keeps_continuation_metadata_for_fs_read(self) -> None:
+        body = "\n".join(f"{index}| line-{index}" for index in range(1, 400))
+        summary = summarize_tool_payload(
+            {"path": "a.py", "text": body, "total_lines": 400, "next_start_line": 401, "truncated": True},
+            cap=2500,
+        )
+        self.assertIn('"path": "a.py"', summary)
+        self.assertIn("next_start_line", summary)
+        self.assertIn("truncated", summary)
+        parsed = json.loads(summary)
+        self.assertEqual(parsed["path"], "a.py")
+        self.assertTrue(parsed.get("truncated"))
+        self.assertLess(int(parsed.get("end_line") or 0), 400)
+
+    def test_catalog_and_memory_only_specs(self) -> None:
+        mcp = _FakeMCP({"azure-devops", "filesystem", "granola"})
+        gateway = ToolGateway(mcp)
+        names = {spec.name for spec in gateway.available_specs(include_writes=True)}
+        self.assertIn("boards_get_item", names)
+        self.assertIn("fs_write", names)
+        self.assertIn("granola_list_meetings", names)
+        memory_only = {spec.name for spec in gateway.available_specs(memory_only=True)}
+        self.assertTrue(memory_only)
+        self.assertTrue(all(name.startswith("memory_") for name in memory_only))
+        self.assertIn("Available tools:", gateway.catalog_for_prompt())
+        self.assertTrue(gateway.tool_prompt_section(memory_only=True))
+
+    def test_summarize_commits_work_items_and_granola(self) -> None:
+        commits = summarize_tool_payload({
+            "tool": "repo_search_commits",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "results": [{
+                            "commitId": "abcdef123456",
+                            "author": {"name": "Anton"},
+                            "repository": {"name": "app"},
+                            "comment": "fix chart\nmore",
+                        }],
+                    }),
+                }],
+            },
+        })
+        self.assertIn("Commit search", commits)
+        self.assertIn("fix chart", commits)
+
+        empty_commits = summarize_tool_payload({
+            "tool": "repo_search_commits",
+            "result": {"content": [{"type": "text", "text": json.dumps({"results": [], "infoCode": 1})}]},
+        })
+        self.assertIn("0 matches", empty_commits)
+
+        work_item = summarize_tool_payload({
+            "tool": "wit_work_item",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "id": 12,
+                        "fields": {
+                            "System.Title": "Chart",
+                            "System.WorkItemType": "Bug",
+                            "System.State": "Active",
+                            "System.IterationPath": "Sprint 1",
+                        },
+                    }),
+                }],
+            },
+        })
+        self.assertIn("work item #12", work_item)
+        self.assertIn("Chart", work_item)
+
+        search = summarize_tool_payload({
+            "tool": "search_workitem",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "count": 1,
+                        "results": [{"fields": {"system.id": 7, "system.title": "Ship", "system.workitemtype": "Task"}}],
+                    }),
+                }],
+            },
+        })
+        self.assertIn("search_workitem", search)
+        self.assertIn("#7", search)
+
+        granola = summarize_tool_payload({
+            "tool": "list_meetings",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "meetings": [{"id": "m1", "title": "Sync", "date": "2026-08-01", "notes": "ship it"}],
+                    }),
+                }],
+            },
+        })
+        self.assertIn("granola", granola)
+        self.assertIn("Sync", granola)
+        self.assertIn("m1", granola)
+
+    def test_execute_granola_and_repo_happy_paths(self) -> None:
+        class RichMCP(_FakeMCP):
+            def call_tool(self, server_id, tool, arguments=None, timeout=None):
+                self.calls.append((server_id, tool, dict(arguments or {})))
+                if server_id == "granola":
+                    return {
+                        "id": server_id,
+                        "tool": tool,
+                        "result": {"content": [{"type": "text", "text": json.dumps({"meetings": [{"id": "m1", "title": "Sync"}]})}]},
+                    }
+                return {
+                    "id": server_id,
+                    "tool": tool,
+                    "result": {"content": [{"type": "text", "text": json.dumps({"value": [{"id": "repo1", "name": "app"}]})}]},
+                }
+
+        gateway = ToolGateway(RichMCP({"granola", "azure-devops"}), boards_project=lambda: "E-AI")
+        meetings = gateway.execute("granola_list_meetings", {})
+        self.assertTrue(meetings["ok"])
+        self.assertIn("Sync", meetings["summary"])
+        repos = gateway.execute("repo_list_repositories", {})
+        self.assertTrue(repos["ok"])
+        my_work = gateway.execute("boards_my_work", {"top": 3})
+        self.assertTrue(my_work["ok"])
+        search = gateway.execute("boards_search", {"query": "chart"})
+        self.assertTrue(search["ok"])
+        commits = gateway.execute("repo_search_commits", {"searchText": "fix", "repository": "app"})
+        self.assertTrue(commits["ok"])
 
 
 class ProviderApprovalRoutingTests(unittest.TestCase):
