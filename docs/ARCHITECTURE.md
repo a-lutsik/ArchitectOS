@@ -69,7 +69,9 @@ scan/file/inbox/chat candidate builders and composes the mixins.
 `ingestion_service.py` keeps the ingest/rescan/candidate-review mixin and
 re-exports the engine for older imports. Schema migrations and bundled
 MCP/LSP/provider seed catalogs live in `storage_defaults.py`, imported by
-`storage.py`.
+`storage.py`. FTS/embedding search and the candidate review queue live in
+`storage_search.py` and `storage_candidates.py`; `SQLiteMemoryRepository`
+composes those mixins.
 
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
@@ -106,7 +108,10 @@ using two spacer divs so the scroll height matches the full row model.
 
 `data/architectos.db` is the source of truth. Memory evidence is also written under `memory/evidence` as markdown. Release packages exclude `data/`, `memory/`, `dist/`, and cache files.
 
-`SQLiteMemoryRepository` (`storage.py`) owns the schema. Multi-step writes go
+`SQLiteMemoryRepository` (`storage.py`) owns the schema and core CRUD.
+FTS5 / embedding search lives in `storage_search.py`
+(`StorageSearchMixin`); the memory-candidate review queue lives in
+`storage_candidates.py` (`StorageCandidatesMixin`). Multi-step writes go
 through `transaction()`: the connection is pinned to the creating thread via
 thread-local storage (nested calls join the active transaction instead of opening a
 second one), the unit of work opens with `BEGIN IMMEDIATE`, commits on clean exit,

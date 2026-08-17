@@ -88,6 +88,8 @@ module = [
     "architectos.providers_council_service",
     "architectos.retrieval_service",
     "architectos.settings_router_service",
+    "architectos.storage_candidates",
+    "architectos.storage_search",
     "architectos.teams_sync",
     "architectos.tool_exec_service",
 ]
