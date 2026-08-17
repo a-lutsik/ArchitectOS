@@ -76,8 +76,11 @@ view and edit commands. Schema migrations and bundled MCP/LSP/provider seed
 catalogs live in `storage_defaults.py`; FTS/embeddings, candidate queue, and
 tasks/chats/settings live in `storage_search.py`, `storage_candidates.py`, and
 `storage_sessions.py` — `SQLiteMemoryRepository` composes those mixins.
-`mcp_detect.py` owns Node/ADO remote detection; `adapters_extract.py` owns
-HTTP response text helpers re-exported through `adapters.py`.
+`mcp_detect.py` / `mcp_config.py` / `mcp_client.py` own Node/ADO detection,
+server config, and JSON-RPC clients; `mcp.py` keeps `MCPManager`.
+`embedding_providers.py` owns embedding backends; `embeddings.py` keeps
+lexical helpers and `MemoryEmbeddingEngine`. `lsp_fallback.py` owns regex
+fallbacks; `adapters_extract.py` owns HTTP response text helpers.
 
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
