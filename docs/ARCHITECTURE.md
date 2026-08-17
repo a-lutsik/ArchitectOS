@@ -67,12 +67,17 @@ Project scanning follows the same pattern: `project_granola_ingest.py`,
 local-git candidates, and project file I/O; `project_scan_service.py` keeps
 scan/file/inbox/chat candidate builders and composes the mixins.
 `memory_ingestion.py` owns `MemoryIngestionEngine` and token helpers;
-`ingestion_candidates.py` owns list/promote/reject/batch; `ingestion_service.py`
-keeps ingest/rescan/add-memory and re-exports the engine for older imports.
-Schema migrations and bundled MCP/LSP/provider seed catalogs live in
-`storage_defaults.py`, imported by `storage.py`. FTS/embedding search and the
-candidate review queue live in `storage_search.py` and `storage_candidates.py`;
-`SQLiteMemoryRepository` composes those mixins.
+`ingestion_timeouts.py` / `ingestion_rescan.py` / `ingestion_candidates.py`
+own timeout budgets, background rescan, and list/promote/reject/batch;
+`ingestion_service.py` keeps ingest/add-memory and re-exports the engine.
+`graph_code_service.py` and `graph_suggest_service.py` own code-graph queries
+and LLM link/consolidation suggestions; `graph_service.py` keeps the graph
+view and edit commands. Schema migrations and bundled MCP/LSP/provider seed
+catalogs live in `storage_defaults.py`; FTS/embeddings, candidate queue, and
+tasks/chats/settings live in `storage_search.py`, `storage_candidates.py`, and
+`storage_sessions.py` — `SQLiteMemoryRepository` composes those mixins.
+`mcp_detect.py` owns Node/ADO remote detection; `adapters_extract.py` owns
+HTTP response text helpers re-exported through `adapters.py`.
 
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
@@ -112,7 +117,9 @@ using two spacer divs so the scroll height matches the full row model.
 `SQLiteMemoryRepository` (`storage.py`) owns the schema and core CRUD.
 FTS5 / embedding search lives in `storage_search.py`
 (`StorageSearchMixin`); the memory-candidate review queue lives in
-`storage_candidates.py` (`StorageCandidatesMixin`). Multi-step writes go
+`storage_candidates.py` (`StorageCandidatesMixin`); tasks/chats/providers/
+settings/analytics/bundle I/O live in `storage_sessions.py`
+(`StorageSessionsMixin`). Multi-step writes go
 through `transaction()`: the connection is pinned to the creating thread via
 thread-local storage (nested calls join the active transaction instead of opening a
 second one), the unit of work opens with `BEGIN IMMEDIATE`, commits on clean exit,

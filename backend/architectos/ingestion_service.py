@@ -13,20 +13,16 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections import Counter
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any
 
 from .constants import (
-    ALL_LOCAL_INGESTION_SOURCES,
-    DEFAULT_INGEST_TIMEOUTS,
     SYSTEM_PROJECT_ID,
 )
 from .ingestion_candidates import IngestionCandidatesMixin
+from .ingestion_rescan import IngestionRescanMixin
+from .ingestion_timeouts import IngestionTimeoutsMixin
 from .mcp import MCPError
 from .memory_ingestion import (
     DUPLICATE_STOPWORDS,
@@ -34,8 +30,8 @@ from .memory_ingestion import (
     _token_set,
     _token_similarity,
 )
-from .models import Project, utc_now
-from .teams_graph import TeamsGraphError, teams_graph_configured
+from .models import utc_now
+from .teams_graph import TeamsGraphError
 
 # Re-exported for ArchitectOSService / graph_autolinker / older imports.
 __all__ = [
@@ -49,7 +45,7 @@ __all__ = [
 _LOG = logging.getLogger("architectos.service")
 
 
-class IngestionServiceMixin(IngestionCandidatesMixin):
+class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, IngestionCandidatesMixin):
     """Ingest scheduling, per-source timeout budgets, and rescan maintenance."""
 
     # Owned by ArchitectOSService.__init__; declared here so mypy can see the
@@ -428,192 +424,6 @@ class IngestionServiceMixin(IngestionCandidatesMixin):
                     self._memory_ingest_state["error"] = str(exc)
             raise
 
-    def _normalize_ingest_mode(self, value: Any) -> str:
-        raw = str(value or "").strip().lower().replace("-", "_")
-        if raw in {"memory", "direct", "direct_memory", "direct_to_memory", "add_to_memory"}:
-            return "memory"
-        if raw in {"candidate", "candidates", "review", "review_queue"}:
-            return "candidates"
-        if raw in {"", "mixed", "legacy", "auto"}:
-            return "mixed"
-        raise ValueError("ingest_mode must be candidates, memory, or mixed")
-
-    def _resolve_ingest_timeouts(self, source: str, payload: dict[str, Any] | None = None) -> tuple[float, float]:
-        """Return (item_timeout_seconds, source_timeout_seconds) for an ingest source."""
-        payload = payload or {}
-        defaults = DEFAULT_INGEST_TIMEOUTS.get(source) or {"item": 30, "source": 300}
-        item_default = float(defaults.get("item") or 30)
-        source_default = float(defaults.get("source") or 300)
-
-        per_source = {}
-        raw_map = payload.get("timeouts")
-        if isinstance(raw_map, dict):
-            entry = raw_map.get(source) or raw_map.get(source.replace("-", "_"))
-            if isinstance(entry, dict):
-                per_source = entry
-            elif isinstance(entry, (int, float, str)):
-                per_source = {"source": entry}
-
-        source_key = source.replace("-", "_")
-        item_raw = (
-            per_source.get("item")
-            or per_source.get("item_timeout")
-            or payload.get(f"{source_key}_item_timeout")
-            or payload.get("item_timeout")
-            or item_default
-        )
-        source_raw = (
-            per_source.get("source")
-            or per_source.get("source_timeout")
-            or payload.get(f"{source_key}_source_timeout")
-            or payload.get("source_timeout")
-            or source_default
-        )
-        try:
-            item_timeout = float(item_raw)
-        except (TypeError, ValueError):
-            item_timeout = item_default
-        try:
-            source_timeout = float(source_raw)
-        except (TypeError, ValueError):
-            source_timeout = source_default
-        item_timeout = max(5.0, min(item_timeout, 600.0))
-        source_timeout = max(item_timeout, min(source_timeout, 7200.0))
-        return item_timeout, source_timeout
-
-    def _with_ingest_timeouts(self, source: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        enriched = dict(payload or {})
-        item_timeout, source_timeout = self._resolve_ingest_timeouts(source, enriched)
-        enriched["_ingest_source"] = source
-        enriched["_ingest_item_timeout"] = item_timeout
-        enriched["_ingest_source_timeout"] = source_timeout
-        enriched["_ingest_source_deadline"] = time.monotonic() + source_timeout
-        return enriched
-
-    @staticmethod
-    def _ingest_item_timeout(payload: dict[str, Any] | None, default: float = 30.0) -> float:
-        payload = payload or {}
-        try:
-            value = float(payload.get("_ingest_item_timeout") or default)
-        except (TypeError, ValueError):
-            value = default
-        return max(5.0, min(value, 600.0))
-
-    @staticmethod
-    def _ingest_deadline_remaining(payload: dict[str, Any] | None) -> float | None:
-        payload = payload or {}
-        deadline = payload.get("_ingest_source_deadline")
-        if deadline is None:
-            return None
-        try:
-            return max(0.0, float(deadline) - time.monotonic())
-        except (TypeError, ValueError):
-            return None
-
-    def _ingest_deadline_expired(self, payload: dict[str, Any] | None, source: str = "") -> bool:
-        remaining = self._ingest_deadline_remaining(payload)
-        if remaining is None:
-            return False
-        if remaining > 0:
-            return False
-        label = source or str((payload or {}).get("_ingest_source") or "source")
-        self._log_ingest(
-            f"{label} source timeout reached — skipping remaining work.",
-            level="warn",
-            source=label,
-            current=label,
-        )
-        return True
-
-    def _abort_ingest_source(self, source: str) -> None:
-        """Best-effort: kill wedged MCP sessions so a hung item cannot block later sources."""
-        session_ids = {
-            "azure-boards": ("azure-devops",),
-            "azure-git": ("azure-devops-git", "azure-devops"),
-            "azure-wiki": ("azure-devops",),
-            "granola": ("granola",),
-        }.get(source, ())
-        for server_id in session_ids:
-            try:
-                self.mcp_manager.close_session(server_id)
-            except Exception:
-                pass
-
-    def _set_ingest_partial(self, payload: dict[str, Any] | None, result: Any) -> None:
-        """Publish a salvageable mid-flight result for source-timeout recovery."""
-        box = (payload or {}).get("_ingest_partial")
-        if isinstance(box, dict):
-            box["result"] = result
-
-    def _run_source_with_timeout(
-        self,
-        source: str,
-        payload: dict[str, Any] | None,
-        warnings: list[str],
-        fn: Callable[[dict[str, Any]], Any],
-    ) -> Any:
-        """Run one ingest source under a hard source-level timeout.
-
-        Important: never use ``with ThreadPoolExecutor(...)`` here. Its ``__exit__``
-        calls ``shutdown(wait=True)``, which would block past the timeout while a
-        wedged MCP worker keeps running.
-
-        Sources should call ``_set_ingest_partial`` as items complete so a timeout
-        can still return already-fetched candidates instead of discarding them.
-        """
-        timed = self._with_ingest_timeouts(source, payload)
-        item_timeout = float(timed["_ingest_item_timeout"])
-        source_timeout = float(timed["_ingest_source_timeout"])
-        partial_box: dict[str, Any] = {"result": None}
-        timed["_ingest_partial"] = partial_box
-        self._log_ingest(
-            f"Timeouts · item={item_timeout:g}s · source={source_timeout:g}s",
-            source=source,
-            current=source,
-        )
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            future = executor.submit(fn, timed)
-            try:
-                return future.result(timeout=source_timeout)
-            except FuturesTimeoutError:
-                message = f"{source} source timeout after {source_timeout:g}s"
-                warnings.append(message)
-                self._log_ingest(message, level="warn", source=source, current=source)
-                self._abort_ingest_source(source)
-                # Brief grace: inner path may be returning partial candidates right now.
-                try:
-                    result = future.result(timeout=2.0)
-                    if result is not None:
-                        self._log_ingest(
-                            f"{source} kept partial result after timeout.",
-                            level="warn",
-                            source=source,
-                            current=source,
-                        )
-                        return result
-                except FuturesTimeoutError:
-                    pass
-                except Exception:
-                    pass
-                salvaged = partial_box.get("result")
-                if salvaged is not None:
-                    count = len(salvaged) if isinstance(salvaged, list) else (
-                        len(salvaged.get("imported") or []) if isinstance(salvaged, dict) else 1
-                    )
-                    self._log_ingest(
-                        f"{source} salvaged {count} partial item(s) after timeout.",
-                        level="warn",
-                        source=source,
-                        current=source,
-                    )
-                    return salvaged
-                future.cancel()
-                return None
-        finally:
-            # Detach immediately — do not wait for hung MCP/stdio workers.
-            executor.shutdown(wait=False, cancel_futures=True)
-
     def _write_candidates_directly_to_memory(self, project_id: str, candidates: list[dict[str, Any]]) -> list[Any]:
         written = []
         for candidate in candidates:
@@ -639,209 +449,6 @@ class IngestionServiceMixin(IngestionCandidatesMixin):
             written.append(node)
         return written
 
-    def memory_rescan_status(self) -> dict[str, Any]:
-        with self._memory_rescan_lock:
-            return dict(self._memory_rescan_state)
-
-    def _default_rescan_sources(self, include_mcp: bool = True) -> list[str]:
-        sources = list(ALL_LOCAL_INGESTION_SOURCES)
-        if not include_mcp:
-            return sources
-        granola = self.mcp_manager.get_server("granola")
-        if granola and granola.enabled:
-            sources.append("granola")
-        ado = self.mcp_manager.get_server("azure-devops")
-        if ado and ado.enabled:
-            sources.append("azure-boards")
-            sources.append("azure-wiki")
-        ado_git = self.mcp_manager.get_server("azure-devops-git")
-        if (ado and ado.enabled) or (ado_git and ado_git.enabled):
-            sources.append("azure-git")
-        if teams_graph_configured():
-            sources.append("teams-meetings")
-        return sources
-
-    def _memory_rescan_settings(self) -> dict[str, Any]:
-        life = dict(self.repository.get_setting("memory_lifecycle") or {})
-        return {
-            "auto_rescan_on_startup": bool(life.get("auto_rescan_on_startup", True)),
-            "auto_rescan_limit": max(1, int(life.get("auto_rescan_limit") or 24)),
-            "auto_rescan_all_projects": bool(life.get("auto_rescan_all_projects", True)),
-        }
-
-    def rescan_memory_sources(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = payload or {}
-        settings = self._memory_rescan_settings()
-        include_mcp = payload.get("include_mcp")
-        if include_mcp is None:
-            include_mcp = True
-        sources = payload.get("sources")
-        if not sources or sources == "all" or sources == ["all"]:
-            sources = self._default_rescan_sources(include_mcp=bool(include_mcp))
-        else:
-            sources = self._normalize_ingestion_sources(sources)
-        limit = max(1, int(payload.get("limit") or settings["auto_rescan_limit"]))
-        all_projects = bool(payload.get("all_projects", settings["auto_rescan_all_projects"]))
-        project_id = str(payload.get("project_id") or "").strip()
-        projects = self._projects_for_memory_rescan(project_id or None, all_projects=all_projects)
-        results: list[dict[str, Any]] = []
-        warnings: list[str] = []
-        total = 0
-        duplicates = 0
-        memory_written = 0
-        boards_count = 0
-        azure_git_count = 0
-        wiki_count = 0
-        teams_count = 0
-        for project in projects:
-            try:
-                self._log_ingest(
-                    f"Rescan project {project.name or project.id} · sources={', '.join(sources)}",
-                    current=f"project:{project.id}",
-                )
-                ingest = self.ingest_memory({
-                    "project_id": project.id,
-                    "sources": sources,
-                    "limit": limit,
-                    "root_path": project.root_path,
-                    "all_items": payload.get("all_items"),
-                    "ingest_mode": payload.get("ingest_mode") or payload.get("mode"),
-                })
-            except ValueError as exc:
-                warnings.append(f"{project.name or project.id}: {exc}")
-                continue
-            warnings.extend(str(item) for item in (ingest.get("warnings") or []))
-            total += int(ingest.get("count") or 0)
-            duplicates += int(ingest.get("duplicates") or 0)
-            memory_written += int(ingest.get("memory_written") or 0)
-            boards_count += int(ingest.get("boards_count") or 0)
-            azure_git_count += int(ingest.get("azure_git_count") or 0)
-            wiki_count += int(ingest.get("wiki_count") or 0)
-            teams_count += int(ingest.get("teams_count") or 0)
-            results.append({
-                "project_id": project.id,
-                "name": project.name,
-                "count": ingest.get("count") or 0,
-                "duplicates": ingest.get("duplicates") or 0,
-                "by_source": ingest.get("by_source") or {},
-                "pending": ingest.get("pending") or 0,
-                "memory_written": ingest.get("memory_written") or 0,
-                "boards_count": ingest.get("boards_count") or 0,
-                "azure_git_count": ingest.get("azure_git_count") or 0,
-                "wiki_count": ingest.get("wiki_count") or 0,
-                "teams_count": ingest.get("teams_count") or 0,
-            })
-        return {
-            "ok": True,
-            "sources": sources,
-            "limit": limit,
-            "projects": results,
-            "count": total,
-            "duplicates": duplicates,
-            "memory_written": memory_written,
-            "boards_count": boards_count,
-            "azure_git_count": azure_git_count,
-            "wiki_count": wiki_count,
-            "teams_count": teams_count,
-            "warnings": warnings,
-            "pending": sum(int(item.get("pending") or 0) for item in results),
-        }
-
-    def _projects_for_memory_rescan(self, project_id: str | None, *, all_projects: bool) -> list[Project]:
-        if not all_projects:
-            target_id = project_id
-            if not target_id:
-                workspace = dict(self.repository.get_setting("workspace") or {})
-                target_id = str(workspace.get("current_project_id") or "")
-            project = self.repository.get_project(target_id) if target_id else None
-            if not project:
-                raise ValueError(f"project not found: {target_id or '(none)'}")
-            return [project]
-        projects: list[Project] = []
-        for project in self.repository.list_projects():
-            root = str(project.root_path or "").strip()
-            if project.id == SYSTEM_PROJECT_ID and not root:
-                continue
-            if not root:
-                continue
-            projects.append(project)
-        return projects
-
-    def start_background_maintenance(self) -> None:
-        """Spawn embedding warmup/backfill threads. Called by the HTTP entry
-        points, not __init__, so tests and short-lived service instances never
-        race daemon threads against tempdir cleanup."""
-        if self.memory_embeddings.enabled() and bool((self.repository.get_setting("memory_retrieval") or {}).get("reindex_on_startup", True)):
-            # Never block HTTP startup on embedding backfill — local Ollama/bge-m3 can
-            # take minutes across thousands of nodes.
-            threading.Thread(target=self._backfill_embeddings_safe, name="embed-backfill", daemon=True).start()
-        if self.memory_embeddings.enabled():
-            threading.Thread(target=self._warmup_embeddings_safe, name="embed-warmup", daemon=True).start()
-        if self.memory_embeddings.enabled() and not self._embedding_worker_started:
-            self._embedding_worker_started = True
-            threading.Thread(target=self._embedding_index_worker, name="embed-index", daemon=True).start()
-        threading.Thread(target=self._memory_decay_loop, name="memory-decay", daemon=True).start()
-        threading.Thread(target=self._chat_session_idle_loop, name="chat-session-idle", daemon=True).start()
-
-    def schedule_startup_memory_rescan(self) -> dict[str, Any]:
-        settings = self._memory_rescan_settings()
-        if not settings["auto_rescan_on_startup"]:
-            return {"scheduled": False, "reason": "disabled"}
-        return self.schedule_memory_rescan({
-            "trigger": "startup",
-            "all_projects": settings["auto_rescan_all_projects"],
-            "limit": settings["auto_rescan_limit"],
-            "include_mcp": True,
-        })
-
-    def schedule_memory_rescan(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = dict(payload or {})
-        trigger = str(payload.get("trigger") or "manual")
-        with self._memory_rescan_lock:
-            if self._memory_rescan_state.get("running"):
-                return {"scheduled": False, "reason": "already_running", **dict(self._memory_rescan_state)}
-            self._memory_rescan_state = {
-                "running": True,
-                "trigger": trigger,
-                "started_at": utc_now(),
-                "finished_at": "",
-                "error": "",
-                "result": None,
-            }
-
-        def worker() -> None:
-            try:
-                result = self.rescan_memory_sources(payload)
-                with self._memory_rescan_lock:
-                    self._memory_rescan_state.update({
-                        "running": False,
-                        "finished_at": utc_now(),
-                        "error": "",
-                        "result": result,
-                    })
-                _LOG.info(
-                    "memory rescan (%s) finished: %s candidate(s) across %s project(s)",
-                    trigger,
-                    result.get("count"),
-                    len(result.get("projects") or []),
-                )
-            except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
-                _LOG.exception("memory rescan (%s) failed", trigger)
-                with self._memory_rescan_lock:
-                    self._memory_rescan_state.update({
-                        "running": False,
-                        "finished_at": utc_now(),
-                        "error": str(exc),
-                        "result": None,
-                    })
-
-        threading.Thread(target=worker, name=f"architectos-memory-rescan-{trigger}", daemon=True).start()
-        return {"scheduled": True, "trigger": trigger, **self.memory_rescan_status()}
-
-    # Ingest-time hygiene: an exact restatement of an existing fact updates it in
-    # place instead of spawning a duplicate; a close-but-not-identical fact is
-    # flagged (never silently merged) so a value change like "cap 5k -> 9k" stays a
-    # distinct fact the consolidation/supersede path can reason about.
     NEAR_DUPLICATE_SIMILARITY = 0.72
 
     def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
