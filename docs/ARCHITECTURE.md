@@ -49,6 +49,12 @@ existing `from .adapters import X` call sites and `mock.patch` targets still res
 `_provider_urlopen` deliberately stays in `adapters.py` next to its callers, because
 patching `adapters.urlopen` is how the tests intercept provider HTTP.
 
+Agent tools follow the same pattern: `tool_ado.py` owns Azure DevOps MCP call
+planning (`ado_call_plan` / `call_ado_tool`) shared with `azure_sync_service`;
+`tool_format.py` owns result summarization and `tool_calls` parsing for the agent
+loop; `tool_gateway.py` keeps `ToolSpec` catalogs, `ToolGateway`, and re-exports
+the split surface through `__all__`.
+
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
 the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
 verb (`do_GET`/`do_POST`/`do_PATCH`) funnels through it: index shortcut, `/api/*`
