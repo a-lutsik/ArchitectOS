@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from .storage import SQLiteMemoryRepository
 
-def _migration_001_memory_nodes_updated_at_index(repository: SQLiteMemoryRepository, conn: sqlite3.Connection) -> None:
+def _migration_001_memory_nodes_updated_at_index(repository: Any, conn: sqlite3.Connection) -> None:
     """Index memory_nodes.updated_at for the hot list_nodes ORDER BY path.
 
     memory_edges gets no matching index: list_edges orders by created_at, so an
@@ -22,7 +20,7 @@ def _migration_001_memory_nodes_updated_at_index(repository: SQLiteMemoryReposit
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_nodes_updated_at ON memory_nodes(updated_at)")
 
 
-def _migration_002_memory_lifecycle_defaults(repository: SQLiteMemoryRepository, conn: sqlite3.Connection) -> None:
+def _migration_002_memory_lifecycle_defaults(repository: Any, conn: sqlite3.Connection) -> None:
     """Backfill memory_lifecycle keys added after the initial schema."""
     if repository.get_setting("memory_lifecycle") is None:
         # Fresh database: seed_if_empty writes the full defaults later.
@@ -30,7 +28,7 @@ def _migration_002_memory_lifecycle_defaults(repository: SQLiteMemoryRepository,
     repository._upgrade_memory_lifecycle_defaults()
 
 
-def _migration_003_mcp_server_defaults(repository: SQLiteMemoryRepository, conn: sqlite3.Connection) -> None:
+def _migration_003_mcp_server_defaults(repository: Any, conn: sqlite3.Connection) -> None:
     """Refresh bundled MCP server entries (remote Granola, Azure DevOps git)."""
     if repository.get_setting("mcp_servers") is None:
         # Fresh database: seed_if_empty writes the full defaults later.
@@ -40,7 +38,8 @@ def _migration_003_mcp_server_defaults(repository: SQLiteMemoryRepository, conn:
 
 # Ordered (version, fn) steps; _migrate applies every step above the database's
 # PRAGMA user_version. Keep ids monotonically increasing and every step idempotent.
-MIGRATIONS: list[tuple[int, Callable[[SQLiteMemoryRepository, sqlite3.Connection], None]]] = [
+# ``repository`` is the composed ``SQLiteMemoryRepository`` (via StorageMigrateMixin).
+MIGRATIONS: list[tuple[int, Callable[[Any, sqlite3.Connection], None]]] = [
     (1, _migration_001_memory_nodes_updated_at_index),
     (2, _migration_002_memory_lifecycle_defaults),
     (3, _migration_003_mcp_server_defaults),

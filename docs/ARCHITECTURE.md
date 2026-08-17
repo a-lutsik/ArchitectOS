@@ -117,8 +117,9 @@ using two spacer divs so the scroll height matches the full row model.
 
 `data/architectos.db` is the source of truth. Memory evidence is also written under `memory/evidence` as markdown. Release packages exclude `data/`, `memory/`, `dist/`, and cache files.
 
-`SQLiteMemoryRepository` (`storage.py`) owns the schema and core CRUD.
-FTS5 / embedding search lives in `storage_search.py`
+`SQLiteMemoryRepository` (`storage.py`) owns core CRUD and connection/backup.
+Schema migrate/seed/upgrades live in `storage_migrate.py`
+(`StorageMigrateMixin`); FTS5 / embedding search lives in `storage_search.py`
 (`StorageSearchMixin`); the memory-candidate review queue lives in
 `storage_candidates.py` (`StorageCandidatesMixin`); tasks/chats/providers/
 settings/analytics/bundle I/O live in `storage_sessions.py`

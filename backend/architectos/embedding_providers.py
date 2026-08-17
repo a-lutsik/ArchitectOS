@@ -631,7 +631,11 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
         # On-device real vectors when the optional extra is installed. Selected in
         # `auto` ahead of the hash fallback so a fresh install gets real quality
         # without any API keys. Construction is cheap; the model loads lazily.
-        if not local_embeddings_available():
+        # Resolve via the embeddings facade so tests can patch
+        # ``embeddings.local_embeddings_available`` after the provider split.
+        from . import embeddings as emb_facade
+
+        if not emb_facade.local_embeddings_available():
             return None
         return LocalEmbeddingProvider(model=model or str(os.environ.get("MEMORY_LOCAL_EMBED_MODEL") or ""))
 

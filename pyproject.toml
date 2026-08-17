@@ -99,6 +99,7 @@ module = [
     "architectos.retrieval_service",
     "architectos.settings_router_service",
     "architectos.storage_candidates",
+    "architectos.storage_migrate",
     "architectos.storage_search",
     "architectos.storage_sessions",
     "architectos.teams_sync",
