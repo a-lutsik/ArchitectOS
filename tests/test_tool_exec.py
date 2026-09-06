@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -130,16 +131,70 @@ class ToolExecTerminalExtrasTests(unittest.TestCase):
     def test_timeout_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
-            with mock.patch(
-                "backend.architectos.tool_exec_service.subprocess.run",
-                side_effect=subprocess.TimeoutExpired(cmd="sleep", timeout=1, output="partial", stderr=""),
-            ):
+            proc = mock.Mock()
+            expired = subprocess.TimeoutExpired(cmd="sleep", timeout=1, output="partial", stderr="")
+            proc.communicate.side_effect = [expired, ("", "")]
+            proc.poll.return_value = None
+            proc.pid = 4242
+            with mock.patch("backend.architectos.tool_exec_service.subprocess.Popen", return_value=proc):
                 result = service.terminal_run({
                     "project_id": "architectos",
                     "command": "echo ok",
                     "timeout_seconds": 1,
                 })
             self.assertEqual(result["status"], "timeout")
+            proc.kill.assert_called()
+
+    def test_timeout_explains_silent_mcp_stdio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            proc = mock.Mock()
+            expired = subprocess.TimeoutExpired(cmd="npx", timeout=1, output="", stderr="")
+            proc.communicate.side_effect = [expired, ("", "")]
+            proc.poll.return_value = None
+            proc.pid = 4242
+            with mock.patch("backend.architectos.tool_exec_service.subprocess.Popen", return_value=proc):
+                result = service.terminal_run({
+                    "project_id": "architectos",
+                    "command": "npx -y @modelcontextprotocol/server-filesystem .",
+                    "timeout_seconds": 1,
+                })
+            self.assertEqual(result["status"], "timeout")
+            self.assertIn("JSON-RPC", result["stderr"])
+
+    def test_timeout_returns_when_child_keeps_pipes_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            proc = mock.Mock()
+            expired = subprocess.TimeoutExpired(cmd="npx", timeout=1, output="", stderr="")
+            proc.communicate.side_effect = [
+                expired,
+                subprocess.TimeoutExpired(cmd="npx", timeout=2),
+            ]
+            proc.poll.return_value = None
+            proc.pid = 4242
+            proc.stdout = mock.Mock()
+            proc.stderr = mock.Mock()
+            with mock.patch("backend.architectos.tool_exec_service.subprocess.Popen", return_value=proc):
+                result = service.terminal_run({
+                    "project_id": "architectos",
+                    "command": "npx -y @modelcontextprotocol/server-filesystem .",
+                    "timeout_seconds": 1,
+                })
+            self.assertEqual(result["status"], "timeout")
+            proc.stdout.close.assert_called()
+
+    def test_real_sleep_hits_timeout(self) -> None:
+        hang = "ping -n 30 127.0.0.1 >nul" if os.name == "nt" else "sleep 30"
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            result = service.terminal_run({
+                "project_id": "architectos",
+                "command": hang,
+                "timeout_seconds": 1,
+            })
+            self.assertEqual(result["status"], "timeout")
+            self.assertLessEqual(result["duration_ms"], 15_000)
 
     def test_shell_id_and_open_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -175,7 +175,7 @@ class MCPManager:
             "code_challenge_method": "S256",
             "resource": config.url,
         }
-        scope = str(resource_metadata.get("scope") or auth_metadata.get("scope") or "").strip()
+        scope = self._oauth_scope(resource_metadata, auth_metadata)
         if scope:
             params["scope"] = scope
         # Start a clean auth session — never keep an expired access token mid-flow.
@@ -200,8 +200,18 @@ class MCPManager:
             "id": server_id,
             "auth_url": auth_url,
             "auth_status": "pending",
-            "message": "Complete Granola sign-in in the browser window, then return here and click Test.",
+            "message": "Complete sign-in in the browser window, then return here and click Test.",
         }
+
+    @staticmethod
+    def _oauth_scope(resource_metadata: dict[str, Any], auth_metadata: dict[str, Any]) -> str:
+        direct = str(resource_metadata.get("scope") or auth_metadata.get("scope") or "").strip()
+        if direct:
+            return direct
+        scopes = resource_metadata.get("scopes_supported")
+        if isinstance(scopes, list):
+            return " ".join(str(item).strip() for item in scopes if str(item).strip())
+        return ""
 
     def complete_auth(self, query: dict[str, Any]) -> dict[str, Any]:
         error = self._query_value(query, "error")
@@ -286,7 +296,7 @@ class MCPManager:
         org = self._azure_devops_org(config, resolved)
         if not org:
             raise MCPError(
-                "Azure DevOps organization is required. Set ADO_ORG in .env, "
+                "Azure DevOps organization is required. Set it in Settings → Sources → Edit on an Azure source, "
                 "put the org name in the MCP command, or open a project with an Azure DevOps git remote."
             )
         package_idx = next((i for i, part in enumerate(resolved) if ADO_MCP_PACKAGE in part), -1)
@@ -330,13 +340,13 @@ class MCPManager:
         if auth_mode in {"envvar", "env"}:
             if not str(env.get("ADO_MCP_AUTH_TOKEN") or "").strip():
                 raise MCPError(
-                    "Azure DevOps auth requires ADO_MCP_AUTH_TOKEN in .env (raw PAT), then restart ArchitectOS."
+                    "Azure DevOps auth requires a PAT in Settings → Sources → Edit (ADO_MCP_AUTH_TOKEN)."
                 )
         elif auth_mode == "pat":
             if not str(env.get("PERSONAL_ACCESS_TOKEN") or "").strip():
                 raise MCPError(
-                    "Azure DevOps PAT auth requires PERSONAL_ACCESS_TOKEN in .env "
-                    "(base64 of ':<pat>'), then restart ArchitectOS."
+                    "Azure DevOps PAT auth requires PERSONAL_ACCESS_TOKEN in Settings → Sources → Edit "
+                    "(base64 of ':<pat>')."
                 )
 
     def _client_for(self, config: MCPServerConfig):
@@ -506,40 +516,67 @@ class MCPManager:
             value = value[0] if value else ""
         return str(value or "")
 
+    @staticmethod
+    def _stdio_client_alive(client: Any) -> bool:
+        process = getattr(client, "_process", None)
+        return bool(process is not None and process.poll() is None)
+
     def _get_client(self, server_id: str) -> Any:
+        # Never hold ``_sessions_lock`` across start/initialize/close: those can block
+        # for tens of seconds, and ingest source-timeout abort needs close_session()
+        # to run immediately.
+        stale = None
         with self._sessions_lock:
             config = self._require_launchable(server_id)
-            if config.transport in {"http", "remote", "streamable-http"}:
-                config = self._ensure_fresh_auth(config)
-            command = self._resolve_command(config) if config.transport not in {"http", "remote", "streamable-http"} else list(config.command)
+            remote = config.transport in {"http", "remote", "streamable-http"}
+            command = self._resolve_command(config) if not remote else list(config.command)
             probe = MCPServerConfig.from_dict({**config.to_dict(), "command": command})
             current_config_dict = probe.to_dict()
-
             cached = self._sessions.get(server_id)
             if cached:
                 cached_client, cached_config = cached
-                valid = True
-                if config.transport not in {"http", "remote", "streamable-http"}:
-                    if not cached_client._process or cached_client._process.poll() is not None:
-                        valid = False
-                if cached_config != current_config_dict:
-                    valid = False
-
+                valid = cached_config == current_config_dict
+                if valid and not remote:
+                    valid = self._stdio_client_alive(cached_client)
                 if valid:
                     return cached_client
-                else:
-                    try:
-                        if hasattr(cached_client, "close"):
-                            cached_client.close()
-                    except Exception:
-                        pass
-                    self._sessions.pop(server_id, None)
+                stale = cached_client
+                self._sessions.pop(server_id, None)
 
-            client = self._client_for(probe)
+        if remote:
+            probe = self._ensure_fresh_auth(probe)
+            current_config_dict = probe.to_dict()
+
+        if stale is not None:
+            try:
+                if hasattr(stale, "close"):
+                    stale.close()
+            except Exception:
+                pass
+
+        client = self._client_for(probe)
+        with self._sessions_lock:
+            # Register before initialize so close_session() can kill a wedged handshake.
+            self._sessions[server_id] = (client, current_config_dict)
+        try:
             if hasattr(client, "start"):
                 client.start()
-            client.initialize()
-            self._sessions[server_id] = (client, current_config_dict)
+            if hasattr(client, "initialize"):
+                client.initialize(timeout=20.0)
+        except Exception:
+            self.close_session(server_id)
+            raise
+        with self._sessions_lock:
+            installed = self._sessions.get(server_id)
+            if not installed or installed[0] is not client:
+                try:
+                    if hasattr(client, "close"):
+                        client.close()
+                except Exception:
+                    pass
+                if installed:
+                    return installed[0]
+                raise MCPError("MCP session was closed during initialize.")
             return client
 
     def check(self, server_id: str) -> dict[str, Any]:

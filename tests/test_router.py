@@ -49,6 +49,35 @@ class RouterPolicyTests(unittest.TestCase):
         self.assertEqual(plan["decision"]["mode"], "fallback")
         self.assertEqual(plan["provider"]["id"], "local-memory")
 
+    def test_balanced_ready_azure_beats_local_memory_for_code(self) -> None:
+        policy = RouterPolicy({"strategy": "balanced"})
+        providers = [
+            {"id": "azure-openai", "label": "Azure OpenAI", "enabled": True, "status": "configured", "last_check": {"ready": True, "status": "ok"}},
+            {"id": "local-memory", "label": "Local Memory", "enabled": True, "status": "fallback"},
+        ]
+        plan = policy.select(providers, "auto", role="code")
+        self.assertEqual(plan["decision"]["mode"], "auto")
+        self.assertEqual(plan["provider"]["id"], "azure-openai")
+
+    def test_missing_credentials_last_check_is_not_ready(self) -> None:
+        from backend.architectos.routing import provider_is_ready
+
+        provider = {
+            "id": "anthropic",
+            "label": "Anthropic",
+            "enabled": True,
+            "status": "configured",
+            "last_check": {"ready": False, "status": "missing_credentials", "message": "ANTHROPIC_API_KEY is not set."},
+        }
+        self.assertFalse(provider_is_ready(provider))
+        policy = RouterPolicy({"strategy": "balanced"})
+        plan = policy.select(
+            [provider, {"id": "local-memory", "label": "Local Memory", "enabled": True, "status": "fallback"}],
+            "auto",
+            role="code",
+        )
+        self.assertEqual(plan["provider"]["id"], "local-memory")
+
     def test_role_classification(self) -> None:
         self.assertEqual(classify_role("please implement this function and add a test"), "code")
         self.assertEqual(classify_role("review this for security risks"), "review")

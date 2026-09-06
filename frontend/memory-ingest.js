@@ -2,13 +2,14 @@
 import { api } from "./api-client.js";
 import { escapeHtml } from "./dom-utils.js";
 import { loadMemoryCandidates, loadMemoryLifecycle } from "./memory-panel.js";
+import { loadProjectSources, selectedSourceIds } from "./memory-sources.js";
 import { loadAnalytics } from "./providers.js";
 import { scheduleGraphLoad } from "./projects.js";
 import { state } from "./state.js";
 
 function ingestTimeoutPayload(sources = []) {
   const itemTimeout = Number(document.querySelector("#ingest-item-timeout")?.value || 25);
-  const sourceTimeout = Number(document.querySelector("#ingest-source-timeout")?.value || 600);
+  const sourceTimeout = Number(document.querySelector("#ingest-source-timeout")?.value || 90);
   const timeouts = {};
   for (const source of sources) {
     timeouts[source] = { item: itemTimeout, source: sourceTimeout };
@@ -22,8 +23,7 @@ function ingestTimeoutPayload(sources = []) {
 
 async function ingestMemorySources() {
   const summary = document.querySelector("#candidate-summary");
-  const sources = [...document.querySelectorAll(".ingest-source")].filter(input => input.checked).map(input => input.value);
-  const limit = Number(document.querySelector("#ingest-limit")?.value || 12);
+  const sources = selectedSourceIds();
   const ingestMode = document.querySelector("#ingest-direct-memory")?.checked ? "memory" : "candidates";
   const mineOnlyEl = document.querySelector("#ingest-boards-mine-only");
   const allItems = mineOnlyEl ? !mineOnlyEl.checked : true;
@@ -39,7 +39,7 @@ async function ingestMemorySources() {
     current: "queued",
     sources,
     project_id: state.projectId,
-    logs: [{ level: "info", message: `Starting AutoScan for ${sources.length} source group(s) · ${ingestMode === "memory" ? "direct memory" : "review candidates"}` }],
+    logs: [{ level: "info", message: `Starting AutoScan for ${sources.length} source(s) · ${ingestMode === "memory" ? "direct memory" : "review candidates"}` }],
   });
   try {
     const scheduled = await api("/api/memory/ingest", {
@@ -47,7 +47,7 @@ async function ingestMemorySources() {
       body: JSON.stringify({
         project_id: state.projectId,
         sources,
-        limit,
+        limit: 0,
         async: true,
         all_items: allItems,
         work_item_types: boardsTypes,
@@ -73,34 +73,23 @@ function showIngestProgress(visible) {
   if (panel) panel.hidden = !visible;
 }
 
-const INGEST_STEP_META = {
-  queued: { title: "Queued", mark: "…" },
-  starting: { title: "Starting", mark: "1" },
-  files: { title: "Project files", mark: "F" },
-  chat: { title: "App chat", mark: "C" },
-  git: { title: "Git history", mark: "G" },
-  granola: { title: "Granola meetings", mark: "N" },
-  "azure-boards": { title: "Azure Boards", mark: "B" },
-  "azure-git": { title: "Azure Git", mark: "R" },
-  "azure-wiki": { title: "Azure Wiki", mark: "W" },
-  "teams-meetings": { title: "Teams meetings", mark: "T" },
-  prepare: { title: "Prepare review queue", mark: "P" },
-  done: { title: "Finished", mark: "✓" },
-  error: { title: "Failed", mark: "!" },
-};
-
 function ingestStepTitle(key) {
-  if (INGEST_STEP_META[key]) return INGEST_STEP_META[key].title;
+  if (String(key).startsWith("source_")) return "Source scan";
   if (String(key).startsWith("project:")) return "Project scan";
+  if (key === "queued") return "Queued";
+  if (key === "starting") return "Starting";
+  if (key === "prepare") return "Prepare review queue";
+  if (key === "done") return "Finished";
+  if (key === "error") return "Failed";
   return String(key || "Step").replace(/-/g, " ");
 }
 
-function ingestStepMark(key, state) {
-  if (state === "done") return "✓";
-  if (state === "error") return "!";
-  if (state === "warn") return "!";
-  if (state === "running") return "●";
-  return (INGEST_STEP_META[key] && INGEST_STEP_META[key].mark) || "·";
+function ingestStepMark(_key, stepState) {
+  if (stepState === "done") return "✓";
+  if (stepState === "error") return "!";
+  if (stepState === "warn") return "!";
+  if (stepState === "running") return "●";
+  return "·";
 }
 
 function friendlyIngestMessage(entry) {
@@ -108,36 +97,13 @@ function friendlyIngestMessage(entry) {
   if (!message) return "Waiting…";
   return message
     .replace(/^Starting ingest · /, "Starting · ")
-    .replace(/^Scanning project files for /, "Looking through ")
-    .replace(/^File scan done · /, "Found ")
-    .replace(/^Reading chat history…$/, "Reading recent chats…")
-    .replace(/^Chat done · /, "Chat: ")
-    .replace(/^Scanning git history…$/, "Reading git commits…")
-    .replace(/^Git done · /, "Git: ")
-    .replace(/^Calling Granola MCP…$/, "Asking Granola for meetings…")
-    .replace(/^Granola done · /, "Granola: ")
-    .replace(/^Importing Azure Boards work items…$/, "Fetching Azure Boards work items…")
-    .replace(/^Azure Boards done · /, "Boards: ")
-    .replace(/^Importing Azure Git repos and pull requests…$/, "Fetching Azure Git repos and PRs…")
-    .replace(/^Azure Git done · /, "Azure Git: ")
-    .replace(/^Importing Azure Wiki pages…$/, "Fetching Azure Wiki pages…")
-    .replace(/^Azure Wiki done · /, "Wiki: ")
-    .replace(/^Importing Teams meetings \(Graph transcripts \/ AI Insights\)…$/, "Fetching Teams transcripts & insights…")
-    .replace(/^Teams done · /, "Teams: ")
     .replace(/^Preparing review queue from /, "Building review queue from ")
     .replace(/^Ingest finished · /, "Done · ");
 }
 
 function buildIngestSteps(status) {
   const sources = Array.isArray(status.sources) ? status.sources.slice() : [];
-  const fileGroup = ["docs", "code", "adr", "issues", "prs", "meetings"];
-  const steps = [];
-  const hasFiles = sources.some(item => fileGroup.includes(item));
-  if (hasFiles) steps.push("files");
-  for (const source of ["chat", "git", "granola", "azure-boards", "azure-git", "azure-wiki", "teams-meetings"]) {
-    if (sources.includes(source)) steps.push(source);
-  }
-  if (!steps.length) steps.push("starting");
+  const steps = sources.length ? sources.slice() : ["starting"];
   steps.push("prepare");
   return steps;
 }
@@ -148,105 +114,57 @@ function inferIngestStepStates(status) {
   const current = String(status.current || "");
   const states = {};
   const summaries = {};
-  for (const key of steps) {
-    states[key] = "pending";
-    summaries[key] = "Waiting…";
-  }
-  for (const entry of logs) {
-    let key = entry.source || "";
-    const msg = String(entry.message || "");
-    if (!key) {
-      if (/prepare|review queue/i.test(msg)) key = "prepare";
-      else if (/starting ingest|queued ingest/i.test(msg)) key = steps[0];
-      else if (/finished/i.test(msg)) key = "prepare";
-    }
-    if (key === "docs" || key === "code" || key === "adr" || key === "issues" || key === "prs" || key === "meetings") key = "files";
-    if (!steps.includes(key)) continue;
-    const level = entry.level || "info";
-    if (level === "error") states[key] = "error";
-    else if (level === "warn") states[key] = states[key] === "error" ? "error" : "warn";
-    else if (/done|finished|found |candidate|written/i.test(msg)) states[key] = states[key] === "error" ? "error" : (states[key] === "warn" ? "warn" : "done");
-    else if (/scanning|reading|calling|importing|fetching|preparing|starting|looking/i.test(msg) || /…$/.test(msg)) {
-      if (states[key] === "pending") states[key] = "running";
-    }
-    summaries[key] = friendlyIngestMessage(entry);
+  for (const step of steps) {
+    states[step] = "pending";
   }
   if (status.running && current) {
-    let active = current;
-    if (active.startsWith("project:")) active = steps[0] || "files";
-    if (active === "starting" || active === "queued" || active === "done") active = steps.find(key => states[key] === "pending" || states[key] === "running") || steps[steps.length - 1];
-    if (steps.includes(active) && states[active] !== "done" && states[active] !== "error" && states[active] !== "warn") {
-      states[active] = "running";
-    }
-    // Mark earlier steps done if we've moved past them.
-    const idx = steps.indexOf(active);
-    if (idx > 0) {
-      for (let i = 0; i < idx; i += 1) {
-        if (states[steps[i]] === "pending" || states[steps[i]] === "running") states[steps[i]] = "done";
-      }
+    const idx = steps.indexOf(current);
+    if (idx >= 0) {
+      for (let i = 0; i < idx; i += 1) states[steps[i]] = "done";
+      states[current] = "running";
     }
   }
   if (!status.running && !status.error) {
-    for (const key of steps) {
-      if (states[key] === "pending" || states[key] === "running") states[key] = "done";
-    }
+    for (const step of steps) states[step] = "done";
   }
   if (status.error) {
-    const active = steps.find(key => states[key] === "running" || states[key] === "pending") || steps[steps.length - 1];
-    states[active] = "error";
-    summaries[active] = status.error;
+    const idx = steps.indexOf(current);
+    for (let i = 0; i < steps.length; i += 1) {
+      if (i < idx) states[steps[i]] = "done";
+      else if (i === idx) states[steps[i]] = "error";
+    }
+  }
+  for (const entry of logs) {
+    const source = String(entry.source || "").trim();
+    if (source && steps.includes(source)) {
+      summaries[source] = friendlyIngestMessage(entry);
+      if (/done ·/i.test(entry.message || "")) states[source] = "done";
+      else if (entry.level === "error") states[source] = "error";
+      else if (entry.level === "warn") states[source] = "warn";
+      else if (/scanning/i.test(entry.message || "")) states[source] = "running";
+    }
   }
   return { steps, states, summaries };
 }
 
 function renderIngestProgress(status) {
   const panel = document.querySelector("#ingest-progress");
-  const statusEl = document.querySelector("#ingest-agent-status");
-  const stepsEl = document.querySelector("#ingest-agent-steps");
-  const barFill = document.querySelector("#ingest-agent-bar-fill");
-  const countEl = document.querySelector("#ingest-agent-count");
-  const latestEl = document.querySelector("#ingest-agent-latest");
-  const feedEl = document.querySelector("#ingest-agent-feed");
-  if (!panel || !statusEl || !stepsEl) return;
-  panel.hidden = false;
-
-  const { steps, states, summaries } = inferIngestStepStates(status);
-  const doneCount = steps.filter(key => ["done", "warn"].includes(states[key])).length;
-  const total = steps.length || 1;
-  const pct = status.running ? Math.round((doneCount / total) * 100) : (status.error ? Math.round((doneCount / total) * 100) : 100);
-
-  if (status.running) {
-    statusEl.textContent = `Working on ${ingestStepTitle(status.current || steps.find(key => states[key] === "running") || "scan")}…`;
-    statusEl.dataset.tone = "running";
-  } else if (status.error) {
-    statusEl.textContent = "Stopped with an error";
-    statusEl.dataset.tone = "error";
-  } else {
-    statusEl.textContent = "Finished";
-    statusEl.dataset.tone = "ok";
+  if (!panel) return;
+  const { steps, states, summaries } = inferIngestStepStates(status || {});
+  const stepsEl = panel.querySelector(".ingest-steps");
+  if (stepsEl) {
+    stepsEl.innerHTML = steps.map(step => {
+      const stateName = states[step] || "pending";
+      return `<li class="ingest-step ingest-step-${stateName}" data-step="${escapeHtml(step)}">
+        <span class="ingest-step-mark">${ingestStepMark(step, stateName)}</span>
+        <span class="ingest-step-title">${escapeHtml(ingestStepTitle(step))}</span>
+        <span class="ingest-step-summary">${escapeHtml(summaries[step] || "")}</span>
+      </li>`;
+    }).join("");
   }
-
-  if (barFill) barFill.style.width = `${Math.max(status.running ? 8 : 0, pct)}%`;
-  if (countEl) countEl.textContent = `${Math.min(doneCount + (status.running ? 1 : 0), total)} / ${total}`;
-
-  stepsEl.innerHTML = steps.map(key => {
-    const state = states[key] || "pending";
-    const badge = state === "running" ? "now" : state === "done" ? "done" : state === "warn" ? "skipped" : state === "error" ? "error" : "queued";
-    return `<div class="ingest-agent-step" data-state="${escapeHtml(state)}" role="listitem">
-      <span class="ingest-agent-step-mark">${escapeHtml(ingestStepMark(key, state))}</span>
-      <div class="ingest-agent-step-body">
-        <strong>${escapeHtml(ingestStepTitle(key))}</strong>
-        <p>${escapeHtml(summaries[key] || "Waiting…")}</p>
-      </div>
-      <span class="ingest-agent-step-badge">${escapeHtml(badge)}</span>
-    </div>`;
-  }).join("");
-
-  const latest = (status.logs || []).slice().reverse().find(Boolean);
-  if (latestEl) latestEl.textContent = latest ? friendlyIngestMessage(latest) : "";
-
-  if (feedEl) {
-    feedEl.textContent = (status.logs || []).map(entry => {
+  const feedEl = panel.querySelector(".ingest-log-feed");
+  if (feedEl && Array.isArray(status?.logs)) {
+    feedEl.textContent = status.logs.map(entry => {
       const level = (entry.level || "info").toUpperCase();
       const source = entry.source ? `[${entry.source}] ` : "";
       return `${level} ${source}${entry.message || ""}`;
@@ -255,8 +173,11 @@ function renderIngestProgress(status) {
   }
 }
 
-async function waitForMemoryIngest(summary, attempts = 180) {
-  for (let i = 0; i < attempts; i += 1) {
+async function waitForMemoryIngest(summary) {
+  const sourceTimeout = Number(document.querySelector("#ingest-source-timeout")?.value || 90);
+  const sourceCount = Math.max(1, selectedSourceIds().length);
+  const deadline = Date.now() + (Math.max(15, sourceTimeout) * sourceCount + 60) * 1000;
+  while (Date.now() < deadline) {
     const status = await api("/api/memory/ingest");
     renderIngestProgress(status);
     if (status.running) {
@@ -276,11 +197,10 @@ async function waitForMemoryIngest(summary, attempts = 180) {
     const boards = result.boards_count ? `, ${result.boards_count} Boards→memory` : "";
     const azureGit = result.azure_git_count ? `, ${result.azure_git_count} Azure Git→memory` : "";
     const wiki = result.wiki_count ? `, ${result.wiki_count} Wiki→memory` : "";
-    const teams = result.teams_count ? `, ${result.teams_count} Teams→memory` : "";
     const direct = result.direct_count ? `, ${result.direct_count} direct→memory` : "";
     if (summary) {
       summary.className = "provider-test ok";
-      summary.textContent = `${result.count || 0} candidate(s), ${result.duplicates || 0} duplicate hint(s), ${result.pending || 0} pending${direct}${boards}${azureGit}${wiki}${teams}${warnings}`;
+      summary.textContent = `${result.count || 0} candidate(s), ${result.duplicates || 0} duplicate hint(s), ${result.pending || 0} pending${direct}${boards}${azureGit}${wiki}${warnings}`;
     }
     return status;
   }
@@ -290,15 +210,14 @@ async function waitForMemoryIngest(summary, attempts = 180) {
   }
   return null;
 }
+
 async function rescanAllMemorySources() {
   const summary = document.querySelector("#candidate-summary");
-  const limit = Number(document.querySelector("#ingest-limit")?.value || 24);
   const ingestMode = document.querySelector("#ingest-direct-memory")?.checked ? "memory" : "candidates";
   const mineOnlyEl = document.querySelector("#ingest-boards-mine-only");
   const allItems = mineOnlyEl ? !mineOnlyEl.checked : true;
   const boardsTypes = selectedBoardsTypes();
-  setIngestSourcesSelected(true);
-  if (summary) { summary.className = "provider-test"; summary.textContent = "rescanning all sources..."; }
+  if (summary) { summary.className = "provider-test"; summary.textContent = "rescanning enabled sources..."; }
   try {
     const scheduled = await api("/api/memory/rescan", {
       method: "POST",
@@ -307,15 +226,12 @@ async function rescanAllMemorySources() {
         project_id: state.projectId,
         all_projects: false,
         sources: "all",
-        limit,
+        limit: 0,
         include_mcp: true,
         all_items: allItems,
         work_item_types: boardsTypes,
         ingest_mode: ingestMode,
-        ...ingestTimeoutPayload([
-          "docs", "code", "chat", "git", "adr", "issues", "prs", "meetings",
-          "granola", "azure-boards", "azure-git", "azure-wiki", "teams-meetings",
-        ]),
+        ...ingestTimeoutPayload(selectedSourceIds()),
       })
     });
     if (!scheduled.scheduled && scheduled.reason === "already_running") {
@@ -326,6 +242,7 @@ async function rescanAllMemorySources() {
     if (summary) { summary.className = "provider-test error"; summary.textContent = error.message; }
   }
 }
+
 async function waitForMemoryRescan(summary, attempts = 120) {
   showIngestProgress(true);
   for (let i = 0; i < attempts; i += 1) {
@@ -351,11 +268,10 @@ async function waitForMemoryRescan(summary, attempts = 120) {
     const boards = result.boards_count ? `, ${result.boards_count} Boards→memory` : "";
     const azureGit = result.azure_git_count ? `, ${result.azure_git_count} Azure Git→memory` : "";
     const wiki = result.wiki_count ? `, ${result.wiki_count} Wiki→memory` : "";
-    const teams = result.teams_count ? `, ${result.teams_count} Teams→memory` : "";
     const direct = result.memory_written ? `, ${result.memory_written} memory write(s)` : "";
     if (summary) {
       summary.className = "provider-test ok";
-      summary.textContent = `${result.count || 0} candidate(s), ${result.duplicates || 0} duplicate hint(s)${direct}${boards}${azureGit}${wiki}${teams}${warnings}`;
+      summary.textContent = `${result.count || 0} candidate(s), ${result.duplicates || 0} duplicate hint(s)${direct}${boards}${azureGit}${wiki}${warnings}`;
     }
     await refreshMemorySurfaces();
     scheduleGraphLoad();
@@ -375,6 +291,7 @@ async function refreshMemorySurfaces() {
     loadAnalytics(),
   ]);
 }
+
 async function syncStartupMemoryRescan() {
   try {
     const status = await api("/api/memory/rescan");
@@ -393,7 +310,8 @@ async function syncStartupMemoryRescan() {
     // Startup rescan is best-effort; UI stays usable if it fails.
   }
 }
-function setIngestSourcesSelected(selected) {
+
+async function setIngestSourcesSelected(selected) {
   document.querySelectorAll(".ingest-source").forEach(input => {
     input.checked = Boolean(selected);
   });
@@ -423,45 +341,53 @@ function syncBoardsTypeSummary() {
 function syncBoardsOptionsVisibility() {
   const panel = document.querySelector("#ingest-boards-options");
   if (!panel) return;
-  const enabled = Boolean(document.querySelector('.ingest-source[value="azure-boards"]')?.checked);
-  panel.hidden = !enabled;
+  const boardsChecked = [...document.querySelectorAll(".ingest-source:checked")].some(input => {
+    const adapter = input.dataset.adapter || "";
+    const legacy = input.value || "";
+    return adapter === "azure-boards" || legacy === "azure-boards";
+  });
+  panel.hidden = !boardsChecked;
+  panel.setAttribute("aria-hidden", boardsChecked ? "false" : "true");
   syncBoardsTypeSummary();
 }
 
 async function syncIngestSourcesWithMcp() {
   try {
-    const payload = await api("/api/mcp/servers");
-    const servers = payload.servers || [];
+    const [mcpPayload] = await Promise.all([
+      api("/api/mcp/servers"),
+      loadProjectSources(),
+    ]);
+    const servers = mcpPayload.servers || [];
     const byId = Object.fromEntries(servers.map(server => [server.id, server]));
-    const ado = byId["azure-devops"];
-    const adoGit = byId["azure-devops-git"];
-    const granola = byId.granola;
-    const adoOn = Boolean(ado?.enabled);
-    const adoGitOn = Boolean(adoGit?.enabled) || adoOn;
-    const granolaOn = Boolean(granola?.enabled);
-    const mark = (value, enabled) => {
-      const input = document.querySelector(`.ingest-source[value="${value}"]`);
-      if (!input) return;
+    document.querySelectorAll(".ingest-source").forEach(input => {
+      const adapter = input.dataset.adapter || "";
+      const serverId = input.dataset.mcpServer || "";
+      const server = byId[serverId];
       const label = input.closest(".source-checkbox");
-      if (enabled) {
-        input.checked = true;
-        input.disabled = false;
-        if (label) label.title = label.dataset.readyTitle || label.title;
-      } else {
-        input.disabled = false;
+      const enabled = !serverId || Boolean(server?.enabled);
+      input.disabled = false;
+      if (adapter.startsWith("azure") && !enabled) {
         if (label && !label.dataset.readyTitle) label.dataset.readyTitle = label.title;
+        if (label) label.title = `Enable MCP server ${serverId || adapter} in MCP settings first`;
+      } else if (label?.dataset.readyTitle) {
+        label.title = label.dataset.readyTitle;
       }
-    };
-    mark("azure-boards", adoOn);
-    mark("azure-wiki", adoOn);
-    mark("azure-git", adoGitOn);
-    mark("granola", granolaOn);
+    });
     syncBoardsOptionsVisibility();
   } catch (_error) {
-    // MCP list is best-effort for AutoScan defaults.
     syncBoardsOptionsVisibility();
   }
 }
+
+document.querySelector("#source-grid")?.addEventListener("aos:sources-rendered", () => {
+  syncBoardsOptionsVisibility();
+});
+
+document.addEventListener("change", event => {
+  if (event.target?.classList?.contains("ingest-source")) {
+    syncBoardsOptionsVisibility();
+  }
+});
 
 export {
   ingestMemorySources, refreshMemorySurfaces, rescanAllMemorySources,

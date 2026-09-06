@@ -33,14 +33,17 @@ class MCPServerConfig:
         command = data.get("command")
         if isinstance(command, str):
             command = command.split()
-        transport = str(data.get("transport") or "stdio").strip().lower()
-        if transport in {"remote http", "remote-http"}:
+        transport = str(data.get("transport") or "").strip().lower()
+        url = str(data.get("url") or "")
+        if transport in {"remote http", "remote-http", "sse"}:
             transport = "http"
+        if transport not in {"stdio", "http", "remote", "streamable-http"}:
+            transport = "http" if url.startswith(("http://", "https://")) else "stdio"
         return cls(
             id=str(data.get("id") or ""),
             label=str(data.get("label") or data.get("id") or ""),
             command=[str(part) for part in (command or []) if str(part)],
-            url=str(data.get("url") or ""),
+            url=url,
             enabled=bool(data.get("enabled")),
             approval_required=bool(data.get("approval_required", True)),
             allow_local=bool(data.get("allow_local")),

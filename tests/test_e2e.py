@@ -74,11 +74,38 @@ class ArchitectOSE2ETests(unittest.TestCase):
             return exc.code, json.loads(exc.read().decode("utf-8"))
 
     def test_validation_error_returns_400(self) -> None:
-        # create_project raises ValueError when root_path is missing.
-        status, body = self.request_error("POST", "/api/projects", {"name": "NoRoot"})
+        # create_project requires at least a name or a root_path.
+        status, body = self.request_error("POST", "/api/projects", {})
         self.assertEqual(status, 400)
         self.assertEqual(body["type"], "ValueError")
         self.assertIn("error", body)
+
+    def test_create_knowledge_project_without_root_path(self) -> None:
+        # T0.A2: name-only create yields a knowledge project (no local folder).
+        created = self.request_json("POST", "/api/projects", {"name": "NoRoot"})
+        self.assertTrue(created["created"])
+        self.assertEqual(created["root_path"], "")
+        projects = self.request_json("GET", "/api/projects")["projects"]
+        self.assertIn(created["id"], {p["id"] for p in projects})
+
+    def test_sources_endpoints(self) -> None:
+        # T0.A4: POST/GET /api/sources.
+        project = self.request_json("POST", "/api/projects", {"name": "SourcesProj"})
+        created = self.request_json("POST", "/api/sources", {
+            "project_id": project["id"], "name": "Feed", "kind": "docs", "config": {"driver": "http", "http": {"url": "https://example.com/f"}},
+        })
+        self.assertTrue(created["created"])
+        again = self.request_json("POST", "/api/sources", {
+            "project_id": project["id"], "name": "Feed", "kind": "docs", "config": {"driver": "http", "http": {"url": "https://example.com/f"}},
+        })
+        self.assertFalse(again["created"])
+        self.assertEqual(again["id"], created["id"])
+        listed = self.request_json("GET", f"/api/sources?project_id={project['id']}")["sources"]
+        by_id = {item["id"]: item for item in listed}
+        self.assertIn(created["id"], by_id)
+        self.assertEqual(by_id[created["id"]]["kind"], "docs")
+        status, body = self.request_error("POST", "/api/sources", {"name": "NoProject"})
+        self.assertEqual(status, 400)
 
     def test_internal_error_returns_500(self) -> None:
         with mock.patch.object(self.service, "create_project", side_effect=RuntimeError("boom")):
@@ -285,16 +312,17 @@ class ArchitectOSE2ETests(unittest.TestCase):
         self.assertIn("code-language-support", index_html)
         self.assertIn("code-page", index_html)
         self.assertIn("code-setup-panel", index_html)
-        self.assertIn("code-use-selected-file", index_html)
-        self.assertIn("code-tab-hover", index_html)
-        self.assertIn("code-tab-diagnostics", index_html)
-        self.assertIn("code-tab-references", index_html)
-        self.assertIn("code-run-insight", index_html)
-        self.assertIn('data-view="terminal"', index_html)
-        self.assertIn("terminal-view", index_html)
+        self.assertIn("mcp-run-command-btn", index_html)
+        self.assertIn("mcp-detail-command", index_html)
+        self.assertIn("open-terminal-modal", index_html)
+        self.assertIn("terminal-modal", index_html)
+        self.assertIn("terminal-ask-agent", index_html)
         self.assertIn("terminal-command", index_html)
         self.assertIn("terminal-confirm-modal", index_html)
         self.assertIn("terminal-confirm-input", index_html)
+        self.assertIn("app-dialog-modal", index_html)
+        self.assertIn("app-dialog-input", index_html)
+        self.assertIn('id="app-dialog-detail"', index_html)
         self.assertIn("language-select", index_html)
         self.assertIn("language-menu", index_html)
         self.assertIn("data-language-option", index_html)
@@ -313,6 +341,16 @@ class ArchitectOSE2ETests(unittest.TestCase):
             for path in sorted((root / "frontend").glob("*.js"))
         )
         self.assertNotIn("workspace-tasks", frontend_js)
+        self.assertNotIn("window.prompt", frontend_js)
+        self.assertNotIn("window.confirm", frontend_js)
+        self.assertNotIn("window.alert", frontend_js)
+        self.assertNotIn("prompt('", frontend_js)
+        self.assertNotIn('prompt("', frontend_js)
+        self.assertNotIn("confirm('", frontend_js)
+        self.assertNotIn('confirm("', frontend_js)
+        self.assertIn("showAppConfirm", frontend_js)
+        self.assertIn("settings.vectorRuntimeNoPip", frontend_js)
+        self.assertIn("settings.vectorRuntimeBootstrap", frontend_js)
         self.assertNotIn('"view.graph"', frontend_js)
         self.assertNotIn('"view.workflows"', frontend_js)
         self.assertNotIn("loadWorkflows", frontend_js)
@@ -328,9 +366,6 @@ class ArchitectOSE2ETests(unittest.TestCase):
         self.assertIn("saveVoiceMemory", frontend_js)
         self.assertIn("voiceRecognitionLanguage", frontend_js)
         self.assertIn("/api/code/languages", frontend_js)
-        self.assertIn("/api/code/diagnostics", frontend_js)
-        self.assertIn("/api/code/references", frontend_js)
-        self.assertIn("fillCodeFileFromSelection", frontend_js)
         self.assertIn("/api/terminal/run", frontend_js)
         self.assertIn("/api/terminal/open", frontend_js)
         self.assertIn("runTerminalCommand", frontend_js)
@@ -340,6 +375,11 @@ class ArchitectOSE2ETests(unittest.TestCase):
         self.assertIn("code-server-card", frontend_js)
         self.assertIn("install-actions", frontend_js)
         self.assertIn("runInstallCommandInTerminal", frontend_js)
+        self.assertIn("openTerminalModal", frontend_js)
+        self.assertIn("askAgentFromTerminal", frontend_js)
+        self.assertIn("data-rich-code-copy", frontend_js)
+        self.assertIn("data-rich-code-run", frontend_js)
+        self.assertIn("runSelectedMcpCommand", frontend_js)
         self.assertIn("installCodeLanguageServer", frontend_js)
         self.assertIn("/api/code/servers/", frontend_js)
         self.assertIn("copyInstallCommand", frontend_js)
@@ -366,7 +406,9 @@ class ArchitectOSE2ETests(unittest.TestCase):
         self.assertIn("#code-server-list{grid-template-columns:repeat(auto-fit,minmax(440px,1fr))", styles_compact)
         self.assertIn("white-space:nowrap", styles_compact)
         self.assertIn(".voice-memory-container{display:grid", styles_compact)
-        self.assertIn(".voice-record-btn{background:linear-gradient", styles_compact)
+        self.assertIn(".voice-record-btn{background:var(--danger)", styles_compact)
+        # The design system uses solid accent fills; accent gradients are gone.
+        self.assertNotIn("linear-gradient(135deg,var(--accent),var(--accent-2))", styles_compact)
         self.assertIn(".project-folder-modal{position:fixed", styles_compact)
         self.assertIn(".project-folder-summary{display:flex", styles_compact)
         self.assertIn(".language-menu{position:absolute", styles_compact)

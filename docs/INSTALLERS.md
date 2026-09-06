@@ -78,13 +78,41 @@ are missing.
 ### Build
 
 ```bash
-./scripts/build_desktop.sh          # macOS / Linux
-# .\scripts\build_desktop.ps1       # Windows
+./scripts/build_desktop.sh          # macOS → dist/desktop/ArchitectOS_<ver>_macos.dmg
+# .\scripts\build_desktop.ps1       # Windows → .msi + NSIS .exe
 ```
 
 Pipeline: PyInstaller (`architectos-server.spec`) → copy sidecar into
 `desktop/src-tauri/binaries/architectos-server-<target-triple>` →
 `npm run build` (Tauri) → copy `.dmg` / `.msi` / `.exe` into `dist/desktop/`.
+
+**Platform note:** build the DMG on a Mac and the MSI on a Windows machine
+(same script family; no cross-compile).
+
+### First launch (asks the user)
+
+DMG/MSI have no multi-page installer wizard. After you open **ArchitectOS** the
+first time, a setup screen asks:
+
+1. **Start the local server now?** — needed for the desktop UI (Ask / Memory).
+2. **Start the server when I log in?** — background LaunchAgent (macOS) or
+   Scheduled Task (Windows) so MCP/agents work even with the window closed.
+
+Choices are stored in `~/ArchitectOS/data/desktop-prefs.json`
+(`%LOCALAPPDATA%\ArchitectOS\data\desktop-prefs.json` on Windows).
+
+Share-package `install.sh` / `install.ps1` ask the same two questions in the
+terminal when run interactively.
+
+### How to open the app from the icon
+
+| OS | Install | Launch |
+| --- | --- | --- |
+| macOS | Open the `.dmg`, drag **ArchitectOS** into **Applications** | Spotlight (`⌘Space` → ArchitectOS), Launchpad, or Applications folder. Right‑click → Open the first time if Gatekeeper blocks an unsigned build. Dock icon appears after the first open (keep in Dock if you want). |
+| Windows | Run the `.msi` (or NSIS `.exe`) | Start Menu → **ArchitectOS**, or the desktop shortcut if the installer created one. |
+
+The window loads the local UI; the HTTP server is either started by the app or
+reused if login autostart already has it on `127.0.0.1:8766`.
 
 ### Dev without a full bundle
 
@@ -101,7 +129,7 @@ If the sidecar binary is absent, the Rust shell falls back to
 Optional env:
 
 - `ARCHITECTOS_ROOT` — data directory
-- `ARCHITECTOS_PORT` — preferred port (default `8765`)
+- `ARCHITECTOS_PORT` — preferred port (default `8766`)
 - `ARCHITECTOS_SERVER_BIN` — path to a prebuilt sidecar
 
 ### Out of scope (v1)
@@ -200,14 +228,29 @@ python3 scripts/build_share_package.py
 # optional: --with-mcp --with-ide  /  make dist-share-all
 ```
 
-Requires PyInstaller (same as the desktop sidecar). Output:
+Requires PyInstaller (same as the desktop sidecar) **on the target OS**.
+To build a Windows zip from macOS/Linux:
+
+```bash
+python3 scripts/build_share_package.py --platform windows --with-mcp --with-ide
+```
+
+That packs embeddable CPython + a small `.exe` launcher (needs Docker or
+`x86_64-w64-mingw32-gcc`). Output:
 `dist/share/ArchitectOS_Full_<ver>_<platform>.zip`.
 
 ### Recipient steps
 
 1. Unpack the zip.
-2. Run `./install.sh` or `install.bat`.
-3. Open `http://127.0.0.1:8765/`.
+2. Run `./install.sh` or `install.bat`. The script copies the binary, docs,
+   uninstall helper, and optional MCP/IDE extras into `ARCHITECTOS_ROOT`,
+   probes sqlite-vec (`architectos-server vector-runtime`, with a timeout so
+   install cannot hang), then registers autostart. Ask/Search still work if
+   sqlite-vec is off (Python fallback). To bake it in, freeze with
+   Homebrew/conda Python: `pip install -e ".[vectors,packaging]"`.
+   On macOS the installer strips Gatekeeper quarantine on copied binaries.
+   `ARCHITECTOS_SKIP_AUTOSTART=1` copies files without registering a LaunchAgent.
+3. Open `http://127.0.0.1:8766/`.
 4. To disable: `./uninstall.sh` / `uninstall.bat` (data under `ARCHITECTOS_ROOT` is kept).
 
 Repo helpers (without a zip): `scripts/install_autostart.sh` /
@@ -244,7 +287,7 @@ Run after building the artifacts you care about.
 
 ### Full share + autostart
 
-- [ ] After `install`, server answers on `http://127.0.0.1:8765/` without Python on PATH.
+- [ ] After `install`, server answers on `http://127.0.0.1:8766/` without Python on PATH.
 - [ ] Log off / reboot (or `launchctl` / Task Scheduler start) brings the server back.
 - [ ] `uninstall` removes LaunchAgent / Scheduled Task; `architectos.runtime.json` cleared after stop.
 - [ ] MCP / IDE using the same `ARCHITECTOS_ROOT` see the same memory.
@@ -257,4 +300,5 @@ Run after building the artifacts you care about.
 - [STARTUP.md](STARTUP.md) — port selection, app-window launcher
 - [CONFIGURATION.md](CONFIGURATION.md) — providers / security
 - [MCP_MEMORY_SERVER.md](MCP_MEMORY_SERVER.md) — MCP tools and client snippets
+- [AGENT_HOOKS.md](AGENT_HOOKS.md) — hook-based capture for Cursor, Claude Code, and Codex CLI
 - [ROADMAP_CHECKLIST.md](ROADMAP_CHECKLIST.md) — release-train status

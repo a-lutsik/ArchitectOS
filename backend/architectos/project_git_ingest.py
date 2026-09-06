@@ -19,9 +19,11 @@ _LOG = logging.getLogger("architectos.service")
 class ProjectGitIngestMixin:
     """Git log clustering into memory candidates and project_git_diff."""
 
-    def _ingest_git_candidates(self, project_id: str, root: Path, limit: int) -> list[dict[str, Any]]:
+    def _ingest_git_candidates(self, project_id: str, root: Path, limit: int = 0, *, max_items: int | None = None) -> list[dict[str, Any]]:
+        cap = max_items if max_items is not None else limit
+        fetch = 80 if cap <= 0 else min(max(cap * 4, 20), 80)
         try:
-            proc = subprocess.run(["git", "-C", str(root), "log", "--pretty=format:%h%x09%s", "-n", str(min(max(limit * 4, 20), 80))], text=True, capture_output=True, timeout=5, shell=False)
+            proc = subprocess.run(["git", "-C", str(root), "log", "--pretty=format:%h%x09%s", "-n", str(fetch)], text=True, capture_output=True, timeout=5, shell=False)
         except OSError:
             return []
         except subprocess.TimeoutExpired:
@@ -38,7 +40,7 @@ class ProjectGitIngestMixin:
                 commit_hash, subject = parts[0], parts[1] if len(parts) > 1 else line
             commits.append((commit_hash.strip(), subject.strip()))
         candidates = [{
-            "id": stable_id("candidate", project_id, "git", root.as_posix(), output[:1000]),
+            "id": stable_id("candidate", project_id, "git", root.as_posix()),
             "project_id": project_id,
             "source_type": "git",
             "source_ref": str(root),
@@ -49,8 +51,8 @@ class ProjectGitIngestMixin:
             "confidence": 0.55,
             "metadata": {"root": str(root), "commits": len(commits), "template": "git_history"},
         }]
-        candidates.extend(self._build_git_cluster_candidates(project_id, root, commits, limit))
-        return candidates[:limit]
+        candidates.extend(self._build_git_cluster_candidates(project_id, root, commits, cap if cap > 0 else len(commits)))
+        return candidates if cap <= 0 else candidates[:cap]
 
     def _build_git_cluster_candidates(self, project_id: str, root: Path, commits: list[tuple[str, str]], limit: int) -> list[dict[str, Any]]:
         clusters: dict[str, list[tuple[str, str]]] = {}
@@ -63,7 +65,7 @@ class ProjectGitIngestMixin:
                 continue
             lines = [f"- {commit_hash} {subject}" for commit_hash, subject in items[:12]]
             candidates.append({
-                "id": stable_id("candidate", project_id, "git_cluster", root.as_posix(), cluster, "|".join(subject for _commit_hash, subject in items[:12])),
+                "id": stable_id("candidate", project_id, "git_cluster", root.as_posix(), cluster),
                 "project_id": project_id,
                 "source_type": "git_cluster",
                 "source_ref": f"{root}#{cluster}",

@@ -16,19 +16,132 @@ import os
 from collections.abc import Iterator
 from typing import Any
 
+from .ask_advice import ask_memory_advice_enabled, merge_advice_into_structured
 from .models import utc_now
 from .rich_response import split_rich_response
+from .routing import ERROR_STATUSES, provider_is_ready
 
 _LOG = logging.getLogger("architectos.service")
+
+_PROVIDER_CREDENTIAL_SPECS: dict[str, dict[str, str]] = {
+    "openai": {"api_key_env": "OPENAI_API_KEY", "base_url_env": "OPENAI_BASE_URL"},
+    "azure-openai": {"api_key_env": "AZURE_OPENAI_API_KEY", "base_url_env": "AZURE_OPENAI_ENDPOINT", "model_env": "AZURE_OPENAI_DEPLOYMENT"},
+    "anthropic": {"api_key_env": "ANTHROPIC_API_KEY"},
+    "openrouter": {"api_key_env": "OPENROUTER_API_KEY"},
+    "ollama": {"base_url_env": "OLLAMA_HOST"},
+    "gemini-cli": {"api_key_env": "GEMINI_API_KEY"},
+}
 
 
 class ProvidersCouncilServiceMixin:
     """Provider CRUD/selection helpers and multi-agent council orchestration."""
 
     def providers(self) -> dict[str, Any]:
-        return {"mode": "local-memory-first", "providers": self.repository.list_providers()}
+        return {
+            "mode": "local-memory-first",
+            "providers": [self._annotate_provider_credentials(item) for item in self.repository.list_providers()],
+        }
 
-    def test_provider(self, provider_id: str) -> dict[str, Any]:
+    def _provider_credential_fields(self, provider: dict[str, Any]) -> dict[str, Any]:
+        provider_id = str(provider.get("id") or "")
+        spec = _PROVIDER_CREDENTIAL_SPECS.get(provider_id, {})
+        api_key_env = str(provider.get("api_key_env") or spec.get("api_key_env") or "").strip()
+        base_url_env = str(spec.get("base_url_env") or "").strip()
+        model_env = str(spec.get("model_env") or "").strip()
+        key_set = bool(api_key_env and str(os.environ.get(api_key_env) or "").strip())
+        if provider_id == "gemini-cli" and not key_set:
+            from .adapters import _gemini_session_auth_state
+            key_set = bool(_gemini_session_auth_state().get("ready"))
+        base_url = str(provider.get("base_url") or (os.environ.get(base_url_env) if base_url_env else "") or "").strip()
+        if provider_id == "ollama" and not base_url:
+            base_url = str(os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST") or "").strip()
+        model = str(provider.get("model") or (os.environ.get(model_env) if model_env else "") or "").strip()
+        accepts_api_key = bool(api_key_env) and provider_id in {"openai", "azure-openai", "anthropic", "openrouter", "gemini-cli"}
+        accepts_base_url = provider_id in {"openai", "azure-openai", "openrouter", "ollama"}
+        accepts_model = provider_id == "azure-openai"
+        if provider_id == "azure-openai":
+            ready = key_set and bool(base_url)
+        elif provider_id == "ollama":
+            ready = True
+        elif accepts_api_key:
+            ready = key_set
+        else:
+            ready = bool(provider.get("status") == "configured")
+        return {
+            "api_key_env": api_key_env,
+            "api_key_set": key_set if accepts_api_key else False,
+            "base_url_env": base_url_env,
+            "base_url": base_url,
+            "model_env": model_env,
+            "model": model,
+            "accepts_api_key": accepts_api_key,
+            "accepts_base_url": accepts_base_url,
+            "accepts_model": accepts_model,
+            "ready": ready,
+        }
+
+    def _annotate_provider_credentials(self, provider: dict[str, Any]) -> dict[str, Any]:
+        item = dict(provider)
+        fields = self._provider_credential_fields(item)
+        item["credentials_set"] = bool(fields["api_key_set"] if fields["accepts_api_key"] else fields["ready"])
+        item["credentials"] = fields
+        return item
+
+    def _apply_provider_secrets(self, provider_id: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(payload or {})
+        provider = next(
+            (item for item in self.repository.list_providers() if item["id"] == provider_id),
+            {"id": provider_id, "label": provider_id, "provider_type": "custom", "status": "planned", "enabled": False, "model": "", "notes": ""},
+        )
+        fields = self._provider_credential_fields(provider)
+        updates: dict[str, str] = {}
+        api_key = str(payload.get("api_key") or "").strip()
+        if api_key and fields["api_key_env"]:
+            updates[fields["api_key_env"]] = api_key
+        base_url = str(payload.get("base_url") or payload.get("endpoint") or "").strip()
+        if base_url:
+            if fields["base_url_env"]:
+                updates[fields["base_url_env"]] = base_url
+            if provider_id == "ollama":
+                updates["OLLAMA_BASE_URL"] = base_url
+                updates.setdefault("OLLAMA_HOST", base_url)
+            provider["base_url"] = base_url
+        model = str(payload.get("model") or payload.get("deployment") or "").strip()
+        if model:
+            if fields["model_env"]:
+                updates[fields["model_env"]] = model
+            provider["model"] = model
+        if updates:
+            self._upsert_env_local(updates)
+        fields = self._provider_credential_fields(provider)
+        if fields["ready"]:
+            provider["enabled"] = True
+            provider["status"] = "configured"
+            if fields["api_key_env"]:
+                provider["notes"] = f"Uses {fields['api_key_env']} from Setup → Providers or .env.local."
+        elif fields["api_key_set"] or api_key:
+            provider["enabled"] = True
+            provider["status"] = "missing_model" if provider_id == "azure-openai" else "missing_credentials"
+        return self.repository.upsert_provider(provider)
+
+    def save_provider_credentials(self, provider_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = dict(payload or {})
+        provider = self._apply_provider_secrets(provider_id, payload)
+        annotated = self._annotate_provider_credentials(provider)
+        result: dict[str, Any] = {
+            "provider": annotated,
+            "credentials_set": bool(annotated.get("credentials_set")),
+            "message": "Provider credentials saved.",
+        }
+        if payload.get("test", True):
+            check = self.test_provider(provider_id)
+            result["check"] = check
+            result["message"] = str(check.get("message") or result["message"])
+        return result
+
+    def test_provider(self, provider_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if payload and any(str(payload.get(key) or "").strip() for key in ("api_key", "base_url", "endpoint", "model", "deployment")):
+            self._apply_provider_secrets(provider_id, payload)
         result = self.provider_router.check(self.repository.list_providers(), provider_id)
         selected = dict(result.get("selected_provider") or {})
         last_check = {
@@ -79,7 +192,7 @@ class ProvidersCouncilServiceMixin:
         self._load_project_env_files()
         specs = {
             "openai": {"label": "OpenAI", "api_key_env": "OPENAI_API_KEY", "model": "gpt-4.1-mini"},
-            "azure-openai": {"label": "Azure OpenAI", "api_key_env": "AZURE_OPENAI_API_KEY", "endpoint_env": "AZURE_OPENAI_ENDPOINT", "model": "gpt-4.1-mini", "model_env": "AZURE_OPENAI_DEPLOYMENT"},
+            "azure-openai": {"label": "Azure OpenAI", "api_key_env": "AZURE_OPENAI_API_KEY", "endpoint_env": "AZURE_OPENAI_ENDPOINT", "model": "", "model_env": "AZURE_OPENAI_DEPLOYMENT"},
             "anthropic": {"label": "Anthropic", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-sonnet-4-20250514"},
             "gemini-cli": {"label": "Antigravity CLI", "api_key_env": "GEMINI_API_KEY", "model": "", "provider_type": "cli"},
         }
@@ -103,16 +216,16 @@ class ProvidersCouncilServiceMixin:
                 "enabled": available,
                 "status": "configured" if available else "missing_credentials",
                 "notes": (
-                    "Uses Antigravity CLI (agy) with Google account sign-in. Gemini CLI is deprecated."
+                    "Antigravity: Google sign-in once, then headless `agy -p`. Do not keep the agy TUI running."
                     if provider_id == "gemini-cli"
-                    else f"Uses {env_name} from process environment or .env.local."
+                    else f"Uses {env_name} from Setup → Providers or .env.local."
                 ),
                 "command": "agy -p" if provider_id == "gemini-cli" else None,
             }
             payload = {key: value for key, value in payload.items() if value is not None}
             if endpoint:
                 payload["base_url"] = endpoint
-            provider = self.update_provider(provider_id, payload)
+            self.update_provider(provider_id, payload)
             check = self.test_provider(provider_id)
             item = {
                 "id": provider_id,
@@ -174,7 +287,6 @@ class ProvidersCouncilServiceMixin:
             provider["allow_local"] = bool(payload["allow_local"])
         if "enabled" in payload:
             provider["enabled"] = bool(payload["enabled"])
-            provider["status"] = "configured" if provider["enabled"] else provider["status"]
         return self.repository.upsert_provider(provider)
 
     # --- Multi-Agent ---------------------------------------------------------
@@ -206,13 +318,52 @@ class ProvidersCouncilServiceMixin:
         return selectable
 
     def _provider_is_selectable(self, provider: dict[str, Any]) -> bool:
-        if not provider or not provider.get("enabled"):
-            return False
-        last = provider.get("last_check") or {}
-        if last.get("ready"):
-            return True
-        status = str(provider.get("status") or "").lower()
-        return status in {"configured", "ok", "available", "ready"}
+        return provider_is_ready(provider)
+
+    def remember_provider_runtime_status(self, result: dict[str, Any]) -> None:
+        """Persist last_check after Ask so a 404 cannot stay green Ready."""
+        selected = result.get("selected_provider") if isinstance(result.get("selected_provider"), dict) else {}
+        provider_id = str(result.get("provider_id") or selected.get("id") or "").strip()
+        if not provider_id or provider_id == "local-memory":
+            return
+        status = str(result.get("status") or "").lower()
+        if status in {"approval_required"}:
+            return
+        if status not in {"error", "ok", "fallback"}:
+            return
+        provider = self._lookup_provider(provider_id)
+        if not provider:
+            return
+        text = str(result.get("text") or result.get("message") or "").strip()
+        if status == "ok":
+            check_status = "ok"
+            ready = True
+            message = str((provider.get("last_check") or {}).get("message") or "") or f"{provider.get('label') or provider_id} responded."
+        else:
+            check_status = self._runtime_check_status(text)
+            ready = False
+            message = text[:500] or f"{provider_id} failed."
+        provider["status"] = "configured" if ready else check_status
+        provider["last_check"] = {
+            "ready": ready,
+            "status": check_status,
+            "message": message,
+            "checked_at": utc_now(),
+        }
+        self.repository.upsert_provider(provider)
+
+    def _runtime_check_status(self, text: str) -> str:
+        lowered = (text or "").lower()
+        if "is not set" in lowered or "missing_credentials" in lowered:
+            return "missing_credentials"
+        if "deployment was not found" in lowered or "deploymentnotfound" in lowered or "deployment name is not set" in lowered:
+            return "missing_model"
+        if "unreachable" in lowered or "timed out" in lowered:
+            return "unreachable"
+        for token in ERROR_STATUSES:
+            if token in lowered or token.replace("_", " ") in lowered:
+                return token
+        return "error"
 
     def _provider_run_stats(self, limit: int = 240, project_id: str | None = None) -> dict[str, Any]:
         runs = self.repository.list_provider_runs(project_id, limit=max(20, min(int(limit or 240), 500)))
@@ -227,6 +378,11 @@ class ProvidersCouncilServiceMixin:
             "runs_with_usage": 0,
             "runs_with_cost": 0,
         }
+        economy_runs = 0
+        saved_pct_sum = 0.0
+        saved_tokens_sum = 0
+        corpus_tokens_sum = 0
+        packed_tokens_sum = 0
         for run in runs:
             provider_id = str(run.get("provider_id") or "").strip()
             if not provider_id:
@@ -296,6 +452,17 @@ class ProvidersCouncilServiceMixin:
                     model_bucket["cost_usd"] += cost
                     model_bucket["has_cost"] = True
 
+            economy = run.get("token_economy") if isinstance(run.get("token_economy"), dict) else None
+            if economy and (economy.get("corpus_tokens") or economy.get("packed_tokens")):
+                economy_runs += 1
+                try:
+                    saved_pct_sum += float(economy.get("saved_pct") or 0)
+                except (TypeError, ValueError):
+                    pass
+                saved_tokens_sum += int(economy.get("saved_tokens") or 0)
+                corpus_tokens_sum += int(economy.get("corpus_tokens") or 0)
+                packed_tokens_sum += int(economy.get("packed_tokens") or 0)
+
         for bucket in by_provider.values():
             total = max(1, int(bucket["total"]))
             bucket["success_rate"] = round(int(bucket["ok"]) / total, 3)
@@ -308,6 +475,13 @@ class ProvidersCouncilServiceMixin:
             row["cost_usd"] = round(float(row["cost_usd"]), 6) if row.get("has_cost") else None
             row.pop("has_cost", None)
         totals["cost_usd"] = round(float(totals["cost_usd"]), 6)
+        memory_token_economy = {
+            "runs": economy_runs,
+            "avg_saved_pct": round(saved_pct_sum / economy_runs, 1) if economy_runs else 0.0,
+            "saved_tokens": saved_tokens_sum,
+            "corpus_tokens": corpus_tokens_sum,
+            "packed_tokens": packed_tokens_sum,
+        }
         return {
             "runs_sampled": len(runs),
             "by_provider": by_provider,
@@ -315,6 +489,7 @@ class ProvidersCouncilServiceMixin:
             "usage": {
                 "totals": totals,
                 "by_model": model_rows,
+                "memory_token_economy": memory_token_economy,
             },
         }
 
@@ -327,15 +502,39 @@ class ProvidersCouncilServiceMixin:
 
     def stream_council(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         project_id = str(payload.get("project_id") or "architectos")
-        message = str(payload.get("message") or payload.get("query") or "").strip()
+        raw_message = str(payload.get("message") or payload.get("query") or "").strip()
+        message_security = self.security_policy.inspect_text(raw_message)
+        message = str(message_security["text"])
         chat_id = str(payload.get("chat_id") or "").strip()
+        payload = {**payload, "message": message, "query": message}
 
         chat = self._activate_chat_session(self._chat_for_agent_turn(project_id, chat_id, message))
-        chat["messages"].append({"role": "user", "text": message, "created_at": utc_now()})
+        user_message: dict[str, Any] = {"role": "user", "text": message, "created_at": utc_now()}
+        if message_security["redacted"]:
+            user_message["security"] = {"redacted": True, "findings": message_security["findings"]}
+        chat["messages"].append(user_message)
         chat = self.repository.upsert_chat(chat)
 
+        # One advice pass on the original user query; panel members reuse it.
+        advice: list[dict[str, Any]] = []
+        if ask_memory_advice_enabled(dict(self.repository.get_setting("ui") or {})):
+            try:
+                from .ask_advice import collect_advice_candidates
+                pack = self.context(message, project_id=project_id, limit=int(payload.get("limit") or 6), tools_available=False)
+                candidates = collect_advice_candidates(
+                    pack.get("hits") if isinstance(pack.get("hits"), list) else [],
+                    pack.get("stable_hits") if isinstance(pack.get("stable_hits"), list) else [],
+                    pack.get("rule_layer_hits") if isinstance(pack.get("rule_layer_hits"), list) else [],
+                )
+                judge = getattr(self, "_run_ask_advice_judge", None)
+                if candidates and callable(judge):
+                    advice = judge(message, candidates, project_id=project_id, provider_id=None)
+            except Exception as exc:  # noqa: BLE001 - advice is best-effort
+                _LOG.warning("council memory advice skipped: %s", exc)
+        council_payload = {**payload, "advice": advice}
+
         activity_trace_by_role: dict[str, dict[str, Any]] = {}
-        for event in self.council.stream(payload):
+        for event in self.council.stream(council_payload):
             if event.get("type") == "progress":
                 agent = event.get("agent") if isinstance(event.get("agent"), dict) else {}
                 role = str(agent.get("role") or "")
@@ -355,7 +554,16 @@ class ProvidersCouncilServiceMixin:
             if event.get("type") == "done":
                 result = event.get("result") or {}
                 assistant_text = self._council_assistant_text(result)
+                result_security = self.security_policy.inspect_text(assistant_text)
+                assistant_text = str(result_security["text"])
                 display_text, structured = split_rich_response(assistant_text)
+                structured = merge_advice_into_structured(structured, advice)
+                security = {
+                    "redacted": bool(message_security["redacted"] or result_security["redacted"]),
+                    "message_redacted": bool(message_security["redacted"]),
+                    "result_redacted": bool(result_security["redacted"]),
+                    "message_findings": message_security["findings"] if message_security["redacted"] else [],
+                }
                 chat["messages"].append({
                     "role": "assistant",
                     "text": display_text or assistant_text,
@@ -366,10 +574,14 @@ class ProvidersCouncilServiceMixin:
                     "provider": {"id": "council", "status": "ok"},
                     "tool_trace": list(activity_trace_by_role.values()),
                     "tool_trace_label": "Council",
+                    "security": security,
                 })
                 chat["last_activity_at"] = utc_now()
                 chat = self.repository.upsert_chat(chat)
-                event["result"]["chat"] = chat
-                event["result"]["structured"] = structured
-                event["result"]["response"] = display_text or assistant_text
+                result["chat"] = chat
+                result["structured"] = structured
+                result["response"] = display_text or assistant_text
+                result["security"] = security
+                result["advice"] = advice
+                event["result"] = result
             yield event

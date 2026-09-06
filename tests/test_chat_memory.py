@@ -46,6 +46,22 @@ class ChatMemoryGateTests(unittest.TestCase):
         self.assertTrue(facts)
         self.assertIn("API keys", facts[0]["text"])
 
+    def test_facts_from_memory_blob_splits_durable_lines(self) -> None:
+        from backend.architectos.chat_memory import facts_from_memory_blob
+
+        facts = facts_from_memory_blob(
+            "Never commit directly to main.\nRemember: the team prefers pytest for unit tests."
+        )
+        self.assertGreaterEqual(len(facts), 2)
+
+    def test_facts_from_memory_blob_keeps_single_paragraph(self) -> None:
+        from backend.architectos.chat_memory import facts_from_memory_blob
+
+        self.assertEqual(
+            facts_from_memory_blob("Never commit API keys to the git repository."),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

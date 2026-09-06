@@ -28,6 +28,8 @@ from .constants import (
     TEXT_SAMPLE_BYTES,
 )
 from .files import TEXT_LIKE_EXTENSIONS, decode_text
+from .candidate_identity import CHAT_DUMP_TEMPLATE, CHAT_KEEPER_TEMPLATES
+from .code_revision import build_content_metadata
 from .models import stable_id, utc_now
 from .project_files_service import ProjectFilesMixin
 from .project_git_ingest import ProjectGitIngestMixin
@@ -119,12 +121,19 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
         return self.repository.import_bundle(payload)
 
     def _normalize_ingestion_sources(self, sources: Any) -> list[str]:
+        from .source_registry import normalize_kind
+
         normalized: list[str] = []
         for source in sources:
-            item = INGESTION_SOURCE_ALIASES.get(str(source).strip().lower(), str(source).strip().lower())
-            if item and item not in normalized:
-                normalized.append(item)
-        return normalized or ["docs", "code", "chat", "git"]
+            item = normalize_kind(str(source).strip().lower())
+            legacy = INGESTION_SOURCE_ALIASES.get(str(source).strip().lower(), item)
+            if legacy == "git_history":
+                legacy = "git"
+            if legacy == "pull_requests":
+                legacy = "prs"
+            if legacy and legacy not in normalized:
+                normalized.append(legacy)
+        return normalized or ["docs", "adr"]
 
     def _inbox_dir(self) -> Path:
         """Folder where users drop files for ingestion into memory.
@@ -161,7 +170,7 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
                 continue
             relative = str(path.relative_to(inbox))
             candidates.append({
-                "id": stable_id("candidate", project_id, "inbox", relative, str(path.stat().st_mtime_ns)),
+                "id": stable_id("candidate", project_id, "inbox", relative),
                 "project_id": project_id,
                 "source_type": "inbox",
                 "source_ref": relative,
@@ -181,9 +190,11 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
                 break
         return candidates
 
-    def _ingest_file_candidates(self, project_id: str, root: Path, sources: list[str], limit: int) -> list[dict[str, Any]]:
+    def _ingest_file_candidates(self, project_id: str, root: Path, sources: list[str], limit: int = 0, *, max_items: int | None = None) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
-        walk_limit = max(limit * 12, 120) if "code" in sources else max(limit * 3, 24)
+        cap = max_items if max_items is not None else limit
+        per_kind: dict[str, list[dict[str, Any]]] = {key: [] for key in sources}
+        walk_limit = 50_000 if cap <= 0 else max(cap * 12, 120) if "code" in sources else max(cap * 3, 24)
         for path in self._iter_importable_files(root, walk_limit):
             preview = self._read_text_preview(path)
             if not preview["readable"]:
@@ -192,13 +203,30 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
             relative = str(path.relative_to(root))
             specialized = self._specialized_file_candidate(project_id, root, path, clean, sources)
             if specialized:
-                candidates.append(specialized)
+                bucket = str(specialized.get("source_type") or "docs")
+                if bucket == "issue":
+                    bucket = "issues"
+                if bucket == "pr":
+                    bucket = "pull_requests" if "pull_requests" in sources else "prs"
+                if bucket == "meeting":
+                    bucket = "meetings"
+                if bucket in per_kind:
+                    per_kind[bucket].append(specialized)
+                else:
+                    candidates.append(specialized)
             else:
                 source_type = self._generic_file_source(path)
-                if source_type not in sources:
+                mapped = source_type
+                if source_type == "code" and "code" not in sources:
                     continue
-                candidates.append({
-                    "id": stable_id("candidate", project_id, source_type, relative, str(path.stat().st_mtime_ns)),
+                if source_type == "docs" and "docs" not in sources:
+                    continue
+                if mapped not in per_kind and mapped not in sources:
+                    continue
+                extension = path.suffix.lower()
+                content_meta = build_content_metadata(clean, extension)
+                item = {
+                    "id": stable_id("candidate", project_id, source_type, relative),
                     "project_id": project_id,
                     "source_type": source_type,
                     "source_ref": relative,
@@ -210,12 +238,25 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
                     "metadata": {
                         "path": str(path),
                         "size": path.stat().st_size,
-                        "extension": path.suffix.lower(),
+                        "extension": extension,
                         "template": "generic",
+                        "source_text": clean[:12000],
+                        **content_meta,
                     },
-                })
-            if len(candidates) >= limit:
-                break
+                }
+                if mapped in per_kind:
+                    per_kind[mapped].append(item)
+                else:
+                    candidates.append(item)
+        if per_kind:
+            for key in sources:
+                bucket = per_kind.get(key) or []
+                if cap <= 0:
+                    candidates.extend(bucket)
+                else:
+                    candidates.extend(bucket[: max(1, cap)])
+        if cap > 0:
+            return candidates[: cap * max(1, len(sources))]
         return candidates
 
     def _specialized_file_candidate(self, project_id: str, root: Path, path: Path, clean: str, sources: list[str]) -> dict[str, Any] | None:
@@ -256,7 +297,7 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
             parts.append(f"Decision: {decision}")
         if consequences:
             parts.append(f"Consequences: {consequences}")
-        return self._candidate(project_id, "adr", relative, f"ADR: {title}", "Decision", "\n\n".join(parts), 0.82, path, {"template": "adr", "sections": ["status", "context", "decision", "consequences"]})
+        return self._candidate(project_id, "adr", relative, f"ADR: {title}", "Decision", "\n\n".join(parts), 0.82, path, {"template": "adr", "sections": ["status", "context", "decision", "consequences"], "source_text": clean})
 
     def _build_issue_candidate(self, project_id: str, root: Path, path: Path, clean: str) -> dict[str, Any]:
         relative = str(path.relative_to(root))
@@ -266,7 +307,7 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
         text = f"Issue tracker item: {title}\n\nSummary: {summary}"
         if acceptance:
             text += f"\n\nAcceptance/Expected: {acceptance}"
-        return self._candidate(project_id, "issue", relative, f"Issue: {title}", "Requirement", text, 0.72, path, {"template": "issue"})
+        return self._candidate(project_id, "issue", relative, f"Issue: {title}", "Requirement", text, 0.72, path, {"template": "issue", "source_text": clean})
 
     def _build_pr_candidate(self, project_id: str, root: Path, path: Path, clean: str) -> dict[str, Any]:
         relative = str(path.relative_to(root))
@@ -276,7 +317,7 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
         text = f"Pull request memory candidate: {title}\n\nSummary: {summary}"
         if testing:
             text += f"\n\nTesting: {testing}"
-        return self._candidate(project_id, "pr", relative, f"PR: {title}", "Artifact", text, 0.68, path, {"template": "pr"})
+        return self._candidate(project_id, "pr", relative, f"PR: {title}", "Artifact", text, 0.68, path, {"template": "pr", "source_text": clean})
 
     def _build_meeting_candidate(self, project_id: str, root: Path, path: Path, clean: str) -> dict[str, Any]:
         relative = str(path.relative_to(root))
@@ -289,11 +330,15 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
             text += f"\n\nDecisions: {decisions}"
         if actions:
             text += f"\n\nAction Items: {actions}"
-        return self._candidate(project_id, "meeting", relative, f"Meeting: {title}", "Meeting", text, 0.7, path, {"template": "meeting"})
+        return self._candidate(project_id, "meeting", relative, f"Meeting: {title}", "Meeting", text, 0.7, path, {"template": "meeting", "source_text": clean})
 
     def _candidate(self, project_id: str, source_type: str, source_ref: str, label: str, node_type: str, text: str, confidence: float, path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+        extension = path.suffix.lower()
+        # Prefer hashing the full file when available (callers pass clean via metadata).
+        source_text = str(metadata.pop("source_text", "") or text or "")
+        content_meta = build_content_metadata(source_text, extension)
         payload = {
-            "id": stable_id("candidate", project_id, source_type, source_ref, text[:500]),
+            "id": stable_id("candidate", project_id, source_type, source_ref),
             "project_id": project_id,
             "source_type": source_type,
             "source_ref": source_ref,
@@ -302,7 +347,13 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
             "scope": "project",
             "text": text[:3000],
             "confidence": confidence,
-            "metadata": {"path": str(path), "size": path.stat().st_size, **metadata},
+            "metadata": {
+                "path": str(path),
+                "size": path.stat().st_size,
+                "extension": extension,
+                **content_meta,
+                **metadata,
+            },
         }
         return payload
 
@@ -375,24 +426,42 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
     def _first_lines(self, clean: str, limit: int) -> str:
         return "\n".join(line.strip() for line in clean.splitlines() if line.strip())[:limit * 120]
 
-    def _ingest_chat_candidates(self, project_id: str, limit: int) -> list[dict[str, Any]]:
+    def _ingest_chat_candidates(self, project_id: str, limit: int = 0, *, max_items: int | None = None) -> list[dict[str, Any]]:
+        cap = max_items if max_items is not None else limit
+        engine = getattr(self, "ingestion_engine", None)
+        keeper_chats: set[str] = set()
+        if engine is not None:
+            engine.retire_autoscan_chat_dumps(project_id)
+            keeper_chats = engine.chat_ids_with_keeper(project_id)
+        else:
+            for item in self.repository.list_memory_candidates(project_id, status=None, limit=None):
+                meta = dict(item.get("metadata") or {})
+                if str(meta.get("template") or "") in CHAT_KEEPER_TEMPLATES:
+                    chat_id = str(meta.get("chat_id") or item.get("source_ref") or "").strip()
+                    if chat_id:
+                        keeper_chats.add(chat_id)
         candidates = []
-        for chat in self.repository.list_chats(project_id)[:limit]:
+        for chat in self.repository.list_chats(project_id)[:(500 if cap <= 0 else cap)]:
+            chat_id = str(chat.get("id") or "").strip()
+            if not chat_id or chat_id in keeper_chats:
+                continue
+            if str(chat.get("session_status") or "") == "complete":
+                continue
             messages = [message for message in chat.get("messages", []) if str(message.get("text") or "").strip()]
             if not messages:
                 continue
             text = "\n".join(f"{message.get('role', 'message')}: {str(message.get('text') or '').strip()}" for message in messages[-6:])
             candidates.append({
-                "id": stable_id("candidate", project_id, "chat", chat["id"], text[:500]),
+                "id": stable_id("candidate", project_id, "chat", chat_id),
                 "project_id": project_id,
                 "source_type": "chat",
-                "source_ref": chat["id"],
-                "label": f"Chat: {chat.get('title') or chat['id']}",
+                "source_ref": chat_id,
+                "label": f"Chat: {chat.get('title') or chat_id}",
                 "type": "Lesson",
                 "scope": "project",
-                "text": f"Chat memory candidate from {chat.get('title') or chat['id']}.\n\n{text}",
+                "text": f"Chat memory candidate from {chat.get('title') or chat_id}.\n\n{text}",
                 "confidence": 0.58,
-                "metadata": {"chat_id": chat["id"], "messages": len(messages), "template": "chat"},
+                "metadata": {"chat_id": chat_id, "messages": len(messages), "template": CHAT_DUMP_TEMPLATE},
             })
         return candidates
 

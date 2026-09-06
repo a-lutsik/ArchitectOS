@@ -1,6 +1,6 @@
 // Voice memory capture (Web Speech API). ES module.
 import { api } from "./api-client.js";
-import { on, setElementValue } from "./dom-utils.js";
+import { on, setElementValue, showSnackbar } from "./dom-utils.js";
 import { refreshWorkspace, runSearch, scheduleGraphLoad } from "./projects.js";
 import { state } from "./state.js";
 import { showError } from "./ui.js";
@@ -77,7 +77,9 @@ function ensureVoiceRecognition() {
 function startVoiceMemory() {
   const recognition = ensureVoiceRecognition();
   if (!recognition) {
-    voiceStatus("Voice input is not supported in this browser.", "error");
+    const message = "Voice input is not supported in this browser.";
+    voiceStatus(message, "error");
+    showSnackbar(message, "error");
     const start = document.querySelector("#voice-start");
     if (start) start.disabled = true;
     return;
@@ -87,7 +89,9 @@ function startVoiceMemory() {
   try {
     recognition.start();
   } catch (error) {
-    voiceStatus(error.message || "Could not start voice input.", "error");
+    const message = error.message || "Could not start voice input.";
+    voiceStatus(message, "error");
+    showSnackbar(message, "error");
   }
 }
 function stopVoiceMemory() {
@@ -102,7 +106,11 @@ async function saveVoiceMemory(event) {
   event.preventDefault();
   const text = (document.querySelector("#voice-memory-text")?.value || "").trim();
   const labelInput = document.querySelector("#voice-memory-label");
-  if (!text) throw new Error("Record or type a transcript first.");
+  const submitBtn = document.querySelector('#voice-memory-form button[type="submit"]');
+  if (!text) {
+    showSnackbar("Record or type a transcript first", "info");
+    throw new Error("Record or type a transcript first.");
+  }
   const label = (labelInput?.value || "").trim() || autoVoiceLabel(text) || "Voice memory";
   const payload = {
     project_id: state.projectId,
@@ -112,12 +120,23 @@ async function saveVoiceMemory(event) {
     text,
   };
   voiceStatus("Saving voice memory...");
-  await api("/api/memory", { method: "POST", body: JSON.stringify(payload) });
-  document.querySelector("#voice-memory-form")?.reset();
-  voiceStatus("Voice memory saved", "ok");
-  await refreshWorkspace();
-  await runSearch("voice memory");
-  scheduleGraphLoad();
+  if (submitBtn) submitBtn.disabled = true;
+  try {
+    await api("/api/memory", { method: "POST", body: JSON.stringify(payload) });
+    document.querySelector("#voice-memory-form")?.reset();
+    voiceStatus("Voice memory saved", "ok");
+    showSnackbar("Voice memory saved", "success");
+    await refreshWorkspace();
+    await runSearch("voice memory");
+    scheduleGraphLoad();
+  } catch (error) {
+    const message = error.message || "Could not save voice memory";
+    voiceStatus(message, "error");
+    showSnackbar(message, "error");
+    throw error;
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
 }
 function initVoiceMemory() {
   const start = document.querySelector("#voice-start");

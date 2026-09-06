@@ -20,9 +20,21 @@ def _ensure_backend_path() -> None:
 
 def main() -> int:
     _ensure_backend_path()
+    argv = list(sys.argv[1:])
+    if argv and argv[0] == "hook":
+        from architectos.agent_hooks import main as hook_main
+
+        return hook_main(argv[1:])
+    if argv and argv[0] in {"vector-runtime", "sqlite-vec"}:
+        try:
+            from architectos.vec_runtime import cli_vector_runtime
+
+            return cli_vector_runtime(argv[1:])
+        except Exception as exc:
+            sys.stderr.write(f"vector-runtime probe failed: {exc}\n")
+            return 1
     from architectos.launcher import main as launcher_main
 
-    argv = list(sys.argv[1:])
     if "--no-browser" not in argv and "--app-window" not in argv:
         argv.insert(0, "--no-browser")
     return launcher_main(argv)

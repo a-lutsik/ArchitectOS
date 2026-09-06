@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # Remove ArchitectOS server login/boot autostart (macOS / Linux).
+# Env:
+#   ARCHITECTOS_SKIP_PAUSE=1 — do not wait for Enter (CI / tests)
 set -euo pipefail
+
+wait_if_interactive() {
+  if [[ "${ARCHITECTOS_SKIP_PAUSE:-}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -t 0 && -t 1 ]]; then
+    echo
+    read -r -p "Press Enter to close... / Нажмите Enter, чтобы закрыть..." || true
+  fi
+}
 
 ROOT="${ARCHITECTOS_ROOT:-$HOME/ArchitectOS}"
 LABEL="com.architectos.server"
@@ -55,4 +67,9 @@ for profile in "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.profile"; do
   fi
 done
 
+echo
+echo "========================================"
+echo "  SUCCESS / УСПЕХ"
+echo "========================================"
 echo "Autostart disabled. Data kept under $ROOT (delete manually if desired)."
+wait_if_interactive

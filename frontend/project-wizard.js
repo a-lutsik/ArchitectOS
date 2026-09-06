@@ -8,6 +8,7 @@ import { saveWorkspaceSettings, showError } from "./ui.js";
 const projectWizard = {
   firstRun: false,
   projectData: {},
+  submitting: false,
 
   init() {
     this.bindEvents();
@@ -124,6 +125,8 @@ const projectWizard = {
     if (folderPathInput) folderPathInput.value = '';
     if (projectNameInput) projectNameInput.value = '';
     setWizardFolderStatus('');
+    this.setWizardError('');
+    this.setSubmitting(false);
 
     this.openModal('new-project-wizard');
   },
@@ -158,6 +161,40 @@ const projectWizard = {
       modal.setAttribute('hidden', '');
       document.body.style.overflow = '';
     }
+    if (modalId === 'new-project-wizard') this.setSubmitting(false);
+  },
+
+  wizardIsOpen() {
+    const modal = document.getElementById('new-project-wizard');
+    return Boolean(modal && !modal.hasAttribute('hidden'));
+  },
+
+  setWizardError(message) {
+    const errorEl = document.getElementById('wizard-submit-error');
+    if (!errorEl) return;
+    if (message) {
+      errorEl.textContent = message;
+      errorEl.hidden = false;
+    } else {
+      errorEl.textContent = '';
+      errorEl.hidden = true;
+    }
+  },
+
+  setSubmitting(submitting) {
+    this.submitting = Boolean(submitting);
+    const finishBtn = document.getElementById('wizard-finish');
+    const browseBtn = document.getElementById('wizard-browse-folder');
+    const skipBtn = document.getElementById('wizard-skip');
+    if (finishBtn) {
+      finishBtn.disabled = this.submitting;
+      finishBtn.setAttribute('aria-busy', this.submitting ? 'true' : 'false');
+      finishBtn.textContent = this.submitting
+        ? t('wizard.creating')
+        : (this.firstRun ? t('wizard.getStarted') : t('wizard.create'));
+    }
+    if (browseBtn) browseBtn.disabled = this.submitting;
+    if (skipBtn) skipBtn.disabled = this.submitting;
   },
 
   async browseFolder() {
@@ -191,22 +228,25 @@ const projectWizard = {
   },
 
   async finishWizard() {
+    if (this.submitting) return;
+
+    const folderPath = document.getElementById('wizard-folder-path')?.value?.trim();
+    const projectName = document.getElementById('wizard-project-name')?.value?.trim();
+    const codeStyle = document.getElementById('wizard-code-style')?.value;
+    const ignorePatterns = document.getElementById('wizard-ignore-patterns')?.value;
+    const autoIndex = this.firstRun ? true : (document.getElementById('wizard-auto-index')?.checked ?? true);
+    const autoMemory = document.getElementById('wizard-auto-memory')?.checked;
+    const memoryScope = document.getElementById('wizard-memory-scope')?.value;
+
+    if (!folderPath || !projectName) {
+      this.setWizardError(t('wizard.validation'));
+      return;
+    }
+
+    this.setWizardError('');
+    this.setSubmitting(true);
+
     try {
-      // Gather all wizard data
-      const folderPath = document.getElementById('wizard-folder-path')?.value;
-      const projectName = document.getElementById('wizard-project-name')?.value;
-      const codeStyle = document.getElementById('wizard-code-style')?.value;
-      const ignorePatterns = document.getElementById('wizard-ignore-patterns')?.value;
-      const autoIndex = this.firstRun ? true : (document.getElementById('wizard-auto-index')?.checked ?? true);
-      const autoMemory = document.getElementById('wizard-auto-memory')?.checked;
-      const memoryScope = document.getElementById('wizard-memory-scope')?.value;
-
-      if (!folderPath || !projectName) {
-        showSnackbar(t('wizard.validation'), 'error');
-        return;
-      }
-
-      // Create project via API
       const response = await api('/api/projects', {
         method: 'POST',
         body: JSON.stringify({
@@ -222,43 +262,51 @@ const projectWizard = {
         })
       });
 
-      // Update UI
-      const actualProjectId = response.project_id || response.id || (response.project && response.project.id) || projectName;
+      const actualProjectId = response.project_id || response.id || (response.project && response.project.id);
+      if (!actualProjectId) throw new Error(t('error.invalidResponse'));
+
       state.projectId = actualProjectId;
-      await saveWorkspaceSettings({ current_project_id: state.projectId });
       state.selectedFile = "";
-
       const projectNameEl = document.getElementById('current-project-name');
-      if (projectNameEl) {
-        projectNameEl.textContent = projectName;
-      }
+      if (projectNameEl) projectNameEl.textContent = projectName;
 
-      await markOnboardingComplete();
+      this.closeModal('new-project-wizard');
 
-      if (autoIndex) {
+      const successMessage = autoIndex
+        ? t('wizard.createdIndexing').replace('{name}', projectName)
+        : (response.message || t('wizard.created').replace('{name}', projectName));
+      showSnackbar(successMessage, response.created === false ? 'info' : 'success');
+
+      const followUp = async () => {
+        await saveWorkspaceSettings({ current_project_id: state.projectId });
+        await markOnboardingComplete();
+        await loadProjects();
+        await loadProjectFiles();
+        if (!autoIndex) return;
         try {
           await api('/api/project/scan', {
             method: 'POST',
-            body: JSON.stringify({ project_id: state.projectId, root_path: folderPath, name: projectName, limit: 80, reindex: true, rebuild_links: true })
+            body: JSON.stringify({
+              project_id: state.projectId,
+              root_path: folderPath,
+              name: projectName,
+              limit: 80,
+              reindex: true,
+              rebuild_links: true,
+            }),
           });
+          await loadProjectFiles();
         } catch (scanError) {
           console.warn('Auto-index after wizard failed:', scanError);
+          showSnackbar(t('wizard.indexFailed'), 'error');
         }
-      }
-
-      // Close wizard
-      this.closeModal('new-project-wizard');
-
-      // Refresh workspace
-      await loadProjects();
-      await loadProjectFiles();
-
-      // Show success message
-      console.log(`Project created: ${projectName} (ID: ${actualProjectId})`);
-      showSnackbar(response.message || `Project ${projectName} was created successfully.`, response.created === false ? 'info' : 'success');
-
+      };
+      followUp().catch(showError);
     } catch (error) {
-      showError(error);
+      this.setSubmitting(false);
+      const message = error && error.message ? error.message : t('error.unexpected');
+      if (this.wizardIsOpen()) this.setWizardError(message);
+      else showError(error);
     }
   },
 

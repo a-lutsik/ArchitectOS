@@ -13,9 +13,18 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from .chat_memory import evaluate_chat_turn, normalize_chat_memory_mode
+from .adapters_base import is_local_memory_stub_text
+from .candidate_identity import candidate_origin_key
+from .chat_memory import (
+    collapse_similar_facts,
+    evaluate_chat_turn,
+    facts_from_markdown_summary,
+    infer_fact_subject,
+    normalize_chat_memory_mode,
+)
 from .models import stable_id, utc_now
 
 _LOG = logging.getLogger("architectos.service")
@@ -32,7 +41,7 @@ class ChatSessionServiceMixin:
         trigger: str = "manual",
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        """Close an active chat session and enqueue one factual summary candidate."""
+        """Close an active chat session and enqueue per-fact review candidates (summary is context-only)."""
         chat = self.repository.get_chat(chat_id)
         if not chat:
             raise ValueError("chat not found")
@@ -108,33 +117,58 @@ class ChatSessionServiceMixin:
                 )
                 return {"chat": chat, "candidate": None, "skipped": True, "reason": "no_durable_facts", "summary": summary}
 
-            candidate = {
-                "id": stable_id("candidate", actual_project_id, "chat_session_summary", chat_id, str(revision)),
-                "project_id": actual_project_id,
-                "source_type": "chat",
-                "source_ref": chat_id,
-                "label": f"Chat session {revision}: {str(chat.get('title') or chat_id)[:64]}",
-                "type": str(summary.get("type") or "Lesson"),
-                "scope": "project",
-                "text": str(summary.get("text") or "").strip(),
-                "confidence": float(summary.get("confidence") or 0.72),
-                "metadata": {
-                    "chat_id": chat_id,
-                    "template": "chat_session_summary",
-                    "source": "session_keeper",
-                    "source_type": "chat",
-                    "trigger": trigger,
-                    "session_revision": revision,
-                    "session_start_message_index": start_index,
-                    "session_end_message_index": len(all_messages),
-                    "message_count": len(messages),
-                    "facts": list(summary.get("facts") or [])[:12],
-                    "chat_memory_mode": mode,
-                },
-            }
-            prepared = self.ingestion_engine.prepare_candidates(actual_project_id, [candidate], 1)
-            saved = self.repository.upsert_memory_candidate(prepared[0]) if prepared else None
-            if saved:
+            facts = list(summary.get("facts") or [])
+            skip_ask_card = self._facts_already_captured_as_mcp(actual_project_id, facts)
+            saved = None
+            atoms: list[dict[str, Any]] = []
+            if not skip_ask_card:
+                atoms = self._enqueue_session_fact_atoms(
+                    actual_project_id,
+                    chat_id,
+                    revision,
+                    facts,
+                    mode=mode,
+                    trigger=trigger,
+                )
+                if not atoms and summary.get("has_facts"):
+                    candidate = {
+                        "id": stable_id("candidate", actual_project_id, "chat_session_summary", chat_id, str(revision)),
+                        "project_id": actual_project_id,
+                        "source_type": "chat",
+                        "source_ref": chat_id,
+                        "label": f"Chat session {revision}: {str(chat.get('title') or chat_id)[:64]}",
+                        "type": str(summary.get("type") or "Lesson"),
+                        "scope": "project",
+                        "text": str(summary.get("text") or "").strip(),
+                        "confidence": float(summary.get("confidence") or 0.72),
+                        "metadata": {
+                            "chat_id": chat_id,
+                            "template": "chat_session_summary",
+                            "source": "session_keeper",
+                            "source_type": "chat",
+                            "trigger": trigger,
+                            "session_revision": revision,
+                            "session_start_message_index": start_index,
+                            "session_end_message_index": len(all_messages),
+                            "message_count": len(messages),
+                            "facts": facts[:12],
+                            "chat_memory_mode": mode,
+                        },
+                    }
+                    prepared = self.ingestion_engine.prepare_candidates(actual_project_id, [candidate], 1)
+                    saved = self.repository.upsert_memory_candidate(prepared[0]) if prepared else None
+            if skip_ask_card or saved or atoms:
+                self.ingestion_engine.retire_autoscan_chat_dumps(actual_project_id, chat_id)
+            if skip_ask_card:
+                self._record_keeper_event(
+                    actual_project_id,
+                    chat_id,
+                    "session_keeper",
+                    "skipped",
+                    "Skipped Ask summary: the same facts are already queued as MCP.",
+                    {"trigger": trigger, "revision": revision},
+                )
+            elif saved:
                 promoted = self._maybe_auto_accept_chat_candidate(saved, life)
                 if promoted and promoted.get("memory"):
                     self._record_keeper_event(
@@ -154,13 +188,13 @@ class ChatSessionServiceMixin:
                         f"Created session summary candidate: {saved.get('label')}",
                         {"candidate_id": saved.get("id"), "trigger": trigger, "revision": revision},
                     )
-            else:
+            elif not atoms:
                 self._record_keeper_event(
                     actual_project_id,
                     chat_id,
                     "session_keeper",
                     "skipped",
-                    "Skipped session summary: duplicate or low-value candidate.",
+                    "Skipped session facts: duplicate or low-value candidate.",
                     {"trigger": trigger, "revision": revision},
                 )
 
@@ -196,7 +230,7 @@ class ChatSessionServiceMixin:
             else:
                 # A new message reopened the chat while the previous revision was being summarized.
                 chat = current
-            return {"chat": chat, "candidate": saved, "skipped": saved is None, "summary": summary, "trigger": trigger}
+            return {"chat": chat, "candidate": saved, "atoms": atoms, "skipped": saved is None and not atoms, "summary": summary, "trigger": trigger}
         except Exception as exc:  # noqa: BLE001 - keep chat usable if summarization fails
             _LOG.warning("chat session finalize failed for %s: %s", chat_id, exc)
             chat["session_status"] = "active"
@@ -213,6 +247,116 @@ class ChatSessionServiceMixin:
         finally:
             with self._chat_finalize_lock:
                 self._chat_finalize_inflight.discard(chat_id)
+
+    def _facts_already_captured_as_mcp(self, project_id: str, facts: list[dict[str, Any]]) -> bool:
+        """True when every durable fact is already a pending/promoted MCP candidate."""
+        keyed = [str(fact.get("text") or "").strip() for fact in facts if len(str(fact.get("text") or "").strip()) >= 18]
+        if not keyed:
+            return False
+        owned = 0
+        for text in keyed:
+            origin = candidate_origin_key({
+                "source_type": "mcp",
+                "metadata": {"template": "mcp_turn_atom", "fact_key": text},
+            })
+            existing = self.repository.find_memory_candidate_by_origin(project_id, origin) if origin else None
+            if existing and str(existing.get("source_type") or "") == "mcp":
+                owned += 1
+        return owned == len(keyed)
+
+    def _enqueue_session_fact_atoms(
+        self,
+        project_id: str,
+        chat_id: str,
+        revision: int,
+        facts: list[dict[str, Any]],
+        *,
+        mode: str,
+        trigger: str,
+        source_type: str = "chat",
+        template: str = "chat_session_atom",
+        id_kind: str = "chat_session_atom",
+    ) -> list[dict[str, Any]]:
+        """One review-queue candidate per durable fact, not one blob for the whole chat."""
+        facts = collapse_similar_facts(list(facts or []), limit=12)
+        saved_atoms: list[dict[str, Any]] = []
+        origin = "mcp" if source_type == "mcp" else "session_keeper"
+        from_mcp = source_type == "mcp"
+        label_prefix = "MCP fact" if from_mcp else "Chat fact"
+        body_prefix = (
+            "Durable fact captured from an MCP agent turn (not a full transcript)."
+            if from_mcp
+            else "Durable fact extracted from Ask (not a full transcript)."
+        )
+        for fact in facts[:12]:
+            fact_text = str(fact.get("text") or "").strip()
+            if len(fact_text) < 18:
+                continue
+            label_seed = fact_text[:72]
+            fact_subject = str(fact.get("subject") or "").strip() or infer_fact_subject(fact_text)
+            candidate = {
+                "id": stable_id("candidate", project_id, id_kind, chat_id, str(revision), fact_text[:240]),
+                "project_id": project_id,
+                "source_type": source_type,
+                "source_ref": chat_id,
+                "label": f"{label_prefix}: {label_seed}",
+                "type": str(fact.get("type") or "Lesson"),
+                "scope": "project",
+                "text": f"{body_prefix}\n\n{fact_text}".strip(),
+                "confidence": 0.74,
+                "metadata": {
+                    "chat_id": chat_id,
+                    "template": template,
+                    "source": origin,
+                    "source_type": source_type,
+                    "fact_key": fact_text[:240],
+                    "fact_source": fact.get("source") or "session",
+                    "trigger": trigger,
+                    "session_revision": revision,
+                    "chat_memory_mode": mode,
+                    **({"fact_subject": fact_subject} if fact_subject else {}),
+                },
+            }
+            prepared = self.ingestion_engine.prepare_candidates(project_id, [candidate], 1)
+            if not prepared:
+                continue
+            saved = self.repository.upsert_memory_candidate(prepared[0])
+            if not saved:
+                continue
+            promoted = self._maybe_auto_accept_chat_candidate(saved, self.memory_lifecycle.settings())
+            if promoted and promoted.get("memory"):
+                saved = self.repository.get_memory_candidate(str(saved.get("id") or "")) or saved
+                self._record_keeper_event(
+                    project_id,
+                    chat_id,
+                    "session_keeper",
+                    "auto_accepted",
+                    f"Auto-accepted session fact: {saved.get('label')}",
+                    {
+                        "candidate_id": saved.get("id"),
+                        "node_id": (promoted.get("memory") or {}).get("id"),
+                        "trigger": trigger,
+                        "revision": revision,
+                        "template": str((saved.get("metadata") or {}).get("template") or "chat_session_atom"),
+                    },
+                )
+            else:
+                self._record_keeper_event(
+                    project_id,
+                    chat_id,
+                    "session_keeper",
+                    "candidate_created",
+                    f"Created session fact candidate: {saved.get('label')}",
+                    {"candidate_id": saved.get("id"), "trigger": trigger, "revision": revision, "template": template},
+                )
+            saved_atoms.append(saved)
+        if saved_atoms:
+            self.ingestion_engine.refresh_candidate_duplicate_flags(project_id)
+            saved_atoms = [
+                self.repository.get_memory_candidate(str(item.get("id") or "")) or item
+                for item in saved_atoms
+            ]
+        return saved_atoms
 
     def _activate_chat_session(self, chat: dict[str, Any]) -> dict[str, Any]:
         """Reopen a finalized/idle chat when the user continues the conversation."""
@@ -286,7 +430,7 @@ class ChatSessionServiceMixin:
             user_text = self._nearest_user_message_before(messages, index)
             assistant_text = str(messages[index].get("text") or "")
             verdict = evaluate_chat_turn(user_text, assistant_text, mode="aggressive")
-            for fact in list(verdict.facts or [])[:3]:
+            for fact in list(verdict.facts or [])[:5]:
                 text = str(fact.get("text") or "").strip()
                 if not text:
                     continue
@@ -304,7 +448,7 @@ class ChatSessionServiceMixin:
                 continue
             seen_facts.add(key)
             unique_facts.append(fact)
-        facts = unique_facts[:12]
+        facts = collapse_similar_facts(unique_facts, limit=12)
         decisions = list(dict.fromkeys(decisions))[:8]
 
         previous_summaries = [
@@ -354,6 +498,15 @@ class ChatSessionServiceMixin:
                 llm_summary = str(res.get("text") or "").strip()
             except Exception as exc:  # noqa: BLE001 - fall back to heuristic summary
                 _LOG.warning("session LLM summary failed: %s", exc)
+
+        if llm_summary:
+            for extra in facts_from_markdown_summary(llm_summary, limit=12):
+                key = str(extra.get("text") or "").lower()
+                if not key or key in seen_facts:
+                    continue
+                seen_facts.add(key)
+                facts.append(extra)
+            facts = collapse_similar_facts(facts, limit=12)
 
         if llm_summary and "NO_DURABLE_FACTS" in llm_summary.upper() and not facts and not decisions:
             return {"text": "No durable project facts found in this chat session.", "has_facts": False, "facts": [], "type": "Lesson", "confidence": 0.4}
@@ -431,6 +584,8 @@ class ChatSessionServiceMixin:
 
     def _council_assistant_text(self, result: dict[str, Any]) -> str:
         synthesis = str(result.get("synthesis") or "").strip()
+        if is_local_memory_stub_text(synthesis):
+            synthesis = ""
         answers = result.get("answers") or []
         if synthesis:
             details = []
@@ -507,6 +662,12 @@ class ChatSessionServiceMixin:
                         "salience": verdict.score,
                         "chat_memory_mode": mode,
                         **dict(metadata or {}),
+                        "fact_key": fact_text[:240],
+                        **(
+                            {"fact_subject": (str(fact.get("subject") or "").strip() or infer_fact_subject(fact_text))}
+                            if (str(fact.get("subject") or "").strip() or infer_fact_subject(fact_text))
+                            else {}
+                        ),
                     },
                 }
                 prepared = self.ingestion_engine.prepare_candidates(project_id, [candidate], 1)
@@ -561,6 +722,7 @@ class ChatSessionServiceMixin:
                 "salience": verdict.score,
                 "chat_memory_mode": mode,
                 **dict(metadata or {}),
+                "fact_key": user_text[:240],
             },
         }
         prepared = self.ingestion_engine.prepare_candidates(project_id, [candidate], 1)
@@ -571,26 +733,122 @@ class ChatSessionServiceMixin:
         self._record_keeper_event(project_id, chat_id, source, "candidate_created", f"Created memory candidate: {saved.get('label')}", {"candidate_id": saved.get("id"), **dict(metadata or {})})
         return saved
 
-    CHAT_AUTO_ACCEPT_TYPES = {"Decision", "Constraint", "Rule"}
+    # Low-risk only. Decisions / constraints / requirements stay in review.
+    CHAT_AUTO_ACCEPT_TYPES = {"Lesson"}
+    CHAT_AUTO_ACCEPT_TEMPLATES = {"chat_session_atom", "chat_fact_keeper", "mcp_turn_atom"}
+    CHAT_AUTO_ACCEPT_MIN_CONFIDENCE = 0.70
+
+    def project_id_for_path(self, path: str | None) -> str | None:
+        """Map a working directory to the project that owns it (longest root wins).
+
+        Agent hooks only know the cwd they fired in, so the caller cannot supply a
+        project id. Returns None when no project root contains the path.
+        """
+        raw = str(path or "").strip()
+        if not raw:
+            return None
+        try:
+            target = Path(raw).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        best_id: str | None = None
+        best_depth = -1
+        for project in self.repository.list_projects():
+            root = str(getattr(project, "root_path", "") or "").strip()
+            if not root:
+                continue
+            try:
+                candidate = Path(root).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if candidate != target and candidate not in target.parents:
+                continue
+            depth = len(candidate.parts)
+            if depth > best_depth:
+                best_id = str(project.id)
+                best_depth = depth
+        return best_id
+
+    def capture_memory_turn(
+        self,
+        user_text: str,
+        assistant_text: str = "",
+        *,
+        project_id: str | None = None,
+        scope: str | None = None,
+        limit: int = 8,
+        cwd: str | None = None,
+        client: str | None = None,
+    ) -> dict[str, Any]:
+        """Per-turn hook for MCP agents and IDE hooks: pack memory, enqueue fact atoms.
+
+        Atoms land in the review queue (TTL) unless they are low-risk Lessons,
+        which auto-promote to short-term memory. Raw dialogue is not stored.
+        ``cwd`` resolves the project when the caller is a hook that only knows a
+        working directory; ``client`` is recorded on candidates for auditing.
+        """
+        actual_project_id = str(project_id or self.project_id_for_path(cwd) or "architectos")
+        user = str(user_text or "").strip()
+        assistant = str(assistant_text or "").strip()
+        packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
+        life = self.memory_lifecycle.settings()
+        mode = normalize_chat_memory_mode(life.get("chat_memory_mode"))
+        verdict = evaluate_chat_turn(user, assistant, mode=mode)
+        source_ref = stable_id("mcp_turn", actual_project_id, user[:240], assistant[:240])
+        trigger = f"hook_turn:{client}" if client else "mcp_turn"
+        atoms: list[dict[str, Any]] = []
+        if verdict.keep:
+            atoms = self._enqueue_session_fact_atoms(
+                actual_project_id,
+                source_ref,
+                1,
+                list(verdict.facts or []),
+                mode=mode,
+                trigger=trigger,
+                source_type="mcp",
+                template="mcp_turn_atom",
+                id_kind="mcp_turn_atom",
+            )
+        queued = [item for item in atoms if str(item.get("status") or "") == "candidate"]
+        accepted = [item for item in atoms if str(item.get("status") or "") == "promoted"]
+        return {
+            "project_id": actual_project_id,
+            "context": packed.get("context") or "",
+            "hits": packed.get("hits") or [],
+            "kept": bool(verdict.keep),
+            "reason": verdict.reason,
+            "atoms": atoms,
+            "queued": queued,
+            "auto_accepted": accepted,
+        }
 
     def _maybe_auto_accept_chat_candidate(self, candidate: dict[str, Any] | None, settings: dict[str, Any]) -> dict[str, Any] | None:
-        """Promote high-confidence durable chat facts straight to memory (opt-in).
+        """Promote low-risk Lesson atoms; decisions and constraints stay in review.
 
-        Only facts that look like decisions/constraints/rules with a traceable
-        source and confidence ≥ 0.75 qualify; everything else stays in the
-        review queue. The promoted node carries metadata.auto_accepted=True.
+        Default on. Requires a fact template, source_ref, confidence ≥ 0.70, and
+        no near-duplicate of an existing node. The promoted node has
+        metadata.auto_accepted=True.
         """
         if not settings.get("chat_auto_accept"):
             return None
         if not candidate or str(candidate.get("status") or "candidate") != "candidate":
             return None
-        if float(candidate.get("confidence") or 0.0) < 0.75:
+        if float(candidate.get("confidence") or 0.0) < self.CHAT_AUTO_ACCEPT_MIN_CONFIDENCE:
             return None
         if not str(candidate.get("source_ref") or "").strip():
             return None
         if str(candidate.get("type") or "") not in self.CHAT_AUTO_ACCEPT_TYPES:
             return None
         meta = dict(candidate.get("metadata") or {})
+        if str(meta.get("template") or "") not in self.CHAT_AUTO_ACCEPT_TEMPLATES:
+            return None
+        if meta.get("duplicate"):
+            return None
+        if meta.get("revision"):
+            # Human fact updates stay in Review for explicit accept → SUPERSEDES.
+            return None
+        if self._auto_accept_near_duplicate(candidate):
+            return None
         meta["auto_accepted"] = True
         candidate["metadata"] = meta
         self.repository.update_memory_candidate(candidate)
@@ -599,6 +857,24 @@ class ChatSessionServiceMixin:
         except Exception as exc:  # noqa: BLE001 - auto-accept must never break the chat turn
             _LOG.warning("chat auto-accept failed for %s: %s", candidate.get("id"), exc)
             return None
+
+    def _auto_accept_near_duplicate(self, candidate: dict[str, Any]) -> bool:
+        """Block auto-write when the atom restates or nearly restates an existing node."""
+        meta = dict(candidate.get("metadata") or {})
+        if meta.get("revision"):
+            # Revisions must promote as a new node + SUPERSEDES, not be blocked as near-dups.
+            return False
+        try:
+            _exact, near_id, near_score = self._ingest_dedup_scan(
+                str(candidate.get("label") or ""),
+                str(candidate.get("text") or ""),
+                str(candidate.get("type") or "Lesson"),
+                str(candidate.get("scope") or "project"),
+                candidate.get("project_id"),
+            )
+        except Exception:  # noqa: BLE001 - never fail a chat/MCP turn on dedup
+            return False
+        return bool(near_id) and float(near_score or 0.0) >= float(getattr(self, "NEAR_DUPLICATE_SIMILARITY", 0.72))
 
     def _capture_favorite_message_candidate(self, project_id: str, chat_id: str, message_index: int, user_text: str, assistant_text: str) -> dict[str, Any] | None:
         # Explicit ★ save always creates a candidate (opt-in), but still prefer facts when possible.

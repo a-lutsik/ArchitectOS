@@ -3,6 +3,9 @@ __pycache__/
 .pytest_cache/
 .env
 .env.*
+!.env.example
+!.env.sample
+!.env.template
 .playwright-mcp/
 dist/
 build/
@@ -34,3 +37,17 @@ memory/
 .vscode/
 .local-bin/
 .agents/
+.github/skills/
+skills-lock.json
+
+# Local tooling / agent session data (never published)
+.claude/
+.impeccable/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Local archives and throwaway artifacts
+ArchitectOS-archive-*.zip
+*.log

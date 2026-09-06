@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
 from collections.abc import Callable
@@ -11,7 +12,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
-from .config import ACCESS_LOG
+from .config import ACCESS_LOG, DEFAULT_HOST, DEFAULT_PORT
 from .paths import resolve_frontend_root, resolve_project_root
 from .service import ArchitectOSService
 
@@ -49,10 +50,10 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _authorize_api(self, path: str) -> bool:
         """Guard /api/* against cross-site requests and DNS rebinding.
 
-        Returns True when the request may proceed; otherwise sends 403.
+        Host and Origin loopback checks run for every /api/* request, including
+        TOKEN_EXEMPT_PATHS (OAuth callback), so DNS rebinding cannot bypass them;
+        only the token requirement is waived for exempt paths.
         """
-        if path in TOKEN_EXEMPT_PATHS:
-            return True
         host = (self.headers.get("Host") or "").strip()
         hostname, _, host_port = host.rpartition(":")
         if hostname not in ALLOWED_HOSTNAMES or (host_port and host_port != str(self._server_port())):
@@ -64,6 +65,8 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
             if parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or (parsed.port is not None and parsed.port != self._server_port()):
                 self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
                 return False
+        if path in TOKEN_EXEMPT_PATHS:
+            return True
         token = self.headers.get("X-ArchitectOS-Token") or ""
         if not hmac.compare_digest(token, self.get_service().auth_token):
             self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
@@ -85,6 +88,9 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         self._dispatch("PATCH")
+
+    def do_DELETE(self) -> None:
+        self._dispatch("DELETE")
 
     def _dispatch(self, method: str) -> None:
         """Route one request through the ROUTES table.
@@ -114,7 +120,7 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
             if method == "GET":
                 super().do_GET()
             else:
-                self._json({"error": "not found", "path": parsed.path}, HTTPStatus.NOT_FOUND)
+                self._json({"error": f"not found: {parsed.path}", "path": parsed.path}, HTTPStatus.NOT_FOUND)
         except Exception as exc:
             self._error(exc)
 
@@ -238,7 +244,13 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
         self._json({"projects": self.get_service().projects()})
 
     def _get_memory_candidates(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
-        self._json(self.get_service().list_memory_candidates(self._first(query, "project_id") or None, self._first(query, "status") or "candidate", int(self._first(query, "limit") or "50")))
+        self._json(self.get_service().list_memory_candidates(
+            self._first(query, "project_id") or None,
+            self._first(query, "status") or "candidate",
+            int(self._first(query, "limit") or "50"),
+            offset=int(self._first(query, "offset") or "0"),
+            source_type=self._first(query, "source_type") or None,
+        ))
 
     def _get_memory_rescan(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().memory_rescan_status())
@@ -253,6 +265,14 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
             tier=self._first(query, "tier") or None,
             status=self._first(query, "status") or None,
             limit=int(self._first(query, "limit") or "50"),
+        ))
+
+    def _get_memory_briefing(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        raw_limit = (self._first(query, "limit") or "").strip()
+        self._json(self.get_service().memory_briefing(
+            project_id=self._first(query, "project_id") or None,
+            cwd=self._first(query, "cwd") or None,
+            limit=max(1, min(int(raw_limit), 12)) if raw_limit.isdigit() else 6,
         ))
 
     def _get_memory_search(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
@@ -406,6 +426,15 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _get_settings(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().settings())
 
+    def _get_integration_credentials(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().integration_credentials())
+
+    def _get_vector_runtime(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().vector_runtime_status(discover=True))
+
+    def _post_vector_runtime_repair(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().repair_vector_runtime(payload))
+
     def _get_bundle_export(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().export_bundle(self._first(query, "project_id") or "architectos"))
 
@@ -421,6 +450,47 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
 
     def _post_project(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().create_project(payload), HTTPStatus.CREATED)
+
+    def _get_sources(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        project_id = self._first(query, "project_id") or None
+        if project_id:
+            self._json({"sources": self.get_service().list_project_sources(project_id)})
+        else:
+            self._json({"sources": self.get_service().list_sources(None)})
+
+    def _post_source(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().create_source(payload), HTTPStatus.CREATED)
+
+    def _patch_source(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        source_id = match.group("source_id")
+        self._json(self.get_service().update_source(source_id, payload))
+
+    def _delete_source(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        source_id = match.group("source_id")
+        raw = self._first(query, "purge_memory").strip().lower()
+        # Default True so Delete in Settings removes ingested memory too.
+        purge_memory = raw not in {"0", "false", "no", "off"} if raw else True
+        self._json(self.get_service().delete_project_source(source_id, purge_memory=purge_memory))
+
+    def _post_source_clear(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        source_id = match.group("source_id")
+        confirm = bool(payload.get("confirm"))
+        self._json(self.get_service().clear_source_memory(source_id, confirm=confirm, delete_binding=False))
+
+    def _post_memory_wipe(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        project_id = str(payload.get("project_id") or "").strip()
+        confirm = bool(payload.get("confirm"))
+        self._json(self.get_service().wipe_project_memory(project_id, confirm=confirm))
+
+    def _post_source_test(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        source_id = match.group("source_id")
+        self._json(self.get_service().test_project_source(source_id))
+
+    def _post_sources_probe(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().probe_source_config(payload))
+
+    def _post_sources_discover(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().discover_sources_from_mcp(payload), HTTPStatus.CREATED)
 
     def _post_memory(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().add_memory(payload), HTTPStatus.CREATED)
@@ -447,6 +517,9 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _post_memory_embeddings_rebuild(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().rebuild_memory_embeddings(payload), HTTPStatus.ACCEPTED)
 
+    def _post_memory_embeddings_test(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().test_memory_embeddings(payload))
+
     def _post_memory_ingest(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         if bool(payload.get("async", True)):
             self._json(self.get_service().schedule_memory_ingest(payload), HTTPStatus.ACCEPTED)
@@ -461,6 +534,22 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
 
     def _post_memory_feedback(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().record_retrieval_feedback(payload), HTTPStatus.CREATED)
+
+    def _post_memory_turn(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        raw_limit = str(payload.get("limit") or "").strip()
+        limit = max(1, min(int(raw_limit), 50)) if raw_limit.isdigit() else 8
+        self._json(
+            self.get_service().capture_memory_turn(
+                str(payload.get("user_text") or ""),
+                str(payload.get("assistant_text") or ""),
+                project_id=payload.get("project_id") or None,
+                scope=payload.get("scope") or None,
+                limit=limit,
+                cwd=payload.get("cwd") or None,
+                client=payload.get("client") or None,
+            ),
+            HTTPStatus.CREATED,
+        )
 
     def _post_memory_promote_long_term(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().promote_memory_long_term(match.group("memory_id"), payload), HTTPStatus.CREATED)
@@ -542,11 +631,20 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _post_providers_connect_env(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().connect_env_providers(), HTTPStatus.CREATED)
 
+    def _post_run_permission(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().decide_run_permission(match.group("run_id"), payload), HTTPStatus.CREATED)
+
     def _post_run_cancel(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().cancel_run(match.group("run_id")), HTTPStatus.CREATED)
 
     def _post_provider_test(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
-        self._json(self.get_service().test_provider(match.group("provider_id")), HTTPStatus.CREATED)
+        self._json(self.get_service().test_provider(match.group("provider_id"), payload), HTTPStatus.CREATED)
+
+    def _post_provider_credentials(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().save_provider_credentials(match.group("provider_id"), payload), HTTPStatus.CREATED)
+
+    def _post_integration_credentials(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().save_integration_credentials(payload), HTTPStatus.CREATED)
 
     def _post_provider_login(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().start_provider_login(match.group("provider_id")), HTTPStatus.CREATED)
@@ -577,6 +675,15 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
 
     def _post_mcp_server_call(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().call_mcp_tool(match.group("server_id"), payload), HTTPStatus.CREATED)
+
+    def _get_agent_hooks(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().agent_hook_status())
+
+    def _post_agent_hooks_install(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().configure_agent_hooks(payload), HTTPStatus.CREATED)
+
+    def _post_agent_hooks_uninstall(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().configure_agent_hooks(payload, remove=True), HTTPStatus.CREATED)
 
     def _post_code_server_test(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().test_code_intel_server(match.group("server_id")), HTTPStatus.CREATED)
@@ -638,10 +745,12 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("GET", re.compile(r"^/api/version$"), ArchitectOSHandler._get_version),
     ("GET", re.compile(r"^/api/ops/backups$"), ArchitectOSHandler._get_ops_backups),
     ("GET", re.compile(r"^/api/projects$"), ArchitectOSHandler._get_projects),
+    ("GET", re.compile(r"^/api/sources$"), ArchitectOSHandler._get_sources),
     ("GET", re.compile(r"^/api/memory/candidates$"), ArchitectOSHandler._get_memory_candidates),
     ("GET", re.compile(r"^/api/memory/rescan$"), ArchitectOSHandler._get_memory_rescan),
     ("GET", re.compile(r"^/api/memory/ingest$"), ArchitectOSHandler._get_memory_ingest),
     ("GET", re.compile(r"^/api/memory/items$"), ArchitectOSHandler._get_memory_items),
+    ("GET", re.compile(r"^/api/memory/briefing$"), ArchitectOSHandler._get_memory_briefing),
     ("GET", re.compile(r"^/api/memory/search$"), ArchitectOSHandler._get_memory_search),
     ("GET", re.compile(r"^/api/memory/feedback$"), ArchitectOSHandler._get_memory_feedback),
     ("GET", re.compile(r"^/api/memory/embeddings$"), ArchitectOSHandler._get_memory_embeddings),
@@ -665,12 +774,15 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("GET", re.compile(r"^/api/mcp/servers$"), ArchitectOSHandler._get_mcp_servers),
     ("GET", re.compile(r"^/api/mcp/oauth/callback$"), ArchitectOSHandler._get_mcp_oauth_callback),
     ("GET", re.compile(r"^/api/mcp/servers/(?P<server_id>[^/]+)/tools$"), ArchitectOSHandler._get_mcp_server_tools),
+    ("GET", re.compile(r"^/api/hooks$"), ArchitectOSHandler._get_agent_hooks),
     ("GET", re.compile(r"^/api/code/servers$"), ArchitectOSHandler._get_code_servers),
     ("GET", re.compile(r"^/api/code/languages$"), ArchitectOSHandler._get_code_languages),
     ("GET", re.compile(r"^/api/files$"), ArchitectOSHandler._get_files),
     ("GET", re.compile(r"^/api/(?:providers|router)$"), ArchitectOSHandler._get_providers),
     ("GET", re.compile(r"^/api/providers/(?P<provider_id>[^/]+)/models$"), ArchitectOSHandler._get_provider_models),
     ("GET", re.compile(r"^/api/settings$"), ArchitectOSHandler._get_settings),
+    ("GET", re.compile(r"^/api/integrations/credentials$"), ArchitectOSHandler._get_integration_credentials),
+    ("GET", re.compile(r"^/api/settings/vector-runtime$"), ArchitectOSHandler._get_vector_runtime),
     ("GET", re.compile(r"^/api/bundle/export$"), ArchitectOSHandler._get_bundle_export),
     # POST
     ("POST", re.compile(r"^/api/ai/stream$"), ArchitectOSHandler._post_ai_stream),
@@ -678,17 +790,27 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     # rstrip("/") in the old chain accepted any number of trailing slashes.
     ("POST", re.compile(r"^/api/(?:ai|chat)/run/*$"), ArchitectOSHandler._post_ai_run),
     ("POST", re.compile(r"^/api/projects$"), ArchitectOSHandler._post_project),
+    ("POST", re.compile(r"^/api/sources/probe$"), ArchitectOSHandler._post_sources_probe),
+    ("POST", re.compile(r"^/api/sources/discover$"), ArchitectOSHandler._post_sources_discover),
+    ("POST", re.compile(r"^/api/sources/(?P<source_id>[^/]+)/test$"), ArchitectOSHandler._post_source_test),
+    ("POST", re.compile(r"^/api/sources/(?P<source_id>[^/]+)/clear$"), ArchitectOSHandler._post_source_clear),
+    ("PATCH", re.compile(r"^/api/sources/(?P<source_id>[^/]+)$"), ArchitectOSHandler._patch_source),
+    ("DELETE", re.compile(r"^/api/sources/(?P<source_id>[^/]+)$"), ArchitectOSHandler._delete_source),
+    ("POST", re.compile(r"^/api/sources$"), ArchitectOSHandler._post_source),
     ("POST", re.compile(r"^/api/memory$"), ArchitectOSHandler._post_memory),
     ("POST", re.compile(r"^/api/security/preview$"), ArchitectOSHandler._post_security_preview),
     ("POST", re.compile(r"^/api/ops/backup$"), ArchitectOSHandler._post_ops_backup),
     ("POST", re.compile(r"^/api/memory/decay/run$"), ArchitectOSHandler._post_memory_decay_run),
     ("POST", re.compile(r"^/api/memory/reclassify$"), ArchitectOSHandler._post_memory_reclassify),
     ("POST", re.compile(r"^/api/memory/purge-noise$"), ArchitectOSHandler._post_memory_purge_noise),
+    ("POST", re.compile(r"^/api/memory/wipe$"), ArchitectOSHandler._post_memory_wipe),
     ("POST", re.compile(r"^/api/memory/embeddings/rebuild$"), ArchitectOSHandler._post_memory_embeddings_rebuild),
+    ("POST", re.compile(r"^/api/memory/embeddings/test$"), ArchitectOSHandler._post_memory_embeddings_test),
     ("POST", re.compile(r"^/api/memory/ingest$"), ArchitectOSHandler._post_memory_ingest),
     ("POST", re.compile(r"^/api/memory/rescan$"), ArchitectOSHandler._post_memory_rescan),
     ("POST", re.compile(r"^/api/memory/files$"), ArchitectOSHandler._post_memory_files),
     ("POST", re.compile(r"^/api/memory/feedback$"), ArchitectOSHandler._post_memory_feedback),
+    ("POST", re.compile(r"^/api/memory/turn$"), ArchitectOSHandler._post_memory_turn),
     ("POST", re.compile(r"^/api/memory/(?P<memory_id>[^/]+)/promote-long-term$"), ArchitectOSHandler._post_memory_promote_long_term),
     ("POST", re.compile(r"^/api/memory/candidates/(?P<candidate_id>[^/]+)/promote$"), ArchitectOSHandler._post_memory_candidate_promote),
     ("POST", re.compile(r"^/api/memory/candidates/(?P<candidate_id>[^/]+)/reject$"), ArchitectOSHandler._post_memory_candidate_reject),
@@ -714,8 +836,11 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("POST", re.compile(r"^/api/bundle/import$"), ArchitectOSHandler._post_bundle_import),
     ("POST", re.compile(r"^/api/providers/test-all$"), ArchitectOSHandler._post_providers_test_all),
     ("POST", re.compile(r"^/api/providers/connect-env$"), ArchitectOSHandler._post_providers_connect_env),
+    ("POST", re.compile(r"^/api/runs/(?P<run_id>[^/]+)/permission$"), ArchitectOSHandler._post_run_permission),
     ("POST", re.compile(r"^/api/runs/(?P<run_id>[^/]+)/cancel$"), ArchitectOSHandler._post_run_cancel),
     ("POST", re.compile(r"^/api/providers/(?P<provider_id>[^/]+)/test$"), ArchitectOSHandler._post_provider_test),
+    ("POST", re.compile(r"^/api/providers/(?P<provider_id>[^/]+)/credentials$"), ArchitectOSHandler._post_provider_credentials),
+    ("POST", re.compile(r"^/api/integrations/credentials$"), ArchitectOSHandler._post_integration_credentials),
     ("POST", re.compile(r"^/api/providers/(?P<provider_id>[^/]+)/login$"), ArchitectOSHandler._post_provider_login),
     ("POST", re.compile(r"^/api/workflows/(?P<workflow_id>[^/]+)/run$"), ArchitectOSHandler._post_workflow_run),
     ("POST", re.compile(r"^/api/router/preview$"), ArchitectOSHandler._post_router_preview),
@@ -726,6 +851,9 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("POST", re.compile(r"^/api/mcp/servers/(?P<server_id>[^/]+)/test$"), ArchitectOSHandler._post_mcp_server_test),
     ("POST", re.compile(r"^/api/mcp/servers/(?P<server_id>[^/]+)/auth/start$"), ArchitectOSHandler._post_mcp_server_auth_start),
     ("POST", re.compile(r"^/api/mcp/servers/(?P<server_id>[^/]+)/call$"), ArchitectOSHandler._post_mcp_server_call),
+    ("POST", re.compile(r"^/api/settings/vector-runtime/repair$"), ArchitectOSHandler._post_vector_runtime_repair),
+    ("POST", re.compile(r"^/api/hooks/install$"), ArchitectOSHandler._post_agent_hooks_install),
+    ("POST", re.compile(r"^/api/hooks/uninstall$"), ArchitectOSHandler._post_agent_hooks_uninstall),
     ("POST", re.compile(r"^/api/code/servers/(?P<server_id>[^/]+)/test$"), ArchitectOSHandler._post_code_server_test),
     ("POST", re.compile(r"^/api/code/servers/(?P<server_id>[^/]+)/install$"), ArchitectOSHandler._post_code_server_install),
     ("POST", re.compile(r"^/api/code/symbols$"), ArchitectOSHandler._post_code_symbols),
@@ -745,10 +873,16 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
 ]
 
 
-def run(host: str = "127.0.0.1", port: int = 8765) -> None:
+def run(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    # Bind FIRST: if the port is busy this raises before any background threads
+    # start or a startup rescan is scheduled (no orphaned work on failure).
+    server = ThreadingHTTPServer((host, port), ArchitectOSHandler)
+    print(
+        f"[server] pid={os.getpid()} run(): bound to {host}:{port}; "
+        f"starting background maintenance + startup rescan after bind."
+    )
     ArchitectOSHandler.get_service().start_background_maintenance()
     ArchitectOSHandler.get_service().schedule_startup_memory_rescan()
-    server = ThreadingHTTPServer((host, port), ArchitectOSHandler)
     print(f"ArchitectOS running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
     server.serve_forever()

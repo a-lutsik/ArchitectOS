@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ArchitectOS setup</title>
+    <link rel="icon" href="icon.png" type="image/png">
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fbfbfc;
+        --fg: #09090b;
+        --muted: #52525b;
+        --line: #e4e4e7;
+        --panel: #ffffff;
+        --accent: #6366f1;
+        --accent-ink: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #09090b;
+          --fg: #fafafa;
+          --muted: #a1a1aa;
+          --line: #27272a;
+          --panel: #18181b;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        min-height: 100%;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      main {
+        max-width: 34rem;
+        margin: 0 auto;
+        padding: 2.5rem 1.5rem 3rem;
+      }
+      h1 {
+        margin: 0 0 0.4rem;
+        font-size: 1.45rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      .lead {
+        margin: 0 0 1.5rem;
+        color: var(--muted);
+        font-size: 0.95rem;
+        line-height: 1.5;
+      }
+      .card {
+        display: grid;
+        gap: 0.85rem;
+        padding: 1.1rem 1.15rem;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+      }
+      label.option {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 0.65rem 0.75rem;
+        align-items: start;
+        cursor: pointer;
+      }
+      label.option + label.option {
+        padding-top: 0.85rem;
+        border-top: 1px solid var(--line);
+      }
+      label.option input {
+        margin-top: 0.2rem;
+        width: 1.05rem;
+        height: 1.05rem;
+        accent-color: var(--accent);
+      }
+      .option-title {
+        font-weight: 650;
+        font-size: 0.95rem;
+      }
+      .option-desc {
+        grid-column: 2;
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.82rem;
+        line-height: 1.45;
+      }
+      .actions {
+        display: flex;
+        gap: 0.75rem;
+        justify-content: flex-end;
+        margin-top: 1.35rem;
+      }
+      button {
+        border: 0;
+        border-radius: 9px;
+        padding: 0.65rem 1.1rem;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        color: var(--accent-ink);
+      }
+      button.primary:disabled {
+        opacity: 0.55;
+        cursor: wait;
+      }
+      .hint {
+        margin: 1rem 0 0;
+        color: var(--muted);
+        font-size: 0.8rem;
+        line-height: 1.4;
+      }
+      .error {
+        margin: 1rem 0 0;
+        color: #dc2626;
+        font-size: 0.85rem;
+        white-space: pre-wrap;
+      }
+      .launch {
+        margin-top: 1.25rem;
+        padding: 0.9rem 1rem;
+        border-radius: 10px;
+        border: 1px dashed var(--line);
+        font-size: 0.82rem;
+        line-height: 1.45;
+        color: var(--muted);
+      }
+      .launch strong { color: var(--fg); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>ArchitectOS setup</h1>
+      <p class="lead">Choose how the local server should run. You can change login autostart later by deleting the Launch Agent / Scheduled Task.</p>
+
+      <div class="card">
+        <label class="option">
+          <input id="start-now" type="checkbox" checked />
+          <span class="option-title">Start the local server now</span>
+          <p class="option-desc">Needed to use this window (Ask, Memory, Workspace). Uncheck only if you want to configure login autostart and quit without opening the UI.</p>
+        </label>
+        <label class="option">
+          <input id="login-autostart" type="checkbox" checked />
+          <span class="option-title">Start the server when I log in</span>
+          <p class="option-desc">Keeps ArchitectOS available in the background for MCP / agents even when this desktop window is closed. Does not open the UI automatically.</p>
+        </label>
+      </div>
+
+      <div class="launch">
+        <strong>Later:</strong> open <em>ArchitectOS</em> from Applications (macOS) or the Start Menu (Windows). The Dock / taskbar icon appears after the first launch.
+      </div>
+
+      <p id="error" class="error" hidden></p>
+      <div class="actions">
+        <button id="continue" class="primary" type="button">Continue</button>
+      </div>
+      <p class="hint">Data folder: ~/ArchitectOS (macOS/Linux) or %LOCALAPPDATA%\ArchitectOS (Windows).</p>
+    </main>
+    <script>
+      const invoke = window.__TAURI__?.core?.invoke;
+      const btn = document.getElementById("continue");
+      const err = document.getElementById("error");
+
+      btn.addEventListener("click", async () => {
+        err.hidden = true;
+        btn.disabled = true;
+        btn.textContent = "Working…";
+        const startNow = document.getElementById("start-now").checked;
+        const loginAutostart = document.getElementById("login-autostart").checked;
+        try {
+          if (!invoke) throw new Error("Tauri bridge missing — rebuild the desktop app.");
+          await invoke("complete_first_run", {
+            startNow,
+            loginAutostart,
+          });
+        } catch (e) {
+          err.textContent = String(e?.message || e);
+          err.hidden = false;
+          btn.disabled = false;
+          btn.textContent = "Continue";
+        }
+      });
+    </script>
+  </body>
+</html>

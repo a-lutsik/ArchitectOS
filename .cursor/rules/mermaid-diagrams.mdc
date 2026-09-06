@@ -1,0 +1,27 @@
+---
+description: Strict Mermaid arrows for architecture and flow diagrams
+alwaysApply: true
+---
+
+# Mermaid
+
+Architecture, call-flow, layers, and DB diagrams use orthogonal/straight edges, not bezier.
+
+Every such `mermaid` fence starts with:
+
+```
+---
+config:
+  layout: elk
+  flowchart:
+    curve: linear
+    nodeSpacing: 40
+    rankSpacing: 50
+---
+flowchart TB
+```
+
+- Default: `layout: elk` + `curve: linear`. Never `basis`, `cardinal`, `natural`, or `look: handDrawn`.
+- Smooth (`curve: basis`) only for UX/onboarding journeys, and only on those edges: `e1@{ curve: basis }`.
+- Group layers with `subgraph`. Use `flowchart TB` or `flowchart LR`, not `graph TD`.
+- Quote labels that contain `()`, `/`, or punctuation: `Load["Load config (decrypt)"]`.

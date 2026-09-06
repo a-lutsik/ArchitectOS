@@ -124,10 +124,11 @@ class ChatServiceMixin:
             "context": route["context"],
             "provider": route["provider"],
             "usage": route.get("usage") or {},
+            "token_economy": route.get("token_economy") or {},
             "security": route.get("security") or {},
         })
         chat["last_activity_at"] = utc_now()
         chat = self.repository.upsert_chat(chat)
         if bool(payload.get("remember", False)):
             self.add_memory({"project_id": project_id, "type": "Lesson", "label": f"Dialog note: {message[:48]}", "scope": "project", "text": f"User asked: {message}. Local response: {response[:300]}", "source": "chat"})
-        return {"chat": chat, "response": display_text or response, "structured": structured, "context": route["context"], "usage": route.get("usage") or {}, "security": route.get("security") or {}}
+        return {"chat": chat, "response": display_text or response, "structured": structured, "context": route["context"], "usage": route.get("usage") or {}, "token_economy": route.get("token_economy") or {}, "security": route.get("security") or {}}

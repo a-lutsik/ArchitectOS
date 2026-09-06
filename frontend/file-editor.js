@@ -1,9 +1,10 @@
 // File editor module. ES module.
 import { api } from "./api-client.js";
+import { showAppConfirm, showAppPrompt } from "./app-dialog.js";
 import { on } from "./dom-utils.js";
 import { getFileExtension } from "./file-tree.js";
 import { loadProjectFiles } from "./projects.js";
-import { projectParam, state } from "./state.js";
+import { projectParam, state, t } from "./state.js";
 import { showError } from "./ui.js";
 import { workspaceChat } from "./workspace-chat.js";
 
@@ -178,11 +179,15 @@ const fileEditor = {
     }
   },
 
-  closeFile() {
-    if (this.isModified) {
-      if (!confirm('File has unsaved changes. Close anyway?')) {
-        return;
-      }
+  async closeFile({ force = false } = {}) {
+    if (this.isModified && !force) {
+      const ok = await showAppConfirm({
+        title: t("files.unsavedTitle"),
+        message: t("files.unsavedClose"),
+        confirmLabel: t("files.closeAnyway"),
+        danger: true,
+      });
+      if (!ok) return false;
     }
 
     const editor = document.getElementById('file-editor');
@@ -190,6 +195,7 @@ const fileEditor = {
     const statusEl = document.getElementById('editor-file-status');
     const saveBtn = document.getElementById('editor-save');
     const closeBtn = document.getElementById('editor-close');
+    const closedPath = this.currentFile;
 
     this.currentFile = null;
     this.originalContent = '';
@@ -211,8 +217,9 @@ const fileEditor = {
     if (saveBtn) saveBtn.disabled = true;
     if (closeBtn) closeBtn.disabled = true;
 
-    this.removeTab(this.currentFile);
+    this.removeTab(closedPath);
     this.updateEditorUI();
+    return true;
   },
 
   markAsModified() {
@@ -238,7 +245,12 @@ const fileEditor = {
   },
 
   async createNewFile() {
-    const fileName = prompt('Enter file name (with extension):');
+    const fileName = await showAppPrompt({
+      title: t("files.newFileTitle"),
+      label: t("files.newFileLabel"),
+      placeholder: t("files.newFilePlaceholder"),
+      confirmLabel: t("files.createFile"),
+    });
     if (!fileName) return;
 
     try {
@@ -262,7 +274,12 @@ const fileEditor = {
   },
 
   async createNewFolder() {
-    const folderName = prompt('Enter folder name:');
+    const folderName = await showAppPrompt({
+      title: t("files.newFolderTitle"),
+      label: t("files.newFolderLabel"),
+      placeholder: t("files.newFolderPlaceholder"),
+      confirmLabel: t("files.createFolder"),
+    });
     if (!folderName) return;
 
     try {
@@ -285,7 +302,13 @@ const fileEditor = {
   },
 
   async deleteFile(path) {
-    if (!confirm(`Delete ${path}?`)) return;
+    const ok = await showAppConfirm({
+      title: t("files.deleteTitle"),
+      message: t("files.deleteConfirm").replace("{path}", path),
+      confirmLabel: t("files.delete"),
+      danger: true,
+    });
+    if (!ok) return;
 
     try {
       await api('/api/project/file/delete', {
@@ -297,7 +320,7 @@ const fileEditor = {
       });
 
       if (this.currentFile === path) {
-        this.closeFile();
+        await this.closeFile({ force: true });
       }
 
       await loadProjectFiles();
@@ -308,7 +331,12 @@ const fileEditor = {
   },
 
   async renameFile(oldPath) {
-    const newPath = prompt('Enter new name:', oldPath);
+    const newPath = await showAppPrompt({
+      title: t("files.renameTitle"),
+      label: t("files.renameLabel"),
+      value: oldPath,
+      confirmLabel: t("files.rename"),
+    });
     if (!newPath || newPath === oldPath) return;
 
     try {

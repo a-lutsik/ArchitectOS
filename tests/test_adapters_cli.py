@@ -22,6 +22,7 @@ from backend.architectos.adapters_cli import (
     _normalize_cli_command,
     _provider_command,
     _provider_workdir,
+    _which_cli,
 )
 
 
@@ -41,6 +42,29 @@ class JwtEmailClaimTests(unittest.TestCase):
         self.assertEqual(_jwt_email_claim("a.b"), "")
         bad = base64.urlsafe_b64encode(b'{"preferred_username":"local"}').decode().rstrip("=")
         self.assertEqual(_jwt_email_claim(f"x.{bad}.y"), "")
+
+
+class WhichCliTests(unittest.TestCase):
+    def test_finds_agy_in_user_local_bin_when_path_is_short(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            agy = bin_dir / "agy"
+            agy.write_text("#!/bin/sh\n", encoding="utf-8")
+            agy.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+                with mock.patch(
+                    "backend.architectos.adapters_cli._cli_extra_path_dirs",
+                    return_value=[str(bin_dir)],
+                ):
+                    self.assertEqual(_which_cli("agy"), str(agy))
+
+    def test_accepts_absolute_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            agy = Path(tmp) / "agy"
+            agy.write_text("#!/bin/sh\n", encoding="utf-8")
+            agy.chmod(0o755)
+            self.assertEqual(_which_cli(str(agy)), str(agy))
 
 
 class ProviderCommandTests(unittest.TestCase):
@@ -110,6 +134,13 @@ class WorkdirPolicyTests(unittest.TestCase):
 
 
 class CliGuardTests(unittest.TestCase):
+    def test_antigravity_print_mode_skips_approval(self) -> None:
+        request = ProviderRequest(message="hi", context="", project_id="p", approved=False)
+        with mock.patch("backend.architectos.adapters_cli.shutil.which", return_value="/bin/agy"):
+            guard = _cli_guard({"id": "gemini-cli", "command": ["agy", "-p"], "approval_required": True}, request, Path("."))
+        self.assertFalse(guard["error"])
+        self.assertEqual(guard["command"][0], "/bin/agy")
+
     def test_requires_approval_by_default(self) -> None:
         request = ProviderRequest(message="hi", context="", project_id="p", approved=False)
         guard = _cli_guard({"command": ["echo"]}, request, Path("."))
@@ -334,14 +365,32 @@ class CliAdapterBehaviorTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "done")
 
 
+    def test_gemini_login_skips_tui_when_already_signed_in(self) -> None:
+        adapter = CliAdapter("gemini-cli", ["agy", "-p"])
+        with mock.patch("backend.architectos.adapters_cli.shutil.which", return_value="/bin/agy"):
+            with mock.patch(
+                "backend.architectos.adapters_cli._gemini_session_auth_state",
+                return_value={"ready": True, "method": "google-account", "email": "a@b.c"},
+            ):
+                with mock.patch("backend.architectos.adapters_cli._launch_cli_login_terminal") as launch:
+                    login = adapter.login({"command": ["agy", "-p"]}, Path("/tmp"))
+        self.assertTrue(login["ok"])
+        self.assertEqual(login["status"], "already_signed_in")
+        self.assertIn("do not need to launch", login["message"])
+        launch.assert_not_called()
+
     def test_gemini_login_and_run_oserror(self) -> None:
         adapter = CliAdapter("gemini-cli", ["agy", "-p"])
         with mock.patch("backend.architectos.adapters_cli.shutil.which", return_value="/bin/agy"):
             with mock.patch(
-                "backend.architectos.adapters_cli._launch_cli_login_terminal",
-                return_value={"ok": True, "launcher": "Terminal.app", "message": "opened"},
+                "backend.architectos.adapters_cli._gemini_session_auth_state",
+                return_value={"ready": False},
             ):
-                login = adapter.login({"command": ["agy", "-p"]}, Path("/tmp"))
+                with mock.patch(
+                    "backend.architectos.adapters_cli._launch_cli_login_terminal",
+                    return_value={"ok": True, "launcher": "Terminal.app", "message": "opened"},
+                ):
+                    login = adapter.login({"command": ["agy", "-p"]}, Path("/tmp"))
             request = ProviderRequest(message="hi", context="", project_id="p", approved=True)
             with mock.patch(
                 "backend.architectos.adapters_cli.subprocess.run",

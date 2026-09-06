@@ -4,6 +4,9 @@
   "description": "Capability for the ArchitectOS main window",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:webview:default",
+    "core:window:default",
+    "allow-complete-first-run"
   ]
 }

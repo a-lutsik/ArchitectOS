@@ -282,10 +282,22 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
         )
         types = sorted({node.type for node in nodes if node.type})
         scopes = sorted({node.scope for node in nodes if node.scope})
-        sources = [
-            {"id": key, "label": (SOURCE_HUB_CATALOG.get(key) or {}).get("label") or key}
-            for key in sorted({self.graph_auto_linker._source_key_for_node(node) for node in nodes})
-        ]
+        source_labels: dict[str, str] = {}
+        source_keys: set[str] = set()
+        for node in nodes:
+            key = self.graph_auto_linker._source_key_for_node(node)
+            if not key:
+                continue
+            source_keys.add(key)
+            meta = dict(node.metadata or {})
+            label = str(meta.get("source_name") or "").strip()
+            if label and key not in source_labels:
+                source_labels[key] = label
+        sources = []
+        for key in sorted(source_keys):
+            catalog = SOURCE_HUB_CATALOG.get(key) if not key.startswith("source_") else None
+            label = source_labels.get(key) or (catalog or {}).get("label") or key
+            sources.append({"id": key, "label": label})
         facets = (types, scopes, sources)
         self._graph_facet_cache = (cache_key, facets)
         return facets
@@ -328,6 +340,10 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
             scope=scope or None,
             text_like=search if (search and like_prefilter_supported(search)) else None,
         )
+        if project_id and not node_type:
+            root = self.graph_auto_linker._project_root_node(project_id)
+            if root is not None and not any(node.id == root.id for node in all_nodes):
+                all_nodes.append(root)
 
         if pinned:
             all_nodes = [node for node in all_nodes if bool(node.metadata.get("favorite") or node.metadata.get("pinned"))]
@@ -364,6 +380,11 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
 
         query = str(search or "").strip().lower()
         exact_id_hits: set[str] = set()
+        query_work = query
+        for prefix in ("ado://", "ab://", "ab#", "ado:", "#"):
+            if query_work.startswith(prefix):
+                query_work = query_work[len(prefix):]
+                break
         if query:
             matched: list[Any] = []
             for node in filtered_nodes:
@@ -390,9 +411,14 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
                     ]
                 ).lower()
                 node_id = str(node.id or "").lower()
+                work_id = str(meta.get("work_item_id") or meta.get("workItemId") or "").strip().lower()
                 if node_id == query or node_id.startswith(query) or query in haystack:
                     matched.append(node)
-                    if node_id == query or (query.startswith("node_") and node_id.startswith(query)):
+                    if (
+                        node_id == query
+                        or (query.startswith("node_") and node_id.startswith(query))
+                        or (work_id and query_work.isdigit() and work_id == query_work)
+                    ):
                         exact_id_hits.add(node.id)
             filtered_nodes = matched
             
@@ -641,6 +667,14 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
         meta["superseded_by"] = getattr(source_node, "id", "")
         target_node.metadata = meta
         self.repository.upsert_node(target_node)
+        try:
+            self.repository.record_memory_event(
+                target_node.id,
+                "superseded",
+                details={"superseded_by": getattr(source_node, "id", ""), "invalid_at": when},
+            )
+        except Exception:  # history is best-effort
+            pass
 
     def merge_graph_nodes(self, source_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         target_id = str(payload.get("target_id") or "").strip()
@@ -650,6 +684,8 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
         target = self.repository.get_node(target_id)
         if not source or not target:
             raise ValueError("source and target graph nodes are required")
+        if source.type == "Project" or target.type == "Project":
+            raise ValueError("project root node cannot be merged")
         # Fetch neighborhood outside the write lock — list_edges() under BEGIN IMMEDIATE
         # held the lock for a full table scan.
         touching = self.repository.list_edges_touching([source.id])
@@ -669,6 +705,10 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
             source.metadata["merged_at"] = utc_now()
             target = self.repository.upsert_node(target)
             source = self.repository.upsert_node(source)
+        try:
+            self.repository.record_memory_event(target.id, "updated", details={"merged_from": source.id})
+        except Exception:  # history is best-effort
+            pass
         return {"target": target.to_dict(), "source": source.to_dict()}
 
     def apply_graph_command(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -720,6 +760,8 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
             node = self.repository.get_node(node_id)
             if not node:
                 raise ValueError("graph node not found")
+            if node.type == "Project":
+                raise ValueError("project root node cannot be deleted")
             if hard:
                 # Edge removal + tombstone update as one unit (no half-deleted graphs).
                 with self.repository.transaction():

@@ -1,10 +1,31 @@
 // MCP Master-Detail Layout JavaScript — ES module.
 import { api } from "./api-client.js";
+import { brandIconHtml, brandKeyFromText } from "./brand-icons.js";
 import { escapeHtml, showSnackbar } from "./dom-utils.js";
+import { t } from "./state.js";
+
+const REMOTE_TRANSPORTS = ["http", "remote", "streamable-http", "remote http"];
 
 let mcpServers = [];
 let selectedServerId = null;
 let mcpEventsBound = false;
+
+function isRemoteTransport(transport) {
+  return REMOTE_TRANSPORTS.includes(String(transport || "").trim().toLowerCase());
+}
+
+function normalizeTransport(transport, url = "") {
+  const raw = String(transport || "").trim().toLowerCase();
+  if (raw === "remote http" || raw === "remote-http" || raw === "sse") return "http";
+  if (REMOTE_TRANSPORTS.includes(raw)) return raw === "remote http" ? "http" : raw;
+  const remoteUrl = String(url || "").trim();
+  if (remoteUrl.startsWith("http://") || remoteUrl.startsWith("https://")) return "http";
+  return raw || "stdio";
+}
+
+function transportLabel(transport) {
+  return isRemoteTransport(transport) ? "remote http" : (transport || "stdio");
+}
 
 async function loadMcpMasterDetail() {
   try {
@@ -40,13 +61,13 @@ function renderMcpServerList() {
       item.classList.add("active");
     }
 
-    const icon = getServerIcon(server.label);
+    const icon = getServerIcon(server.label || server.id);
 
     item.innerHTML = `
       <div class="mcp-server-icon">${icon}</div>
       <div class="mcp-server-info">
         <div class="mcp-server-item-name">${escapeHtml(server.label)}</div>
-        <div class="mcp-server-item-status">${escapeHtml(server.transport || 'stdio')} • ${escapeHtml(server.status || 'planned')}</div>
+        <div class="mcp-server-item-status">${escapeHtml(transportLabel(server.transport))} • ${escapeHtml(server.status || 'planned')}</div>
       </div>
     `;
 
@@ -56,25 +77,21 @@ function renderMcpServerList() {
 }
 
 function getServerIcon(label) {
+  const brand = brandKeyFromText(label);
+  if (brand) return brandIconHtml(brand);
   const icons = {
-    'filesystem': '📁',
-    'github': '🐙',
-    'azure': '☁️',
-    'jira': '📋',
-    'slack': '💬',
-    'confluence': '📄',
-    'granola': '🎥',
-    'gitlab': '🦊',
-    'notion': '📝',
-    'google': '🌐'
+    filesystem: "📁",
+    jira: "📋",
+    slack: "💬",
+    confluence: "📄",
+    notion: "📝",
+    google: "🌐",
   };
-
-  const key = label.toLowerCase();
+  const key = String(label || "").toLowerCase();
   for (const [name, icon] of Object.entries(icons)) {
     if (key.includes(name)) return icon;
   }
-
-  return '🔌';
+  return "🔌";
 }
 
 function selectMcpServer(serverId) {
@@ -124,8 +141,9 @@ function renderMcpServerDetail() {
   const headersEl = document.querySelector("#mcp-detail-headers");
   const authorizeBtn = document.querySelector("#mcp-authorize-btn");
 
+  const transport = normalizeTransport(server.transport, server.url);
   if (enabledEl) enabledEl.checked = server.enabled || false;
-  if (transportEl) transportEl.value = server.transport || 'stdio';
+  if (transportEl) transportEl.value = isRemoteTransport(transport) ? "http" : "stdio";
   if (remoteUrlEl) remoteUrlEl.value = server.url || '';
   if (commandEl) {
     const command = Array.isArray(server.command) ? server.command.join(' ') : (server.command || '');
@@ -140,11 +158,11 @@ function renderMcpServerDetail() {
   }
 
   // Show/hide fields based on transport
-  updateFieldVisibility(server.transport || 'stdio');
+  updateFieldVisibility(transport);
   if (authorizeBtn) {
-    const isRemote = ['http', 'remote', 'streamable-http', 'remote http'].includes(server.transport || 'stdio');
-    authorizeBtn.style.display = isRemote ? '' : 'none';
+    authorizeBtn.style.display = isRemoteTransport(transport) ? '' : 'none';
   }
+  syncMcpRunCommandButton(transport);
   // Clear tools list (will be populated when user clicks Test)
   const toolsList = document.querySelector("#mcp-tools-list");
   if (toolsList) {
@@ -162,12 +180,42 @@ function updateFieldVisibility(transport) {
   const envField = document.querySelector("#mcp-field-env");
   const headersField = document.querySelector("#mcp-field-headers");
 
-  const isRemote = ['http', 'remote', 'streamable-http', 'remote http'].includes(transport);
+  const isRemote = isRemoteTransport(transport);
 
   if (remoteField) remoteField.style.display = isRemote ? 'block' : 'none';
   if (headersField) headersField.style.display = isRemote ? 'block' : 'none';
   if (commandField) commandField.style.display = isRemote ? 'none' : 'block';
   if (envField) envField.style.display = isRemote ? 'none' : 'block';
+  syncMcpRunCommandButton(transport);
+}
+
+function syncMcpRunCommandButton(transport) {
+  const btn = document.querySelector("#mcp-run-command-btn");
+  const commandEl = document.querySelector("#mcp-detail-command");
+  if (!btn) return;
+  const remote = isRemoteTransport(transport || document.querySelector("#mcp-detail-transport")?.value);
+  const command = (commandEl?.value || "").trim();
+  btn.hidden = remote;
+  btn.disabled = remote || !command;
+  btn.title = remote ? t("mcp.runCommandRemote") : t("mcp.runCommandHint");
+}
+
+async function runSelectedMcpCommand() {
+  const transport = normalizeTransport(
+    document.querySelector("#mcp-detail-transport")?.value,
+    document.querySelector("#mcp-detail-remote-url")?.value,
+  );
+  if (isRemoteTransport(transport)) {
+    showSnackbar(t("mcp.runCommandRemote"), "error");
+    return;
+  }
+  const command = (document.querySelector("#mcp-detail-command")?.value || "").trim();
+  if (!command) {
+    showSnackbar(t("mcp.runCommandEmpty"), "error");
+    return;
+  }
+  const { runInstallCommandInTerminal } = await import("./terminal.js");
+  await runInstallCommandInTerminal(command);
 }
 
 function mcpSlugify(value) {
@@ -193,7 +241,7 @@ function setAddMcpError(message) {
 
 function updateAddMcpVisibility() {
   const transport = document.querySelector("#add-mcp-transport")?.value || "stdio";
-  const isRemote = ["http", "remote", "streamable-http", "remote http"].includes(transport);
+  const isRemote = isRemoteTransport(transport);
   const commandGroup = document.querySelector("#add-mcp-command-group");
   const urlGroup = document.querySelector("#add-mcp-url-group");
   const envGroup = document.querySelector("#add-mcp-env-group");
@@ -245,7 +293,7 @@ async function submitAddMcpServer() {
   if (!id) id = mcpSlugify(label);
   else id = mcpSlugify(id);
   const transport = document.querySelector("#add-mcp-transport")?.value || "stdio";
-  const isRemote = ["http", "remote", "streamable-http", "remote http"].includes(transport);
+  const isRemote = isRemoteTransport(transport);
   const commandRaw = (document.querySelector("#add-mcp-command")?.value || "").trim();
   const url = (document.querySelector("#add-mcp-url")?.value || "").trim();
   const envRaw = (document.querySelector("#add-mcp-env")?.value || "").trim();
@@ -329,14 +377,18 @@ function initMcpMasterDetail() {
   const transportEl = document.querySelector("#mcp-detail-transport");
   if (transportEl) {
     transportEl.addEventListener("change", async () => {
-      updateFieldVisibility(transportEl.value);
+      const transport = normalizeTransport(
+        transportEl.value,
+        document.querySelector("#mcp-detail-remote-url")?.value,
+      );
+      updateFieldVisibility(transport);
 
       try {
         await api("/api/mcp/servers", {
           method: "PATCH",
           body: JSON.stringify({
             id: selectedServerId,
-            transport: transportEl.value
+            transport
           })
         });
         await loadMcpMasterDetail();
@@ -346,14 +398,25 @@ function initMcpMasterDetail() {
     });
   }
 
+  const commandEl = document.querySelector("#mcp-detail-command");
+  if (commandEl) {
+    commandEl.addEventListener("input", () => syncMcpRunCommandButton(document.querySelector("#mcp-detail-transport")?.value));
+  }
+  const runCommandBtn = document.querySelector("#mcp-run-command-btn");
+  if (runCommandBtn) {
+    runCommandBtn.addEventListener("click", () => {
+      runSelectedMcpCommand().catch(error => {
+        showSnackbar(error.message || t("mcp.runCommandEmpty"), "error");
+      });
+    });
+  }
+
   // Authorize button
   const authorizeBtn = document.querySelector("#mcp-authorize-btn");
   if (authorizeBtn) {
     authorizeBtn.addEventListener("click", async () => {
       const resultsEl = document.querySelector("#mcp-test-results");
-      if (!resultsEl) return;
-
-      resultsEl.innerHTML = '<p>Starting authorization...</p>';
+      if (resultsEl) resultsEl.innerHTML = '<p>Starting authorization...</p>';
 
       try {
         const popup = window.open("about:blank", "architectos-mcp-auth");
@@ -363,10 +426,12 @@ function initMcpMasterDetail() {
         });
 
         const authUrl = payload.auth_url || "";
-        resultsEl.innerHTML = `
-          <p class="success">${escapeHtml(payload.message || "Complete auth in browser")}</p>
-          ${authUrl ? `<p><a href="${escapeHtml(authUrl)}" target="architectos-mcp-auth" rel="noopener noreferrer">Open Granola sign-in</a></p>` : ""}
-        `;
+        if (resultsEl) {
+          resultsEl.innerHTML = `
+            <p class="success">${escapeHtml(payload.message || "Complete auth in browser")}</p>
+            ${authUrl ? `<p><a href="${escapeHtml(authUrl)}" target="architectos-mcp-auth" rel="noopener noreferrer">Open sign-in</a></p>` : ""}
+          `;
+        }
 
         if (popup && authUrl) {
           popup.location.href = authUrl;
@@ -376,7 +441,8 @@ function initMcpMasterDetail() {
 
         await loadMcpMasterDetail();
       } catch (error) {
-        resultsEl.innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+        if (resultsEl) resultsEl.innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+        else showSnackbar(error.message || "Authorization failed", "error");
       }
     });
   }
@@ -464,7 +530,7 @@ function initMcpMasterDetail() {
         const updates = {
           id: selectedServerId,
           enabled: enabledEl ? enabledEl.checked : false,
-          transport: transportEl ? transportEl.value : 'stdio',
+          transport: normalizeTransport(transportEl ? transportEl.value : "", remoteUrlEl ? remoteUrlEl.value : ""),
           url: remoteUrlEl ? remoteUrlEl.value : '',
           command: commandEl ? commandEl.value.split(' ').filter(Boolean) : []
         };

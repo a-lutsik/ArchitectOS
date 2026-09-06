@@ -19,7 +19,7 @@ Application-style window:
 Useful environment variables:
 
 - `ARCHITECTOS_HOST`: bind host, defaults to `127.0.0.1`.
-- `ARCHITECTOS_PORT`: preferred port, defaults to `8765`.
+- `ARCHITECTOS_PORT`: preferred port, defaults to `8766`.
 - `ARCHITECTOS_ENV`: label returned by `/api/version`, defaults to `local`.
 - `ARCHITECTOS_BACKUP_RETENTION`: local backup retention count, defaults to `10`.
 - `ARCHITECTOS_ACCESS_LOG`: set to `1` for request logs.
@@ -27,9 +27,9 @@ Useful environment variables:
 ## Health And Readiness
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8765/api/health
-Invoke-RestMethod http://127.0.0.1:8765/api/ready
-Invoke-RestMethod http://127.0.0.1:8765/api/version
+Invoke-RestMethod http://127.0.0.1:8766/api/health
+Invoke-RestMethod http://127.0.0.1:8766/api/ready
+Invoke-RestMethod http://127.0.0.1:8766/api/version
 ```
 
 Readiness validates the SQLite database, required frontend assets, security settings, release manifest, and provider catalog.
@@ -39,13 +39,13 @@ Readiness validates the SQLite database, required frontend assets, security sett
 Create a local SQLite backup:
 
 ```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:8765/api/ops/backup -Method Post -ContentType "application/json" -Body "{}"
+Invoke-RestMethod -Uri http://127.0.0.1:8766/api/ops/backup -Method Post -ContentType "application/json" -Body "{}"
 ```
 
 List backups:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8765/api/ops/backups
+Invoke-RestMethod http://127.0.0.1:8766/api/ops/backups
 ```
 
 Backups are written under `backups/` and are excluded from release archives.

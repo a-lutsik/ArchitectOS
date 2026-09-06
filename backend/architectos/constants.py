@@ -82,66 +82,10 @@ TERMINAL_DANGEROUS_PATTERNS = [
 ]
 # Client must echo this exact string to override a blocked command (UI checkbox alone is not enough).
 TERMINAL_DESTRUCTIVE_CONFIRM = "I_UNDERSTAND_DESTRUCTIVE"
-INGESTION_SOURCE_ALIASES = {
-    "issue": "issues",
-    "issues": "issues",
-    "tracker": "issues",
-    "trackers": "issues",
-    "pr": "prs",
-    "prs": "prs",
-    "pull_request": "prs",
-    "pull_requests": "prs",
-    "meeting": "meetings",
-    "meetings": "meetings",
-    "granola": "granola",
-    "granola_meeting": "granola",
-    "granola_meetings": "granola",
-    "commit": "git",
-    "commits": "git",
-    "azure-boards": "azure-boards",
-    "azure_boards": "azure-boards",
-    "azureboards": "azure-boards",
-    "boards": "azure-boards",
-    "ado-boards": "azure-boards",
-    "ado_boards": "azure-boards",
-    "work-items": "azure-boards",
-    "work_items": "azure-boards",
-    "workitems": "azure-boards",
-    "azure-devops": "azure-boards",
-    "azure_devops": "azure-boards",
-    "azure-wiki": "azure-wiki",
-    "azure_wiki": "azure-wiki",
-    "azurewiki": "azure-wiki",
-    "ado-wiki": "azure-wiki",
-    "ado_wiki": "azure-wiki",
-    "wiki": "azure-wiki",
-    "azure-git": "azure-git",
-    "azure_git": "azure-git",
-    "azure-repos": "azure-git",
-    "azure_repos": "azure-git",
-    "ado-git": "azure-git",
-    "ado_git": "azure-git",
-    "ado-repos": "azure-git",
-    "ado_repos": "azure-git",
-    "azure-prs": "azure-git",
-    "azure_prs": "azure-git",
-    "teams": "teams-meetings",
-    "teams-meetings": "teams-meetings",
-    "teams_meetings": "teams-meetings",
-    "teams-meeting": "teams-meetings",
-    "ms-teams": "teams-meetings",
-    "microsoft-teams": "teams-meetings",
-    "graph-teams": "teams-meetings",
-    "facilitator": "teams-meetings",
-    "inbox": "inbox",
-    "folder": "inbox",
-    "drop_folder": "inbox",
-    "drop-folder": "inbox",
-    "watch_folder": "inbox",
-    "watch-folder": "inbox",
-}
-ALL_LOCAL_INGESTION_SOURCES = ["docs", "code", "chat", "git", "adr", "issues", "prs", "meetings", "inbox"]
-ALL_INGESTION_SOURCES = [*ALL_LOCAL_INGESTION_SOURCES, "granola", "azure-boards", "azure-wiki", "azure-git", "teams-meetings"]
+from .source_registry import INGESTION_SOURCE_ALIASES  # noqa: E402
+
+ALL_LOCAL_INGESTION_SOURCES = ["docs", "code", "chat", "git_history", "adr", "issues", "pull_requests", "meetings", "inbox"]
+ALL_INGESTION_SOURCES = [*ALL_LOCAL_INGESTION_SOURCES, "granola", "azure-boards", "azure-wiki", "azure-git", "github", "gitlab"]
 ADO_BOARD_WORK_ITEM_TYPES = ["Requirement", "Feature", "User Story", "Task", "Bug", "Epic", "Product Backlog Item"]
 
 
@@ -163,7 +107,7 @@ ADO_FETCH_WORKERS = _ado_env_int("ADO_FETCH_WORKERS", 1, minimum=1, maximum=8)
 # restart the session so the rest of the import keeps moving.
 ADO_ITEM_TIMEOUT = _ado_env_int("ADO_ITEM_TIMEOUT", 25, minimum=5, maximum=600)
 # Whole Azure Boards source budget (collect IDs + fetch details).
-ADO_SOURCE_TIMEOUT = _ado_env_int("ADO_SOURCE_TIMEOUT", 600, minimum=30, maximum=7200)
+ADO_SOURCE_TIMEOUT = _ado_env_int("ADO_SOURCE_TIMEOUT", 90, minimum=15, maximum=7200)
 
 # Per-source ingest budgets. Payload can override via timeouts / item_timeout / source_timeout.
 DEFAULT_INGEST_TIMEOUTS: dict[str, dict[str, int]] = {
@@ -175,7 +119,8 @@ DEFAULT_INGEST_TIMEOUTS: dict[str, dict[str, int]] = {
     "azure-boards": {"item": ADO_ITEM_TIMEOUT, "source": ADO_SOURCE_TIMEOUT},
     "azure-git": {"item": 30, "source": 180},
     "azure-wiki": {"item": 20, "source": 300},
-    "teams-meetings": {"item": 30, "source": 300},
+    "github": {"item": 25, "source": 180},
+    "gitlab": {"item": 25, "source": 180},
 }
 ADO_BOARD_MEMORY_TYPES = {
     "requirement": "Requirement",

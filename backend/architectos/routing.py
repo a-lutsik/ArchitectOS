@@ -4,6 +4,18 @@ from typing import Any
 
 READY_STATUSES = {"configured", "ok", "available", "ready", "fallback"}
 
+ERROR_STATUSES = {
+    "missing_credentials",
+    "missing_endpoint",
+    "missing_cli",
+    "missing_command",
+    "missing_model",
+    "unreachable",
+    "error",
+}
+
+LOCAL_MEMORY_ID = "local-memory"
+
 DEFAULT_WEIGHTS = {"quality": 0.4, "cost": 0.3, "speed": 0.2, "availability": 0.1}
 
 DEFAULT_STRATEGY = "balanced"
@@ -32,11 +44,33 @@ PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
 DEFAULT_PROFILE = {"cost": 0.5, "latency": 0.5, "quality": 0.6, "strengths": set()}
 
 _ROLE_KEYWORDS = {
-    "code": ("code", "implement", "bug", "function", "refactor", "test", "compile", "stack trace", "exception"),
+    "code": ("code", "implement", "bug", "function", "refactor", "test", "compile", "stack trace", "exception", "install", "npx", "mcp", "execute", "command", "jira", "confluence"),
     "architecture": ("architecture", "design", "adr", "decision", "trade-off", "tradeoff", "scal", "pattern", "diagram"),
     "docs": ("doc", "documentation", "readme", "explain", "summary", "write-up", "guide"),
     "review": ("review", "risk", "security", "audit", "quality", "correctness", "regression"),
 }
+
+
+def provider_is_ready(provider: dict[str, Any] | None) -> bool:
+    """Same Ready rule as the Providers UI: enabled and last_check actually succeeded.
+
+    A stale ``status=configured`` card with ``last_check.missing_credentials`` is not Ready.
+    """
+    if not provider or not provider.get("enabled"):
+        return False
+    last = provider.get("last_check") if isinstance(provider.get("last_check"), dict) else {}
+    last_status = str(last.get("status") or "").lower()
+    if last:
+        if last.get("ready") is False:
+            return False
+        if last_status in ERROR_STATUSES:
+            return False
+        if last.get("ready") is True:
+            return True
+    status = str(provider.get("status") or "").lower()
+    if status in ERROR_STATUSES:
+        return False
+    return status in READY_STATUSES
 
 
 def classify_role(text: str) -> str:
@@ -86,12 +120,13 @@ class RouterPolicy:
     def availability(self, provider: dict[str, Any]) -> float:
         if not provider.get("enabled"):
             return 0.0
+        if provider_is_ready(provider):
+            return 1.0
+        last_check = provider.get("last_check") if isinstance(provider.get("last_check"), dict) else {}
+        last_status = str(last_check.get("status") or "").lower()
         status = str(provider.get("status") or "").lower()
-        if status in READY_STATUSES:
-            return 1.0
-        last_check = provider.get("last_check") or {}
-        if str(last_check.get("status") or "").lower() in READY_STATUSES:
-            return 1.0
+        if last_check.get("ready") is False or last_status in ERROR_STATUSES or status in ERROR_STATUSES:
+            return 0.0
         return 0.35
 
     def score_provider(self, provider: dict[str, Any], weights: dict[str, float], role: str | None = None) -> dict[str, Any]:
@@ -149,7 +184,18 @@ class RouterPolicy:
             return {"provider": provider, "decision": decision}
 
         ranked = self.rank(providers, role)
-        best = next((item for item in ranked if item["availability"] > 0 and item["enabled"]), None)
+
+        def _auto_pick(exclude_local: bool) -> dict[str, Any] | None:
+            for item in ranked:
+                if not item.get("enabled") or float(item.get("availability") or 0) <= 0:
+                    continue
+                if exclude_local and str(item.get("provider_id") or "") == LOCAL_MEMORY_ID:
+                    continue
+                return item
+            return None
+
+        # A ready LLM must beat local-memory for Agent/code/install. Cost=0 made local-memory win "balanced".
+        best = _auto_pick(exclude_local=True) or _auto_pick(exclude_local=False)
         if best:
             provider = by_id[best["provider_id"]]
             reason = (

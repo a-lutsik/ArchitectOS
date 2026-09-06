@@ -154,12 +154,12 @@ class MCPClient:
         assert message_id is not None
         return self._await(message_id, timeout=timeout)
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, timeout: float | None = 20.0) -> dict[str, Any]:
         result = self.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}, "resources": {}},
             "clientInfo": CLIENT_INFO,
-        })
+        }, timeout=timeout)
         self._send("notifications/initialized", {}, notify=True)
         return result
 
@@ -295,12 +295,12 @@ class MCPRemoteHTTPClient:
             return candidates[-1]
         raise MCPError("Remote MCP returned an event-stream without a JSON-RPC response.")
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, timeout: float | None = 20.0) -> dict[str, Any]:
         return self.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}, "resources": {}},
             "clientInfo": CLIENT_INFO,
-        })
+        }, timeout=timeout)
 
     def list_tools(self) -> list[dict[str, Any]]:
         result = self.request("tools/list", {})

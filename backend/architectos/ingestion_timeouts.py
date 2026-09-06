@@ -64,7 +64,7 @@ class IngestionTimeoutsMixin:
         except (TypeError, ValueError):
             source_timeout = source_default
         item_timeout = max(5.0, min(item_timeout, 600.0))
-        source_timeout = max(item_timeout, min(source_timeout, 7200.0))
+        source_timeout = max(1.0, min(source_timeout, 7200.0))
         return item_timeout, source_timeout
 
     def _with_ingest_timeouts(self, source: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -95,6 +95,18 @@ class IngestionTimeoutsMixin:
             return max(0.0, float(deadline) - time.monotonic())
         except (TypeError, ValueError):
             return None
+
+    def _ingest_call_timeout(self, payload: dict[str, Any] | None, item_timeout: float) -> float:
+        """Cap a single MCP call to the remaining source budget so item timeouts cannot overrun the source."""
+        try:
+            item = float(item_timeout or 5.0)
+        except (TypeError, ValueError):
+            item = 5.0
+        item = max(0.5, min(item, 600.0))
+        remaining = self._ingest_deadline_remaining(payload)
+        if remaining is None:
+            return item
+        return max(0.5, min(item, remaining))
 
     def _ingest_deadline_expired(self, payload: dict[str, Any] | None, source: str = "") -> bool:
         remaining = self._ingest_deadline_remaining(payload)
@@ -152,6 +164,7 @@ class IngestionTimeoutsMixin:
         source_timeout = float(timed["_ingest_source_timeout"])
         partial_box: dict[str, Any] = {"result": None}
         timed["_ingest_partial"] = partial_box
+        timed["_ingest_warnings"] = warnings
         self._log_ingest(
             f"Timeouts · item={item_timeout:g}s · source={source_timeout:g}s",
             source=source,
@@ -169,7 +182,7 @@ class IngestionTimeoutsMixin:
                 self._abort_ingest_source(source)
                 # Brief grace: inner path may be returning partial candidates right now.
                 try:
-                    result = future.result(timeout=2.0)
+                    result = future.result(timeout=0.4)
                     if result is not None:
                         self._log_ingest(
                             f"{source} kept partial result after timeout.",

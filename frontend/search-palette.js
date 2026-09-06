@@ -1,16 +1,16 @@
 // Search command palette. ES module.
 import { api } from "./api-client.js";
-import { switchView } from "./ask-ui.js";
 import { escapeHtml, showSnackbar, trapFocus } from "./dom-utils.js";
-import { graphState, openGraphNodeModal } from "./graph.js";
+import { openMemoryNodeCard } from "./graph.js";
 import { projectParam, state, t } from "./state.js";
-import { renderResults, showError } from "./ui.js";
+import { showError } from "./ui.js";
 
 const searchPalette = {
   isOpen: false,
   highlightedIndex: -1,
   currentResults: [],
   releaseFocusTrap: null,
+  _searchTimeout: null,
 
   getRecentSearches() {
     try {
@@ -48,6 +48,19 @@ const searchPalette = {
 
     document.body.style.overflow = 'hidden';
     this.renderRecentSearches();
+  },
+
+  openWithQuery(query) {
+    const q = String(query || '').trim();
+    document.querySelectorAll('.filter-pill.active').forEach(pill => pill.classList.remove('active'));
+    if (this._searchTimeout) {
+      clearTimeout(this._searchTimeout);
+      this._searchTimeout = null;
+    }
+    this.open();
+    const input = document.getElementById('paletteSearchInput');
+    if (input) input.value = q;
+    if (q) this.performSearch(q);
   },
 
   close() {
@@ -120,8 +133,8 @@ const searchPalette = {
     }
 
     this.showResultsSection();
-    this.renderLoading(query);
     this.currentQuery = query;
+    this.renderLoading(query);
 
     const activeFilters = Array.from(document.querySelectorAll('.filter-pill.active'))
       .map(pill => pill.dataset.filterType);
@@ -155,15 +168,43 @@ const searchPalette = {
     }
   },
 
+  setResultsBusy(busy) {
+    const container = document.getElementById('paletteResultList');
+    if (!container) return;
+    container.toggleAttribute('aria-busy', Boolean(busy));
+  },
+
   renderLoading(query) {
     const container = document.getElementById('paletteResultList');
     const countSpan = document.getElementById('paletteResultCount');
     if (countSpan) countSpan.textContent = '';
     if (!container) return;
+    const q = escapeHtml(query.trim());
+    this.setResultsBusy(true);
     container.innerHTML = `
-      <div class="no-palette-results">
-        <div class="no-palette-results-icon">⏳</div>
-        <div>Searching memory for “${escapeHtml(query.trim())}”…</div>
+      <div class="palette-searching" role="status" aria-live="polite">
+        <div class="palette-searching-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40" fill="none">
+            <circle class="palette-searching-halo" cx="20" cy="20" r="15.5"/>
+            <circle class="palette-searching-orbit" cx="20" cy="20" r="9.5"/>
+            <circle class="palette-searching-core" cx="20" cy="20" r="3.2"/>
+            <circle class="palette-searching-sweep" cx="20" cy="20" r="15.5"/>
+          </svg>
+        </div>
+        <p class="palette-searching-copy">Searching memory for “${q}”…</p>
+      </div>
+      <div class="palette-searching-skeleton" aria-hidden="true">
+        ${[0, 1, 2].map((i) => `
+          <div class="palette-skeleton-row" style="--i:${i}">
+            <div class="palette-skeleton-icon"></div>
+            <div class="palette-skeleton-content">
+              <div class="palette-skeleton-title"></div>
+              <div class="palette-skeleton-meta"><span></span><span></span></div>
+              <div class="palette-skeleton-line"></div>
+              <div class="palette-skeleton-line is-short"></div>
+            </div>
+          </div>
+        `).join('')}
       </div>
     `;
     this.highlightedIndex = -1;
@@ -188,12 +229,33 @@ const searchPalette = {
   },
 
   groupFor(hit) {
+    if (this.isExactHit(hit)) return 'exact';
     const node = hit.node || {};
     const meta = node.metadata || {};
     const source = String(meta.source || meta.source_type || '').toLowerCase();
-    if (meta.work_item_id || source.includes('boards')) return 'boards';
+    if (meta.work_item_id || meta.workItemId || source.includes('boards')) return 'boards';
     if (node.type === 'Artifact' || ['code', 'project_scan', 'azure-git'].some(key => source.includes(key))) return 'code';
     return 'knowledge';
+  },
+
+  exactWorkItemId(query) {
+    const text = String(query || '').trim();
+    const tagged = text.match(/(?:AB#|ado[:/#\s]+|#)(\d{3,7})\b/i);
+    if (tagged) return tagged[1];
+    const bare = text.match(/^\s*(\d{3,7})\s*$/);
+    return bare ? bare[1] : '';
+  },
+
+  isExactHit(hit) {
+    const query = String(this.currentQuery || '').trim();
+    const node = hit.node || {};
+    const meta = node.metadata || {};
+    const reasons = hit.reasons || [];
+    if (reasons.includes('exact-work-item') || reasons.includes('exact-node-id')) return true;
+    if (query && String(node.id || '') === query) return true;
+    const workId = this.exactWorkItemId(query);
+    if (workId && String(meta.work_item_id || meta.workItemId || '') === workId) return true;
+    return false;
   },
 
   renderResults(results) {
@@ -202,6 +264,7 @@ const searchPalette = {
     if (!container || !countSpan) return;
 
     countSpan.textContent = `(${results.length})`;
+    this.setResultsBusy(false);
 
     if (!results.length) {
       container.innerHTML = `
@@ -215,6 +278,7 @@ const searchPalette = {
     }
 
     const groups = [
+      ['exact', t('palette.group.exact') || 'Exact'],
       ['knowledge', t('palette.group.knowledge') || 'Knowledge'],
       ['boards', t('palette.group.boards') || 'Boards'],
       ['code', t('palette.group.code') || 'Code'],
@@ -286,6 +350,7 @@ const searchPalette = {
 
   renderError(message) {
     const container = document.getElementById('paletteResultList');
+    this.setResultsBusy(false);
     container.innerHTML = `
       <div class="no-palette-results">
         <div class="no-palette-results-icon">⚠️</div>
@@ -296,28 +361,8 @@ const searchPalette = {
 
   selectResult(nodeId) {
     this.close();
-
-    // Switch to memory view
-    switchView('memory');
-
-    // Try to focus the node in graph if it exists
-    setTimeout(() => {
-      if (graphState.nodes.find(n => n.id === nodeId)) {
-        const node = graphState.nodes.find(n => n.id === nodeId);
-        if (node) {
-          openGraphNodeModal(node);
-          // Center the graph on this node if possible
-          const particle = graphState.particles.find(p => p.id === nodeId);
-          if (particle) {
-            const canvas = document.querySelector('#graph-canvas');
-            if (canvas) {
-              graphState.offsetX = canvas.width / 2 - particle.x;
-              graphState.offsetY = canvas.height / 2 - particle.y;
-            }
-          }
-        }
-      }
-    }, 300);
+    const fallback = this.currentResults.find(hit => hit.node?.id === nodeId)?.node;
+    openMemoryNodeCard(nodeId, fallback).catch(showError);
   },
 
   navigateResults(direction) {
@@ -359,10 +404,9 @@ const searchPalette = {
 
     // Search input
     const input = document.getElementById('paletteSearchInput');
-    let searchTimeout;
     input.addEventListener('input', (e) => {
-      clearTimeout(searchTimeout);
-      searchTimeout = setTimeout(() => {
+      clearTimeout(this._searchTimeout);
+      this._searchTimeout = setTimeout(() => {
         this.performSearch(e.target.value);
       }, 300);
     });

@@ -9,6 +9,14 @@
   let startX = 0;
   let startWidth = 0;
 
+  function applySidebarWidth(sidebar, width) {
+    const px = `${width}px`;
+    sidebar.style.width = px;
+    sidebar.style.flexBasis = px;
+    sidebar.style.flexGrow = "0";
+    sidebar.style.flexShrink = "0";
+  }
+
   function initWorkspaceResizer() {
     const resizer = document.getElementById('workspace-resizer');
     const sidebar = document.querySelector('.workspace-sidebar');
@@ -18,14 +26,16 @@
       return;
     }
 
-    // Load saved width from localStorage
+    let width = DEFAULT_WIDTH;
     const savedWidth = localStorage.getItem('workspace-sidebar-width');
     if (savedWidth) {
-      const width = parseInt(savedWidth, 10);
-      if (width >= MIN_WIDTH && width <= MAX_WIDTH) {
-        sidebar.style.width = `${width}px`;
-      }
+      const parsed = parseInt(savedWidth, 10);
+      if (parsed >= MIN_WIDTH && parsed <= MAX_WIDTH) width = parsed;
     }
+    applySidebarWidth(sidebar, width);
+
+    if (resizer.dataset.bound === "1") return;
+    resizer.dataset.bound = "1";
 
     resizer.addEventListener('mousedown', handleMouseDown);
 
@@ -54,7 +64,7 @@
       if (newWidth < MIN_WIDTH) newWidth = MIN_WIDTH;
       if (newWidth > MAX_WIDTH) newWidth = MAX_WIDTH;
 
-      sidebar.style.width = `${newWidth}px`;
+      applySidebarWidth(sidebar, newWidth);
     }
 
     function handleMouseUp() {
@@ -75,7 +85,7 @@
 
     // Double-click to reset to default width
     resizer.addEventListener('dblclick', () => {
-      sidebar.style.width = `${DEFAULT_WIDTH}px`;
+      applySidebarWidth(sidebar, DEFAULT_WIDTH);
       localStorage.setItem('workspace-sidebar-width', DEFAULT_WIDTH.toString());
     });
   }

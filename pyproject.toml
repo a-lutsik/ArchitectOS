@@ -14,7 +14,8 @@ dependencies = []
 
 [project.optional-dependencies]
 # Faster cosine index for memory embeddings (embeddings.py falls back to pure Python).
-vectors = ["numpy>=1.26"]
+# sqlite-vec moves KNN into SQLite; numpy keeps the in-RAM fallback.
+vectors = ["numpy>=1.26", "sqlite-vec>=0.1.6"]
 # On-device real embedding model (no API keys). fastembed is lightweight (ONNX,
 # no torch); LocalEmbeddingProvider also uses sentence-transformers if present.
 # With this installed, a fresh setup gets real vectors instead of the hash fallback.
@@ -26,10 +27,11 @@ dev = ["ruff>=0.6"]
 packaging = ["pyinstaller>=6.0"]
 
 [project.scripts]
-# MCP memory server for external agents (Cursor, Copilot, Claude, Junie, ...).
-# After `pip install -e .` run `architectos-mcp`; set ARCHITECTOS_ROOT to point
-# at the checkout whose data/architectos.db should be shared.
+# After `pip install -e .`: architectos / architectos-mcp / architectos-hook.
+# Set ARCHITECTOS_ROOT to the checkout whose data/architectos.db should be shared.
+architectos = "architectos.cli:main"
 architectos-mcp = "architectos.mcp_server:main"
+architectos-hook = "architectos.agent_hooks:main"
 
 [tool.setuptools]
 package-dir = {"" = "backend"}

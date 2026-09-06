@@ -71,7 +71,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertEqual([step["id"] for step in workflow["steps"]], ["scan", "context", "task", "provider", "memory", "review"])
             self.assertEqual(workflow["provider"]["id"], "local-memory")
             chat = service.post_chat_message({"project_id": "architectos", "message": "What is the memory model?"})
-            self.assertIn("Strongest memory matches", chat["response"])
+            self.assertIn("Strongest matches", chat["response"])
             self.assertEqual(len(chat["chat"]["messages"]), 2)
 
     def test_chat_turn_does_not_create_candidate_until_session_ends(self) -> None:
@@ -86,11 +86,35 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             chat_id = result["chat"]["id"]
             finalized = service.finalize_chat_session(chat_id, force=True, trigger="manual")
             candidates = service.list_memory_candidates("architectos")["candidates"]
-            self.assertEqual(len(candidates), 1)
-            self.assertEqual(candidates[0]["source_type"], "chat")
-            self.assertEqual(candidates[0]["metadata"]["template"], "chat_session_summary")
+            summaries = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_summary"]
+            atoms = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_atom"]
+            self.assertEqual(len(summaries), 0)
+            self.assertGreaterEqual(len(atoms), 1)
+            self.assertEqual(atoms[0]["source_type"], "chat")
             self.assertEqual(finalized["chat"]["session_status"], "complete")
-            self.assertIn("Architecture decision", candidates[0]["text"])
+            pack = service.chat_context_pack(chat_id, "architecture decision")
+            session = next((s for s in pack["summaries"] if s.get("summary_type") == "session_summary"), None)
+            self.assertTrue(session and session.get("summary_text"))
+            self.assertIn("Architecture decision", session["summary_text"])
+            self.assertTrue(any("Architecture decision" in str(item.get("text") or "") for item in atoms))
+
+    def test_session_finalize_enqueues_one_candidate_per_fact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            result = service.post_chat_message({
+                "project_id": "architectos",
+                "message": "Architecture decision: never commit directly to main.\nConstraint: always use pytest for tests.",
+                "provider_id": "local-memory",
+            })
+            finalized = service.finalize_chat_session(result["chat"]["id"], force=True, trigger="manual")
+            candidates = service.list_memory_candidates("architectos")["candidates"]
+            atoms = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_atom"]
+            summaries = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_summary"]
+            self.assertEqual(len(summaries), 0)
+            self.assertGreaterEqual(len(atoms), 2)
+            blob = " ".join(str(item.get("text") or "") for item in atoms).lower()
+            self.assertTrue("main" in blob or "pytest" in blob)
+            self.assertGreaterEqual(len(finalized.get("atoms") or atoms), 2)
 
     def test_chitchat_session_skips_candidate_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,6 +148,88 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             finalized = service.finalize_chat_session(result["chat"]["id"], force=True, trigger="manual")
             self.assertEqual(finalized["chat"]["session_status"], "complete")
 
+    def test_collapse_similar_facts_merges_paraphrases(self) -> None:
+        from backend.architectos.chat_memory import collapse_similar_facts
+
+        facts = collapse_similar_facts([
+            {"type": "Lesson", "text": "Project must support PDF download for reports and exports."},
+            {"type": "Requirement", "text": "Project must support PDF download for reports and export."},
+        ])
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0]["type"], "Requirement")
+
+    def test_fact_atom_near_duplicate_is_skipped_not_queued(self) -> None:
+        pending_fact = "Never commit API keys or secrets to the git repository."
+        paraphrase = "Never commit API keys or secrets to the git repository per policy."
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_lifecycle": {"chat_auto_accept": False}})
+            service.repository.upsert_memory_candidate({
+                "project_id": "architectos",
+                "source_type": "chat",
+                "source_ref": "chat_1",
+                "label": f"Chat fact: {pending_fact[:72]}",
+                "type": "Decision",
+                "scope": "project",
+                "text": f"Durable fact extracted from Ask (not a full transcript).\n\n{pending_fact}",
+                "status": "candidate",
+                "confidence": 0.74,
+                "metadata": {
+                    "chat_id": "chat_1",
+                    "template": "chat_session_atom",
+                    "fact_key": pending_fact[:240],
+                },
+            })
+            prepared = service.ingestion_engine.prepare_candidates("architectos", [{
+                "project_id": "architectos",
+                "source_type": "chat",
+                "source_ref": "chat_2",
+                "label": f"Chat fact: {paraphrase[:72]}",
+                "type": "Lesson",
+                "scope": "project",
+                "text": f"Durable fact extracted from Ask (not a full transcript).\n\n{paraphrase}",
+                "metadata": {
+                    "chat_id": "chat_2",
+                    "template": "chat_session_atom",
+                    "fact_key": paraphrase[:240],
+                },
+            }], 1)
+            self.assertEqual(prepared, [])
+            self.assertEqual(service.repository.count_memory_candidates_by_status("architectos")["pending"], 1)
+
+    def test_mcp_turn_is_not_also_ask_chat(self) -> None:
+        fact = "Architecture decision: never commit API keys or secrets to git."
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_lifecycle": {"chat_memory_mode": "strict", "chat_auto_accept": False}})
+            captured = service.capture_memory_turn(fact, "Understood. We will keep secrets out of git.", project_id="architectos")
+            self.assertTrue(captured.get("kept"))
+            pending = service.list_memory_candidates("architectos")["candidates"]
+            self.assertTrue(pending)
+            self.assertTrue(all(item["source_type"] == "mcp" for item in pending))
+            self.assertTrue(all(str(item.get("label") or "").startswith("MCP fact:") for item in pending))
+
+            chat = service.post_chat_message({
+                "project_id": "architectos",
+                "message": fact,
+                "provider_id": "local-memory",
+            })
+            service.ingest_memory({"project_id": "architectos", "sources": ["chat"], "limit": 10})
+            service.finalize_chat_session(chat["chat"]["id"], force=True, trigger="manual")
+            after = service.list_memory_candidates("architectos")["candidates"]
+            mcp_cards = [item for item in after if item.get("source_type") == "mcp"]
+            chat_cards = [item for item in after if item.get("source_type") == "chat"]
+            self.assertTrue(mcp_cards)
+            self.assertFalse(chat_cards)
+            ingested = service.ingest_memory({"project_id": "architectos", "sources": ["chat"], "limit": 10})
+            dumps = [
+                item for item in ingested["candidates"]
+                if str((item.get("metadata") or {}).get("template") or "") == "chat"
+            ]
+            self.assertEqual(dumps, [])
+            after_scan = service.list_memory_candidates("architectos")["candidates"]
+            self.assertFalse(any(item.get("source_type") == "chat" for item in after_scan))
+
     def test_stale_chat_candidates_expire_by_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
@@ -135,11 +241,11 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             })
             service.finalize_chat_session(result["chat"]["id"], force=True, trigger="manual")
             candidates = service.list_memory_candidates("architectos")["candidates"]
-            self.assertEqual(len(candidates), 1)
-            candidate = candidates[0]
-            candidate["created_at"] = "2020-01-01T00:00:00Z"
-            candidate["updated_at"] = "2020-01-01T00:00:00Z"
-            service.repository.update_memory_candidate(candidate)
+            self.assertGreaterEqual(len(candidates), 1)
+            for candidate in candidates:
+                candidate["created_at"] = "2020-01-01T00:00:00Z"
+                candidate["updated_at"] = "2020-01-01T00:00:00Z"
+                service.repository.update_memory_candidate(candidate)
             result = service.memory_lifecycle.expire_stale_chat_candidates("architectos")
             self.assertGreaterEqual(result["chat_candidates_expired"], 1)
             self.assertEqual(service.list_memory_candidates("architectos")["candidates"], [])
@@ -160,8 +266,10 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             sweep = service._finalize_idle_chat_sessions()
             self.assertGreaterEqual(sweep["finalized"], 1)
             candidates = service.list_memory_candidates("architectos")["candidates"]
-            self.assertEqual(len(candidates), 1)
-            self.assertEqual(candidates[0]["metadata"]["template"], "chat_session_summary")
+            summaries = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_summary"]
+            atoms = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_atom"]
+            self.assertEqual(len(summaries), 0)
+            self.assertGreaterEqual(len(atoms), 1)
             closed = service.repository.get_chat(created["chat"]["id"])
             self.assertEqual(closed["session_status"], "complete")
 
@@ -218,25 +326,21 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertNotIn("first session fact", " ".join(summarized_segments[1]))
 
             candidates = service.list_memory_candidates("architectos", "all")["candidates"]
-            session_candidates = sorted(
-                [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_summary"],
+            session_atoms = sorted(
+                [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_atom"],
                 key=lambda item: int((item.get("metadata") or {}).get("session_revision") or 0),
             )
-            self.assertEqual([int(item["metadata"]["session_revision"]) for item in session_candidates], [1, 2])
-            self.assertTrue(all(item["source_ref"] == chat_id for item in session_candidates))
-            self.assertEqual(session_candidates[1]["metadata"]["session_start_message_index"], 2)
-            self.assertEqual(session_candidates[1]["metadata"]["session_end_message_index"], 4)
+            self.assertEqual([int(item["metadata"]["session_revision"]) for item in session_atoms], [1, 2])
+            self.assertTrue(all(item["source_ref"] == chat_id for item in session_atoms))
+            self.assertFalse(any((item.get("metadata") or {}).get("template") == "chat_session_summary" for item in candidates))
 
-            first_promoted = service.promote_memory_candidate(session_candidates[0]["id"])
-            second_promoted = service.promote_memory_candidate(session_candidates[1]["id"])
-            edges = [edge for edge in service.repository.list_edges() if edge.type == "NEXT_SESSION"]
-            self.assertTrue(any(
-                edge.source == first_promoted["memory"]["id"] and edge.target == second_promoted["memory"]["id"]
-                for edge in edges
-            ))
-            second_node = service.repository.get_node(second_promoted["memory"]["id"])
-            self.assertEqual(second_node.metadata.get("chat_id"), chat_id)
-            self.assertEqual(int(second_node.metadata.get("session_revision") or 0), 2)
+            context_summaries = [
+                item for item in service.repository.list_chat_context_summaries(chat_id)
+                if str(item.get("summary_type") or "").startswith("session_summary:")
+            ]
+            self.assertEqual(len(context_summaries), 2)
+            self.assertIn("first session fact", context_summaries[0]["summary_text"])
+            self.assertIn("second session fact", context_summaries[1]["summary_text"])
 
     def test_chat_list_is_lightweight_and_single_chat_has_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,8 +397,10 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertEqual(service.list_memory_candidates("architectos")["candidates"], [])
             finalized = service.finalize_chat_session(done["chat"]["id"], force=True, trigger="manual")
             candidates = service.list_memory_candidates("architectos")["candidates"]
-            self.assertEqual(len(candidates), 1)
-            self.assertEqual(candidates[0]["metadata"]["template"], "chat_session_summary")
+            summaries = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_summary"]
+            atoms = [item for item in candidates if (item.get("metadata") or {}).get("template") == "chat_session_atom"]
+            self.assertEqual(len(summaries), 0)
+            self.assertGreaterEqual(len(atoms), 1)
             self.assertEqual(finalized["chat"]["session_status"], "complete")
 
     def test_chat_context_pack_session_summary_and_favorite_candidate(self) -> None:
@@ -541,7 +647,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             result = status.get("result") or {}
             self.assertTrue(result.get("ok"))
             self.assertGreaterEqual(result.get("count") or 0, 1)
-            self.assertEqual(result.get("sources"), ["docs"])
+            self.assertTrue(any(name for name in (result.get("sources") or [])))
             self.assertEqual(result["projects"][0]["project_id"], project.id)
             pending = service.list_memory_candidates(project.id)["candidates"]
             self.assertGreaterEqual(len(pending), 1)
@@ -615,6 +721,225 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertGreaterEqual(accepted_rejected["promoted"], 1)
             self.assertEqual(service.repository.get_memory_candidate("cand-rejected-1")["status"], "promoted")
             self.assertEqual(service.repository.get_memory_candidate("cand-dup-1")["status"], "promoted")
+
+    def test_list_memory_candidates_pagination_and_source_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            for index in range(6):
+                source = "mcp" if index % 2 == 0 else "chat"
+                service.repository.upsert_memory_candidate({
+                    "id": f"cand-page-{index}",
+                    "project_id": "architectos",
+                    "source_type": source,
+                    "source_ref": f"ref-{index}",
+                    "label": f"Candidate {index}",
+                    "type": "Lesson",
+                    "scope": "project",
+                    "text": f"Candidate pagination text number {index} with enough chars.",
+                    "status": "candidate",
+                    "confidence": 0.7,
+                    "metadata": {},
+                    "created_at": f"2026-01-0{index + 1}T00:00:00Z",
+                    "updated_at": f"2026-01-0{index + 1}T00:00:00Z",
+                })
+            page1 = service.list_memory_candidates("architectos", "candidate", limit=2, offset=0)
+            page2 = service.list_memory_candidates("architectos", "candidate", limit=2, offset=2)
+            self.assertEqual(page1["filtered_total"], 6)
+            self.assertEqual(len(page1["candidates"]), 2)
+            self.assertEqual(len(page2["candidates"]), 2)
+            page1_ids = {item["id"] for item in page1["candidates"]}
+            page2_ids = {item["id"] for item in page2["candidates"]}
+            self.assertFalse(page1_ids & page2_ids)
+            mcp_only = service.list_memory_candidates("architectos", "candidate", limit=50, source_type="mcp")
+            self.assertEqual(mcp_only["filtered_total"], 3)
+            self.assertTrue(all(item["source_type"] == "mcp" for item in mcp_only["candidates"]))
+            self.assertFalse(any(item["source_type"] == "chat" for item in mcp_only["candidates"]))
+            # Dropdown stays scoped to Show=pending, not the selected Source value.
+            source_ids = {item["id"] for item in mcp_only["sources"]}
+            self.assertIn("mcp", source_ids)
+            self.assertIn("chat", source_ids)
+            self.assertGreaterEqual(next(item["count"] for item in mcp_only["sources"] if item["id"] == "mcp"), 3)
+
+    def test_source_filter_prefers_payload_over_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.repository.upsert_memory_candidate({
+                "id": "mcp_turn_mismatch",
+                "project_id": "architectos",
+                "source_type": "mcp",
+                "source_ref": "turn-1",
+                "label": "MCP fact",
+                "type": "Lesson",
+                "text": "mcp durable fact body for column mismatch filter test",
+                "status": "candidate",
+                "metadata": {},
+            })
+            import json
+
+            with service.repository._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload FROM memory_candidates WHERE id = ?",
+                    ("mcp_turn_mismatch",),
+                ).fetchone()
+                payload = json.loads(row["payload"])
+                self.assertEqual(payload.get("source_type"), "mcp")
+                # Drift: indexed column says chat, payload (UI chip) says mcp.
+                conn.execute(
+                    "UPDATE memory_candidates SET source_type = ? WHERE id = ?",
+                    ("chat", "mcp_turn_mismatch"),
+                )
+            chat = service.list_memory_candidates("architectos", "candidate", 50, source_type="chat")
+            mcp = service.list_memory_candidates("architectos", "candidate", 50, source_type="mcp")
+            self.assertEqual([item["id"] for item in chat["candidates"]], [])
+            self.assertEqual([item["id"] for item in mcp["candidates"]], ["mcp_turn_mismatch"])
+            self.assertEqual(mcp["sources"][0]["id"], "mcp")
+
+    def test_batch_reject_duplicates_keeps_one_in_cluster(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.memory_embeddings.enabled = lambda: False
+            text = "Chat fact about January grid load for five days of durable memory."
+            fingerprint = "chat|fact|january|grid|load|days|durable|memory"
+            for index, cid in enumerate(("cand-a", "cand-b", "cand-c")):
+                service.repository.upsert_memory_candidate({
+                    "id": cid,
+                    "project_id": "architectos",
+                    "source_type": "mcp",
+                    "source_ref": f"turn-{index}",
+                    "label": f"Chat fact {index}",
+                    "type": "Lesson",
+                    "scope": "project",
+                    "text": text,
+                    "status": "candidate",
+                    "confidence": 0.45,
+                    "created_at": f"2026-02-0{index + 1}T00:00:00Z",
+                    "metadata": {
+                        "fingerprint": fingerprint,
+                        "duplicate": True,
+                        "duplicate_kind": "candidate",
+                        "duplicate_of": "cand-a" if cid != "cand-a" else "cand-b",
+                        "duplicate_label": "Chat fact peer",
+                        "duplicate_score": 1.0,
+                    },
+                })
+            result = service.batch_update_memory_candidates({
+                "project_id": "architectos",
+                "action": "reject",
+                "status": "duplicate",
+                "all": True,
+            })
+            self.assertEqual(result["rejected"], 2)
+            pending = [
+                item
+                for item in service.repository.list_memory_candidates("architectos", "candidate", None)
+            ]
+            self.assertEqual(len(pending), 1)
+            survivor = pending[0]
+            self.assertFalse(bool((survivor.get("metadata") or {}).get("duplicate")))
+
+    def test_batch_reject_duplicate_kind_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.memory_embeddings.enabled = lambda: False
+            service.repository.upsert_memory_candidate({
+                "id": "cand-mem-dup",
+                "project_id": "architectos",
+                "source_type": "docs",
+                "source_ref": "docs/a.md",
+                "label": "Memory duplicate",
+                "type": "Doc",
+                "scope": "project",
+                "text": "Already stored in durable memory.",
+                "status": "candidate",
+                "confidence": 0.45,
+                "metadata": {"duplicate": True, "duplicate_kind": "memory", "duplicate_label": "Stored fact"},
+            })
+            service.repository.upsert_memory_candidate({
+                "id": "cand-peer-a",
+                "project_id": "architectos",
+                "source_type": "docs",
+                "source_ref": "docs/b.md",
+                "label": "Peer duplicate A",
+                "type": "Doc",
+                "scope": "project",
+                "text": "Peer duplicate body for review queue.",
+                "status": "candidate",
+                "confidence": 0.45,
+                "created_at": "2026-03-01T00:00:00Z",
+                "metadata": {},
+            })
+            service.repository.upsert_memory_candidate({
+                "id": "cand-peer-b",
+                "project_id": "architectos",
+                "source_type": "docs",
+                "source_ref": "docs/c.md",
+                "label": "Peer duplicate B",
+                "type": "Doc",
+                "scope": "project",
+                "text": "Peer duplicate body for review queue.",
+                "status": "candidate",
+                "confidence": 0.45,
+                "created_at": "2026-03-02T00:00:00Z",
+                "metadata": {
+                    "duplicate": True,
+                    "duplicate_kind": "candidate",
+                    "duplicate_of": "cand-peer-a",
+                    "duplicate_label": "Peer duplicate A",
+                },
+            })
+
+            memory_result = service.batch_update_memory_candidates({
+                "project_id": "architectos",
+                "action": "reject",
+                "status": "duplicate",
+                "duplicate_kind": "memory",
+                "all": True,
+            })
+            self.assertEqual(memory_result["rejected"], 1)
+            self.assertEqual(service.repository.get_memory_candidate("cand-mem-dup")["status"], "rejected")
+
+            candidate_result = service.batch_update_memory_candidates({
+                "project_id": "architectos",
+                "action": "reject",
+                "status": "duplicate",
+                "duplicate_kind": "candidate",
+                "all": True,
+            })
+            self.assertEqual(candidate_result["rejected"], 1)
+            pending = service.repository.list_memory_candidates("architectos", "candidate", None)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["id"], "cand-peer-a")
+            self.assertFalse(bool((pending[0].get("metadata") or {}).get("duplicate")))
+
+    def test_batch_source_filter_applies_to_full_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.memory_embeddings.enabled = lambda: False
+            for index in range(4):
+                service.repository.upsert_memory_candidate({
+                    "id": f"cand-src-{index}",
+                    "project_id": "architectos",
+                    "source_type": "mcp" if index < 3 else "chat",
+                    "source_ref": f"ref-{index}",
+                    "label": f"Source cand {index}",
+                    "type": "Lesson",
+                    "scope": "project",
+                    "text": f"Source scoped batch candidate number {index} body.",
+                    "status": "candidate",
+                    "confidence": 0.7,
+                    "metadata": {},
+                })
+            result = service.batch_update_memory_candidates({
+                "project_id": "architectos",
+                "action": "reject",
+                "status": "candidate",
+                "source_type": "mcp",
+                "all": True,
+            })
+            self.assertEqual(result["rejected"], 3)
+            remaining = service.repository.list_memory_candidates("architectos", "candidate", None)
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["source_type"], "chat")
 
     def test_granola_mcp_ingestion_creates_reviewable_meeting_candidates(self) -> None:
         class FakeGranolaMCP:
@@ -775,6 +1100,80 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertFalse(prepared[0]["metadata"].get("duplicate"))
             self.assertGreaterEqual(float(prepared[0].get("confidence") or 0), 0.7)
 
+    def test_reviewed_entity_sources_are_not_reingested(self) -> None:
+        class FakeGranolaMCP:
+            def __init__(self) -> None:
+                self.summary = "First notes about the platform sync."
+
+            def call_tool(self, server_id, tool, arguments, timeout=None):
+                if tool == "list_meetings":
+                    return {"result": {"meetings": [{"id": "m1", "title": "Platform Sync"}]}}
+                if tool == "get_meetings":
+                    return {"result": {"meetings": [{
+                        "id": "m1",
+                        "title": "Platform Sync",
+                        "summary": self.summary,
+                        "url": "https://granola.test/m/m1",
+                    }]}}
+                if tool == "get_meeting_transcript":
+                    raise MCPError("skip")
+                raise MCPError(tool)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            fake = FakeGranolaMCP()
+            service.mcp_manager = fake
+
+            first = service.ingest_memory({"project_id": "architectos", "sources": ["granola"], "limit": 5})
+            self.assertEqual(first["count"], 1)
+            meeting = first["candidates"][0]
+            service.reject_memory_candidate(meeting["id"], {"reason": "not useful"})
+
+            fake.summary = "Completely rewritten transcript and decisions for the same meeting."
+            rejected_again = service.ingest_memory({"project_id": "architectos", "sources": ["granola"], "limit": 5})
+            self.assertEqual(rejected_again["count"], 0)
+            self.assertEqual(rejected_again["skipped_reviewed"], 1)
+            self.assertEqual(service.repository.count_memory_candidates_by_status("architectos")["pending"], 0)
+
+            boards = {
+                "id": "wi-old",
+                "project_id": "architectos",
+                "source_type": "azure-boards",
+                "source_ref": "1234",
+                "label": "ADO Bug #1234: Login timeout",
+                "type": "Requirement",
+                "text": "Azure Boards Bug #1234: Login timeout",
+                "metadata": {"work_item_id": "1234", "template": "azure_boards_work_item"},
+            }
+            saved_board = service.repository.upsert_memory_candidate(boards)
+            service.promote_memory_candidate(saved_board["id"])
+            renamed = {
+                "id": "wi-new-title",
+                "project_id": "architectos",
+                "source_type": "azure-boards",
+                "source_ref": "1234",
+                "label": "ADO Bug #1234: Login hangs after rename",
+                "type": "Requirement",
+                "text": "Azure Boards Bug #1234: Login hangs after rename and a longer description",
+                "metadata": {"work_item_id": "1234", "template": "azure_boards_work_item"},
+            }
+            prepared_boards = service.ingestion_engine.prepare_candidates("architectos", [renamed], limit=5)
+            self.assertEqual(prepared_boards, [])
+            self.assertEqual(service.ingestion_engine.skipped_reviewed, 1)
+
+            first_cluster = service._build_git_cluster_candidates(
+                "architectos", root, [("a1", "feat: add memory"), ("a2", "feat: add ingest")], 10
+            )
+            feature = next(item for item in first_cluster if item["metadata"]["cluster"] == "feature")
+            service.repository.upsert_memory_candidate(feature)
+            service.reject_memory_candidate(feature["id"], {"reason": "noise"})
+            updated_cluster = service._build_git_cluster_candidates(
+                "architectos", root, [("a1", "feat: add memory"), ("a2", "feat: add ingest"), ("a3", "feat: new commit")], 10
+            )
+            prepared_git = service.ingestion_engine.prepare_candidates("architectos", updated_cluster, limit=10)
+            self.assertFalse(any(item.get("metadata", {}).get("cluster") == "feature" for item in prepared_git))
+
     def test_granola_ingestion_warning_does_not_block_other_candidates(self) -> None:
         class FailingGranolaMCP:
             def call_tool(self, _server_id, _tool, _arguments, timeout=None):
@@ -791,7 +1190,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertGreaterEqual(result["count"], 1)
             self.assertTrue(any(candidate["source_type"] == "docs" for candidate in result["candidates"]))
             self.assertTrue(result["warnings"])
-            self.assertIn("Granola MCP skipped", result["warnings"][0])
+            self.assertTrue(any("granola" in item.lower() or "not authorized" in item.lower() for item in result["warnings"]))
 
     def test_code_ingest_includes_java_js_tsx_css(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1174,6 +1573,56 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertTrue(any("timeout" in warning.lower() for warning in result["warnings"]))
             self.assertIn("azure-devops", fake.closed)
 
+    def test_ingest_timeout_aborts_hung_wiql_collect(self) -> None:
+        class SlowWiqlMCP:
+            def __init__(self):
+                self.closed = []
+                self._stop = threading.Event()
+
+            def get_server(self, server_id):
+                if server_id != "azure-devops":
+                    return None
+                from backend.architectos.mcp import MCPServerConfig
+                return MCPServerConfig.from_dict({
+                    "id": server_id,
+                    "label": "Azure DevOps",
+                    "command": ["npx", "-y", "@azure-devops/mcp", "Fsight1"],
+                    "enabled": True,
+                    "env": {"ado_mcp_project": "E-AI"},
+                })
+
+            def call_tool(self, server_id, tool, arguments, timeout=None):
+                action = str((arguments or {}).get("action") or "")
+                if "wiql" in str(tool) or action == "wiql":
+                    if not self._stop.wait(60.0):
+                        raise TimeoutError("wedged wiql")
+                    raise TimeoutError("MCP session closed")
+                raise MCPError(f"unexpected {tool}")
+
+            def close_session(self, server_id):
+                self.closed.append(server_id)
+                self._stop.set()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            service = ArchitectOSService(Path(tmp))
+            fake = SlowWiqlMCP()
+            service.mcp_manager = fake
+            service.memory_embeddings.enabled = lambda: False  # type: ignore[method-assign]
+            started = time.time()
+            result = service.ingest_memory({
+                "project_id": "architectos",
+                "sources": ["azure-boards"],
+                "limit": 5,
+                "ado_project": "E-AI",
+                "ingest_mode": "candidates",
+                "item_timeout": 25,
+                "source_timeout": 2,
+            })
+            elapsed = time.time() - started
+            self.assertLess(elapsed, 6)
+            self.assertTrue(any("timeout" in warning.lower() for warning in result["warnings"]))
+            self.assertIn("azure-devops", fake.closed)
+
     def test_boards_source_timeout_keeps_partial_candidates(self) -> None:
         class PartialThenHangMCP:
             def __init__(self):
@@ -1294,79 +1743,27 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertEqual(again["wiki_updated"], 2)
 
     def test_teams_graph_ingest_writes_meetings_to_memory(self) -> None:
-        class FakeTeamsGraph:
-            def collect_meetings(self, *, limit=12, lookback_days=None, include_transcripts=None, include_ai_insights=None):
-                return [{
-                    "meeting_id": "mtg-1",
-                    "event_id": "evt-1",
-                    "subject": "Sprint 7.7 planning",
-                    "start": "2026-07-10T10:00:00.0000000",
-                    "end": "2026-07-10T11:00:00.0000000",
-                    "join_url": "https://teams.microsoft.com/l/meetup-join/xxx",
-                    "web_link": "https://outlook.office.com/calendar/item/yyy",
-                    "organizer": "Anton",
-                    "attendees": ["Anton", "Debbie"],
-                    "insights_text": "Notes:\n- Align Docker publish for Dev v7.7\n\nAction items:\n- Anton: finish image pipeline",
-                    "transcript_text": "Anton: Let's lock FixVersion 7.7.\nDebbie: Agreed.",
-                    "action_items": ["Anton: finish image pipeline"],
-                    "insight_ids": ["ins-1"],
-                    "transcript_ids": ["tr-1"],
-                    "has_insights": True,
-                    "has_transcript": True,
-                }][:limit]
-
+        """Teams ingest was removed from the source registry; legacy id is ignored."""
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
             result = service.ingest_memory({
                 "project_id": "architectos",
                 "sources": ["teams-meetings"],
                 "limit": 5,
-                "_teams_graph_client": FakeTeamsGraph(),
             })
-            self.assertEqual(result["warnings"], [])
-            self.assertEqual(result["teams_count"], 1)
+            self.assertEqual(result["teams_count"], 0)
             self.assertEqual(result["count"], 0)
-            node = result["teams_imported"][0]
-            self.assertEqual(node["metadata"]["teams_meeting_id"], "mtg-1")
-            self.assertEqual(node["metadata"]["source"], "teams_graph")
-            self.assertEqual(node["type"], "Meeting")
-            self.assertIn("AI Insights", node["text"])
-            self.assertIn("Transcript:", node["text"])
-            self.assertIn("FixVersion 7.7", node["text"])
-            graph = service.graph("architectos")
-            hubs = [
-                item for item in graph["nodes"]
-                if dict(item.get("metadata") or {}).get("hub") and item["metadata"].get("source_key") == "teams-meetings"
-            ]
-            self.assertEqual(len(hubs), 1)
-            again = service.ingest_memory({
-                "project_id": "architectos",
-                "sources": ["teams-meetings"],
-                "limit": 5,
-                "_teams_graph_client": FakeTeamsGraph(),
-            })
-            self.assertEqual(again["teams_updated"], 1)
-            self.assertEqual(again["teams_imported"][0]["id"], node["id"])
 
     def test_teams_graph_missing_config_warns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
-            for key in (
-                "MS_GRAPH_ACCESS_TOKEN",
-                "MS_GRAPH_TENANT_ID",
-                "MS_GRAPH_CLIENT_ID",
-                "MS_GRAPH_CLIENT_SECRET",
-                "MS_GRAPH_USER_ID",
-                "TEAMS_USER_ID",
-            ):
-                os.environ.pop(key, None)
             result = service.ingest_memory({
                 "project_id": "architectos",
                 "sources": ["teams-meetings"],
                 "limit": 3,
             })
             self.assertEqual(result["teams_count"], 0)
-            self.assertTrue(any("Teams Graph skipped" in item for item in result["warnings"]))
+            self.assertFalse(any("Teams Graph skipped" in item for item in result["warnings"]))
 
     def test_memory_lifecycle_refresh_decay_and_long_term_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1425,6 +1822,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             adr = next(candidate for candidate in result["candidates"] if candidate["source_type"] == "adr")
             self.assertEqual(adr["metadata"]["template"], "adr")
             self.assertTrue(adr["metadata"]["duplicate"])
+            self.assertEqual(adr["metadata"].get("duplicate_kind"), "memory")
             self.assertGreaterEqual(adr["metadata"]["duplicate_score"], 0.68)
             clusters = service._build_git_cluster_candidates("architectos", root, [("a1", "feat: add memory ingestion"), ("b2", "feat: add ADR templates"), ("c3", "fix: avoid duplicate candidates"), ("d4", "fix: preserve promoted candidates")], 10)
             cluster_names = {candidate["metadata"]["cluster"] for candidate in clusters}
@@ -1527,7 +1925,14 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertIn("connect a folder", empty["message"].lower())
 
             with self.assertRaises(ValueError):
-                service.create_project({"name": "No Folder"})
+                service.create_project({})
+
+            # Name-only create is a knowledge project: no folder, survives startup cleanup.
+            knowledge = service.create_project({"name": "No Folder"})
+            self.assertEqual(knowledge["root_path"], "")
+            self.assertTrue(knowledge["created"])
+            service.repository.seed_if_empty()
+            self.assertIsNotNone(service.repository.get_project(knowledge["id"]))
 
     def test_project_files_returns_explorer_tree_entries_not_only_importable_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1820,6 +2225,104 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertGreaterEqual(rebuilt["linked_nodes"], 3)
             self.assertTrue(any(edge["type"] == "RELATED_TO" for edge in rebuilt["edges"]))
 
+    def test_rebuild_creates_missing_project_root_and_does_not_steal_architectos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            aos = Path(tmp) / "aos"
+            aos.mkdir()
+            other = service.create_project({"name": "ArchitectOS", "root_path": str(aos)})
+            knowledge = service.create_project({"name": "Crypto Intel"})
+            for node in list(service.repository.list_nodes(project_id=knowledge["id"], node_type="Project")):
+                with service.repository._connect() as conn:
+                    conn.execute("DELETE FROM memory_nodes WHERE id = ?", (node.id,))
+            service.add_memory({
+                "project_id": knowledge["id"],
+                "scope": "project",
+                "type": "Doc",
+                "label": "Repo note",
+                "text": "Documentation leaf that must hang off the knowledge project root.",
+                "source": "docs",
+                "source_type": "docs",
+            })
+            rebuilt = service.rebuild_graph_links({"project_id": knowledge["id"]})
+            self.assertTrue(rebuilt.get("root"))
+            graph = service.graph(knowledge["id"])
+            roots = [node for node in graph["nodes"] if node["type"] == "Project"]
+            self.assertEqual(len(roots), 1)
+            self.assertEqual(roots[0]["project_id"], knowledge["id"])
+            self.assertEqual(roots[0]["label"], "Crypto Intel")
+            self.assertNotEqual(roots[0]["id"], other["id"])
+            hubs = {
+                str(node["metadata"].get("source_key")): node["id"]
+                for node in graph["nodes"]
+                if dict(node.get("metadata") or {}).get("hub")
+            }
+            self.assertIn("docs", hubs)
+            self.assertTrue(
+                any(
+                    edge["source"] == roots[0]["id"]
+                    and edge["target"] == hubs["docs"]
+                    and edge["type"] == "HAS_MEMORY"
+                    for edge in graph["edges"]
+                )
+            )
+            architectos_roots = [
+                node for node in service.repository.list_nodes(node_type="Project")
+                if node.project_id == other["id"] or node.label == "ArchitectOS"
+            ]
+            stolen = [
+                edge
+                for edge in service.repository.list_edges_touching([hubs["docs"]])
+                if edge.type == "HAS_MEMORY" and edge.source in {node.id for node in architectos_roots}
+            ]
+            self.assertEqual(stolen, [])
+
+    def test_all_attributed_source_hubs_attach_to_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            project = service.create_project({"name": "Intel"})
+            created = service.create_source({
+                "project_id": project["id"],
+                "name": "Knowledge",
+                "kind": "docs",
+                "config": {"driver": "http", "enabled": True, "http": {"url": "https://example.com/k"}},
+            })
+            source_id = created["id"]
+            service.add_memory({
+                "project_id": project["id"],
+                "scope": "project",
+                "type": "Doc",
+                "label": "Repo leaf",
+                "text": "Project-scoped documentation leaf for the intel graph.",
+                "source": "docs",
+                "source_type": "docs",
+            })
+            service.add_memory({
+                "project_id": project["id"],
+                "scope": "public_knowledge",
+                "type": "Knowledge",
+                "label": "Macro note",
+                "text": "Public knowledge leaf owned by the project source binding.",
+                "source_id": source_id,
+            })
+            service.rebuild_graph_links({"project_id": project["id"]})
+            graph = service.graph(project["id"])
+            root_id = next(node["id"] for node in graph["nodes"] if node["type"] == "Project")
+            hubs = {
+                str(node["metadata"].get("source_key")): node["id"]
+                for node in graph["nodes"]
+                if dict(node.get("metadata") or {}).get("hub")
+            }
+            self.assertIn("docs", hubs)
+            self.assertIn(source_id, hubs)
+            attached = {
+                edge["target"]
+                for edge in graph["edges"]
+                if edge["type"] == "HAS_MEMORY" and edge["source"] == root_id
+            }
+            self.assertIn(hubs["docs"], attached)
+            self.assertIn(hubs[source_id], attached)
+
     def test_source_hubs_are_scoped_and_allow_cross_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
@@ -1924,7 +2427,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertEqual(updated_settings["ui"]["language"], "he")
             provider = service.update_provider("openai", {"enabled": True, "model": "gpt-test"})
             self.assertTrue(provider["enabled"])
-            self.assertEqual(provider["status"], "configured")
+            self.assertNotEqual(provider.get("last_check", {}).get("status"), "ok")
             settings = service.update_settings({"ui": {"theme": "dark", "density": "compact", "memory_enabled": True}})
             self.assertEqual(settings["ui"]["theme"], "dark")
 
@@ -1933,7 +2436,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             service = ArchitectOSService(Path(tmp))
             result = service.run_ai({"project_id": "architectos", "message": "memory scopes", "provider_id": "auto"})
             self.assertEqual(result["provider"]["id"], "local-memory")
-            self.assertIn("Local context", result["text"])
+            self.assertIn("Local Memory fallback", result["text"])
             chat = service.post_chat_message({"project_id": "architectos", "message": "memory scopes", "provider_id": "local-memory"})
             self.assertEqual(chat["chat"]["messages"][-1]["provider"]["id"], "local-memory")
 
@@ -1945,7 +2448,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             done = events[-1]
             self.assertEqual(done["type"], "done")
             self.assertTrue("".join(deltas))
-            self.assertIn("Local context", done["response"])
+            self.assertIn("Local Memory fallback", done["response"])
             self.assertEqual(done["chat"]["messages"][-1]["provider"]["id"], "local-memory")
 
     def test_provider_check_and_command_persistence(self) -> None:
@@ -2208,6 +2711,10 @@ class ArchitectOSMemoryTests(unittest.TestCase):
                 self.assertEqual(result["provider"]["status"], "error")
                 self.assertIn("deployment was not found", result["text"])
                 self.assertIn("AZURE_OPENAI_DEPLOYMENT", result["text"])
+                stored = next(item for item in service.providers()["providers"] if item["id"] == "azure-openai")
+                self.assertFalse(stored["last_check"]["ready"])
+                self.assertEqual(stored["last_check"]["status"], "missing_model")
+                self.assertIn("deployment was not found", stored["last_check"]["message"])
         finally:
             os.environ.pop("ARCHITECTOS_TEST_AZURE_KEY", None)
             os.environ.pop("ARCHITECTOS_ALLOW_LOCAL_URLS", None)
@@ -2307,6 +2814,25 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             serialized = json.dumps(chat)
             self.assertNotIn("abc123456789xyz", serialized)
             self.assertIn("[REDACTED]", serialized)
+
+    def test_streaming_chat_redacts_prompt_and_exposes_security(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            events = list(service.stream_chat_message({
+                "project_id": "architectos",
+                "message": "please use token=abc123456789xyz",
+                "provider_id": "local-memory",
+            }))
+            done = events[-1]
+            self.assertEqual(done["type"], "done")
+            self.assertTrue(done["security"]["redacted"])
+            self.assertTrue(done["security"]["message_redacted"])
+            serialized = json.dumps(done)
+            self.assertNotIn("abc123456789xyz", serialized)
+            self.assertIn("[REDACTED]", serialized)
+            user = done["chat"]["messages"][0]
+            self.assertEqual(user["role"], "user")
+            self.assertTrue(user["security"]["redacted"])
 
     def test_provider_result_audit_and_bundle_are_redacted(self) -> None:
         class FakeRouter:

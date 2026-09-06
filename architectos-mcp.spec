@@ -11,12 +11,24 @@ from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH)
 hiddenimports = collect_submodules("architectos")
+datas = []
+binaries = []
+try:
+    import sqlite_vec
+    from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+
+    hiddenimports.append("sqlite_vec")
+    datas += collect_data_files("sqlite_vec")
+    binaries += collect_dynamic_libs("sqlite_vec")
+    del sqlite_vec
+except Exception:
+    pass
 
 a = Analysis(
     [str(ROOT / "mcp_memory_server.py")],
     pathex=[str(ROOT / "backend")],
-    binaries=[],
-    datas=[],
+    binaries=binaries,
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

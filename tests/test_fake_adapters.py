@@ -80,7 +80,7 @@ class ProviderRouterFakeAdapterTests(unittest.TestCase):
             result = router.route([], request, "auto")
             self.assertEqual(result["provider_id"], "local-memory")
             self.assertEqual(result["selected_provider"]["id"], "local-memory")
-            self.assertIn("Local context", result["text"])
+            self.assertIn("Local Memory", result["text"])
 
     def test_router_falls_back_when_auto_selected_provider_fails(self) -> None:
         class FailingProviderAdapter(ProviderAdapter):
@@ -101,14 +101,14 @@ class ProviderRouterFakeAdapterTests(unittest.TestCase):
             ]
             request = ProviderRequest(message="hello", context="- [Lesson] Test: fallback", project_id="architectos")
             result = router.route(providers, request, "auto")
-            self.assertEqual(result["provider_id"], "local-memory")
-            self.assertEqual(result["routing"]["mode"], "fallback")
-            self.assertEqual(result["routing"]["fallback_from"], "anthropic")
+            self.assertEqual(result["provider_id"], "anthropic")
+            self.assertEqual(result["status"], "error")
+            self.assertIn("forced failure", result["text"])
 
             events = list(router.stream(providers, request, "auto"))
             self.assertEqual(events[0]["type"], "start")
-            self.assertEqual(events[-1]["result"]["provider_id"], "local-memory")
-            self.assertEqual(events[-1]["result"]["routing"]["mode"], "fallback")
+            self.assertEqual(events[-1]["result"]["provider_id"], "anthropic")
+            self.assertEqual(events[-1]["result"]["status"], "error")
 
 
 if __name__ == "__main__":

@@ -35,8 +35,10 @@ from .embedding_providers import (
     default_memory_retrieval_settings,
     embedding_provider_catalog,
     local_embeddings_available,
+    probe_embedding_provider,
 )
 from .models import MemoryNode
+from .vecsql import sqlite_vec_status
 
 # Keep provider symbols importable from ``embeddings`` after the split.
 __all__ = [
@@ -72,6 +74,7 @@ __all__ = [
     "local_embeddings_available",
     "node_embedding_text",
     "pack_vector",
+    "probe_embedding_provider",
     "tokens",
     "unpack_vector",
 ]
@@ -260,6 +263,8 @@ class MemoryEmbeddingEngine:
             "dimensions": dims,
             "enabled": self.enabled(),
             "numpy": bool(np is not None),
+            "vector_backend": getattr(self.repository, "vector_backend", lambda: "python")(),
+            "sqlite_vec": sqlite_vec_status(),
         }
 
     def status(self, project_id: str | None = None) -> dict[str, Any]:
@@ -275,6 +280,12 @@ class MemoryEmbeddingEngine:
             "settings": settings,
             "coverage": coverage,
             "catalog": embedding_provider_catalog(),
+            "last_check": settings.get("embedding_last_check") or {},
+            "requested_provider": str(settings.get("embedding_provider") or "auto"),
+            "connection": {
+                "account_id": str(settings.get("embedding_account_id") or os.environ.get("CLOUDFLARE_ACCOUNT_ID") or os.environ.get("CF_ACCOUNT_ID") or "").strip(),
+                "base_url": str(settings.get("embedding_base_url") or "").strip(),
+            },
             "env": {
                 "cloudflare_token": bool(_env_api_key("CLOUDFLARE_API_TOKEN", "CF_API_TOKEN")),
                 "cloudflare_account": bool(str(os.environ.get("CLOUDFLARE_ACCOUNT_ID") or os.environ.get("CF_ACCOUNT_ID") or "").strip()),
@@ -459,6 +470,16 @@ class MemoryEmbeddingEngine:
         dims = len(query_vector)
         if dims <= 0:
             return []
+        repo_search = getattr(self.repository, "search_memory_vectors_scored", None)
+        uses_sqlite_vec = callable(getattr(self.repository, "vector_backend", None)) and self.repository.vector_backend() == "sqlite-vec"
+        if uses_sqlite_vec and callable(repo_search):
+            return repo_search(
+                query_vector,
+                project_id=project_id,
+                scope=scope,
+                limit=limit,
+                min_score=threshold,
+            )
         index = self._load_vector_cache()
         if not len(index) or index.dims != dims:
             return []

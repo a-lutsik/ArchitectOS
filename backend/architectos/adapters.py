@@ -70,6 +70,29 @@ __all__ = [
 ]
 
 
+def _azure_model_ids(payload: Any) -> list[str]:
+    rows = []
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(payload.get("models"), list):
+            rows = payload["models"]
+    elif isinstance(payload, list):
+        rows = payload
+    ids: list[str] = []
+    for item in rows:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            name = str(item.get("id") or item.get("name") or item.get("deployment") or "").strip()
+        else:
+            name = ""
+        if name and name not in ids:
+            ids.append(name)
+    return ids
+
+
 def _provider_urlopen(provider: dict[str, Any], req: urllib.request.Request, *, timeout: float | int):
     """urlopen with redirect policy matching the provider's allow_local setting.
 
@@ -127,8 +150,8 @@ class OpenAIResponsesAdapter(ProviderAdapter):
                 "ready": False,
                 "status": "missing_credentials",
                 "message": f"{api_key_env} is not set.",
-                "hint": f"Set {api_key_env} in the environment before starting ArchitectOS.",
-                "actions": [f"Set {api_key_env}", "Restart ArchitectOS", "Run provider test again"],
+                "hint": f"Paste {api_key_env} in Setup → Providers, then Test.",
+                "actions": [f"Set {api_key_env} in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model},
             }
         return {
@@ -243,8 +266,9 @@ class AzureOpenAIResponsesAdapter(OpenAIResponsesAdapter):
     provider_id = "azure-openai"
     service_name = "Azure OpenAI"
     default_api_key_env = "AZURE_OPENAI_API_KEY"
-    default_model = "gpt-4.1-mini"
+    default_model = ""
     default_endpoint = ""
+    probe_timeout_seconds = 5
 
     def _responses_endpoint(self, provider: dict[str, Any]) -> str:
         base_url = str(provider.get("base_url") or os.environ.get("AZURE_OPENAI_ENDPOINT") or "").rstrip("/")
@@ -258,11 +282,26 @@ class AzureOpenAIResponsesAdapter(OpenAIResponsesAdapter):
     def _request_headers(self, api_key: str) -> dict[str, str]:
         return {"api-key": api_key, "Content-Type": "application/json"}
 
+    def _model(self, provider: dict[str, Any]) -> str:
+        configured = str(provider.get("model") or "").strip()
+        if configured:
+            return configured
+        return str(os.environ.get("AZURE_OPENAI_DEPLOYMENT") or self.default_model or "").strip()
+
+    def _models_endpoint(self, provider: dict[str, Any]) -> str:
+        responses = self._responses_endpoint(provider)
+        if not responses:
+            return ""
+        if responses.endswith("/responses"):
+            return responses[: -len("/responses")] + "/models"
+        return responses.rstrip("/") + "/models"
+
     def _http_error_text(self, code: int, body: str) -> str:
-        if "DeploymentNotFound" in body:
+        if "DeploymentNotFound" in body or (code == 404 and "deployment" in body.lower()):
             return (
                 f"Azure OpenAI HTTP {code}: deployment was not found. "
-                "Set the provider Model field to the Azure deployment name, or set AZURE_OPENAI_DEPLOYMENT in .env, then Connect Env again."
+                "Set the provider Model field to the Azure deployment name (not the OpenAI model id), "
+                "or set the deployment name in Setup → Providers, then Test."
             )
         return super()._http_error_text(code, body)
 
@@ -276,8 +315,8 @@ class AzureOpenAIResponsesAdapter(OpenAIResponsesAdapter):
                 "ready": False,
                 "status": "missing_credentials",
                 "message": f"{api_key_env} is not set.",
-                "hint": f"Set {api_key_env} in the environment before starting ArchitectOS.",
-                "actions": [f"Set {api_key_env}", "Restart ArchitectOS", "Run provider test again"],
+                "hint": f"Paste {api_key_env} in Setup → Providers, then Test.",
+                "actions": [f"Set {api_key_env} in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint},
             }
         if not endpoint:
@@ -286,19 +325,109 @@ class AzureOpenAIResponsesAdapter(OpenAIResponsesAdapter):
                 "ready": False,
                 "status": "missing_endpoint",
                 "message": "AZURE_OPENAI_ENDPOINT is not set.",
-                "hint": "Set AZURE_OPENAI_ENDPOINT to your Azure OpenAI /openai/v1 endpoint.",
-                "actions": ["Set AZURE_OPENAI_ENDPOINT", "Restart ArchitectOS", "Run provider test again"],
+                "hint": "Paste the Azure endpoint in Setup → Providers, then Test.",
+                "actions": ["Set AZURE_OPENAI_ENDPOINT in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint},
+            }
+        if not model:
+            return {
+                "provider_id": self.provider_id,
+                "ready": False,
+                "status": "missing_model",
+                "message": "Azure deployment name is not set.",
+                "hint": "Set the deployment name in Setup → Providers (Azure deployment, not the OpenAI model id).",
+                "actions": ["Set Model to the Azure deployment name", "Set AZURE_OPENAI_DEPLOYMENT", "Run provider test again"],
+                "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint},
+            }
+        return self._probe_deployment(provider, api_key_env, model, endpoint)
+
+    def _probe_deployment(self, provider: dict[str, Any], api_key_env: str, model: str, endpoint: str) -> dict[str, Any]:
+        models_url = self._models_endpoint(provider)
+        api_key = os.environ.get(api_key_env) or ""
+        req = urllib.request.Request(models_url, headers=self._request_headers(api_key), method="GET")
+        timeout = min(self.probe_timeout_seconds, int(provider.get("timeout_seconds") or self.probe_timeout_seconds))
+        try:
+            with _provider_urlopen(provider, req, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            text = self._http_error_text(exc.code, body)
+            if exc.code in {401, 403}:
+                status = "missing_credentials"
+                hint = f"Check {api_key_env} and reconnect from env."
+            elif exc.code == 404 or "DeploymentNotFound" in body:
+                status = "missing_model"
+                hint = "Set Model to the Azure deployment name, then Test again."
+            else:
+                status = "error"
+                hint = "Fix the Azure endpoint or deployment name, then Test again."
+            return {
+                "provider_id": self.provider_id,
+                "ready": False,
+                "status": status,
+                "message": text,
+                "hint": hint,
+                "actions": ["Set Model to the Azure deployment name", "Run provider test again"],
+                "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint, "probe": models_url, "http_status": exc.code},
+            }
+        except OSError as exc:
+            return {
+                "provider_id": self.provider_id,
+                "ready": False,
+                "status": "unreachable",
+                "message": f"Azure OpenAI is not reachable at {endpoint}: {exc}",
+                "hint": "Check AZURE_OPENAI_ENDPOINT and network access, then Test again.",
+                "actions": ["Verify AZURE_OPENAI_ENDPOINT", "Run provider test again"],
+                "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint, "probe": models_url},
+            }
+        ids = _azure_model_ids(data)
+        if ids and model not in ids:
+            return {
+                "provider_id": self.provider_id,
+                "ready": False,
+                "status": "missing_model",
+                "message": (
+                    f"Azure deployment {model} was not found. "
+                    "Set the provider Model field to the Azure deployment name (not the OpenAI model id)."
+                ),
+                "hint": "Use the deployment name from Azure AI Studio / Foundry, then Test again.",
+                "actions": ["Set Model to the Azure deployment name", "Run provider test again"],
+                "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint, "deployments": ids[:20]},
             }
         return {
             "provider_id": self.provider_id,
             "ready": True,
             "status": "configured",
-            "message": f"{api_key_env} and AZURE_OPENAI_ENDPOINT are available for model/deployment {model}.",
-            "hint": "Credentials are present. If execution fails, set Model to the Azure deployment name.",
-            "actions": ["Send a short chat prompt", "Check Azure deployment/model name if execution fails"],
-            "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint},
+            "message": f"{api_key_env} and AZURE_OPENAI_ENDPOINT accepted deployment {model}.",
+            "hint": "Azure OpenAI probe succeeded. Ask will use this deployment name as the model id.",
+            "actions": ["Send a short chat prompt"],
+            "details": {"api_key_env": api_key_env, "model": model, "base_url": endpoint, "deployments": ids[:20]},
         }
+
+    def _missing_deployment_result(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "status": "error",
+            "text": (
+                "Azure deployment name is not set. "
+                "Set the provider Model field to the Azure deployment name (not the OpenAI model id), "
+                "or set the deployment name in Setup → Providers, then Test."
+            ),
+            "raw": None,
+        }
+
+    def run(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> dict[str, Any]:
+        if not self._model(provider):
+            return self._missing_deployment_result()
+        return super().run(provider, request, project_root)
+
+    def stream(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> Iterator[dict[str, Any]]:
+        if not self._model(provider):
+            result = self._missing_deployment_result()
+            yield {"type": "delta", "text": result["text"]}
+            yield {"type": "done", "result": result}
+            return
+        yield from super().stream(provider, request, project_root)
 
 
 class AnthropicMessagesAdapter(ProviderAdapter):
@@ -322,8 +451,8 @@ class AnthropicMessagesAdapter(ProviderAdapter):
                 "ready": False,
                 "status": "missing_credentials",
                 "message": f"{api_key_env} is not set.",
-                "hint": f"Set {api_key_env} before starting ArchitectOS.",
-                "actions": [f"Set {api_key_env}", "Restart ArchitectOS", "Run provider test again"],
+                "hint": f"Paste {api_key_env} in Setup → Providers, then Test.",
+                "actions": [f"Set {api_key_env} in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model},
             }
         return {
@@ -470,8 +599,8 @@ class OpenRouterAdapter(ProviderAdapter):
                 "ready": False,
                 "status": "missing_credentials",
                 "message": f"{api_key_env} is not set.",
-                "hint": f"Set {api_key_env} before starting ArchitectOS.",
-                "actions": [f"Set {api_key_env}", "Restart ArchitectOS", "Run provider test again"],
+                "hint": f"Paste {api_key_env} in Setup → Providers, then Test.",
+                "actions": [f"Set {api_key_env} in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model},
             }
         return {
@@ -935,10 +1064,13 @@ class ProviderRouter:
 
         explicit = plan["decision"].get("mode") == "explicit"
         skipped_for_approval = False
+        attempted_non_local = False
         if initial_id:
             tried.add(initial_id)
             if explicit or not self._needs_cli_approval(initial_provider, approved):
                 yield initial_provider, plan["decision"]
+                if initial_id != "local-memory":
+                    attempted_non_local = True
             else:
                 skipped_for_approval = True
 
@@ -949,6 +1081,9 @@ class ProviderRouter:
         for item in ranked:
             candidate_id = str(item.get("provider_id") or "")
             if not candidate_id or candidate_id in tried:
+                continue
+            if candidate_id == "local-memory" and attempted_non_local:
+                # Do not swallow Azure/OpenAI errors with a canned Local Memory success.
                 continue
             if not item.get("enabled") or float(item.get("availability") or 0) <= 0:
                 continue
@@ -964,8 +1099,10 @@ class ProviderRouter:
             else:
                 reason = f"Falling back to {label} after {initial_id or 'previous provider'} failed."
             yield provider, build_decision(provider, "fallback", reason, initial_id or None)
+            if candidate_id != "local-memory":
+                attempted_non_local = True
 
-        if "local-memory" not in tried:
+        if "local-memory" not in tried and not attempted_non_local:
             fallback = by_id.get("local-memory") or {
                 "id": "local-memory",
                 "label": "Local Memory",

@@ -4,7 +4,9 @@ import {
   stopAgentActivityTimer, updateAgentActivity, updateCouncilActivity,
 } from "./agent-activity.js";
 import { api, authHeaders, readSseEvents } from "./api-client.js";
-import { autoGrowChatInput, closeChatMenu, renderAttachments, switchView, syncAskMode } from "./ask-ui.js";
+import { confirmAskSend, setAskSecurityStatus, setBubbleSecurity } from "./ask-security.js";
+import { showAppPermission } from "./app-dialog.js";
+import { autoGrowChatInput, closeChatMenu, placeAskQuestionCards, renderAttachments, switchView, syncAskMode } from "./ask-ui.js";
 import { escapeHtml, setElementDisabled, showSnackbar } from "./dom-utils.js";
 import { loadMemoryCandidates } from "./memory-panel.js";
 import { loadProviderRuns } from "./providers.js";
@@ -20,18 +22,21 @@ async function loadChats(options = {}) {
   list.innerHTML = "";
   for (const chat of payload.chats) {
     const el = document.createElement("article");
-    el.className = "result";
+    el.className = "ask-history-item";
+    el.dataset.chatId = chat.id;
+    if (chat.id === state.chatId) el.classList.add("is-active");
     const keeper = chat.keeper_status || {};
     const rolling = (chat.context_summaries || []).find(item => item.summary_type === "rolling") || {};
     const statusLabel = chat.session_status === "complete"
-      ? "session complete"
+      ? "complete"
       : (keeper.status || "");
-    const status = statusLabel ? `<span class="badge">${escapeHtml(statusLabel)}</span>` : "";
-    const summary = rolling.summary_text ? `<p class="chat-summary-preview">${escapeHtml(String(rolling.summary_text).split("\n").slice(-1)[0] || "")}</p>` : "";
+    const preview = rolling.summary_text
+      ? escapeHtml(String(rolling.summary_text).split("\n").slice(-1)[0] || "")
+      : `${Number(chat.message_count || 0)} messages`;
     const finalizeBtn = chat.session_status === "complete"
-      ? `<button type="button" data-chat-finalize="${escapeHtml(chat.id)}">Re-summarize</button>`
-      : `<button type="button" data-chat-finalize="${escapeHtml(chat.id)}">End session</button>`;
-    el.innerHTML = `<strong>${escapeHtml(chat.title)}</strong><p>${Number(chat.message_count || 0)} messages ${status}</p>${summary}<div class="chat-card-actions"><button type="button" data-chat-context="${escapeHtml(chat.id)}">Context</button>${finalizeBtn}</div>`;
+      ? `<button type="button" data-chat-finalize="${escapeHtml(chat.id)}" title="Re-summarize">Re-summarize</button>`
+      : `<button type="button" data-chat-finalize="${escapeHtml(chat.id)}" title="End session">End</button>`;
+    el.innerHTML = `<div class="ask-history-copy"><strong class="ask-history-title">${escapeHtml(chat.title)}</strong><p class="ask-history-meta">${preview}${statusLabel ? ` · ${escapeHtml(statusLabel)}` : ""}</p></div><div class="ask-history-actions"><button type="button" data-chat-context="${escapeHtml(chat.id)}">Context</button>${finalizeBtn}</div>`;
     el.addEventListener("click", event => {
       if (event.target.closest("button")) return;
       openChat(chat.id).catch(showError);
@@ -40,6 +45,7 @@ async function loadChats(options = {}) {
   }
   if (openDefault && !state.chatId && payload.chats[0]) await openChat(payload.chats[0].id);
   else if (!state.chatId) updateChatEmpty();
+  markActiveChat();
   syncAskHeaderActions();
 }
 async function fetchChat(chatId) {
@@ -50,11 +56,33 @@ async function openChat(chatId) {
   const chat = await fetchChat(chatId);
   state.chatId = chat.id;
   renderChat(chat);
+  markActiveChat();
   syncAskHeaderActions();
   return chat;
 }
+function markActiveChat() {
+  document.querySelectorAll("#chat-list .ask-history-item").forEach(el => {
+    el.classList.toggle("is-active", el.dataset.chatId === state.chatId);
+  });
+}
 function syncAskHeaderActions() {
   setElementDisabled("#chat-end-session", !state.chatId);
+}
+function setAskInFlight(running) {
+  for (const id of ["#chat-stop", "#workspace-chat-stop"]) {
+    const stop = document.querySelector(id);
+    if (!stop) continue;
+    stop.disabled = !running;
+    stop.hidden = !running;
+  }
+  for (const id of ["#chat-send", "#workspace-chat-send"]) {
+    const send = document.querySelector(id);
+    if (!send) continue;
+    send.hidden = Boolean(running);
+    send.disabled = Boolean(running);
+  }
+  document.querySelector("#chat-form")?.classList.toggle("is-busy", Boolean(running));
+  document.querySelector("#workspace-chat-form")?.classList.toggle("is-busy", Boolean(running));
 }
 function startNewAskThread({ notify = true } = {}) {
   state.chatId = "";
@@ -67,12 +95,14 @@ function startNewAskThread({ notify = true } = {}) {
     updateChatEmpty();
   }
   if (typeof workspaceChat !== "undefined" && workspaceChat.showEmptyState) workspaceChat.showEmptyState();
+  placeAskQuestionCards();
   const input = document.querySelector("#chat-message");
   if (input) {
     input.value = "";
     autoGrowChatInput();
     input.focus();
   }
+  markActiveChat();
   syncAskHeaderActions();
   if (notify) showSnackbar("Started a new Ask thread. The previous one stays in Dialogs.", "info");
 }
@@ -92,8 +122,14 @@ const CHAT_SUGGESTIONS = [
   "Review the architecture decisions",
 ];
 function chatEmptyHtml() {
+  const needsProvider = !state.apiProviderReady && state.askMode !== "memory";
+  const title = escapeHtml(t(needsProvider ? "ask.empty.needsProviderTitle" : "ask.empty.title"));
+  const sub = escapeHtml(t(needsProvider ? "ask.empty.needsProvider" : "ask.empty.sub"));
+  const extra = needsProvider
+    ? `<button type="button" class="btn-primary chat-empty-connect" data-connect-provider>${escapeHtml(t("ask.empty.connect"))}</button>`
+    : "";
   const chips = CHAT_SUGGESTIONS.map(text => `<button type="button" class="chat-suggestion" data-suggest="${escapeHtml(text)}">${escapeHtml(text)}</button>`).join("");
-  return `<div id="chat-empty" class="chat-empty"><div class="chat-empty-inner"><div class="chat-empty-mark">AO</div><p class="chat-empty-title">Ask ArchitectOS using project memory</p><p class="chat-empty-sub">Pick the model below, or start with a suggestion.</p><div class="chat-suggestions">${chips}</div></div></div>`;
+  return `<div id="chat-empty" class="chat-empty"><div class="chat-empty-inner"><p class="chat-empty-title">${title}</p><p class="chat-empty-sub">${sub}</p>${extra}<div class="chat-suggestions">${chips}</div></div></div>`;
 }
 function updateChatEmpty() {
   const thread = document.querySelector("#chat-thread");
@@ -118,6 +154,8 @@ function renderChat(chat) {
     structured: message.structured || null,
     rawText: message.raw_text || "",
     usage: message.usage || null,
+    tokenEconomy: message.token_economy || null,
+    security: message.security || null,
   }));
   updateChatEmpty();
   thread.scrollTop = thread.scrollHeight;
@@ -150,6 +188,17 @@ function formatUsageCost(cost) {
   if (n < 0.01) return `$${n.toFixed(4)}`;
   return `$${n.toFixed(3)}`;
 }
+function formatSavedPct(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0";
+  if (Math.abs(n - Math.round(n)) < 0.05) return String(Math.round(n));
+  return n.toFixed(1);
+}
+function formatMemorySavedLabel(economy) {
+  const pct = Number(economy && economy.saved_pct);
+  if (!Number.isFinite(pct) || pct <= 0) return "";
+  return t("chat.memorySaved").replace("{pct}", formatSavedPct(pct));
+}
 function formatUsageLabel(usage) {
   if (!usage || typeof usage !== "object") return "";
   const prompt = Number(usage.prompt_tokens || 0);
@@ -165,10 +214,12 @@ function formatUsageLabel(usage) {
   if (cost) parts.push(usage.cost_estimated ? `~${cost}` : cost);
   return parts.join(" · ");
 }
-function setBubbleUsage(el, usage) {
+function setBubbleUsage(el, usage, economy) {
   if (!el) return;
   let footer = el.querySelector(".message-usage");
-  const label = formatUsageLabel(usage);
+  const usageLabel = formatUsageLabel(usage);
+  const savedLabel = formatMemorySavedLabel(economy);
+  const label = [usageLabel, savedLabel].filter(Boolean).join(" · ");
   if (!label) {
     if (footer) footer.remove();
     return;
@@ -181,7 +232,10 @@ function setBubbleUsage(el, usage) {
     else el.appendChild(footer);
   }
   footer.textContent = label;
-  footer.title = t("chat.usageTitle");
+  const pct = Number(economy && economy.saved_pct);
+  footer.title = Number.isFinite(pct) && pct > 0
+    ? `${t("chat.usageTitle")} · ${t("usage.memorySavedNote")}`
+    : t("chat.usageTitle");
 }
 function setAgentActivityModel(bubble, provider) {
   const panel = bubble && bubble.querySelector(".agent-activity");
@@ -298,11 +352,13 @@ function appendChatBubble(role, text, streaming = false, provider = null, meta =
   const thread = document.querySelector("#chat-thread");
   const empty = thread.querySelector("#chat-empty");
   if (empty) empty.remove();
+  const turn = document.createElement("div");
+  turn.className = `ask-turn ask-turn-${role}`;
   let persona = null;
   if (role === "assistant") {
     persona = document.createElement("div");
     persona.className = "msg-persona";
-    thread.appendChild(persona);
+    turn.appendChild(persona);
   }
   const el = document.createElement("div");
   el.className = `message ${role}${streaming ? " streaming" : ""}`;
@@ -331,27 +387,68 @@ function appendChatBubble(role, text, streaming = false, provider = null, meta =
       ].join("");
       el.appendChild(actions);
     }
-    if (!streaming) setBubbleUsage(el, meta.usage);
+    if (!streaming) {
+      setBubbleUsage(el, meta.usage, meta.tokenEconomy);
+      setBubbleSecurity(el, meta.security);
+    }
   } else {
-    el.textContent = text || "";
+    const textNode = document.createElement("div");
+    textNode.className = "message-text";
+    textNode.textContent = text || "";
+    el.appendChild(textNode);
   }
-  thread.appendChild(el);
+  turn.appendChild(el);
+  thread.appendChild(turn);
   if (persona) { el._persona = persona; setBubbleProvider(el, provider); }
   if (role === "assistant" && !streaming && isProviderError(provider)) {
     renderProviderErrorBubble(el, text, provider);
   }
   thread.scrollTop = thread.scrollHeight;
+  placeAskQuestionCards();
   return el;
+}
+async function answerPermissionPrompt(event) {
+  const kind = String(event.kind || "sandbox");
+  const action = String(event.action || "read");
+  let message = t("ask.permission.sandboxRead");
+  if (kind === "write") message = t("ask.permission.write");
+  else if (action === "write") message = t("ask.permission.sandboxWrite");
+  else if (action === "list") message = t("ask.permission.sandboxList");
+  const scope = await showAppPermission({
+    title: t("ask.permission.title"),
+    message,
+    detail: event.target || event.reason || "",
+    danger: kind === "write" || action === "write",
+  });
+  try {
+    await api(`/api/runs/${encodeURIComponent(event.run_id || state.activeRunId)}/permission`, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: event.request_id,
+        allow: Boolean(scope),
+        scope: scope === "session" ? "session" : "once",
+        chat_id: state.chatId,
+      }),
+    });
+  } catch (_err) {
+    /* stream times out if the decision never arrives */
+  }
 }
 async function sendChatMessage(event, options = {}) {
   event.preventDefault();
   const workspaceMirror = Boolean(options.workspaceMirror);
   const input = document.querySelector("#chat-message");
-  const message = input.value.trim();
-  if (!message) return;
+  const typed = input.value.trim();
+  const message = typed || (state.attachments.length ? "Look at the attached image." : "");
+  if (!message) return false;
+  if (document.querySelector("#chat-form")?.classList.contains("is-busy")) return false;
+  if (!options.securityConfirmed) {
+    const allowed = await confirmAskSend(message);
+    if (!allowed) return false;
+  }
   if (state.askMode === "council") {
     await runAskCouncil(message);
-    return;
+    return true;
   }
   const providerValue = askProviderId();
   state.lastFailedMessage = message;
@@ -373,6 +470,7 @@ async function sendChatMessage(event, options = {}) {
   appendChatBubble("user", message);
   const assistant = appendChatBubble("assistant", "", true);
   beginAgentActivity(assistant);
+  setAskInFlight(true);
   if (workspaceMirror && typeof workspaceChat !== "undefined") {
     workspaceChat.beginStream(message);
   }
@@ -387,7 +485,7 @@ async function sendChatMessage(event, options = {}) {
       {
         if (event.type === "start") {
           state.activeRunId = event.run_id || "";
-          setElementDisabled("#chat-stop", !state.activeRunId);
+          setAskInFlight(true);
           if (event.provider) setBubbleProvider(assistant, event.provider);
           beginAgentActivity(assistant);
           if (workspaceMirror) workspaceChat.onStreamStart?.(event);
@@ -397,12 +495,18 @@ async function sendChatMessage(event, options = {}) {
         } else if (event.type === "progress") {
           updateAgentActivity(assistant, event);
           if (workspaceMirror) workspaceChat.onStreamProgress?.(event);
+        } else if (event.type === "permission") {
+          await answerPermissionPrompt(event);
         } else if (event.type === "done") {
           assistant.classList.remove("streaming");
           state.activeRunId = "";
-          setElementDisabled("#chat-stop", true);
+          setAskInFlight(false);
           if (event.provider) setBubbleProvider(assistant, event.provider);
-          if (event.usage) setBubbleUsage(assistant, event.usage);
+          if (event.usage || event.token_economy) setBubbleUsage(assistant, event.usage, event.token_economy);
+          if (event.security) {
+            setBubbleSecurity(assistant, event.security);
+            setAskSecurityStatus(event.security);
+          }
           if (isProviderError(event.provider)) {
             state.lastFailedMessage = message;
             renderProviderErrorBubble(assistant, event.response || getMessageTextElement(assistant).textContent, event.provider);
@@ -442,11 +546,12 @@ async function sendChatMessage(event, options = {}) {
   } finally {
     assistant.classList.remove("streaming");
     state.activeRunId = "";
-    setElementDisabled("#chat-stop", true);
+    setAskInFlight(false);
     stopAgentActivityTimer(assistant.querySelector(".agent-activity"));
   }
   await loadChats({ openDefault: false });
   await loadProviderRuns();
+  return true;
 }
 
 async function runAskCouncil(message) {
@@ -462,6 +567,7 @@ async function runAskCouncil(message) {
   appendChatBubble("user", message);
   const assistant = appendChatBubble("assistant", "⚖️ Convening the council...", true, { selected: { label: "Council" }, routing: { role: "council" } });
   beginAgentActivity(assistant);
+  setAskInFlight(true);
   try {
     const models = [...document.querySelectorAll(".ask-council-model")].filter(el => el.checked).map(el => el.value);
     const response = await fetch("/api/council/run/stream", {
@@ -485,9 +591,12 @@ async function runAskCouncil(message) {
       {
         if (event.type === "progress") {
           updateCouncilActivity(assistant, event);
+        } else if (event.type === "permission") {
+          await answerPermissionPrompt(event);
         } else if (event.type === "done") {
           const result = event.result;
           assistant.classList.remove("streaming");
+          setAskInFlight(false);
           if (result.chat && result.chat.id) {
             state.chatId = result.chat.id;
             syncAskHeaderActions();
@@ -500,6 +609,10 @@ async function runAskCouncil(message) {
           }
           const combined = result.response || parts.join("").trim() || "No model produced a response.";
           renderAssistantRichContent(assistant, combined, result.structured || null);
+          if (result.security) {
+            setBubbleSecurity(assistant, result.security);
+            setAskSecurityStatus(result.security);
+          }
           const messages = result.chat && Array.isArray(result.chat.messages) ? result.chat.messages : [];
           const savedTrace = messages.length ? messages[messages.length - 1].tool_trace : [];
           finalizeAgentActivity(assistant, Array.isArray(savedTrace) ? savedTrace : []);
@@ -509,8 +622,10 @@ async function runAskCouncil(message) {
     }
   } catch (error) {
     assistant.classList.remove("streaming");
+    setAskInFlight(false);
     renderProviderErrorBubble(assistant, `Council failed: ${error.message || error}`, { status: "error" });
   }
+  setAskInFlight(false);
   document.querySelector("#chat-thread").scrollTop = document.querySelector("#chat-thread").scrollHeight;
   await loadProviderRuns();
   if (typeof workspaceChat !== "undefined" && workspaceChat.refreshThread) {
@@ -520,12 +635,12 @@ async function runAskCouncil(message) {
 async function cancelActiveRun() {
   if (!state.activeRunId) return;
   await api(`/api/runs/${state.activeRunId}/cancel`, { method: "POST", body: "{}" });
-  setElementDisabled("#chat-stop", true);
+  setAskInFlight(false);
 }
 
 export {
   appendChatBubble, cancelActiveRun, fetchChat, finalizeChatSession,
-  formatTokenCount, formatUsageCost, formatUsageLabel, getMessageTextElement,
+  formatTokenCount, formatSavedPct, formatUsageCost, formatUsageLabel, getMessageTextElement,
   handleProviderErrorAction, isProviderError, loadChats, providerErrorAction,
   providerLabel, renderAssistantRichContent, renderProviderErrorBubble,
   sendChatMessage, setAgentActivityModel, setBubbleProvider, setBubbleUsage,

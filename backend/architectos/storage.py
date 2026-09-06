@@ -10,15 +10,17 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .config import BACKUP_RETENTION
 from .constants import SECRET_MASK
-from .models import MemoryEdge, MemoryNode, Project, stable_id, utc_now
+from .models import MemoryEdge, MemoryNode, Project, Source, stable_id, utc_now
 from .security import SecurityPolicy
 from .storage_candidates import StorageCandidatesMixin
 from .storage_migrate import SCHEMA_VERSION, StorageMigrateMixin
 from .storage_search import StorageSearchMixin
 from .storage_sessions import StorageSessionsMixin
+from .vecsql import load_sqlite_vec, sqlite_vec_available
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -122,6 +124,20 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         if listener not in self._node_upsert_listeners:
             self._node_upsert_listeners.append(listener)
 
+    @staticmethod
+    def _prepare_connection(conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error as exc:
+            _LOG.debug("SQLite pragma setup failed: %s", exc)
+        if sqlite_vec_available():
+            load_sqlite_vec(conn)
+
+    def vector_backend(self) -> str:
+        return "sqlite-vec" if sqlite_vec_available() else "python"
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         # Inside transaction() the current thread already owns a connection; join it
@@ -133,12 +149,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         # timeout + WAL: embedding backfill writers must not freeze Search palette reads.
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-        except sqlite3.Error as exc:
-            _LOG.debug("SQLite pragma setup failed: %s", exc)
+        self._prepare_connection(conn)
         try:
             yield conn
             conn.commit()
@@ -160,12 +171,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
             return
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-        except sqlite3.Error as exc:
-            _LOG.debug("SQLite pragma setup failed: %s", exc)
+        self._prepare_connection(conn)
         self._local.transaction_connection = conn
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -272,6 +278,75 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         project = Project(id=stable_id("project", name, root_path), name=name.strip(), root_path=root_path.strip(), description=description.strip())
         return self.upsert_project(project)
 
+    # -- Sources (external data origins) ------------------------------------
+    def upsert_source(self, source: Source) -> Source:
+        source.updated_at = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sources(id, project_id, name, kind, created_at, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (source.id, source.project_id, source.name, source.kind, source.created_at, source.updated_at, json.dumps(source.to_dict(), sort_keys=True)),
+            )
+        return source
+
+    def get_source(self, source_id: str) -> Source | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT payload FROM sources WHERE id = ?", (source_id,)).fetchone()
+        return Source.from_dict(json.loads(row["payload"])) if row else None
+
+    def list_sources(self, project_id: str | None = None) -> list[Source]:
+        with self._connect() as conn:
+            if project_id:
+                rows = conn.execute("SELECT payload FROM sources WHERE project_id = ? ORDER BY name", (project_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT payload FROM sources ORDER BY project_id, name").fetchall()
+        return [Source.from_dict(json.loads(row["payload"])) for row in rows]
+
+    # -- Memory node events (history) ----------------------------------------
+    def record_memory_event(
+        self,
+        node_id: str,
+        event_type: str,
+        actor: str | None = None,
+        details: dict[str, Any] | None = None,
+        timestamp: str | None = None,
+    ) -> dict[str, Any]:
+        event = {
+            "id": f"event_{uuid4().hex[:16]}",
+            "node_id": node_id,
+            "event_type": event_type,
+            "actor": actor or "",
+            "timestamp": timestamp or utc_now(),
+            "details": dict(details or {}),
+        }
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO memory_node_events(id, node_id, event_type, actor, timestamp, details) VALUES (?, ?, ?, ?, ?, ?)",
+                (event["id"], event["node_id"], event["event_type"], event["actor"], event["timestamp"], json.dumps(event["details"], sort_keys=True)),
+            )
+        return event
+
+    def list_memory_events(self, node_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, node_id, event_type, actor, timestamp, details FROM memory_node_events WHERE node_id = ? ORDER BY timestamp, rowid LIMIT ?",
+                (node_id, max(1, int(limit or 200))),
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                details = json.loads(row["details"] or "{}")
+            except ValueError:
+                details = {}
+            events.append({
+                "id": row["id"],
+                "node_id": row["node_id"],
+                "event_type": row["event_type"],
+                "actor": row["actor"] or "",
+                "timestamp": row["timestamp"],
+                "details": details if isinstance(details, dict) else {},
+            })
+        return events
+
     def add_node(
         self,
         node_type: str,
@@ -282,6 +357,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         interface_id: str | None = None,
         confidence: float = 0.8,
         metadata: dict[str, Any] | None = None,
+        source_id: str | None = None,
     ) -> MemoryNode:
         clean_text, redacted = sanitize_text(text)
         clean_label, label_redacted = sanitize_text(label)
@@ -296,11 +372,14 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
             text=clean_text,
             project_id=project_id,
             interface_id=interface_id,
+            source_id=source_id,
             confidence=max(0.0, min(1.0, confidence)),
             metadata=dict(metadata or {}),
             created_at=now,
             updated_at=now,
         )
+        if source_id:
+            node.metadata.setdefault("source_id", source_id)
         if redacted or label_redacted:
             node.metadata["redacted"] = True
         node.evidence = [self._write_evidence(node)]
@@ -310,8 +389,8 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         node.updated_at = utc_now()
         with self._connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO memory_nodes(id, type, label, scope, project_id, interface_id, status, confidence, created_at, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (node.id, node.type, node.label, node.scope, node.project_id, node.interface_id, node.status, node.confidence, node.created_at, node.updated_at, json.dumps(node.to_dict(), sort_keys=True)),
+                "INSERT OR REPLACE INTO memory_nodes(id, type, label, scope, project_id, interface_id, source_id, status, confidence, created_at, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (node.id, node.type, node.label, node.scope, node.project_id, node.interface_id, node.source_id, node.status, node.confidence, node.created_at, node.updated_at, json.dumps(node.to_dict(), sort_keys=True)),
             )
             self._sync_memory_fts_row(conn, node)
         if notify:
@@ -366,6 +445,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         status: str | None = None,
         include_shared: bool = False,
         node_type: str | None = None,
+        node_types: list[str] | tuple[str, ...] | None = None,
         scope: str | None = None,
         text_like: str | None = None,
     ) -> list[MemoryNode]:
@@ -386,9 +466,14 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         if status:
             clauses.append("status = ?")
             params.append(status)
-        if node_type:
-            clauses.append("type = ?")
-            params.append(node_type)
+        wanted_types = [
+            str(item).strip()
+            for item in (list(node_types) if node_types is not None else ([node_type] if node_type else []))
+            if str(item or "").strip()
+        ]
+        if wanted_types:
+            clauses.append(f"type IN ({','.join('?' for _ in wanted_types)})")
+            params.extend(wanted_types)
         if scope:
             clauses.append("scope = ?")
             params.append(scope)

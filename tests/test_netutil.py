@@ -6,7 +6,7 @@ import unittest
 import urllib.request
 from unittest import mock
 
-from backend.architectos import embeddings
+from backend.architectos import embedding_providers
 from backend.architectos.adapters import OpenAIResponsesAdapter
 from backend.architectos.netutil import current_allow_local, is_loopback_url, validate_outbound_url
 
@@ -183,8 +183,8 @@ class EmbeddingEndpointPolicyTests(unittest.TestCase):
             captured["allow_local"] = current_allow_local()
             return object()
 
-        with mock.patch("backend.architectos.embeddings.urlopen", fake_urlopen):
-            embeddings._embedding_urlopen(
+        with mock.patch("backend.architectos.embedding_providers.urlopen", fake_urlopen):
+            embedding_providers._embedding_urlopen(
                 "http://127.0.0.1:11434/api/embeddings",
                 mock.Mock(),
                 timeout=5.0,
@@ -198,15 +198,15 @@ class EmbeddingEndpointPolicyTests(unittest.TestCase):
             captured["allow_local"] = current_allow_local()
             return object()
 
-        with mock.patch("backend.architectos.embeddings.urlopen", fake_urlopen):
-            embeddings._embedding_urlopen("https://api.openai.com/v1/embeddings", mock.Mock(), timeout=5.0)
+        with mock.patch("backend.architectos.embedding_providers.urlopen", fake_urlopen):
+            embedding_providers._embedding_urlopen("https://api.openai.com/v1/embeddings", mock.Mock(), timeout=5.0)
         self.assertFalse(captured["allow_local"])
 
     def test_remote_endpoint_pointed_at_metadata_is_rejected(self) -> None:
         # Real ssl_util.urlopen under the derived policy: link-local is never allowed.
         request = urllib.request.Request("http://169.254.169.254/latest/meta-data")
         with self.assertRaises(ValueError):
-            embeddings._embedding_urlopen("http://169.254.169.254/latest/meta-data", request, timeout=3.0)
+            embedding_providers._embedding_urlopen("http://169.254.169.254/latest/meta-data", request, timeout=3.0)
 
 
 if __name__ == "__main__":

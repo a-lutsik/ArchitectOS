@@ -1,21 +1,22 @@
 /* Agent activity / tool-trace UI — extracted from app.js */
-import { getMessageTextElement, providerLabel, setAgentActivityModel, setBubbleProvider } from "./chat.js";
+import { getMessageTextElement, setAgentActivityModel, setBubbleProvider } from "./chat.js";
 
 const TOOL_ACTION_META = {
-  memory_get: { icon: "🧠", verb: "Reading memory node" },
-  boards_search: { icon: "🔎", verb: "Searching Azure Boards" },
-  boards_my_work: { icon: "📋", verb: "Loading my work items" },
-  boards_get_item: { icon: "📄", verb: "Opening work item" },
-  boards_list_comments: { icon: "💬", verb: "Reading work item comments" },
-  boards_query_wiql: { icon: "🧮", verb: "Running WIQL query" },
-  granola_list_meetings: { icon: "📝", verb: "Listing Granola meetings" },
-  granola_get_meetings: { icon: "🗒️", verb: "Reading Granola meeting notes" },
-  granola_get_transcript: { icon: "🎙️", verb: "Fetching Granola transcript" },
-  fs_read: { icon: "📁", verb: "Reading file" },
-  fs_list: { icon: "🗂️", verb: "Listing directory" },
-  fs_search: { icon: "🔍", verb: "Searching files" },
-  fs_write: { icon: "✏️", verb: "Writing file" },
+  memory_get: { verb: "Reading memory" },
+  boards_search: { verb: "Searching Azure Boards" },
+  boards_my_work: { verb: "Loading my work items" },
+  boards_get_item: { verb: "Opening work item" },
+  boards_list_comments: { verb: "Reading work item comments" },
+  boards_query_wiql: { verb: "Running WIQL query" },
+  granola_list_meetings: { verb: "Listing Granola meetings" },
+  granola_get_meetings: { verb: "Reading Granola notes" },
+  granola_get_transcript: { verb: "Fetching transcript" },
+  fs_read: { verb: "Reading file" },
+  fs_list: { verb: "Listing directory" },
+  fs_search: { verb: "Searching files" },
+  fs_write: { verb: "Writing file" },
 };
+const PLUMBING_PHASES = new Set(["provider", "thinking", "thinking_done", "request"]);
 function friendlyToolVerb(name) {
   const raw = String(name || "").trim();
   if (!raw) return "Working";
@@ -34,7 +35,7 @@ function formatActivityDuration(seconds) {
   return mins ? `${hours}h ${mins}m` : `${hours}h`;
 }
 function humanizeToolAction(name, args) {
-  const meta = TOOL_ACTION_META[name] || { icon: "⚙️", verb: friendlyToolVerb(name) };
+  const meta = TOOL_ACTION_META[name] || { verb: friendlyToolVerb(name) };
   const a = args || {};
   let detail = "";
   if (name === "memory_get") detail = a.id || a.node_id || "";
@@ -46,23 +47,33 @@ function humanizeToolAction(name, args) {
     detail = first || "";
   }
   detail = String(detail).slice(0, 80);
-  return { icon: meta.icon, label: detail ? `${meta.verb} ${detail}` : meta.verb };
+  return { label: detail ? `${meta.verb} ${detail}` : meta.verb };
 }
 function humanizeProgressEvent(event) {
   const toolName = String(event?.tool_name || "").trim();
   if (toolName) return humanizeToolAction(toolName, event.arguments);
   const phase = String(event?.phase || "");
   const status = String(event?.status || "").trim();
-  if (phase === "provider") return { icon: "🤖", label: status || "Model selected" };
-  if (phase === "context" || phase === "context_done") return { icon: "📚", label: status || "Searching memory" };
-  if (phase === "thinking" || phase === "thinking_done") return { icon: "💭", label: status || "Thinking…" };
-  if (status) return { icon: "⚙️", label: status };
-  return { icon: "⚙️", label: phase || "Working…" };
+  if (phase === "context" || phase === "context_done") return { label: status || "Searching project memory" };
+  if (status) return { label: status };
+  return { label: phase || "Thinking…" };
+}
+function isPlumbingEvent(event) {
+  const phase = String(event?.phase || "");
+  if (PLUMBING_PHASES.has(phase)) return true;
+  if (String(event?.tool_name || "").trim()) return false;
+  const status = String(event?.status || "").toLowerCase();
+  return /sending request|routing to|thinking/.test(status);
+}
+function isPlumbingTraceItem(item) {
+  if (!item) return true;
+  if (item.kind === "status") return PLUMBING_PHASES.has(String(item.phase || "")) || /sending request|routing to|thinking/.test(String(item.summary || item.status || "").toLowerCase());
+  return false;
 }
 function humanizeTraceItem(item) {
   if (item && item.kind === "agent") {
     const name = item.role_name || item.role || item.name || "Agent";
-    return { icon: item.role === "synthesis" ? "🧩" : "🤖", label: `${name} agent` };
+    return { label: item.role === "synthesis" ? "Synthesizing" : name };
   }
   if (item && item.kind === "status") {
     return humanizeProgressEvent({ phase: item.phase, status: item.summary || item.status, tool_name: "" });
@@ -77,9 +88,9 @@ function getAgentActivity(bubble) {
   panel.className = "agent-activity running";
   panel.innerHTML = `
     <button type="button" class="agent-activity-header" aria-expanded="true">
-      <span class="agent-activity-spinner"></span>
-      <span class="agent-activity-title">Working…</span>
-      <span class="agent-activity-caret">▾</span>
+      <span class="agent-activity-spinner" aria-hidden="true"></span>
+      <span class="agent-activity-title">Thinking…</span>
+      <span class="agent-activity-caret" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </button>
     <div class="agent-activity-steps"></div>`;
   panel.querySelector(".agent-activity-header").addEventListener("click", () => {
@@ -90,7 +101,7 @@ function getAgentActivity(bubble) {
   bubble.insertBefore(panel, textNode);
   return panel;
 }
-function activityStepRow(panel, stepId, icon, label) {
+function activityStepRow(panel, stepId, label) {
   const steps = panel.querySelector(".agent-activity-steps");
   const existing = stepId ? steps.querySelector(`[data-step="${CSS.escape(stepId)}"]`) : null;
   if (existing) return existing;
@@ -99,13 +110,12 @@ function activityStepRow(panel, stepId, icon, label) {
   if (stepId) row.dataset.step = stepId;
   row.dataset.startedAt = String(Date.now());
   row.innerHTML = `
-    <span class="step-icon"></span>
+    <span class="step-mark" aria-hidden="true"></span>
     <span class="step-body"><span class="step-label"></span><span class="step-detail"></span></span>
-    <span class="step-time"></span>
-    <span class="step-status"></span>`;
-  row.querySelector(".step-icon").textContent = icon || "⚙️";
+    <span class="step-time"></span>`;
   setActivityStepLabel(row, label);
   steps.appendChild(row);
+  panel.classList.toggle("has-steps", steps.children.length > 0);
   return row;
 }
 function setActivityStepLabel(row, label) {
@@ -120,7 +130,6 @@ function setActivityStepDetail(row, detail) {
 function finishActivityStep(row, options = {}) {
   const ok = options.ok !== false;
   row.dataset.state = ok ? "ok" : "error";
-  row.querySelector(".step-status").textContent = ok ? "✓" : "✗";
   if (options.detail) setActivityStepDetail(row, options.detail);
   refreshActivityStepTime(row, true);
 }
@@ -136,17 +145,9 @@ function refreshActivityStepTime(row, freeze = false) {
 function refreshAgentActivitySteps(panel) {
   panel.querySelectorAll('.agent-activity-step[data-state="running"]').forEach(row => refreshActivityStepTime(row));
 }
-function openRequestStep(panel) {
-  // The first server event can be seconds away, so never leave the panel empty.
-  if (panel.dataset.requestStep) return;
-  panel.dataset.requestStep = "open";
-  activityStepRow(panel, "prep:request", "📨", "Sending request").dataset.state = "running";
-}
-function closeRequestStep(panel) {
-  if (panel.dataset.requestStep !== "open") return;
-  panel.dataset.requestStep = "done";
-  const row = panel.querySelector('[data-step="prep:request"]');
-  if (row) finishActivityStep(row, { ok: true });
+function runningStepLabel(panel) {
+  const running = [...panel.querySelectorAll('.agent-activity-step[data-state="running"]')].at(-1);
+  return String(running?.dataset.baseLabel || "").trim();
 }
 function refreshAgentActivityTitle(panel) {
   if (!panel) return;
@@ -154,21 +155,11 @@ function refreshAgentActivityTitle(panel) {
   if (!title) return;
   const started = Number(panel.dataset.startedAt || 0);
   const elapsed = started ? formatActivityDuration((Date.now() - started) / 1000) : "";
-  const model = String(panel.dataset.modelLabel || "").trim();
   if (panel.classList.contains("running")) {
-    if (model && elapsed) title.textContent = `${model} · ${elapsed}`;
-    else if (model) title.textContent = model;
-    else title.textContent = elapsed ? `Working… ${elapsed}` : "Working…";
+    title.textContent = runningStepLabel(panel) || "Thinking…";
     return;
   }
-  const count = panel.querySelectorAll(".agent-activity-step").length;
-  const hasAgentTrace = panel.dataset.kind === "agent";
-  const base = count
-    ? hasAgentTrace
-      ? `Ran ${count} agent step${count === 1 ? "" : "s"}`
-      : `Used ${count} step${count === 1 ? "" : "s"}`
-    : "Worked";
-  title.textContent = [base, model, elapsed].filter(Boolean).join(" · ");
+  title.textContent = elapsed ? `Thought for ${elapsed}` : "Thought";
 }
 function beginAgentActivity(bubble) {
   const panel = getAgentActivity(bubble);
@@ -177,7 +168,6 @@ function beginAgentActivity(bubble) {
   panel.classList.add("running");
   panel.classList.remove("done", "collapsed");
   panel.querySelector(".agent-activity-header")?.setAttribute("aria-expanded", "true");
-  openRequestStep(panel);
   if (panel._elapsedTimer) clearInterval(panel._elapsedTimer);
   refreshAgentActivityTitle(panel);
   panel._elapsedTimer = setInterval(() => {
@@ -205,36 +195,24 @@ function updateAgentActivity(bubble, event) {
   const toolName = String(event.tool_name || "").trim();
   if (!toolName && !stepId && !event.status && !event.provider) return;
   const panel = beginAgentActivity(bubble);
-  closeRequestStep(panel);
   if (event.provider) {
     setBubbleProvider(bubble, event.provider);
     setAgentActivityModel(bubble, event.provider);
   }
-  if (phase === "provider" && !toolName) {
-    // Provider announcement is reflected in the header/persona; keep a compact step too.
-    const { icon, label } = humanizeProgressEvent({
-      phase: "provider",
-      status: event.status || `Using ${providerLabel(event.provider)}`,
-    });
-    const text = label || providerLabel(event.provider) || "Model selected";
-    const row = activityStepRow(panel, stepId || "prep:provider", icon === "⚙️" ? "🤖" : icon, text);
-    // Routing announces itself first and names the model later, so this label may sharpen.
-    setActivityStepLabel(row, text);
-    finishActivityStep(row, { ok: true });
+  if (isPlumbingEvent(event) && !toolName) {
     refreshAgentActivityTitle(panel);
     return;
   }
   if (!toolName && !stepId && !event.status) return;
-  const { icon, label } = humanizeProgressEvent(event);
+  const { label } = humanizeProgressEvent(event);
   const rowId = stepId || `step:${panel.querySelectorAll(".agent-activity-step").length}`;
-  const row = activityStepRow(panel, rowId, icon, label);
+  const row = activityStepRow(panel, rowId, label);
   const baseLabel = String(row.dataset.baseLabel || "");
   const donePhase = phase === "tool_finish" || phase.endsWith("_done");
   if (donePhase) {
     const entry = Array.isArray(event.tool_trace)
       ? [...event.tool_trace].reverse().find(item => String(item.step_id || "") === stepId)
       : null;
-    // Keep the action on the label and report the outcome underneath, so the panel reads as a log.
     let detail = "";
     if (entry) detail = entry.ok ? String(entry.summary || "") : String(entry.error || "failed");
     else if (label && label !== baseLabel) detail = label;
@@ -242,7 +220,6 @@ function updateAgentActivity(bubble, event) {
     finishActivityStep(row, { ok: event.ok !== false, detail });
   } else {
     row.dataset.state = "running";
-    row.querySelector(".step-status").textContent = "";
     if (event.status && event.status !== baseLabel) setActivityStepDetail(row, event.status);
     refreshActivityStepTime(row);
   }
@@ -257,9 +234,8 @@ function updateCouncilActivity(bubble, event) {
   const isJudge = role === "judge";
   const done = String(agent.status || "").toLowerCase() === "done";
   const panel = beginAgentActivity(bubble);
-  closeRequestStep(panel);
   panel.dataset.kind = "agent";
-  const row = activityStepRow(panel, `council:${role}`, isJudge ? "⚖️" : "🤖", isJudge ? "Judge" : roleName);
+  const row = activityStepRow(panel, `council:${role}`, isJudge ? "Judge" : roleName);
   const text = String(agent.text || "").trim();
   if (done) {
     finishActivityStep(row, { ok: true, detail: text ? text.slice(0, 140) : "Responded" });
@@ -277,8 +253,9 @@ function finalizeAgentActivity(bubble, trace) {
   if (!panel && Array.isArray(trace) && trace.length) {
     panel = getAgentActivity(bubble);
     trace.forEach((item, index) => {
-      const { icon, label } = humanizeTraceItem(item);
-      const row = activityStepRow(panel, String(item.step_id || `trace:${index}`), icon, label);
+      if (isPlumbingTraceItem(item)) return;
+      const { label } = humanizeTraceItem(item);
+      const row = activityStepRow(panel, String(item.step_id || `trace:${index}`), label);
       row.removeAttribute("data-started-at");
       if (item.pending === true) {
         row.dataset.state = "running";
@@ -291,12 +268,11 @@ function finalizeAgentActivity(bubble, trace) {
     });
   }
   if (!panel) return;
-  closeRequestStep(panel);
-  // A step still marked running when the turn ends would spin forever.
   panel.querySelectorAll('.agent-activity-step[data-state="running"]').forEach(row => finishActivityStep(row, { ok: true }));
   stopAgentActivityTimer(panel);
   panel.classList.remove("running");
   panel.classList.add("done", "collapsed");
+  panel.classList.toggle("has-steps", panel.querySelectorAll(".agent-activity-step").length > 0);
   panel.querySelector(".agent-activity-header").setAttribute("aria-expanded", "false");
   refreshAgentActivityTitle(panel);
 }

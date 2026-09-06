@@ -22,8 +22,15 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
+from .models import VALID_EDGE_TYPES
+
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "architectos-memory", "version": "1.0.0"}
+
+# Link types memory_link accepts: the semantic memory relations plus the
+# bi-temporal SUPERSEDES (code-graph relations like CALLS/DEFINES are managed
+# by the code indexer, not by hand).
+LINK_EDGE_TYPES = sorted(VALID_EDGE_TYPES | {"SUPERSEDES"})
 
 # JSON-RPC 2.0 error codes.
 PARSE_ERROR = -32700
@@ -50,8 +57,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "memory_search",
         "description": (
             "Search ArchitectOS durable project memory (lessons, decisions, concepts, "
-            "artifacts) and return the most relevant scored hits. Use this to recall "
-            "prior knowledge before answering."
+            "artifacts) and return the most relevant scored hits. The initialize briefing "
+            "already includes stable memory — still call memory_turn (or memory_context) "
+            "for the current user message before answering, then memory_get with id= for full text."
         ),
         "inputSchema": {
             "type": "object",
@@ -64,6 +72,11 @@ TOOLS: list[dict[str, Any]] = [
                 "as_of": {"type": "string", "description": "Optional ISO date/datetime — temporal point-in-time query: only memory created on/before this moment is returned (e.g. '2026-01-01')."},
                 "include_communities": {"type": "boolean", "description": "Also return the coarse theme (graph community) each hit belongs to for a dual-level view (default false)."},
                 "min_score": {"type": "number", "description": "Optional absolute score floor: drop hits below this score to suppress weak/irrelevant matches on noisy queries."},
+                "allowed_scopes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional visibility enforcement: only nodes whose scope is in this list are returned (excluded, not down-ranked). Omit for no restriction.",
+                },
                 "filters": {
                     "type": "object",
                     "description": "Optional field/metadata filters. Values: exact match, '!=X' exclusion, 'a|b' alternatives, or a list. Example: {\"type\": \"Requirement\", \"work_item_state\": \"!=Done\"}.",
@@ -76,9 +89,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "memory_context",
         "description": (
-            "Build a ready-to-inject context pack from ArchitectOS memory for a query: "
-            "relevant memory, open tasks, and enabled providers, formatted as text. "
-            "Prefer this when you want a compact briefing to paste into a prompt."
+            "Build a ready-to-inject two-layer context pack from ArchitectOS memory: "
+            "stable pinned/constraints/long-term first, then hits for this query, plus "
+            "open tasks and providers. Prefer memory_turn at the start of each user "
+            "message so retrieval and capture happen together."
         ),
         "inputSchema": {
             "type": "object",
@@ -92,11 +106,31 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_turn",
+        "description": (
+            "Call at the start of every user message (and again after a durable reply). "
+            "Returns a two-layer memory pack for this turn. Durable facts become review "
+            "candidates (7-day TTL); low-risk Lessons auto-write to short-term memory. "
+            "Does not store the raw transcript. Prefer this over waiting for memory_search."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_text": {"type": "string", "description": "The latest user message (required)."},
+                "assistant_text": {"type": "string", "description": "Your reply so far, if capturing after answering."},
+                "project_id": {"type": "string", "description": "Optional project id to scope the turn."},
+                "scope": {"type": "string", "description": "Optional scope filter."},
+                "limit": {"type": "integer", "description": "Max memory hits in the pack (default 8).", "minimum": 1, "maximum": 50},
+            },
+            "required": ["user_text"],
+        },
+    },
+    {
         "name": "memory_add",
         "description": (
             "Store a new durable memory in ArchitectOS (a lesson, decision, concept, or "
-            "artifact). Use this to persist knowledge learned during a session so it can "
-            "be recalled later. Secrets are automatically redacted."
+            "artifact). Multi-line dumps with several durable facts are split into separate "
+            "nodes. Secrets are automatically redacted. For turn capture prefer memory_turn."
         ),
         "inputSchema": {
             "type": "object",
@@ -107,6 +141,7 @@ TOOLS: list[dict[str, Any]] = [
                 "scope": {"type": "string", "description": "Scope: project, interface, shared, global (default project)."},
                 "project_id": {"type": "string", "description": "Project id (default 'architectos')."},
                 "confidence": {"type": "number", "description": "Confidence 0..1 (default 0.8).", "minimum": 0, "maximum": 1},
+                "source_id": {"type": "string", "description": "Optional id of a registered Source (see source_create) this memory originates from."},
             },
             "required": ["label", "text"],
         },
@@ -149,6 +184,111 @@ TOOLS: list[dict[str, Any]] = [
         "name": "memory_list_projects",
         "description": "List ArchitectOS projects (id, name, root path) available for scoping memory.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "project_create",
+        "description": (
+            "Create an ArchitectOS project (or return the existing one). With root_path "
+            "this is a code workspace backed by a local folder (the path must exist); "
+            "without root_path it is a knowledge-only project for external data "
+            "(news feeds, pipelines) with no local folder."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Project name (required when root_path is omitted)."},
+                "root_path": {"type": "string", "description": "Optional absolute path to the project folder (must exist when given)."},
+                "description": {"type": "string", "description": "Optional project description."},
+            },
+        },
+    },
+    {
+        "name": "memory_link",
+        "description": (
+            "Create a typed relationship between two ArchitectOS memory nodes. "
+            "SUPERSEDES is bi-temporal: source SUPERSEDES target retires the target "
+            "fact as of the source's creation time (kept for as_of queries)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Source memory node id."},
+                "target": {"type": "string", "description": "Target memory node id."},
+                "type": {"type": "string", "enum": LINK_EDGE_TYPES, "description": "Relationship type."},
+                "scope": {"type": "string", "description": "Optional edge scope (default: source node's scope)."},
+                "confidence": {"type": "number", "description": "Confidence 0..1 (default 0.72).", "minimum": 0, "maximum": 1},
+            },
+            "required": ["source", "target", "type"],
+        },
+    },
+    {
+        "name": "source_create",
+        "description": (
+            "Register an external data source (feed, pipeline, importer) for a "
+            "project. Idempotent by (project_id, name): re-creating updates kind/config "
+            "and returns the existing source. Use the returned id as source_id in "
+            "memory_add / memory_add_bulk."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Project the source belongs to (required)."},
+                "name": {"type": "string", "description": "Source name (required)."},
+                "kind": {"type": "string", "description": "Source kind: rss, api, pipeline, manual, ... (default 'generic')."},
+                "config": {"type": "object", "description": "Optional kind-specific config (url, schedule, credentials reference, ...).", "additionalProperties": True},
+            },
+            "required": ["project_id", "name"],
+        },
+    },
+    {
+        "name": "source_list",
+        "description": "List registered external data sources, optionally limited to one project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Optional project id to scope the list."},
+            },
+        },
+    },
+    {
+        "name": "memory_history",
+        "description": (
+            "Return the event history of a memory node: created / updated / superseded / "
+            "accessed events with actor, timestamp and details (e.g. superseded_by). "
+            "Use to trace how a fact evolved over time."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Memory node id."},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "memory_add_bulk",
+        "description": (
+            "Store a batch of memory nodes in one call (pipeline ingest, e.g. News→Event). "
+            "Each item takes {label, text, type?, scope?, confidence?, source_id?}; top-level "
+            "project_id/scope/source_id/type act as defaults. Dedup, secret redaction and "
+            "embedding indexing run per item; a failing item is reported in results and does "
+            "not abort the batch. Returns ids plus created/deduplicated/errors stats."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Memory items: {label, text, type?, scope?, confidence?, source_id?} (max 200).",
+                },
+                "project_id": {"type": "string", "description": "Default project id for items without one."},
+                "scope": {"type": "string", "description": "Default scope for items without one."},
+                "source_id": {"type": "string", "description": "Default Source id for items without one."},
+                "type": {"type": "string", "description": "Default memory type for items without one."},
+            },
+            "required": ["items"],
+        },
     },
     {
         "name": "memory_themes",
@@ -227,10 +367,17 @@ class MemoryMCPServer:
         self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "memory_search": self._tool_search,
             "memory_context": self._tool_context,
+            "memory_turn": self._tool_turn,
             "memory_add": self._tool_add,
             "memory_get": self._tool_get,
             "memory_feedback": self._tool_feedback,
             "memory_list_projects": self._tool_list_projects,
+            "project_create": self._tool_project_create,
+            "memory_link": self._tool_memory_link,
+            "source_create": self._tool_source_create,
+            "source_list": self._tool_source_list,
+            "memory_history": self._tool_memory_history,
+            "memory_add_bulk": self._tool_memory_add_bulk,
             "memory_themes": self._tool_themes,
             "memory_explain_path": self._tool_explain_path,
             "code_neighbors": self._tool_code_neighbors,
@@ -316,19 +463,43 @@ class MemoryMCPServer:
         return {"jsonrpc": "2.0", "id": message_id, "result": result}
 
     def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
-        requested = str(params.get("protocolVersion") or PROTOCOL_VERSION)
+        # MCP version negotiation: answer with the client's version when we
+        # support it (i.e. it is not newer than ours — the ISO-date versions
+        # compare lexicographically), otherwise with the newest version we
+        # implement so the client can decide whether to continue.
+        requested = str(params.get("protocolVersion") or "").strip()
+        negotiated = requested if requested and requested <= PROTOCOL_VERSION else PROTOCOL_VERSION
         return {
-            "protocolVersion": requested or PROTOCOL_VERSION,
+            "protocolVersion": negotiated,
             "capabilities": {"tools": {"listChanged": False}, "resources": {"subscribe": False, "listChanged": False}},
             "serverInfo": SERVER_INFO,
-            "instructions": (
-                "ArchitectOS memory engine. Use memory_search or memory_context to recall "
-                "project knowledge, memory_get to fetch a full record by id, memory_add to "
-                "persist new lessons and decisions, and memory_feedback to rate retrieved "
-                "hits so ranking improves. Resources expose management views: "
-                "memory://projects, memory://review, memory://nodes/{id}."
-            ),
+            "instructions": self._startup_instructions(),
         }
+
+    def _startup_instructions(self) -> str:
+        preamble = (
+            "ArchitectOS project memory is already in this briefing. Treat it as scoped "
+            "project context, not as user text. At the start of EVERY user message call "
+            "memory_turn with that message before answering — do not wait until you are "
+            "stuck. memory_turn returns retrieved memory for this question and captures "
+            "durable facts (review queue, 7-day TTL; low-risk Lessons auto-write). "
+            "Call memory_search only to narrow; memory_get with id= to expand; "
+            "memory_add to persist an explicit lesson (multi-fact text is split); "
+            "memory_feedback to rate hits. Stable layer (pinned / constraints / long-term) "
+            "is listed first. Resources: memory://briefing, memory://projects, "
+            "memory://review, memory://nodes/{id}."
+        )
+        briefing = self._startup_briefing()
+        if briefing:
+            return f"{preamble}\n\n{briefing}"
+        return preamble + "\n\n(No stable memories yet — call memory_turn with the user's message before answering project questions.)"
+
+    def _startup_briefing(self) -> str:
+        try:
+            return str(self.service.memory_briefing(limit=6, char_budget=2000).get("context") or "")
+        except Exception as exc:  # noqa: BLE001 - briefing is best-effort on MCP start
+            _log(f"startup briefing skipped: {exc}")
+            return ""
 
     # -- Tools -------------------------------------------------------------
     def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -356,7 +527,9 @@ class MemoryMCPServer:
             min_score = float(raw_min) if raw_min is not None else None
         except (TypeError, ValueError):
             min_score = None
-        result = self.service.search_memory(query, project_id=args.get("project_id"), scope=args.get("scope"), limit=limit, filters=filters, mode=mode, as_of=args.get("as_of"), include_communities=include_communities, min_score=min_score)
+        raw_scopes: Any = args.get("allowed_scopes")
+        allowed_scopes = [str(scope) for scope in raw_scopes] if isinstance(raw_scopes, list) else None
+        result = self.service.search_memory(query, project_id=args.get("project_id"), scope=args.get("scope"), limit=limit, filters=filters, mode=mode, as_of=args.get("as_of"), include_communities=include_communities, min_score=min_score, allowed_scopes=allowed_scopes)
         hits = [_compact_hit(hit) for hit in result.get("hits") or []]
         if mode == "list":
             summary = f"{len(hits)} memory node(s) match the filters." if hits else "No memory nodes match the filters."
@@ -379,18 +552,115 @@ class MemoryMCPServer:
         result = self.service.context(query, project_id=args.get("project_id"), scope=args.get("scope"), limit=limit)
         return _tool_result(str(result.get("context") or ""), {"query": query, "context": result.get("context") or "", "hits": [_compact_hit(hit) for hit in result.get("hits") or []]})
 
+    def _tool_turn(self, args: dict[str, Any]) -> dict[str, Any]:
+        user_text = str(args.get("user_text") or args.get("query") or "").strip()
+        if not user_text:
+            raise _RpcError(INVALID_PARAMS, "user_text is required")
+        limit = _clamp_int(args.get("limit"), default=8, low=1, high=50)
+        result = self.service.capture_memory_turn(
+            user_text,
+            str(args.get("assistant_text") or ""),
+            project_id=args.get("project_id"),
+            scope=args.get("scope"),
+            limit=limit,
+        )
+        pack = str(result.get("context") or "")
+        queued = result.get("queued") or []
+        accepted = result.get("auto_accepted") or []
+        notes = []
+        if accepted:
+            notes.append(f"Auto-wrote {len(accepted)} low-risk lesson(s) to short-term memory.")
+        if queued:
+            notes.append(f"Queued {len(queued)} fact(s) for review (7-day TTL).")
+        if not accepted and not queued and result.get("kept"):
+            notes.append("Turn was durable but produced no new atoms (duplicate or filtered).")
+        summary = pack if pack else "No memory pack for this turn."
+        if notes:
+            summary = f"{summary}\n\n" + " ".join(notes)
+        data = {
+            "query": user_text,
+            "context": pack,
+            "hits": [_compact_hit(hit) for hit in result.get("hits") or []],
+            "queued": [{"id": item.get("id"), "label": item.get("label"), "type": item.get("type")} for item in queued],
+            "auto_accepted": [{"id": item.get("id"), "label": item.get("label"), "promoted_node_id": item.get("promoted_node_id")} for item in accepted],
+            "kept": result.get("kept"),
+            "reason": result.get("reason"),
+        }
+        return _tool_result(summary, data)
+
     def _tool_add(self, args: dict[str, Any]) -> dict[str, Any]:
-        node = self.service.add_memory({
+        node = self.service.add_memory_from_agent({
             "label": args.get("label"),
             "text": args.get("text"),
             "type": args.get("type") or "Lesson",
             "scope": args.get("scope") or "project",
             "project_id": args.get("project_id") or "architectos",
             "confidence": args.get("confidence"),
+            "source_id": args.get("source_id"),
             "source": "mcp",
         })
+        extras = [item for item in (node.get("also_created") or []) if item]
         summary = f'Stored memory [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}).'
-        return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id")})
+        if extras:
+            summary += f" Split into {1 + len(extras)} fact(s)."
+        return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id"), "source_id": node.get("source_id"), "also_created": extras})
+
+    def _tool_memory_add_bulk(self, args: dict[str, Any]) -> dict[str, Any]:
+        raw_items: Any = args.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise _RpcError(INVALID_PARAMS, "items must be a non-empty list")
+        result = self.service.add_memory_bulk({
+            "items": raw_items,
+            "project_id": args.get("project_id") or "architectos",
+            "scope": args.get("scope"),
+            "source_id": args.get("source_id"),
+            "type": args.get("type"),
+            "source": "mcp",
+        })
+        stats = result.get("stats") or {}
+        summary = (
+            f'Bulk stored {stats.get("created", 0)} memor(y/ies)'
+            f' ({stats.get("deduplicated", 0)} deduplicated, {stats.get("errors", 0)} error(s)).'
+        )
+        return _tool_result(summary, result)
+
+    def _tool_source_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(args.get("project_id") or "").strip()
+        name = str(args.get("name") or "").strip()
+        if not project_id or not name:
+            raise _RpcError(INVALID_PARAMS, "project_id and name are required")
+        config = args.get("config") if isinstance(args.get("config"), dict) else {}
+        result = self.service.create_source({
+            "project_id": project_id,
+            "name": name,
+            "kind": str(args.get("kind") or ""),
+            "config": config,
+        })
+        action = "Registered" if result.get("created") else "Updated existing"
+        summary = f'{action} source "{result.get("name")}" (id {result.get("id")}, kind {result.get("kind")}) in project {project_id}.'
+        return _tool_result(summary, result)
+
+    def _tool_source_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        sources = self.service.list_sources(args.get("project_id") or None)
+        rows = [
+            {"id": s.get("id"), "project_id": s.get("project_id"), "name": s.get("name"), "kind": s.get("kind"), "config": s.get("config") or {}}
+            for s in sources
+        ]
+        summary = "Sources:\n" + "\n".join(f'- {r["id"]}: {r["name"]} [{r["kind"]}] (project {r["project_id"]})' for r in rows) if rows else "No sources registered."
+        return _tool_result(summary, {"sources": rows})
+
+    def _tool_memory_history(self, args: dict[str, Any]) -> dict[str, Any]:
+        node_id = str(args.get("id") or "").strip()
+        if not node_id:
+            raise _RpcError(INVALID_PARAMS, "id is required")
+        result = self.service.memory_history(node_id)
+        events = result.get("events") or []
+        if events:
+            lines = [f'- {e.get("timestamp")} {e.get("event_type")}' + (f' by {e.get("actor")}' if e.get("actor") else "") for e in events]
+            summary = f'History of {result.get("label")} ({len(events)} event(s)):\n' + "\n".join(lines)
+        else:
+            summary = f'No history events for {result.get("label")}.'
+        return _tool_result(summary, result)
 
     def _tool_themes(self, args: dict[str, Any]) -> dict[str, Any]:
         limit = _clamp_int(args.get("limit"), default=6, low=1, high=20)
@@ -462,6 +732,53 @@ class MemoryMCPServer:
         summary = "Projects:\n" + "\n".join(f'- {r["id"]}: {r["name"]}' for r in rows) if rows else "No projects yet."
         return _tool_result(summary, {"projects": rows})
 
+    def _tool_project_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or "").strip()
+        root_path = str(args.get("root_path") or "").strip()
+        if not name and not root_path:
+            raise _RpcError(INVALID_PARAMS, "name or root_path is required")
+        result = self.service.create_project({
+            "name": name,
+            "root_path": root_path,
+            "description": str(args.get("description") or ""),
+        })
+        project = result.get("project") or {}
+        kind = "knowledge" if not project.get("root_path") else "workspace"
+        action = "Created" if result.get("created") else "Found existing"
+        summary = f'{action} {kind} project "{project.get("name")}" (id {project.get("id")}).'
+        return _tool_result(summary, {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "root_path": project.get("root_path") or "",
+            "description": project.get("description") or "",
+            "created": bool(result.get("created")),
+        })
+
+    def _tool_memory_link(self, args: dict[str, Any]) -> dict[str, Any]:
+        source = str(args.get("source") or "").strip()
+        target = str(args.get("target") or "").strip()
+        edge_type = str(args.get("type") or "").strip().upper()
+        if not source or not target:
+            raise _RpcError(INVALID_PARAMS, "source and target are required")
+        if edge_type not in LINK_EDGE_TYPES:
+            raise _RpcError(INVALID_PARAMS, f"type must be one of: {', '.join(LINK_EDGE_TYPES)}")
+        result = self.service.create_graph_edge({
+            "source": source,
+            "target": target,
+            "type": edge_type,
+            "scope": str(args.get("scope") or ""),
+            "confidence": args.get("confidence"),
+        })
+        edge = result.get("edge") or {}
+        summary = f'Linked {edge.get("source")} -[{edge.get("type")}]-> {edge.get("target")} (edge id {edge.get("id")}).'
+        return _tool_result(summary, {
+            "edge_id": edge.get("id"),
+            "source": edge.get("source"),
+            "target": edge.get("target"),
+            "type": edge.get("type"),
+            "scope": edge.get("scope"),
+        })
+
     def _tool_get(self, args: dict[str, Any]) -> dict[str, Any]:
         node_id = str(args.get("id") or "").strip()
         if not node_id:
@@ -507,6 +824,12 @@ class MemoryMCPServer:
             }]}
         resources = [
             {
+                "uri": "memory://briefing",
+                "name": "Startup briefing",
+                "description": "Stable ArchitectOS memory (pinned, constraints, long-term) to inject at session start.",
+                "mimeType": "text/plain",
+            },
+            {
                 "uri": "memory://projects",
                 "name": "Projects",
                 "description": "ArchitectOS projects available for scoping memory.",
@@ -523,6 +846,9 @@ class MemoryMCPServer:
 
     def _resource_read(self, params: dict[str, Any]) -> dict[str, Any]:
         uri = str(params.get("uri") or "").strip()
+        if uri == "memory://briefing":
+            text = self._startup_briefing() or self._startup_instructions()
+            return {"contents": [{"uri": uri, "mimeType": "text/plain", "text": text}]}
         if uri == "memory://projects":
             rows = [{"id": p.get("id"), "name": p.get("name"), "root_path": p.get("root_path")} for p in self.service.projects()]
             return _resource_contents(uri, {"projects": rows})
@@ -606,6 +932,11 @@ def _clamp_int(value: Any, *, default: int, low: int, high: int) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "hook":
+        from .agent_hooks import main as hook_main
+
+        return hook_main(raw[1:])
     root = _resolve_root()
     if getattr(sys, "frozen", False) and not os.environ.get("ARCHITECTOS_ROOT"):
         _log(

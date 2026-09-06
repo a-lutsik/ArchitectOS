@@ -48,6 +48,23 @@ class ProductionOpsTests(unittest.TestCase):
             backups = temp_service.list_backups()["backups"]
             self.assertEqual(backups[0]["path"], backup["path"])
 
+    def test_packaged_readiness_uses_bundled_frontend_and_skips_source_manifest(self) -> None:
+        app_root = Path(__file__).resolve().parents[1]
+        frontend_root = app_root / "frontend"
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            with mock.patch("backend.architectos.service.is_frozen", return_value=True), mock.patch(
+                "backend.architectos.service.resolve_frontend_root",
+                return_value=frontend_root,
+            ):
+                ready = service.readiness()
+            self.assertTrue(ready["ok"], ready)
+            self.assertEqual(ready["checks"]["frontend"]["status"], "ok")
+            self.assertEqual(ready["checks"]["frontend"]["root"], str(frontend_root))
+            self.assertEqual(ready["checks"]["release"]["status"], "ok")
+            self.assertEqual(ready["checks"]["release"]["mode"], "packaged")
+            self.assertTrue(ready["checks"]["release"]["checks"]["packaged_runtime"])
+
     def test_http_ops_endpoints_and_security_headers(self) -> None:
         service = ArchitectOSService(Path(__file__).resolve().parents[1])
 
@@ -122,6 +139,11 @@ class ProductionOpsTests(unittest.TestCase):
                 self.assertEqual(status_of(urllib.request.Request(f"{base_url}/api/health", headers={"X-ArchitectOS-Token": service.auth_token, "Origin": "https://evil.example"})), 403)
                 # Foreign Host header (DNS rebinding) is rejected.
                 self.assertEqual(status_of(urllib.request.Request(f"{base_url}/api/health", headers={"X-ArchitectOS-Token": service.auth_token, "Host": "evil.example"})), 403)
+                # OAuth callback is token-exempt, but STILL Host/Origin-guarded (no rebinding bypass).
+                self.assertEqual(status_of(urllib.request.Request(f"{base_url}/api/mcp/oauth/callback", headers={"Host": "evil.example"})), 403)
+                # Token remains waived for the loopback OAuth callback (handler runs, not 403).
+                callback_status = status_of(urllib.request.Request(f"{base_url}/api/mcp/oauth/callback"))
+                self.assertNotEqual(callback_status, 403)
                 # Same-origin request with the token passes.
                 self.assertEqual(status_of(urllib.request.Request(f"{base_url}/api/health", headers={"X-ArchitectOS-Token": service.auth_token, "Origin": base_url})), 200)
                 self.assertEqual(status_of(urllib.request.Request(f"{base_url}/api/health", headers={"X-ArchitectOS-Token": service.auth_token})), 200)

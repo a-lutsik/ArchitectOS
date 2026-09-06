@@ -32,9 +32,13 @@ class MemoryMCPServerTests(unittest.TestCase):
         init = responses[0]["result"]
         self.assertEqual(init["serverInfo"]["name"], "architectos-memory")
         self.assertIn("tools", init["capabilities"])
+        self.assertIn("already in this briefing", init["instructions"])
+        self.assertIn("memory_turn", init["instructions"])
+        self.assertIn("memory_search", init["instructions"])
         tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertEqual(tool_names, {tool["name"] for tool in TOOLS})
         self.assertIn("memory_search", tool_names)
+        self.assertIn("memory_turn", tool_names)
         self.assertIn("memory_add", tool_names)
 
     def test_add_then_search_round_trip(self) -> None:
@@ -80,6 +84,9 @@ class MemoryMCPServerTests(unittest.TestCase):
             ])
         context_text = responses[2]["result"]["content"][0]["text"]
         self.assertIn("ArchitectOS Memory Context", context_text)
+        self.assertTrue(
+            "Stable memory" in context_text or "Retrieved for this query:" in context_text
+        )
 
     def test_add_requires_label_and_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -274,6 +281,7 @@ class MemoryMCPServerTests(unittest.TestCase):
         uris = {r["uri"] for r in responses[0]["result"]["resources"]}
         self.assertIn("memory://projects", uris)
         self.assertIn("memory://review", uris)
+        self.assertIn("memory://briefing", uris)
         templates = responses[1]["result"]["resourceTemplates"]
         self.assertEqual(templates[0]["uriTemplate"], "memory://nodes/{id}")
         projects = json.loads(responses[2]["result"]["contents"][0]["text"])
@@ -284,6 +292,76 @@ class MemoryMCPServerTests(unittest.TestCase):
         self.assertEqual(node["id"], node_id)
         self.assertIn("net amount after tax removal", node["text"])
         self.assertEqual(responses[5]["error"]["code"], -32602)
+
+    def test_briefing_resource_after_constraint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_add", "arguments": {
+                    "label": "Never commit to main",
+                    "text": "Do not commit directly to the main branch. Use pull requests.",
+                    "type": "Constraint",
+                    "project_id": "architectos",
+                }}},
+            ])
+            responses = _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "memory://briefing"}},
+            ])
+        instructions = responses[0]["result"]["instructions"]
+        briefing = responses[1]["result"]["contents"][0]["text"]
+        self.assertIn("Never commit to main", instructions)
+        self.assertIn("Never commit to main", briefing)
+        self.assertIn("Stable memory", briefing)
+
+    def test_memory_turn_packs_and_queues_constraint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            responses = _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_turn", "arguments": {
+                    "user_text": "Architecture decision: never commit directly to main.",
+                    "project_id": "architectos",
+                }}},
+            ])
+        result = responses[0]["result"]
+        self.assertFalse(result.get("isError"))
+        text = result["content"][0]["text"]
+        payload = json.loads(text.split("```json", 1)[1].rsplit("```", 1)[0])
+        self.assertTrue(payload.get("kept"))
+        self.assertGreaterEqual(len(payload.get("queued") or []), 1)
+        self.assertEqual(payload["queued"][0]["type"], "Decision")
+
+    def test_memory_turn_auto_writes_low_risk_lesson(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            responses = _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_turn", "arguments": {
+                    "user_text": "Remember: the team prefers pytest for unit tests in this repository.",
+                    "project_id": "architectos",
+                }}},
+            ])
+        result = responses[0]["result"]
+        self.assertFalse(result.get("isError"))
+        payload = json.loads(result["content"][0]["text"].split("```json", 1)[1].rsplit("```", 1)[0])
+        self.assertTrue(payload.get("kept"))
+        self.assertGreaterEqual(len(payload.get("auto_accepted") or []), 1)
+
+    def test_memory_add_splits_multi_fact_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            responses = _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_add", "arguments": {
+                    "label": "Repo rules",
+                    "text": "Never commit directly to main.\nRemember: the team prefers pytest for unit tests.",
+                    "project_id": "architectos",
+                }}},
+            ])
+        result = responses[0]["result"]
+        self.assertFalse(result.get("isError"))
+        text = result["content"][0]["text"]
+        self.assertIn("Split into", text)
+        payload = json.loads(text.split("```json", 1)[1].rsplit("```", 1)[0])
+        self.assertGreaterEqual(len(payload.get("also_created") or []), 1)
 
 
 class ResolveRootTests(unittest.TestCase):

@@ -6,7 +6,18 @@ from hashlib import sha1
 from typing import Any
 
 SCHEMA_VERSION = "0.1"
-VALID_SCOPES = {"interface", "project", "shared", "global"}
+# Legacy scopes (interface|project|shared|global) stay valid; the PRD scopes
+# extend them for the external platform visibility model.
+VALID_SCOPES = {
+    "interface",
+    "project",
+    "shared",
+    "global",
+    "public_knowledge",
+    "project_shared",
+    "user_private",
+    "system_internal",
+}
 VALID_NODE_TYPES = {
     "Project",
     "Doc",
@@ -57,6 +68,34 @@ class Project:
 
 
 @dataclass(slots=True)
+class Source:
+    """External data origin (feed, pipeline, importer) attached to a project."""
+
+    id: str
+    project_id: str
+    name: str
+    kind: str = "generic"
+    config: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Source":
+        return cls(
+            id=str(data.get("id") or ""),
+            project_id=str(data.get("project_id") or ""),
+            name=str(data.get("name") or ""),
+            kind=str(data.get("kind") or "generic"),
+            config=dict(data.get("config") or {}),
+            created_at=str(data.get("created_at") or utc_now()),
+            updated_at=str(data.get("updated_at") or utc_now()),
+        )
+
+
+@dataclass(slots=True)
 class MemoryNode:
     id: str
     type: str
@@ -65,6 +104,7 @@ class MemoryNode:
     text: str
     project_id: str | None = None
     interface_id: str | None = None
+    source_id: str | None = None
     status: str = "active"
     confidence: float = 0.8
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -86,6 +126,7 @@ class MemoryNode:
             text=str(data.get("text") or ""),
             project_id=data.get("project_id"),
             interface_id=data.get("interface_id"),
+            source_id=data.get("source_id"),
             status=str(data.get("status") or "active"),
             confidence=float(data.get("confidence") or 0.0),
             metadata=dict(data.get("metadata") or {}),

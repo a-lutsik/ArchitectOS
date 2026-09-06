@@ -1,8 +1,9 @@
-"""MCP server hub CRUD and code-intelligence (LSP) endpoints.
+"""MCP server hub CRUD, agent hook installation and code-intelligence (LSP) endpoints.
 
 Extracted from ``service.py``. Covers persistence and management of MCP servers
-(list/upsert/test/auth/tools/call) and the code-intelligence endpoints backed by
-the language-server manager (symbols/hover/diagnostics/references, language
+(list/upsert/test/auth/tools/call), registration of our capture hooks in agent
+clients (Cursor / Claude Code / Codex), and the code-intelligence endpoints backed
+by the language-server manager (symbols/hover/diagnostics/references, language
 discovery and server install). Depends only on leaf modules; repository access
 and language/MCP managers are reached through ``self`` via the MRO on
 :class:`ArchitectOSService`.
@@ -11,9 +12,12 @@ and language/MCP managers are reached through ``self`` via the MRO on
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 from typing import Any
 
+from . import agent_hooks
+from .config import DEFAULT_HOST, DEFAULT_PORT
 from .lsp import LSPError, find_executable, is_runnable_install_command, resolve_install_command
 from .mcp import MCPError
 
@@ -22,6 +26,35 @@ _LOG = logging.getLogger("architectos.service")
 
 class IntegrationsServiceMixin:
     """MCP server hub management and code-intelligence (LSP) endpoints."""
+
+    def integration_credentials(self) -> dict[str, Any]:
+        self._load_project_env_files()
+        ado_org = str(os.environ.get("ADO_ORG") or os.environ.get("AZURE_DEVOPS_ORG") or "").strip()
+        ado_token = bool(str(os.environ.get("ADO_MCP_AUTH_TOKEN") or os.environ.get("PERSONAL_ACCESS_TOKEN") or "").strip())
+        return {
+            "azure_devops": {
+                "ready": bool(ado_org and ado_token),
+                "org_set": bool(ado_org),
+                "token_set": ado_token,
+                "org": ado_org,
+            },
+        }
+
+    def save_integration_credentials(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = dict(payload or {})
+        kind = str(payload.get("kind") or "azure_devops").strip().lower().replace("-", "_")
+        if kind not in {"azure_devops", "ado", "azure", ""}:
+            raise ValueError("kind must be azure_devops")
+        updates: dict[str, str] = {}
+        org = str(payload.get("org") or payload.get("ado_org") or "").strip()
+        token = str(payload.get("token") or payload.get("api_key") or payload.get("pat") or "").strip()
+        if org:
+            updates["ADO_ORG"] = org
+        if token:
+            updates["ADO_MCP_AUTH_TOKEN"] = token
+        if updates:
+            self._upsert_env_local(updates)
+        return {**self.integration_credentials(), "kind": "azure_devops", "message": "Azure DevOps connection saved."}
 
     def _load_mcp_servers(self) -> list[dict[str, Any]]:
         return list((self.repository.get_setting("mcp_servers") or {}).get("servers") or [])
@@ -46,7 +79,7 @@ class IntegrationsServiceMixin:
 
     def start_mcp_auth(self, server_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
-            return self.mcp_manager.start_auth(server_id, str(payload.get("base_url") or "http://127.0.0.1:8765"))
+            return self.mcp_manager.start_auth(server_id, str(payload.get("base_url") or f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"))
         except MCPError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -68,6 +101,33 @@ class IntegrationsServiceMixin:
             return self.mcp_manager.call_tool(server_id, str(payload.get("tool") or ""), arguments)
         except MCPError as exc:
             raise ValueError(str(exc)) from exc
+
+    # --- Agent hooks --------------------------------------------------------
+
+    def agent_hook_status(self) -> dict[str, Any]:
+        """Which client hooks are registered, plus whether this build can install them."""
+        return agent_hooks.status(project_root=self.project_root)
+
+    def configure_agent_hooks(self, payload: dict[str, Any] | None = None, *, remove: bool = False) -> dict[str, Any]:
+        """Register or remove our hooks in the requested clients' config files."""
+        payload = payload or {}
+        scope = str(payload.get("scope") or "user").strip().lower()
+        if scope not in {"user", "project"}:
+            raise ValueError("scope must be 'user' or 'project'")
+        clients = agent_hooks.expand_clients(payload.get("clients"))
+        if not remove and not agent_hooks.hook_entry_available():
+            raise ValueError(
+                "this process cannot install hooks (frozen binary missing or not executable)"
+            )
+        project_root = self.project_root if scope == "project" else None
+        results: list[dict[str, Any]] = []
+        for client in clients:
+            try:
+                results.append(agent_hooks.install(client, project_root=project_root, remove=remove))
+            except OSError as exc:
+                _LOG.warning("agent hook %s failed for %s: %s", "uninstall" if remove else "install", client, exc)
+                results.append({"client": client, "removed": remove, "error": str(exc)})
+        return {"scope": scope, "removed": remove, "results": results, "status": self.agent_hook_status()}
 
     # --- Code Intelligence (LSP) --------------------------------------------
 

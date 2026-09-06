@@ -54,10 +54,17 @@ python3 scripts/build_share_package.py --with-mcp --with-ide
    - **macOS:** `chmod +x install.sh architectos-server && ./install.sh`  
      (первый раз: правый клик → Открыть, если Gatekeeper ругается).
    - **Windows:** `install.bat` или `powershell -File .\install.ps1`.
-3. Открывает UI: [http://127.0.0.1:8765/](http://127.0.0.1:8765/).
+   В конце будет баннер SUCCESS или ERROR; при двойном щелчке окно ждёт Enter (из уже открытого терминала на Windows — не ждёт).
+3. Открывает UI: [http://127.0.0.1:8766/](http://127.0.0.1:8766/).
 
-Установка копирует `architectos-server` в `$ARCHITECTOS_ROOT/bin` и регистрирует
-**автозапуск при входе в систему**:
+`install.sh` сразу проверяет sqlite-vec (ускорение смыслового поиска по памяти).
+Если в логе установки `python fallback` — Ask/Search всё равно работают; чтобы
+запечь sqlite-vec в пакет, собирайте на Homebrew/conda Python
+(`pip install -e ".[vectors,packaging]"`).
+
+Установка копирует `architectos-server` в `$ARCHITECTOS_ROOT/bin`, кладёт рядом
+`uninstall.sh` и `docs/`, и регистрирует **автозапуск при входе в систему**.
+Если в zip есть `architectos-mcp` или `ide/`, они тоже копируются в корень данных.
 
 | ОС | Механизм |
 | --- | --- |
@@ -66,7 +73,8 @@ python3 scripts/build_share_package.py --with-mcp --with-ide
 
 Сервер стартует с `--no-browser` (фоновый HTTP). Логи: `$ARCHITECTOS_ROOT/logs/`.
 
-Отмена автозапуска: `./uninstall.sh` / `uninstall.bat` (данные не удаляются).
+Отмена автозапуска: `$ARCHITECTOS_ROOT/uninstall.sh` (после установки) или
+`./uninstall.sh` / `uninstall.bat` из распакованного zip (данные не удаляются).
 
 ### 2.2. Нативный установщик Desktop (Tauri)
 
@@ -92,18 +100,20 @@ python3 run_architectos.py --no-browser # только сервер
 
 Windows: `start-architectos.ps1` / `start-architectos-app.ps1`.
 
-Предпочтительный порт `8765`; если занят — выбирается следующий свободный
+Предпочтительный порт `8766`; если занят — выбирается следующий свободный
 (см. `docs/STARTUP.md`).
 
 ### 2.4. Первые шаги в UI
 
-1. Выберите язык (EN / RU / UK / HE) в настройках интерфейса.
-2. **Projects** — укажите корень проекта (скан / импорт файлов в память).
-3. **Memory** — поиск, избранное, review queue, inbox-папка (`data/inbox`).
-4. **Chat / Context** — ответы с опорой на память и выбранные файлы.
-5. **Providers** — каталог моделей (Ollama, OpenAI, Anthropic, OpenRouter, CLI).
-   Секреты — в окружении / настройках, не в тексте памяти.
-6. **Settings** — безопасность, embeddings, ingest, авторескан.
+1. Выберите язык (EN / RU / UK / HE) в **Settings**.
+2. **Projects** (в Workspace) — укажите корень проекта (скан / импорт файлов в память).
+3. **Memory** — поиск, избранное, граф Map/Galaxy, review queue (чипы **Ask** и **MCP**), inbox (`data/inbox`).
+4. **Ask** / **Workspace** — вопросы с опорой на память и выбранные файлы. Завершение диалога (**End**) пишет факты Ask в очередь.
+5. **Providers** — вставьте ключ модели в карточку и нажмите Test (Ollama, OpenAI, Anthropic, OpenRouter, CLI).
+   Секреты пишутся в `.env.local`, не в базу и не в память.
+6. **Setup → Agent hooks** — хуки Cursor / Claude Code / Codex, чтобы факты из IDE шли в очередь как **MCP**.
+7. **Settings → Connections** — Azure DevOps (org + PAT).
+   Там же — безопасность, embeddings retrieval, память Ask, авторескан.
 
 Готовность: пока жив процесс сервера, есть файл
 `data/architectos.runtime.json` — его же читает IDE-плагин кнопкой **Detect**.
@@ -185,18 +195,44 @@ python3 mcp_memory_server.py
 
 Подробные сниппеты: `docs/MCP_MEMORY_SERVER.md` и `README-mcp.txt` в zip MCP.
 
+### 3.4a. Хуки: память без вызова инструмента
+
+MCP срабатывает, только если агент сам решил позвать инструмент. Хуки клиента
+срабатывают всегда, поэтому молчащий агент перестаёт быть дырой.
+
+Ставятся из приложения: **Setup → Agent hooks** (русская локаль: **Настройка →
+Хуки агентов**) показывает каждый клиент, путь к его файлу конфигурации и
+состояние установки, а кнопка спрашивает подтверждение со списком файлов,
+которые будут изменены. Флажок «Только этот проект» переключает
+пользовательский конфиг на репозиторный. То же самое из терминала:
+
+```bash
+python3 architectos_hook.py install --client all   # Cursor, Claude Code, Codex
+python3 architectos_hook.py doctor                 # что подключено и виден ли сервер
+```
+
+Codex и Claude Code умеют и захват, и подстановку памяти под текущий вопрос;
+Cursor — только захват, поэтому MCP для него оставляем. Правила те же, что у
+`memory_turn`: сырой диалог не хранится, Lesson низкого риска пишется сразу,
+Decision и Constraint ждут review, карточки в очереди с чипом **MCP** (не Ask).
+Подробности: `docs/AGENT_HOOKS.md`.
+
 ### 3.5. Основные инструменты
 
 | Инструмент | Зачем |
 | --- | --- |
 | `memory_search` | Поиск по памяти |
 | `memory_context` | Готовый бриф (память + задачи + провайдеры) |
-| `memory_add` | Записать урок/решение (секреты редактируются) |
+| `memory_turn` | Каждый ход: pack по сообщению + атомы в очередь (Lesson низкого риска пишется сразу) |
+| `memory_add` | Записать урок/решение (секреты редактируются; несколько фактов режутся на узлы) |
 | `memory_get` | Полный узел по id |
 | `memory_feedback` | Оценка хитов (±1) для ранжирования |
 | `memory_list_projects` | Список проектов для scope |
 
-Типичный цикл агента: search → get → ответ → feedback → add новых уроков.
+Типичный цикл агента: briefing в `instructions` при старте, затем `memory_turn` на каждое сообщение пользователя → при необходимости search/get → ответ → feedback → add явных уроков.
+
+Один факт — одна карточка: `memory_turn` и хуки пишут **MCP**; диалоги в приложении
+пишут **Ask**. Одно и то же сообщение не появляется в обоих каналах.
 
 ---
 
@@ -223,7 +259,7 @@ make dist-ide
    `data/architectos.runtime.json`.
 2. **Settings → Tools → ArchitectOS Memory → Detect** — подставит URL и
    `auth_token`.
-3. Либо укажите URL вручную (`http://127.0.0.1:8765`) и токен из runtime.json.
+3. Либо укажите URL вручную (`http://127.0.0.1:8766`) и токен из runtime.json.
 
 Плагин ходит по HTTP с заголовком `X-ArchitectOS-Token`.
 

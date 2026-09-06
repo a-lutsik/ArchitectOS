@@ -52,6 +52,36 @@ _FACT_LINE_PATTERNS = (
 _DURABLE_RE = [re.compile(pattern, re.I) for pattern in _DURABLE_PATTERNS]
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# Path-like or symbol-like anchors used as fact subjects for revision detection.
+_FACT_SUBJECT_PATH_RE = re.compile(
+    r"(?:^|[\s`\"'(])("
+    r"[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)+\.(?:py|js|jsx|ts|tsx|java|kt|go|rs|md)"
+    r"|[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*){1,6}"
+    r")(?:$|[\s`\"'):,])"
+)
+_FACT_SUBJECT_BACKTICK_RE = re.compile(r"`([^`\n]{3,120})`")
+
+
+def infer_fact_subject(text: str) -> str:
+    """Extract a stable subject (path or symbol) from a fact claim, if any.
+
+    Used so two different claims about the same code entity become revisions
+    rather than unrelated facts or false duplicates.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    for match in _FACT_SUBJECT_BACKTICK_RE.finditer(raw):
+        token = match.group(1).strip()
+        if "/" in token or "." in token or token.endswith(
+            (".py", ".js", ".ts", ".tsx", ".java", ".go", ".rs", ".md")
+        ):
+            return token[:160]
+    match = _FACT_SUBJECT_PATH_RE.search(raw)
+    if match:
+        return match.group(1)[:160]
+    return ""
+
 
 @dataclass(slots=True)
 class ChatMemoryVerdict:
@@ -123,7 +153,7 @@ def chat_turn_score(user_text: str, assistant_text: str) -> float:
     return max(0.0, min(1.0, score))
 
 
-def extract_durable_facts(user_text: str, assistant_text: str, *, limit: int = 3) -> list[dict[str, str]]:
+def extract_durable_facts(user_text: str, assistant_text: str, *, limit: int = 6) -> list[dict[str, str]]:
     """Pull short durable facts instead of storing the full turn."""
     facts: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -143,17 +173,27 @@ def extract_durable_facts(user_text: str, assistant_text: str, *, limit: int = 3
             if source != "user_statement" or len(cleaned) < 40:
                 return
         seen.add(key)
-        facts.append({
+        subject = infer_fact_subject(cleaned)
+        entry = {
             "type": fact_type,
             "text": cleaned[:400],
             "source": source,
-        })
+        }
+        if subject:
+            entry["subject"] = subject
+        facts.append(entry)
 
     user = str(user_text or "").strip()
     assistant = str(assistant_text or "").strip()
 
-    # Prefer explicit user directives as first-class facts.
-    if user and not is_chitchat_user_message(user) and (has_durable_signal(user) or len(user) >= 60):
+    # Prefer explicit user directives as first-class facts. Split multi-line
+    # turns so "never commit to main" and "prefer pytest" become two atoms.
+    user_lines = [line.strip() for line in user.splitlines() if line.strip()]
+    durable_lines = [line for line in user_lines if has_durable_signal(line) and len(line) >= 18]
+    if len(durable_lines) >= 2:
+        for line in durable_lines:
+            add(line, classify_fact_type(line), "user_line")
+    elif user and not is_chitchat_user_message(user) and (has_durable_signal(user) or len(user) >= 60):
         add(user, classify_fact_type(user), "user_statement")
 
     for pattern in _FACT_LINE_PATTERNS:
@@ -169,6 +209,125 @@ def extract_durable_facts(user_text: str, assistant_text: str, *, limit: int = 3
         add(compact, classify_fact_type(compact), "turn_compact")
 
     return facts[:limit]
+
+
+def facts_from_memory_blob(text: str, *, limit: int = 12) -> list[dict[str, str]]:
+    """Split an explicit memory_add blob into line-atoms when the agent dumped several facts.
+
+    A single paragraph stays one fact (empty list = do not split). Two or more
+    durable lines or bullets become separate atoms so one dump is not one node.
+    """
+    facts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        bullet = re.match(r"^(?:[-*•]|\d+[.)])\s+(.{15,400})$", line)
+        cleaned = (bullet.group(1) if bullet else line).strip()
+        cleaned = _WHITESPACE_RE.sub(" ", cleaned)
+        if len(cleaned) < 18:
+            continue
+        key = cleaned.lower()
+        if key in seen or is_chitchat_user_message(cleaned):
+            continue
+        if not has_durable_signal(cleaned):
+            continue
+        seen.add(key)
+        facts.append({"type": classify_fact_type(cleaned), "text": cleaned[:400], "source": "memory_add_split"})
+        if len(facts) >= limit:
+            break
+    if len(facts) < 2:
+        return []
+    return facts
+
+
+_ATOM_HEADING_RE = re.compile(
+    r"(?im)^##\s+(facts|decisions|constraints?(?:\s*/\s*rules?)?)\s*$"
+)
+
+
+def facts_from_markdown_summary(text: str, *, limit: int = 12) -> list[dict[str, str]]:
+    """Pull durable bullets from a session summary's Facts/Decisions/Constraints sections."""
+    facts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    section = ""
+    for raw in str(text or "").splitlines():
+        heading = _ATOM_HEADING_RE.match(raw.strip())
+        if heading:
+            section = heading.group(1).lower()
+            continue
+        if raw.strip().startswith("## "):
+            section = ""
+            continue
+        if not section:
+            continue
+        bullet = re.match(r"^(?:[-*•]|\d+[.)])\s+(.{15,240})$", raw.strip())
+        if not bullet:
+            continue
+        cleaned = _WHITESPACE_RE.sub(" ", bullet.group(1).strip())
+        key = cleaned.lower()
+        if key in seen or is_chitchat_user_message(cleaned):
+            continue
+        seen.add(key)
+        if "decision" in section:
+            fact_type = "Decision"
+        elif "constraint" in section:
+            fact_type = "Constraint"
+        else:
+            fact_type = classify_fact_type(cleaned)
+        facts.append({"type": fact_type, "text": cleaned[:400], "source": "session_markdown"})
+        if len(facts) >= limit:
+            break
+    return facts
+
+
+_FACT_TYPE_RANK = {"Constraint": 3, "Requirement": 2, "Decision": 1, "Lesson": 0}
+
+
+def _prefer_fact_type(left: str, right: str) -> str:
+    left_rank = _FACT_TYPE_RANK.get(str(left or "Lesson"), 0)
+    right_rank = _FACT_TYPE_RANK.get(str(right or "Lesson"), 0)
+    return str(left or "Lesson") if left_rank >= right_rank else str(right or "Lesson")
+
+
+def collapse_similar_facts(
+    facts: list[dict[str, Any]],
+    *,
+    threshold: float = 0.68,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    """Merge paraphrased fact bullets before origin_key / review enqueue."""
+    if not facts:
+        return []
+    from .memory_ingestion import DUPLICATE_STOPWORDS, _token_set, _token_similarity
+
+    clusters: list[dict[str, Any]] = []
+    cluster_tokens: list[set[str]] = []
+    for fact in facts:
+        text = str(fact.get("text") or "").strip()
+        if len(text) < 18:
+            continue
+        tokens = _token_set(text.lower(), DUPLICATE_STOPWORDS)
+        merged = False
+        for index, existing_tokens in enumerate(cluster_tokens):
+            if _token_similarity(tokens, existing_tokens, containment_weight=0.85) < threshold:
+                continue
+            keeper = clusters[index]
+            existing_text = str(keeper.get("text") or "").strip()
+            if len(text) > len(existing_text):
+                keeper["text"] = text[:400]
+                cluster_tokens[index] = tokens
+            keeper["type"] = _prefer_fact_type(str(keeper.get("type") or "Lesson"), str(fact.get("type") or "Lesson"))
+            merged = True
+            break
+        if merged:
+            continue
+        clusters.append(dict(fact))
+        cluster_tokens.append(tokens)
+        if len(clusters) >= limit:
+            break
+    return clusters[:limit]
 
 
 def classify_fact_type(text: str) -> str:

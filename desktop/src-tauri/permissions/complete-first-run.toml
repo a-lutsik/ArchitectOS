@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-complete-first-run"
+description = "Allow completing first-run setup (server start + login autostart)."
+commands.allow = ["complete_first_run"]

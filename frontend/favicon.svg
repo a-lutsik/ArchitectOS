@@ -1,5 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="ArchitectOS">
-  <rect width="32" height="32" rx="7" fill="#111827"/>
-  <rect x="1" y="1" width="30" height="30" rx="6" fill="none" stroke="#34d399" stroke-width="1.5" opacity="0.35"/>
-  <text x="16" y="21.5" text-anchor="middle" fill="#34d399" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="700">AO</text>
+  <defs>
+    <linearGradient id="ao" x1="6" y1="8" x2="26" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="46%" stop-color="#67e8f9"/>
+      <stop offset="54%" stop-color="#e879f9"/>
+      <stop offset="100%" stop-color="#d946ef"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="#07070a"/>
+  <path fill="url(#ao)" d="M10.2 7.6c-3.1.4-5.4 3.2-5.4 6.3 0 2.1 1 4 2.7 5.2-.7 1.4-.4 3.2.9 4.2 1.2.9 2.9.7 3.9-.3.8.3 1.7.4 2.7.4V7.4c-1.6 0-3.2.1-4.8.2zm11.6 0c3.1.4 5.4 3.2 5.4 6.3 0 2.1-1 4-2.7 5.2.7 1.4.4 3.2-.9 4.2-1.2.9-2.9.7-3.9-.3-.8.3-1.7.4-2.7.4V7.4c1.6 0 3.2.1 4.8.2z"/>
+  <path fill="none" stroke="url(#ao)" stroke-width="1.2" stroke-linejoin="round" d="M9.4 23.2 16 26.6l6.6-3.4L16 19.8z"/>
 </svg>

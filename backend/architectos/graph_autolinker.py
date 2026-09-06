@@ -27,7 +27,7 @@ SOURCE_HUB_CATALOG: dict[str, dict[str, str]] = {
     "issues": {"label": "Issue files", "text": "Local issue/bug markdown files for this scope (not Azure Boards)."},
     "prs": {"label": "PR notes", "text": "Local pull-request notes and templates for this scope (not remote PRs)."},
     "meetings": {"label": "Meeting notes", "text": "Local meeting note files for this scope (prefer Granola for live meetings)."},
-    "chat": {"label": "App chat", "text": "ArchitectOS chat-derived memory for this scope."},
+    "chat": {"label": "Ask", "text": "ArchitectOS Ask-derived memory for this scope."},
     "inbox": {"label": "Inbox", "text": "Files dropped into the inbox folder for this scope."},
     "granola": {"label": "Granola", "text": "Granola meeting memory for this scope."},
     "azure-boards": {"label": "Azure Boards", "text": "Azure Boards work items for this scope."},
@@ -85,34 +85,32 @@ class GraphAutoLinker:
         if self._is_structural_node(node):
             return {"created": 0, "edges": [], "linked_nodes": 0}
         scope = str(getattr(node, "scope", None) or "project")
-        resolved_project_id = project_id or getattr(node, "project_id", None)
+        attributed_project_id = self._attributed_project_id(node, project_id)
+        hub_project_id = attributed_project_id if scope == "project" else None
         if scope == "project":
-            resolved_project_id = resolved_project_id or "architectos"
-        else:
-            resolved_project_id = None
+            hub_project_id = hub_project_id or "architectos"
         source_key = self._source_key_for_node(node)
+        source_name = str(dict(getattr(node, "metadata", {}) or {}).get("source_name") or "")
         hub = self._ensure_source_hub(
             scope,
-            resolved_project_id,
+            hub_project_id,
             source_key,
+            source_name=source_name,
             hub_cache=hub_cache,
             nodes_snapshot=nodes_snapshot,
         )
         planned: list[tuple[str, str, str, str, float, str]] = [
             (hub.id, node.id, self._hub_leaf_edge_type(node, source_key), scope, 0.8, "source_hub"),
         ]
-        if scope == "project":
-            root = self._project_root_node(
-                resolved_project_id or "architectos",
-                nodes_snapshot=nodes_snapshot,
-                root_cache=project_root_cache,
-            )
-            if root and root.id != hub.id:
-                planned.append((root.id, hub.id, "HAS_MEMORY", "project", 0.9, "project_source_hub"))
-        else:
-            scope_root = self._ensure_scope_root(scope, nodes_snapshot=nodes_snapshot, hub_cache=hub_cache)
-            if scope_root.id != hub.id:
-                planned.append((scope_root.id, hub.id, "HAS_MEMORY", scope, 0.9, "scope_source_hub"))
+        self._plan_hub_parent_edges(
+            planned,
+            hub,
+            node,
+            project_id=attributed_project_id or project_id,
+            root_cache=project_root_cache,
+            nodes_snapshot=nodes_snapshot,
+            hub_cache=hub_cache,
+        )
         return self._write_edges(planned, existing_edge_ids=existing_edge_ids)
 
     def rebuild(self, project_id: str | None = None, similarity_limit: int = 3) -> dict[str, Any]:
@@ -120,7 +118,12 @@ class GraphAutoLinker:
         if project_id:
             nodes = [
                 node for node in nodes
-                if node.project_id in {project_id, None} or str(getattr(node, "scope", "") or "") in {"shared", "global"}
+                if node.project_id in {project_id, None} or str(getattr(node, "scope", "") or "") in {
+                "shared",
+                "global",
+                "public_knowledge",
+                "project_shared",
+            }
             ]
         hub_cache: dict[tuple[str, str | None, str], Any] = {}
         project_root_cache: dict[str, Any] = {}
@@ -132,26 +135,32 @@ class GraphAutoLinker:
         by_id = {node.id: node for node in content_nodes}
         for node in content_nodes:
             scope = str(getattr(node, "scope", None) or "project")
-            node_project_id = getattr(node, "project_id", None)
+            attributed_project_id = self._attributed_project_id(node, project_id)
+            hub_project_id = attributed_project_id if scope == "project" else None
             if scope == "project":
-                node_project_id = node_project_id or project_id or "architectos"
-            else:
-                node_project_id = None
+                hub_project_id = hub_project_id or project_id or "architectos"
             source_key = self._source_key_for_node(node)
+            source_name = str(dict(getattr(node, "metadata", {}) or {}).get("source_name") or "")
             hub = self._ensure_source_hub(
                 scope,
-                node_project_id,
+                hub_project_id,
                 source_key,
+                source_name=source_name,
                 hub_cache=hub_cache,
                 nodes_snapshot=nodes,
             )
             planned.append((hub.id, node.id, self._hub_leaf_edge_type(node, source_key), scope, 0.8, "source_hub"))
-            if scope == "project" and root and root.id != hub.id:
-                planned.append((root.id, hub.id, "HAS_MEMORY", "project", 0.9, "project_source_hub"))
-            elif scope != "project":
-                scope_root = self._ensure_scope_root(scope, nodes_snapshot=nodes, hub_cache=hub_cache)
-                if scope_root.id != hub.id:
-                    planned.append((scope_root.id, hub.id, "HAS_MEMORY", scope, 0.9, "scope_source_hub"))
+            self._plan_hub_parent_edges(
+                planned,
+                hub,
+                node,
+                project_id=project_id,
+                root=root,
+                nodes_snapshot=nodes,
+                hub_cache=hub_cache,
+            )
+        if root and project_id:
+            planned.extend(self._plan_existing_project_source_hubs(project_id, root, nodes))
 
         # Inverted-index similarity: avoid O(n²) pairwise Jaccard over the full corpus.
         # Code artifacts are excluded: path/token overlap between source files created
@@ -203,7 +212,14 @@ class GraphAutoLinker:
 
         written = self._write_edges(planned, existing_edge_ids=existing_edge_ids)
         pruned = self.prune_empty_source_hubs(project_id)
-        return {**written, "root": root.id if root else "", "candidate_edges": len(planned), "pruned_hubs": pruned}
+        foreign = self._prune_foreign_project_root_edges(project_id, list(hub_cache.values()))
+        return {
+            **written,
+            "root": root.id if root else "",
+            "candidate_edges": len(planned),
+            "pruned_hubs": pruned,
+            "pruned_foreign_roots": foreign,
+        }
 
     def prune_empty_source_hubs(self, project_id: str | None = None) -> dict[str, Any]:
         """Remove source hubs and scope roots that have no content children."""
@@ -295,20 +311,101 @@ class GraphAutoLinker:
             child_targets.setdefault(edge.source, set()).add(edge.target)
         return child_targets
 
+    def _attributed_project_id(self, node: Any, fallback: str | None) -> str | None:
+        meta = dict(getattr(node, "metadata", None) or {})
+        source_id = str(getattr(node, "source_id", None) or meta.get("source_id") or "").strip()
+        if source_id:
+            source = self.repository.get_source(source_id)
+            if source and source.project_id:
+                return str(source.project_id)
+        key = self._source_key_for_node(node)
+        if key.startswith("source_"):
+            source = self.repository.get_source(key)
+            if source and source.project_id:
+                return str(source.project_id)
+        pid = str(getattr(node, "project_id", None) or "").strip()
+        if pid:
+            return pid
+        if str(getattr(node, "scope", None) or "project") == "project":
+            return fallback
+        return None
+
+    def _hub_belongs_to_project(self, hub: Any, project_id: str) -> bool:
+        if str(getattr(hub, "project_id", None) or "") == project_id:
+            return True
+        key = str(dict(getattr(hub, "metadata", None) or {}).get("source_key") or "")
+        if key.startswith("source_"):
+            source = self.repository.get_source(key)
+            return bool(source and str(source.project_id or "") == project_id)
+        return False
+
+    def _plan_hub_parent_edges(
+        self,
+        planned: list[tuple[str, str, str, str, float, str]],
+        hub: Any,
+        node: Any,
+        *,
+        project_id: str | None,
+        root: Any | None = None,
+        root_cache: dict[str, Any] | None = None,
+        nodes_snapshot: list[Any] | None = None,
+        hub_cache: dict[tuple[str, str | None, str], Any] | None = None,
+    ) -> None:
+        scope = str(getattr(node, "scope", None) or "project")
+        attributed = self._attributed_project_id(node, project_id)
+        target_project = project_id or attributed
+        if root is None and target_project:
+            root = self._project_root_node(
+                target_project,
+                nodes_snapshot=nodes_snapshot,
+                root_cache=root_cache,
+            )
+        if root and root.id != hub.id and attributed and attributed == (project_id or attributed):
+            if not project_id or attributed == project_id:
+                planned.append((root.id, hub.id, "HAS_MEMORY", "project", 0.9, "project_source_hub"))
+        if scope != "project":
+            scope_root = self._ensure_scope_root(scope, nodes_snapshot=nodes_snapshot, hub_cache=hub_cache)
+            if scope_root.id != hub.id:
+                planned.append((scope_root.id, hub.id, "HAS_MEMORY", scope, 0.9, "scope_source_hub"))
+
+    def _plan_existing_project_source_hubs(
+        self,
+        project_id: str,
+        root: Any,
+        nodes: list[Any],
+    ) -> list[tuple[str, str, str, str, float, str]]:
+        planned: list[tuple[str, str, str, str, float, str]] = []
+        source_ids = {source.id for source in self.repository.list_sources(project_id)}
+        for node in nodes:
+            meta = dict(getattr(node, "metadata", None) or {})
+            if not meta.get("hub") or node.id == root.id:
+                continue
+            key = str(meta.get("source_key") or "")
+            if node.project_id == project_id or key in source_ids:
+                planned.append((root.id, node.id, "HAS_MEMORY", "project", 0.9, "project_source_hub"))
+        return planned
+
     def _ensure_source_hub(
         self,
         scope: str,
         project_id: str | None,
         source_key: str,
         *,
+        source_name: str = "",
         hub_cache: dict[tuple[str, str | None, str], Any] | None = None,
         nodes_snapshot: list[Any] | None = None,
     ) -> Any:
-        source_key = self._normalize_source_key(source_key)
-        catalog = SOURCE_HUB_CATALOG.get(source_key) or SOURCE_HUB_CATALOG["other"]
-        label = f"Source: {catalog['label']}"
+        registry_key = str(source_key or "").strip()
+        if registry_key.startswith("source_"):
+            display = str(source_name or "").strip() or registry_key
+        else:
+            source_key = self._normalize_source_key(registry_key)
+            catalog = SOURCE_HUB_CATALOG.get(source_key) or SOURCE_HUB_CATALOG["other"]
+            display = str(source_name or "").strip() or catalog["label"]
+            registry_key = source_key
+        label = f"Source: {display}"
         hub_project_id = project_id if scope == "project" else None
-        cache_key = (scope, hub_project_id or None, source_key)
+        cache_key = (scope, hub_project_id or None, registry_key)
         if hub_cache is not None and cache_key in hub_cache:
             return hub_cache[cache_key]
         nodes = nodes_snapshot if nodes_snapshot is not None else self.repository.list_nodes()
@@ -318,13 +415,14 @@ class GraphAutoLinker:
             meta = dict(node.metadata or {})
             if (
                 meta.get("hub")
-                and str(meta.get("source_key") or "") == source_key
+                and str(meta.get("source_key") or "") == registry_key
                 and str(node.scope or "") == scope
                 and (node.project_id or None) == (hub_project_id or None)
             ):
                 if hub_cache is not None:
                     hub_cache[cache_key] = node
                 return node
+        catalog = SOURCE_HUB_CATALOG.get(registry_key if not registry_key.startswith("source_") else "other") or SOURCE_HUB_CATALOG["other"]
         text = f"{catalog['text']} Scope: {scope}."
         if hub_project_id:
             text += f" Project: {hub_project_id}."
@@ -338,9 +436,10 @@ class GraphAutoLinker:
             confidence=0.95,
             metadata={
                 "hub": True,
-                "source_key": source_key,
+                "source_key": registry_key,
+                "source_name": display,
                 "source": "source_hub",
-                "source_type": source_key,
+                "source_type": registry_key if registry_key.startswith("source_") else registry_key,
                 "structural": True,
             },
         )
@@ -390,30 +489,96 @@ class GraphAutoLinker:
         nodes_snapshot: list[Any] | None = None,
         root_cache: dict[str, Any] | None = None,
     ) -> Any | None:
+        """Return the Project memory root, creating or reviving it if needed.
+
+        The root is scoped by ``project_id`` only. Never fall back to another
+        project's node (a previous ArchitectOS-label fallback attached foreign
+        hubs to the wrong spine).
+        """
+        if not project_id:
+            return None
         if root_cache is not None and project_id in root_cache:
             return root_cache[project_id]
-        nodes = nodes_snapshot if nodes_snapshot is not None else self.repository.list_nodes()
-        found = None
-        for node in nodes:
-            if node.type == "Project" and node.project_id == project_id:
-                found = node
-                break
+        found = self._find_project_root(project_id, nodes_snapshot)
+        if found is not None and found.status != "active":
+            found = self._revive_project_root(found)
+            if nodes_snapshot is not None and found not in nodes_snapshot:
+                nodes_snapshot.append(found)
         if found is None:
-            for node in nodes:
-                if node.type == "Project" and node.label.lower() == project_id.lower():
-                    found = node
-                    break
-        if found is None:
-            for node in nodes:
-                if node.type == "Project" and node.label == "ArchitectOS":
-                    found = node
-                    break
+            found = self._create_project_root(project_id)
+            if found is not None and nodes_snapshot is not None:
+                nodes_snapshot.append(found)
         if root_cache is not None:
             root_cache[project_id] = found
         return found
 
+    def _find_project_root(self, project_id: str, nodes_snapshot: list[Any] | None = None) -> Any | None:
+        if nodes_snapshot is not None:
+            for node in nodes_snapshot:
+                if node.type == "Project" and node.project_id == project_id:
+                    return node
+        stored = self.repository.list_nodes(project_id=project_id, node_type="Project")
+        return stored[0] if stored else None
+
+    def _revive_project_root(self, node: Any) -> Any:
+        node.status = "active"
+        meta = dict(node.metadata or {})
+        meta.pop("deleted_at", None)
+        meta.pop("archived_at", None)
+        meta.pop("archived_reason", None)
+        meta.pop("delete_reason", None)
+        meta["structural"] = True
+        node.metadata = meta
+        return self.repository.upsert_node(node)
+
+    def _create_project_root(self, project_id: str) -> Any:
+        project = self.repository.get_project(project_id)
+        name = str(getattr(project, "name", None) or project_id).strip() or project_id
+        root_path = str(getattr(project, "root_path", None) or "")
+        config = dict(getattr(project, "config", None) or {})
+        text = f"Project profile for {name}. Root: {root_path}."
+        return self.repository.add_node(
+            "Project",
+            name,
+            "project",
+            text,
+            project_id,
+            confidence=0.9,
+            metadata={
+                "source": "project_profile",
+                "project_root": root_path,
+                "project_config": config,
+                "structural": True,
+            },
+        )
+
+    def _prune_foreign_project_root_edges(self, project_id: str | None, hubs: list[Any]) -> int:
+        """Drop HAS_MEMORY edges from another project's root onto this project's hubs."""
+        if not project_id or not hubs:
+            return 0
+        owned_ids = {hub.id for hub in hubs if self._hub_belongs_to_project(hub, project_id)}
+        if not owned_ids:
+            return 0
+        pruned = 0
+        for edge in self.repository.list_edges_touching(list(owned_ids)):
+            if str(getattr(edge, "type", "") or "") != "HAS_MEMORY":
+                continue
+            if edge.target not in owned_ids:
+                continue
+            source = self.repository.get_node(edge.source)
+            if source is None or source.type != "Project":
+                continue
+            if source.project_id == project_id:
+                continue
+            if self.repository.delete_edge(edge.id):
+                pruned += 1
+        return pruned
+
     def _source_key_for_node(self, node: Any) -> str:
         metadata = dict(getattr(node, "metadata", {}) or {})
+        source_id = str(metadata.get("source_id") or "").strip()
+        if source_id.startswith("source_"):
+            return source_id
         raw = str(
             metadata.get("source_type")
             or metadata.get("source")
@@ -461,7 +626,7 @@ class GraphAutoLinker:
         return "other"
 
     def _hub_leaf_edge_type(self, node: Any, source_key: str) -> str:
-        if source_key in {"docs", "adr", "meetings", "azure-wiki", "granola", "chat", "teams-meetings", "inbox"}:
+        if source_key in {"docs", "adr", "meetings", "azure-wiki", "granola", "chat", "inbox"}:
             return "DOCUMENTED_IN"
         if source_key in {"code", "project_scan"}:
             return "IMPLEMENTS"

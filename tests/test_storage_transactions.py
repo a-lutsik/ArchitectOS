@@ -171,6 +171,7 @@ class SchemaMigrationTests(unittest.TestCase):
             servers = (repository.get_setting("mcp_servers") or {}).get("servers") or []
             granola = next(server for server in servers if server.get("id") == "granola")
             self.assertEqual(granola.get("url"), "https://mcp.granola.ai/mcp")  # npx -> remote http
+            self.assertEqual(granola.get("transport"), "http")
             self.assertIn("azure-devops-git", {server.get("id") for server in servers})
 
     def test_migrate_is_idempotent_on_current_database(self) -> None:

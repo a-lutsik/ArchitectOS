@@ -48,7 +48,13 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
 
 if ($env:ARCHITECTOS_REMOVE_BIN -eq "1") {
   Remove-Item -LiteralPath $DestBin, $Wrapper -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $BinDir "architectos-mcp.exe") -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $BinDir "runtime") -Recurse -Force -ErrorAction SilentlyContinue
   Write-Host "Removed installed binaries under $BinDir"
 }
 
+Write-Host ""
+Write-Host "========================================"
+Write-Host "  SUCCESS / УСПЕХ"
+Write-Host "========================================"
 Write-Host "Autostart disabled. Data kept under $Root (delete manually if desired)."

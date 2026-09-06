@@ -22,7 +22,7 @@ from .constants import (
     SYSTEM_PROJECT_ID,
     TEXT_EXTENSIONS,
 )
-from .models import Project, stable_id
+from .models import Project, Source, stable_id
 from .project_files import delete_project_file as project_files_delete
 from .project_files import safe_project_path
 from .project_files import save_project_file as project_files_save
@@ -49,10 +49,15 @@ class ProjectFilesMixin:
         return [project.to_dict() for project in self.repository.list_projects()]
 
     def create_project(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if not str(payload.get("root_path") or "").strip():
-            raise ValueError("project folder path is required")
+        # root_path is optional: knowledge-only projects (external data, no
+        # local folder) are created by name. When root_path is given it is
+        # validated as before.
+        if not str(payload.get("root_path") or "").strip() and not str(payload.get("name") or "").strip():
+            raise ValueError("project name or folder path is required")
         project, created = self._upsert_project_profile(payload)
         data = project.to_dict()
+        if hasattr(self, "ensure_project_sources"):
+            self.ensure_project_sources(project.id)
         action = "created" if created else "existing"
         message = (
             f"Project {project.name} was created successfully."
@@ -74,6 +79,14 @@ class ProjectFilesMixin:
         if not name:
             raise ValueError("project name is required")
         existing = self._find_project_by_root(root_path) if root_path else None
+        if not root_path:
+            # Knowledge project (no local folder): mark it so startup cleanup
+            # does not treat it as an accidental empty project, and dedupe by
+            # the deterministic name-derived id.
+            incoming_config.setdefault("project_kind", "knowledge")
+            candidate_id = stable_id("project", name, root_path)
+            found = self.repository.get_project(candidate_id)
+            existing = existing or found
         if existing:
             existing.name = name
             existing.description = description or existing.description
@@ -116,26 +129,28 @@ class ProjectFilesMixin:
     def _ensure_project_memory_root(self, project: Project) -> None:
         if project.id == SYSTEM_PROJECT_ID and not project.root_path and self._is_architectos_source_root():
             return
+        root = self.graph_auto_linker._project_root_node(project.id)
+        if root is None:
+            return
         text = f"Project profile for {project.name}. Root: {project.root_path}."
-        for node in self.repository.list_nodes():
-            if node.type == "Project" and node.project_id == project.id:
-                node.label = project.name
-                node.text = text
-                node.scope = "project"
-                node.metadata["project_root"] = project.root_path
-                node.metadata["project_config"] = dict(project.config or {})
-                self.repository.upsert_node(node)
-                return
-        node = self.repository.add_node(
-            "Project",
-            project.name,
-            "project",
-            text,
-            project.id,
-            confidence=0.9,
-            metadata={"source": "project_profile", "project_root": project.root_path, "project_config": dict(project.config or {})},
-        )
-        self.memory_lifecycle.initialize_node(node, "project_profile")
+        root.label = project.name
+        root.text = text
+        root.scope = "project"
+        root.status = "active"
+        root.project_id = project.id
+        meta = dict(root.metadata or {})
+        meta["source"] = "project_profile"
+        meta["project_root"] = project.root_path
+        meta["project_config"] = dict(project.config or {})
+        meta["structural"] = True
+        meta.pop("deleted_at", None)
+        meta.pop("archived_at", None)
+        meta.pop("archived_reason", None)
+        meta.pop("delete_reason", None)
+        root.metadata = meta
+        self.repository.upsert_node(root)
+        if not meta.get("lifecycle_state"):
+            self.memory_lifecycle.initialize_node(root, "project_profile")
 
     def _is_architectos_source_root(self) -> bool:
         return (
@@ -151,7 +166,12 @@ class ProjectFilesMixin:
 
     def upload_file(self, payload: dict[str, Any]) -> dict[str, Any]:
         project_id = str(payload.get("project_id") or "architectos")
-        meta = self.files.upload(project_id, str(payload.get("name") or "file"), str(payload.get("content") or ""))
+        meta = self.files.upload(
+            project_id,
+            str(payload.get("name") or "file"),
+            str(payload.get("content") or ""),
+            mime=str(payload.get("mime") or "") or None,
+        )
         return {"file": meta, "files": self.files.list_files(project_id)}
 
     def add_files_to_memory(self, payload: dict[str, Any]) -> dict[str, Any]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterator
 
+from .adapters_base import is_local_memory_stub_text
 from .rich_response import RESPONSE_FORMAT_POLICY
 
 # Model fusion / council: ask the same question to several MODELS, then a judge
@@ -9,6 +10,29 @@ from .rich_response import RESPONSE_FORMAT_POLICY
 
 MAX_PANEL = 4
 DEFAULT_PANEL_SIZE = 3
+
+
+def _usable_council_answer(answer: dict[str, Any]) -> bool:
+    text = str(answer.get("text") or "").strip()
+    if not text:
+        return False
+    status = str(answer.get("status") or "").lower()
+    if status in {"error", "approval_required", "fallback"}:
+        return False
+    provider = answer.get("provider") if isinstance(answer.get("provider"), dict) else {}
+    provider_id = str(provider.get("id") or answer.get("provider_id") or "")
+    if provider_id == "local-memory":
+        return False
+    if is_local_memory_stub_text(text):
+        return False
+    return True
+
+
+def _is_stub_synthesis(text: str, provider: dict[str, Any] | None) -> bool:
+    provider_id = str((provider or {}).get("id") or "")
+    if provider_id == "local-memory":
+        return True
+    return is_local_memory_stub_text(text)
 
 
 class CouncilOrchestrator:
@@ -61,16 +85,32 @@ class CouncilOrchestrator:
             raise ValueError("council message is required")
 
         models = [str(m).strip() for m in (payload.get("models") or []) if str(m).strip()]
-        # dedupe while preserving order
         models = list(dict.fromkeys(models))
-        if not models:
-            models = self.default_models()
-        if not models:
-            raise ValueError("no models available for the council")
-        models = models[:MAX_PANEL]
-
         labels = {str(m.get("id")): str(m.get("label") or m.get("id")) for m in self.selectable_models()}
+        ready_ids = {str(m.get("id")) for m in self.selectable_models() if m.get("ready")}
+        if models:
+            models = [model_id for model_id in models if model_id in ready_ids]
+        else:
+            models = self.default_models()
         judge_provider_id = str(payload.get("judge_provider_id") or "auto").strip() or "auto"
+        if not models:
+            yield {
+                "type": "done",
+                "result": {
+                    "project_id": project_id,
+                    "query": query,
+                    "answers": [],
+                    "models": [],
+                    "synthesis": (
+                        "No ready models for Council. Enable a provider with valid credentials in Providers, then Test it. "
+                        "Cards with missing API keys are not included."
+                    ),
+                    "synthesis_provider": None,
+                    "judge_provider_id": judge_provider_id,
+                },
+            }
+            return
+        models = models[:MAX_PANEL]
         attachments = payload.get("attachments")
         limit = int(payload.get("limit") or 6)
 
@@ -91,6 +131,7 @@ class CouncilOrchestrator:
                 "limit": limit,
                 "allow_cli": payload.get("allow_cli"),
                 "attachments": attachments,
+                "advice": list(payload.get("advice") or []),
             })
             provider = result.get("provider") or {}
             answer = {
@@ -114,7 +155,7 @@ class CouncilOrchestrator:
                 },
             }
 
-        valid = [a for a in answers if a["text"].strip()]
+        valid = [answer for answer in answers if _usable_council_answer(answer)]
         synthesis = ""
         synthesis_provider: dict[str, Any] | None = None
         if len(valid) >= 2:
@@ -131,9 +172,13 @@ class CouncilOrchestrator:
                 "role": "review",
                 "limit": limit,
                 "allow_cli": payload.get("allow_cli"),
+                "advice": list(payload.get("advice") or []),
             })
             synthesis = str(synthesis_result.get("text") or "")
             synthesis_provider = synthesis_result.get("provider") or {}
+            if _is_stub_synthesis(synthesis, synthesis_provider):
+                synthesis = ""
+                synthesis_provider = None
             yield {
                 "type": "progress",
                 "status": "Judge finished.",

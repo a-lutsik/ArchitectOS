@@ -2,6 +2,7 @@
     <id>com.architectos.memory</id>
     <name>ArchitectOS Memory</name>
     <vendor>ArchitectOS</vendor>
+    <idea-version since-build="243"/>
 
     <depends>com.intellij.modules.platform</depends>
 

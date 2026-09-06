@@ -6,6 +6,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -88,6 +89,44 @@ class MCPClientTests(unittest.TestCase):
         self.assertEqual(check["tools"][0]["name"], "echo")
         called = manager.call_tool("fake", "echo", {"a": "b"})
         self.assertIn("echo:", called["result"]["content"][0]["text"])
+
+    def test_close_session_unblocks_hung_initialize(self) -> None:
+        started = threading.Event()
+        closed = threading.Event()
+
+        class SlowInitClient:
+            def start(self) -> None:
+                return None
+
+            def initialize(self, timeout=None):
+                started.set()
+                if not closed.wait(30):
+                    raise MCPError("still initializing")
+                raise MCPError("session closed")
+
+            def close(self) -> None:
+                closed.set()
+
+        store = _Store([self._config().to_dict()])
+        manager = MCPManager(self.root, store.load, store.save)
+        manager._client_for = lambda _config: SlowInitClient()  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                manager.call_tool("fake", "echo", {})
+            except BaseException as exc:  # noqa: BLE001 - thread boundary
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.assertTrue(started.wait(2))
+        began = time.monotonic()
+        manager.close_session("fake")
+        thread.join(5)
+        self.assertLess(time.monotonic() - began, 2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(errors)
 
     def test_manager_rejects_missing_executable(self) -> None:
         store = _Store([{"id": "bad", "label": "Bad", "command": ["definitely-not-a-real-binary-xyz"], "enabled": True, "approval_required": False}])
@@ -206,7 +245,7 @@ class MCPClientTests(unittest.TestCase):
             def do_GET(self) -> None:
                 base = f"http://127.0.0.1:{self.server.server_port}"
                 if self.path == "/.well-known/oauth-protected-resource":
-                    self._json({"authorization_servers": [base]})
+                    self._json({"authorization_servers": [base], "scopes_supported": ["mcp"]})
                 elif self.path == "/.well-known/oauth-authorization-server":
                     self._json({
                         "issuer": base,
@@ -271,6 +310,7 @@ class MCPClientTests(unittest.TestCase):
             manager = MCPManager(self.root, store.load, store.save)
             started = manager.start_auth("secure", "http://127.0.0.1:8765")
             self.assertIn("/authorize?", started["auth_url"])
+            self.assertIn("scope=mcp", started["auth_url"])
             state = MCPServerConfig.from_dict(store.servers[0]).auth["state"]
             completed = manager.complete_auth({"code": "code-1", "state": state})
             self.assertEqual(completed["auth_status"], "authorized")
@@ -458,6 +498,37 @@ class AzureDevOpsMCPTests(unittest.TestCase):
         https = parse_azure_devops_remote_url("https://dev.azure.com/Fsight1/E-AI/_git/E-AI")
         self.assertEqual(https["org"], "Fsight1")
         self.assertEqual(https["project"], "E-AI")
+
+
+class MCPTransportNormalizeTests(unittest.TestCase):
+    def test_from_dict_maps_remote_http_label_to_http(self) -> None:
+        config = MCPServerConfig.from_dict({
+            "id": "granola",
+            "label": "Granola",
+            "transport": "remote http",
+            "url": "https://mcp.granola.ai/mcp",
+        })
+        self.assertEqual(config.transport, "http")
+
+    def test_from_dict_infers_http_when_url_and_blank_transport(self) -> None:
+        config = MCPServerConfig.from_dict({
+            "id": "granola",
+            "label": "Granola",
+            "transport": "",
+            "url": "https://mcp.granola.ai/mcp",
+        })
+        self.assertEqual(config.transport, "http")
+        self.assertEqual(config.url, "https://mcp.granola.ai/mcp")
+
+    def test_oauth_scope_uses_scopes_supported(self) -> None:
+        self.assertEqual(
+            MCPManager._oauth_scope({"scopes_supported": ["mcp"]}, {}),
+            "mcp",
+        )
+        self.assertEqual(
+            MCPManager._oauth_scope({"scope": "openid profile"}, {"scopes_supported": ["mcp"]}),
+            "openid profile",
+        )
 
 
 if __name__ == "__main__":

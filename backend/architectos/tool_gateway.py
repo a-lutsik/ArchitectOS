@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .mcp import MCPError, MCPManager
+from .permissions import PermissionRequired
 from .rich_response import RESPONSE_FORMAT_POLICY
 
 TOOL_RESULT_CHAR_CAP = 6000
@@ -19,7 +20,8 @@ AUTONOMY_POLICY = """Autonomy (overrides everything else):
 - Batch related lookups in one round (up to 5 calls) instead of one file per turn.
 - A partial result is not a dead end: when a result reports truncated / next_start_line / hasMore / more pages, call the tool again for the next window before answering. Keep going until you have what the answer needs or the round budget runs out.
 - Never ask the user to paste content you can read yourself, and never end a turn with a list of sources you still need — fetch them now and answer with what you found.
-- Only ask the user something when it is a product decision you cannot make, or when a write/CLI action needs approval.
+- Only ask the user something when it is a product decision you cannot make.
+- If a file path is outside the project folder, still call the tool with that path. ArchitectOS will pause and ask the user for access. Do not ask for permission in chat text.
 - Answer in plain language and never name the tools listed below — write “read the file …”, “searched the project …”, “opened the work item …”."""
 
 MEMORY_FIRST_POLICY = f"""{AUTONOMY_POLICY}
@@ -35,7 +37,8 @@ Memory-first:
 8) Do not call tools when memory already answers the question fully. When memory is truncated, thin, off-topic, or the question is about source code behaviour, fetch/search now instead of guessing.
 9) For code questions (bugs, root cause, how X works) follow the call chain end-to-end: locate files, read them, then read their dependencies. Do not stop at search hits or file names.
 10) Only cite a work item, file, or memory node when the context or a tool result clearly supports it. If the pack is chat noise or unrelated, call memory_search / boards_search / fs_search for the user’s topic now. Short follow-ups (“подтяни данные”, “open it”, “fetch”) mean continue the prior topic with memory_get / search — never switch topics.
-11) Emit tool_calls JSON only when a tool is needed; otherwise answer normally."""
+11) If context includes a “Memory advice” block (contradicts / limits / supports), comply with its CONTRADICTS/LIMITS findings, but never quote the block, its markers, or node ids in the answer — the UI already renders it; do not invent extra conflicts beyond that block and tool results.
+12) Emit tool_calls JSON only when a tool is needed; otherwise answer normally."""
 
 MEMORY_ONLY_POLICY = f"""{AUTONOMY_POLICY}
 
@@ -45,8 +48,9 @@ Memory-first:
 3) Work-item comments and long description parts live as linked child memory nodes — memory_get after the main card.
 4) If the pack is thin or off-topic for the question, call memory_search with a sharper query before answering.
 5) Do not call tools when memory already answers the question fully.
-6) Emit tool_calls JSON only when a tool is needed; otherwise answer normally.
-7) File access is off in this mode: if the answer needs source files, say so in one line instead of asking for approval."""
+6) If context includes a “Memory advice” block, comply with its conflicts and limits, but do not mention the block, its markers, or node ids in the answer — the UI already renders it.
+7) Emit tool_calls JSON only when a tool is needed; otherwise answer normally.
+8) File access is off in this mode: if the answer needs source files, say so in one line instead of asking for approval."""
 
 TOOL_PROTOCOL = """You may request tools by emitting a single JSON object (optionally in a ```json fence):
 {"tool_calls":[{"name":"memory_search","arguments":{"query":"auth token expiry"}},{"name":"memory_get","arguments":{"id":"node_abc"}}]}
@@ -578,18 +582,18 @@ class ToolGateway:
         spec = _ALL_SPECS.get(name)
         if not spec:
             return {"ok": False, "name": name, "error": f"Unknown or disallowed tool: {name}", "summary": ""}
-        if spec.write and not include_writes:
-            return {
-                "ok": False,
-                "name": name,
-                "error": "Write tools require approval (enable CLI/write approval for this turn).",
-                "summary": "",
-            }
-        allowed = {item.name for item in self.available_specs(include_writes=include_writes, memory_only=memory_only)}
-        if name not in allowed:
+        catalog = {item.name for item in self.available_specs(include_writes=True, memory_only=memory_only)}
+        if name not in catalog:
             return {"ok": False, "name": name, "error": f"Tool not available: {name}", "summary": ""}
-
         args = dict(arguments or {})
+        if spec.write and not include_writes:
+            target = str(args.get("path") or args.get("file") or "")
+            return PermissionRequired(
+                "write",
+                "write",
+                target,
+                "Writing files needs your approval.",
+            ).as_payload(name)
         if project_id and "project_id" not in args:
             args["project_id"] = project_id
 
@@ -606,6 +610,8 @@ class ToolGateway:
                 payload = self._execute_fs(spec, args)
             else:
                 return {"ok": False, "name": name, "error": "Unsupported tool kind.", "summary": ""}
+        except PermissionRequired as exc:
+            return exc.as_payload(name)
         except MCPError as exc:
             return {"ok": False, "name": name, "error": str(exc), "summary": ""}
         except Exception as exc:  # noqa: BLE001 — surface to model as tool error

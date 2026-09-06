@@ -8,6 +8,7 @@ from ``tool_gateway`` for backward-compatible imports.
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 from .mcp import MCPError, MCPManager
@@ -337,12 +338,22 @@ def call_ado_tool(
     *,
     server_id: str = "azure-devops",
     timeout: float | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Run an Azure DevOps operation, retrying with legacy tool names on older MCP releases."""
     last_error = ""
     for tool, arguments in ado_call_plan(op, args):
+        slice_timeout = timeout
+        if deadline is not None:
+            left = float(deadline) - time.monotonic()
+            if left <= 0.05:
+                raise MCPError("Azure DevOps call aborted: source timeout")
+            if slice_timeout is None:
+                slice_timeout = left
+            else:
+                slice_timeout = min(float(slice_timeout), left)
         try:
-            result = mcp_manager.call_tool(server_id, tool, arguments, timeout=timeout)
+            result = mcp_manager.call_tool(server_id, tool, arguments, timeout=slice_timeout)
         except MCPError as exc:
             last_error = str(exc)
             if not _MISSING_TOOL_RE.search(last_error):

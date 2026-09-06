@@ -213,3 +213,51 @@ def usage_from_result(result: dict[str, Any] | None, *, model: str | None = None
     if direct is None:
         direct = normalize_usage(result.get("raw"))
     return enrich_usage(direct, model=model_name)
+
+
+# Rough tokenizer stand-in used only for memory-pack vs corpus comparisons.
+# Real tokenizer counts differ by model; 4 chars/token is the usual English/code heuristic.
+CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens_from_chars(chars: int) -> int:
+    chars = max(0, int(chars or 0))
+    if chars <= 0:
+        return 0
+    return max(1, int(round(chars / float(CHARS_PER_TOKEN))))
+
+
+def estimate_tokens_from_text(text: str | None) -> int:
+    return estimate_tokens_from_chars(len(str(text or "")))
+
+
+def memory_token_economy(
+    *,
+    corpus_chars: int,
+    packed_chars: int,
+    corpus_nodes: int = 0,
+    packed_nodes: int = 0,
+    pack_budget_chars: int = 0,
+) -> dict[str, Any]:
+    """Prompt-input savings versus dumping the whole active memory corpus.
+
+    This is not “tokens vs last month” and it ignores completion tokens,
+    chat history, tools, and attached files — those sit on top of the pack.
+    """
+    corpus_tokens = estimate_tokens_from_chars(corpus_chars)
+    packed_tokens = estimate_tokens_from_chars(packed_chars)
+    saved_tokens = max(0, corpus_tokens - packed_tokens)
+    saved_pct = 0.0 if corpus_tokens <= 0 else round(100.0 * saved_tokens / corpus_tokens, 1)
+    return {
+        "baseline": "full_memory_dump",
+        "corpus_nodes": max(0, int(corpus_nodes or 0)),
+        "corpus_chars": max(0, int(corpus_chars or 0)),
+        "corpus_tokens": corpus_tokens,
+        "packed_nodes": max(0, int(packed_nodes or 0)),
+        "packed_chars": max(0, int(packed_chars or 0)),
+        "packed_tokens": packed_tokens,
+        "saved_tokens": saved_tokens,
+        "saved_pct": saved_pct,
+        "pack_budget_chars": max(0, int(pack_budget_chars or 0)),
+        "chars_per_token": CHARS_PER_TOKEN,
+    }

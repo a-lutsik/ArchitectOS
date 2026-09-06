@@ -53,6 +53,11 @@ function labelPrefix(inputSelector, key) {
   const input = document.querySelector(inputSelector);
   const label = input ? input.closest("label") : null;
   if (!label) return;
+  const titled = label.querySelector(".settings-field-label");
+  if (titled) {
+    titled.textContent = t(key);
+    return;
+  }
   const control = label.querySelector("input,select,textarea");
   for (const node of Array.from(label.childNodes)) {
     if (node.nodeType === Node.TEXT_NODE) node.remove();

@@ -1,19 +1,25 @@
 /* App bootstrap: event wiring + startup sequence. ES module, imported last by main.js. */
+import { configureAgentHooks, rerenderAgentHooksScope } from "./agent-hooks.js";
 import { api } from "./api-client.js";
 import { askAgentInstallCommand, bindChatComposer, copyInstallCommand, switchView } from "./ask-ui.js";
 import { cancelActiveRun, finalizeChatSession, sendChatMessage, startNewAskThread, syncAskHeaderActions } from "./chat.js";
-import { analyzeCodeProject, fillCodeFileFromSelection, installCodeLanguageServer, runCodeInsight, setCodeInsightTab } from "./code-intel.js";
+import { analyzeCodeProject, installCodeLanguageServer } from "./code-intel.js";
 import { on, onAll, setElementDisabled, showSnackbar } from "./dom-utils.js";
 import { fileEditor } from "./file-editor.js";
 import { loadGraph } from "./graph.js";
 import {
   ingestMemorySources, rescanAllMemorySources, setIngestSourcesSelected,
-  syncBoardsOptionsVisibility, syncBoardsTypeSummary, syncStartupMemoryRescan,
+  syncBoardsOptionsVisibility, syncBoardsTypeSummary, syncIngestSourcesWithMcp, syncStartupMemoryRescan,
 } from "./memory-ingest.js";
 import {
-  batchUpdateCandidates, handleMemoryFileSelect, importMemoryFiles,
+  bindMemorySourcesUi, closeAddSourceModal, deleteEditingSource, loadProjectSources, openAddSourceModal,
+  persistSourceSettingsFromTable, renderMemorySourcesSettings, submitAddSourceModal, testAddSourceConnection, toggleAllSources,
+} from "./memory-sources.js";
+import {
+  batchUpdateCandidates, candidateBatchFilterFromUi, candidateSourceFromUi,
+  handleMemoryFileSelect, importMemoryFiles,
   loadMemoryCandidates, loadMemoryLifecycle, loadMemoryLifecycleItems,
-  loadMemoryList, renderMemoryFiles, switchMemoryTab, syncCandidateBatchActions,
+  loadMemoryList, renderMemoryFiles, shiftCandidatePage, switchMemoryTab, syncCandidateBatchActions,
 } from "./memory-panel.js";
 import { projectWizard } from "./project-wizard.js";
 import {
@@ -26,12 +32,13 @@ import {
 import { connectEnvProviders, loadAnalytics, loadProviders, testAllProviders } from "./providers.js";
 import { searchPalette } from "./search-palette.js";
 import {
-  ROUTER_PRESETS, loadSettings, previewRouting, rebuildEmbeddingsIndex,
-  refreshEmbeddingModelOptions, runSecurityPreview, saveEmbeddingsSettings,
-  saveRouterSettings, setRouterWeights, syncRouterWeightLabels,
+  ROUTER_PRESETS, checkVectorRuntime, loadSettings, previewRouting, rebuildEmbeddingsIndex,
+  refreshEmbeddingModelOptions, repairVectorRuntime, runSecurityPreview, saveEmbeddingsSettings,
+  saveIntegrationCredentials, saveRouterSettings, setRouterWeights, syncEmbeddingConnectionFields,
+  syncRouterWeightLabels, testEmbeddingsConnection, wipeProjectMemory,
 } from "./settings.js";
 import { projectParam, state, syncProjectSwitcherLabel, syncProjectTerminology, t } from "./state.js";
-import { openExternalTerminal, renderTerminalHistory, runInstallCommandInTerminal, runTerminalCommand } from "./terminal.js";
+import { bindTerminalUi, runInstallCommandInTerminal } from "./terminal.js";
 import { applyDensity, applyLanguage, applyTheme, saveUiSettings, saveWorkspaceSettings, showError, syncLanguageMenu } from "./ui.js";
 import { initVoiceMemory } from "./voice-memory.js";
 import { workspaceChat } from "./workspace-chat.js";
@@ -40,7 +47,7 @@ function bindEvents() {
   bindChatComposer();
   initVoiceMemory();
   onAll(".nav-item", "click", item => switchView(item.currentTarget.dataset.view));
-  on("#project-select", "change", event => { state.projectId = event.target.value; saveWorkspaceSettings({ current_project_id: state.projectId }).catch(showError); state.selectedFile = ""; state.memoryFiles = []; resetGraphFilters(); renderMemoryFiles(); syncProjectSwitcherLabel(); syncProjectTerminology(); syncProjectFields(); refreshWorkspace(); loadProjectFiles(); scheduleGraphLoad(); });
+  on("#project-select", "change", event => { state.projectId = event.target.value; saveWorkspaceSettings({ current_project_id: state.projectId }).catch(showError); state.selectedFile = ""; state.memoryFiles = []; resetGraphFilters(); renderMemoryFiles(); syncProjectSwitcherLabel(); syncProjectTerminology(); syncProjectFields(); refreshWorkspace(); loadProjectFiles(); loadProjectSources().catch(showError); scheduleGraphLoad(); });
   on("#settings-language-select", "change", event => { applyLanguage(event.target.value); saveUiSettings({ language: state.language }).catch(showError); });
   on("#theme-select", "change", event => applyTheme(event.target.value));
   on("#density-select", "change", event => applyDensity(event.target.value));
@@ -48,20 +55,67 @@ function bindEvents() {
   on("#close-project-folder-modal", "click", closeProjectFolderModal);
   onAll("[data-close-project-folder]", "click", closeProjectFolderModal);
   on("#browse-project-folder", "click", () => browseProjectFolder().catch(error => { setProjectFolderStatus(error.message, "error"); }));
-  on("#save-project", "click", () => saveProjectFromFolder().then(project => { setProjectFolderStatus(project.message || "Project folder applied.", "ok"); closeProjectFolderModal(); }).catch(showError));
-  on("#init-project", "click", () => initProjectFromFolder().then(() => { setProjectFolderStatus("Project indexed.", "ok"); showSnackbar("Project indexed successfully.", "success"); closeProjectFolderModal(); }).catch(showError));
+  on("#save-project", "click", () => saveProjectFromFolder());
+  on("#init-project", "click", () => initProjectFromFolder());
   on("#context-form", "submit", event => { event.preventDefault(); buildContext(document.querySelector("#context-query")?.value || "memory context").catch(showError); });
-  on("#memory-form", "submit", async event => { event.preventDefault(); await api("/api/memory", { method: "POST", body: JSON.stringify({ project_id: state.projectId, label: document.querySelector("#memory-label")?.value || "", type: document.querySelector("#memory-type")?.value || "Note", scope: document.querySelector("#memory-scope")?.value || "project", text: document.querySelector("#memory-text")?.value || "" }) }); event.target.reset(); await refreshWorkspace(); scheduleGraphLoad(); });
+  on("#memory-form", "submit", async event => {
+    event.preventDefault();
+    const form = event.target;
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const label = (document.querySelector("#memory-label")?.value || "").trim();
+    const text = (document.querySelector("#memory-text")?.value || "").trim();
+    if (!label || !text) {
+      showSnackbar("Label and text are required", "info");
+      return;
+    }
+    if (submitBtn) submitBtn.disabled = true;
+    try {
+      await api("/api/memory", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: state.projectId,
+          label,
+          type: document.querySelector("#memory-type")?.value || "Note",
+          scope: document.querySelector("#memory-scope")?.value || "project",
+          text,
+        }),
+      });
+      form.reset();
+      showSnackbar("Memory saved", "success");
+      await refreshWorkspace();
+      scheduleGraphLoad();
+    } catch (error) {
+      showSnackbar(error.message || "Could not save memory", "error");
+      throw error;
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+  });
   on("#memory-file-picker", "click", () => document.querySelector("#memory-file-input")?.click());
   on("#memory-file-input", "change", event => { handleMemoryFileSelect(event.target.files).catch(showError); event.target.value = ""; });
   on("#memory-file-import", "click", () => importMemoryFiles().catch(showError));
   on("#ingest-memory", "click", () => ingestMemorySources().catch(showError));
   on("#rescan-memory-all", "click", () => rescanAllMemorySources().catch(showError));
-  on("#ingest-select-all", "click", () => setIngestSourcesSelected(true));
-  on("#ingest-unselect-all", "click", () => setIngestSourcesSelected(false));
+  on("#ingest-select-all", "click", () => toggleAllSources(true).catch(showError));
+  on("#ingest-unselect-all", "click", () => toggleAllSources(false).catch(showError));
+  on("#memory-sources-save", "click", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    persistSourceSettingsFromTable().catch(showError);
+  });
+  on("#memory-sources-add", "click", () => openAddSourceModal());
+  on("#add-source-create", "click", () => submitAddSourceModal().catch(showError));
+  on("#add-source-test", "click", () => testAddSourceConnection().catch(showError));
+  on("#add-source-delete", "click", () => deleteEditingSource().catch(showError));
+  on("#add-source-cancel", "click", () => closeAddSourceModal());
+  document.querySelectorAll("[data-close-add-source]").forEach(el => {
+    el.addEventListener("click", () => closeAddSourceModal());
+  });
+  bindMemorySourcesUi();
   document.querySelectorAll(".ingest-source").forEach(input => {
     input.addEventListener("change", syncBoardsOptionsVisibility);
   });
+  syncBoardsOptionsVisibility();
   document.querySelectorAll(".boards-type-option").forEach(input => {
     input.addEventListener("change", syncBoardsTypeSummary);
   });
@@ -85,12 +139,20 @@ function bindEvents() {
   });
   on("#candidate-status-filter", "change", () => {
     syncCandidateBatchActions();
-    loadMemoryCandidates().catch(showError);
+    loadMemoryCandidates({ resetPage: true }).catch(showError);
   });
-  on("#candidates-accept-pending", "click", () => batchUpdateCandidates({ action: "promote", status: "candidate" }).catch(showError));
-  on("#candidates-accept-non-duplicates", "click", () => batchUpdateCandidates({ action: "promote", status: "candidate", exclude_duplicates: true }).catch(showError));
-  on("#candidates-reject-duplicates", "click", () => batchUpdateCandidates({ action: "reject", status: "duplicate", reason: "Batch rejected duplicate" }).catch(showError));
-  on("#candidates-reject-pending", "click", () => batchUpdateCandidates({ action: "reject", status: "candidate", reason: "Batch rejected pending" }).catch(showError));
+  on("#candidate-source-filter", "change", () => {
+    syncCandidateBatchActions();
+    loadMemoryCandidates({ resetPage: true }).catch(showError);
+  });
+  on("#candidates-page-prev", "click", () => shiftCandidatePage(-25).catch(showError));
+  on("#candidates-page-next", "click", () => shiftCandidatePage(25).catch(showError));
+  on("#candidates-accept-pending", "click", () => batchUpdateCandidates({ action: "promote", status: "candidate", ...candidateSourceFromUi() }).catch(showError));
+  on("#candidates-accept-non-duplicates", "click", () => batchUpdateCandidates({ action: "promote", status: "candidate", exclude_duplicates: true, ...candidateSourceFromUi() }).catch(showError));
+  on("#candidates-reject-memory-duplicates", "click", () => batchUpdateCandidates({ action: "reject", status: "duplicate", duplicate_kind: "memory", reason: "Batch rejected memory duplicate", ...candidateSourceFromUi() }).catch(showError));
+  on("#candidates-reject-candidate-duplicates", "click", () => batchUpdateCandidates({ action: "reject", status: "duplicate", duplicate_kind: "candidate", reason: "Batch rejected duplicate candidate", ...candidateSourceFromUi() }).catch(showError));
+  on("#candidates-reject-duplicates", "click", () => batchUpdateCandidates({ action: "reject", status: "duplicate", reason: "Batch rejected duplicate", ...candidateSourceFromUi() }).catch(showError));
+  on("#candidates-reject-pending", "click", () => batchUpdateCandidates({ action: "reject", status: "candidate", reason: "Batch rejected pending", ...candidateSourceFromUi() }).catch(showError));
   on("#candidates-accept-filtered", "click", () => batchUpdateCandidates({ action: "promote", ...candidateBatchFilterFromUi() }).catch(showError));
   on("#candidates-reject-filtered", "click", () => batchUpdateCandidates({ action: "reject", reason: "Batch rejected filtered", ...candidateBatchFilterFromUi() }).catch(showError));
   document.addEventListener("click", event => {
@@ -129,7 +191,11 @@ function bindEvents() {
     if (btn) {
       btn.classList.toggle("active", state.showDotfiles);
       btn.setAttribute("aria-pressed", String(state.showDotfiles));
-      btn.title = state.showDotfiles ? "Hide hidden (dot) files" : "Show hidden (dot) files";
+      const key = state.showDotfiles ? "files.tip.hideDotfiles" : "files.tip.showDotfiles";
+      const label = t(key);
+      btn.dataset.i18nTitle = key;
+      btn.setAttribute("data-tooltip", label);
+      btn.setAttribute("aria-label", label);
     }
     loadProjectFiles().catch(showError);
   });
@@ -138,11 +204,56 @@ function bindEvents() {
   on("#refresh-graph", "click", () => loadGraph().catch(showError));
   on("#export-bundle", "click", async () => { const bundle = await api(`/api/bundle/export?project_id=${projectParam()}`); const box = document.querySelector("#bundle-box"); if (box) box.value = JSON.stringify(bundle, null, 2); });
   on("#import-bundle", "click", async () => { const box = document.querySelector("#bundle-box"); if (!box) throw new Error("Bundle input is not available."); const payload = JSON.parse(box.value); await api("/api/bundle/import", { method: "POST", body: JSON.stringify(payload) }); await loadProjects(); await refreshWorkspace(); });
-  on("#settings-form", "submit", async event => { event.preventDefault(); await api("/api/settings", { method: "PATCH", body: JSON.stringify({ ui: { theme: document.querySelector("#theme-select")?.value || state.theme, density: document.querySelector("#density-select")?.value || "comfortable", memory_enabled: document.querySelector("#memory-enabled")?.checked ?? true, language: document.querySelector("#settings-language-select")?.value || state.language, onboarding_complete: state.onboardingComplete }, memory_lifecycle: { enabled: document.querySelector("#lifecycle-enabled")?.checked ?? true, refresh_on_access: document.querySelector("#refresh-on-access")?.checked ?? true, auto_rescan_on_startup: document.querySelector("#auto-rescan-on-startup")?.checked ?? true, chat_memory_mode: document.querySelector("#chat-memory-mode")?.value || "strict", chat_candidate_ttl_days: Number(document.querySelector("#chat-candidate-ttl")?.value || 7), chat_session_idle_minutes: Number(document.querySelector("#chat-session-idle")?.value || 30), chat_store_facts_only: document.querySelector("#chat-store-facts-only")?.checked ?? true, short_term_ttl_days: Number(document.querySelector("#short-term-ttl")?.value || 14), archive_after_days: Number(document.querySelector("#archive-after")?.value || 30), delete_after_days: Number(document.querySelector("#delete-after")?.value || 0), promote_after_hits: Number(document.querySelector("#promote-after-hits")?.value || 5) } }) }); applyTheme(document.querySelector("#theme-select")?.value || state.theme); applyDensity(document.querySelector("#density-select")?.value || "comfortable"); applyLanguage(document.querySelector("#settings-language-select")?.value || state.language); });
+  on("#settings-form", "submit", async event => {
+    event.preventDefault();
+    const askAdviceOn = document.querySelector("#ask-memory-advice")?.checked ?? true;
+    await api("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify({
+        ui: {
+          theme: document.querySelector("#theme-select")?.value || state.theme,
+          density: document.querySelector("#density-select")?.value || "comfortable",
+          memory_enabled: document.querySelector("#memory-enabled")?.checked ?? true,
+          ask_memory_advice: askAdviceOn,
+          language: document.querySelector("#settings-language-select")?.value || state.language,
+          onboarding_complete: state.onboardingComplete,
+        },
+        memory_lifecycle: {
+          enabled: document.querySelector("#lifecycle-enabled")?.checked ?? true,
+          refresh_on_access: document.querySelector("#refresh-on-access")?.checked ?? true,
+          auto_rescan_on_startup: document.querySelector("#auto-rescan-on-startup")?.checked ?? true,
+          source_scheduler_enabled: document.querySelector("#source-scheduler-enabled")?.checked ?? true,
+          source_scheduler_tick_minutes: Number(document.querySelector("#source-scheduler-tick")?.value || 5),
+          source_default_interval_minutes: Number(document.querySelector("#source-default-interval")?.value || 60),
+          chat_memory_mode: document.querySelector("#chat-memory-mode")?.value || "strict",
+          chat_candidate_ttl_days: Number(document.querySelector("#chat-candidate-ttl")?.value || 7),
+          chat_session_idle_minutes: Number(document.querySelector("#chat-session-idle")?.value || 30),
+          chat_store_facts_only: document.querySelector("#chat-store-facts-only")?.checked ?? true,
+          short_term_ttl_days: Number(document.querySelector("#short-term-ttl")?.value || 14),
+          archive_after_days: Number(document.querySelector("#archive-after")?.value || 30),
+          delete_after_days: Number(document.querySelector("#delete-after")?.value || 0),
+          promote_after_hits: Number(document.querySelector("#promote-after-hits")?.value || 5),
+        },
+      }),
+    });
+    state.askMemoryAdvice = askAdviceOn;
+    if (typeof window.syncAskMemoryAdviceBadge === "function") window.syncAskMemoryAdviceBadge();
+    applyTheme(document.querySelector("#theme-select")?.value || state.theme);
+    applyDensity(document.querySelector("#density-select")?.value || "comfortable");
+    applyLanguage(document.querySelector("#settings-language-select")?.value || state.language);
+    await persistSourceSettingsFromTable().catch(showError);
+  });
+  on("#settings-ado-form", "submit", async event => { event.preventDefault(); await saveIntegrationCredentials().catch(showError); });
   on("#embeddings-form", "submit", async event => { event.preventDefault(); await saveEmbeddingsSettings().catch(showError); });
+  on("#embeddings-connection-form", "submit", async event => { event.preventDefault(); await saveEmbeddingsSettings().catch(showError); });
+  on("#embeddings-test", "click", () => testEmbeddingsConnection().catch(showError));
   on("#embeddings-rebuild", "click", () => rebuildEmbeddingsIndex().catch(showError));
+  on("#wipe-project-memory", "click", () => wipeProjectMemory().catch(showError));
+  on("#vector-runtime-check", "click", () => checkVectorRuntime().catch(showError));
+  on("#vector-runtime-fix", "click", () => repairVectorRuntime().catch(showError));
   on("#embedding-provider", "change", () => {
     refreshEmbeddingModelOptions();
+    syncEmbeddingConnectionFields();
     const modelSelect = document.querySelector("#embedding-model");
     const dims = document.querySelector("#embedding-dimensions");
     const catalog = state.embeddingCatalog || [];
@@ -164,6 +275,9 @@ function bindEvents() {
   on("#router-form", "submit", event => { event.preventDefault(); saveRouterSettings().catch(showError); });
   on("#connect-env-providers", "click", () => connectEnvProviders().catch(showError));
   on("#test-all-providers", "click", () => testAllProviders().catch(showError));
+  on("#hooks-install-all", "click", () => configureAgentHooks(["cursor", "claude", "codex"], false).catch(showError));
+  on("#hooks-uninstall-all", "click", () => configureAgentHooks(["cursor", "claude", "codex"], true).catch(showError));
+  on("#hooks-scope-project", "change", () => rerenderAgentHooksScope());
   document.querySelectorAll("[data-router-preset]").forEach(btn => {
     btn.addEventListener("click", () => {
       const preset = ROUTER_PRESETS[btn.dataset.routerPreset];
@@ -181,20 +295,9 @@ function bindEvents() {
   const legacyTaskForm = document.querySelector("#task-form");
   if (legacyTaskForm) legacyTaskForm.remove();
   on("#router-preview-form", "submit", event => { event.preventDefault(); previewRouting(document.querySelector("#router-preview-query")?.value || "").catch(showError); });
-  on("#code-run-insight", "click", () => runCodeInsight().catch(showError));
   on("#code-connect-folder", "click", openProjectFolderModal);
   on("#code-analyze-project", "click", () => analyzeCodeProject().catch(showError));
-  document.querySelectorAll("[data-code-tab]").forEach(button => {
-    button.addEventListener("click", () => {
-      setCodeInsightTab(button.dataset.codeTab || "symbols");
-    });
-  });
-  on("#code-use-selected-file", "click", () => {
-    if (!fillCodeFileFromSelection(true)) showError(new Error(t("code.noFileSelected")));
-  });
-  on("#terminal-form", "submit", event => runTerminalCommand(event).catch(showError));
-  on("#terminal-open", "click", () => openExternalTerminal().catch(showError));
-  on("#terminal-clear", "click", () => { state.terminalHistory = []; renderTerminalHistory(); });
+  bindTerminalUi();
   document.addEventListener("click", event => {
     const codeInstall = event.target.closest("[data-code-install]");
     if (codeInstall) {
@@ -262,6 +365,8 @@ async function bootstrap() {
   await loadSettings();
   await loadProjects();
   await loadProjectFiles();
+  await loadProjectSources().catch(() => []);
+  await syncIngestSourcesWithMcp().catch(() => {});
   await loadProviders().catch(showError);
   renderMemoryFiles();
   buildContext("memory context builder").catch(showError);

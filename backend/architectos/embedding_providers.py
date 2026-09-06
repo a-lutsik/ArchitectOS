@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from hashlib import sha1
@@ -56,6 +57,10 @@ EMBEDDING_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
         "multilingual": True,
         "free_tier": True,
         "env_keys": ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"],
+        "connection_fields": [
+            {"id": "account_id", "env": "CLOUDFLARE_ACCOUNT_ID", "label": "Account ID", "secret": False},
+            {"id": "api_key", "env": "CLOUDFLARE_API_TOKEN", "label": "API token", "secret": True},
+        ],
         "models": [
             {
                 "id": "@cf/baai/bge-m3",
@@ -85,6 +90,10 @@ EMBEDDING_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
         "multilingual": True,
         "free_tier": True,
         "env_keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "connection_fields": [
+            {"id": "api_key", "env": "GEMINI_API_KEY", "label": "API key", "secret": True},
+            {"id": "base_url", "env": "GEMINI_API_BASE", "label": "Base URL", "secret": False, "optional": True},
+        ],
         "models": [
             {
                 "id": "gemini-embedding-001",
@@ -107,6 +116,10 @@ EMBEDDING_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
         "multilingual": True,
         "free_tier": False,
         "env_keys": ["OPENAI_API_KEY"],
+        "connection_fields": [
+            {"id": "api_key", "env": "OPENAI_API_KEY", "label": "API key", "secret": True},
+            {"id": "base_url", "env": "OPENAI_BASE_URL", "label": "Base URL", "secret": False, "optional": True},
+        ],
         "models": [
             {"id": "text-embedding-3-small", "label": "text-embedding-3-small", "dims": [1536], "default_dims": 1536},
             {"id": "text-embedding-3-large", "label": "text-embedding-3-large", "dims": [3072], "default_dims": 3072},
@@ -117,6 +130,10 @@ EMBEDDING_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
         "multilingual": True,
         "free_tier": False,
         "env_keys": ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_EMBEDDING_DEPLOYMENT"],
+        "connection_fields": [
+            {"id": "api_key", "env": "AZURE_OPENAI_API_KEY", "label": "API key", "secret": True},
+            {"id": "base_url", "env": "AZURE_OPENAI_ENDPOINT", "label": "Endpoint", "secret": False},
+        ],
         "models": [
             {"id": "text-embedding-3-small", "label": "deployment name (e.g. text-embedding-3-small)", "dims": [1536], "default_dims": 1536},
             {"id": "text-embedding-3-large", "label": "deployment name (e.g. text-embedding-3-large)", "dims": [3072], "default_dims": 3072},
@@ -127,6 +144,9 @@ EMBEDDING_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
         "multilingual": True,
         "free_tier": True,
         "env_keys": ["OLLAMA_HOST", "OLLAMA_EMBED_MODEL"],
+        "connection_fields": [
+            {"id": "base_url", "env": "OLLAMA_HOST", "label": "Host", "secret": False},
+        ],
         "models": [
             {"id": "bge-m3", "label": "bge-m3", "dims": [1024], "default_dims": 1024},
             {"id": "nomic-embed-text", "label": "nomic-embed-text", "dims": [768], "default_dims": 768},
@@ -552,7 +572,15 @@ def default_memory_retrieval_settings() -> dict[str, Any]:
     }
 
 
-def build_embedding_provider(settings: dict[str, Any] | None = None) -> EmbeddingProvider:
+def _setting_text(settings: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = str(settings.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def build_embedding_provider(settings: dict[str, Any] | None = None, *, allow_fallback: bool = True) -> EmbeddingProvider | None:
     settings = dict(settings or {})
     # An explicit saved provider (non-auto) always wins. Otherwise a
     # MEMORY_EMBEDDING_PROVIDER env override takes precedence over the "auto"
@@ -568,10 +596,12 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
         dims = int(settings.get("embedding_dimensions") or os.environ.get("MEMORY_EMBEDDING_DIMENSIONS") or DEFAULT_CLOUDFLARE_EMBED_DIMS)
     except (TypeError, ValueError):
         dims = DEFAULT_CLOUDFLARE_EMBED_DIMS
+    base_override = _setting_text(settings, "embedding_base_url")
+    account_override = _setting_text(settings, "embedding_account_id")
 
     def _cloudflare() -> CloudflareEmbeddingProvider | None:
         token = _env_api_key("CLOUDFLARE_API_TOKEN", "CF_API_TOKEN")
-        account = str(os.environ.get("CLOUDFLARE_ACCOUNT_ID") or os.environ.get("CF_ACCOUNT_ID") or "").strip()
+        account = account_override or str(os.environ.get("CLOUDFLARE_ACCOUNT_ID") or os.environ.get("CF_ACCOUNT_ID") or "").strip()
         if not token or not account:
             return None
         return CloudflareEmbeddingProvider(
@@ -588,14 +618,14 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
             api_key=key,
             model=model or str(os.environ.get("GEMINI_EMBED_MODEL") or DEFAULT_GEMINI_EMBED_MODEL),
             dimensions=dims,
-            base_url=str(os.environ.get("GEMINI_API_BASE") or "").strip() or None,
+            base_url=base_override or str(os.environ.get("GEMINI_API_BASE") or "").strip() or None,
         )
 
     def _openai() -> OpenAICompatibleEmbeddingProvider | None:
         key = _env_api_key("OPENAI_API_KEY")
         if not key:
             return None
-        base = str(os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        base = (base_override or str(os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1")).rstrip("/")
         return OpenAICompatibleEmbeddingProvider(
             provider_id="openai",
             api_key=key,
@@ -605,7 +635,7 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
 
     def _azure() -> OpenAICompatibleEmbeddingProvider | None:
         key = _env_api_key("AZURE_OPENAI_API_KEY")
-        endpoint = str(os.environ.get("AZURE_OPENAI_ENDPOINT") or "").strip()
+        endpoint = (base_override or str(os.environ.get("AZURE_OPENAI_ENDPOINT") or "")).strip()
         if not key or not endpoint:
             return None
         return OpenAICompatibleEmbeddingProvider(
@@ -619,7 +649,7 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
         )
 
     def _ollama() -> OllamaEmbeddingProvider | None:
-        host = str(os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL") or "").strip()
+        host = (base_override or str(os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL") or "")).strip()
         if not host:
             return None
         return OllamaEmbeddingProvider(
@@ -639,27 +669,108 @@ def build_embedding_provider(settings: dict[str, Any] | None = None) -> Embeddin
             return None
         return LocalEmbeddingProvider(model=model or str(os.environ.get("MEMORY_LOCAL_EMBED_MODEL") or ""))
 
+    def _fallback() -> EmbeddingProvider | None:
+        return HashEmbeddingProvider() if allow_fallback else None
+
     if mode in {"", "auto"}:
         # Prefer free multilingual cloud, then paid, then a local model, then the
         # offline hash fallback (weak — only when nothing else is available).
-        return _cloudflare() or _gemini() or _azure() or _openai() or _ollama() or _local() or HashEmbeddingProvider()
+        return _cloudflare() or _gemini() or _azure() or _openai() or _ollama() or _local() or _fallback()
 
     if mode == "hash":
         return HashEmbeddingProvider()
     if mode in {"cloudflare", "cf", "workers-ai"}:
-        return _cloudflare() or HashEmbeddingProvider()
+        return _cloudflare() or _fallback()
     if mode in {"gemini", "google", "google-gemini"}:
-        provider = _gemini()
-        return provider or HashEmbeddingProvider()
+        return _gemini() or _fallback()
     if mode in {"openai"}:
-        return _openai() or HashEmbeddingProvider()
+        return _openai() or _fallback()
     if mode in {"azure", "azure-openai"}:
-        return _azure() or HashEmbeddingProvider()
+        return _azure() or _fallback()
     if mode == "ollama":
-        host = str(os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").strip()
+        host = (base_override or str(os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434")).strip()
         if not host.startswith("http"):
             host = f"http://{host}"
         return OllamaEmbeddingProvider(host=host, model=model or DEFAULT_OLLAMA_EMBED_MODEL)
     if mode in {"local", "fastembed", "sentence-transformers", "st", "onnx"}:
-        return _local() or HashEmbeddingProvider()
-    return HashEmbeddingProvider()
+        return _local() or _fallback()
+    return _fallback()
+
+
+PROBE_TEXT = "ArchitectOS embedding probe"
+
+
+def probe_embedding_provider(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Call the selected embedding backend once. Does not silently fall back to hash."""
+    settings = dict(settings or {})
+    requested = str(settings.get("embedding_provider") or "auto").strip().lower() or "auto"
+    allow_fallback = requested in {"", "auto", "hash"}
+    provider = build_embedding_provider(settings, allow_fallback=allow_fallback)
+    if provider is None:
+        env_keys = list((EMBEDDING_PROVIDER_CATALOG.get(requested) or {}).get("env_keys") or [])
+        label = str((EMBEDDING_PROVIDER_CATALOG.get(requested) or {}).get("label") or requested)
+        return {
+            "ready": False,
+            "status": "missing_credentials",
+            "requested_provider": requested,
+            "provider": requested,
+            "model": str(settings.get("embedding_model") or ""),
+            "dimensions": 0,
+            "latency_ms": 0,
+            "message": f"{label} is selected, but the connection is not configured.",
+            "hint": ("Set " + " and ".join(env_keys) + " in Providers → Embeddings or .env.local, then Test.") if env_keys else "Configure this embedding provider, then Test.",
+        }
+    actual = str(getattr(provider, "provider_id", "") or "")
+    if requested not in {"", "auto", "hash"} and actual == "hash":
+        return {
+            "ready": False,
+            "status": "missing_credentials",
+            "requested_provider": requested,
+            "provider": actual,
+            "model": getattr(provider, "model", ""),
+            "dimensions": int(getattr(provider, "dimensions", 0) or 0),
+            "latency_ms": 0,
+            "message": f"{requested} was selected, but ArchitectOS fell back to hash embeddings.",
+            "hint": "Fill the connection fields for this provider and Test again.",
+        }
+    t0 = time.perf_counter()
+    try:
+        vector = provider.embed(PROBE_TEXT, purpose="query")
+    except Exception as exc:
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        return {
+            "ready": False,
+            "status": "error",
+            "requested_provider": requested,
+            "provider": actual,
+            "model": getattr(provider, "model", ""),
+            "dimensions": int(getattr(provider, "dimensions", 0) or 0),
+            "latency_ms": elapsed,
+            "message": str(exc),
+            "hint": "Check the endpoint, model name, and credentials, then Test again.",
+        }
+    elapsed = int((time.perf_counter() - t0) * 1000)
+    dims = len(vector) if vector else int(getattr(provider, "dimensions", 0) or 0)
+    if not vector:
+        return {
+            "ready": False,
+            "status": "error",
+            "requested_provider": requested,
+            "provider": actual,
+            "model": getattr(provider, "model", ""),
+            "dimensions": 0,
+            "latency_ms": elapsed,
+            "message": "Embedding probe returned an empty vector.",
+            "hint": "The model answered, but produced no embedding. Try another model.",
+        }
+    return {
+        "ready": True,
+        "status": "ok",
+        "requested_provider": requested,
+        "provider": actual,
+        "model": getattr(provider, "model", ""),
+        "dimensions": dims,
+        "latency_ms": elapsed,
+        "message": f"{actual} / {getattr(provider, 'model', '')} returned {dims}d in {elapsed}ms.",
+        "hint": "This model is ready for memory embeddings.",
+    }

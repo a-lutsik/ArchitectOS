@@ -1,16 +1,10 @@
-// Code intelligence UI (languages / LSP / symbols / hover / diagnostics / references). ES module.
+// Code intelligence UI (languages / LSP readiness). ES module.
 import { api } from "./api-client.js";
 import { escapeHtml, showSnackbar } from "./dom-utils.js";
 import { needsProjectOnboarding } from "./projects.js";
 import { projectParam, state, t } from "./state.js";
 import { showError } from "./ui.js";
 
-function renderCodeLanguages(payload) {
-  const languages = payload.languages || [];
-  const servers = state.codeServersCache?.servers || [];
-  renderCodeStatus(languages, servers);
-  renderCodeLanguageSupport(languages, servers);
-}
 function codeLanguageTone(item) {
   if (item.ready) return "ok";
   if (item.fallback) return "fallback";
@@ -41,6 +35,11 @@ function renderCodeStatus(languages, servers) {
       badge.dataset.tone = "idle";
     }
     if (pills) pills.innerHTML = "";
+    const setupBadge = document.querySelector("#code-setup-badge");
+    if (setupBadge) {
+      setupBadge.hidden = true;
+      setupBadge.textContent = "";
+    }
     return;
   }
 
@@ -73,7 +72,10 @@ function renderCodeStatus(languages, servers) {
   }
 
   const setupBadge = document.querySelector("#code-setup-badge");
-  if (setupBadge) setupBadge.textContent = t("code.setup.summary").replace("{ready}", String(effectiveReady)).replace("{total}", String(Math.max(languages.length, servers.length || languages.length)));
+  if (setupBadge) {
+    setupBadge.hidden = false;
+    setupBadge.textContent = t("code.setup.summary").replace("{ready}", String(effectiveReady)).replace("{total}", String(Math.max(languages.length, servers.length || languages.length)));
+  }
 }
 function renderCodeLanguageSupport(languages, servers) {
   const container = document.querySelector("#code-language-support");
@@ -191,35 +193,6 @@ function renderCodeServerList(servers) {
     } catch (error) { result.className = "provider-test error"; result.textContent = error.message; }
   }));
 }
-function syncCodeInsightTab() {
-  const tab = state.codeInsightTab || "symbols";
-  document.querySelectorAll("[data-code-tab]").forEach(button => {
-    const active = button.dataset.codeTab === tab;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", active ? "true" : "false");
-  });
-  const position = document.querySelector("#code-position-controls");
-  if (position) position.hidden = tab === "symbols" || tab === "diagnostics";
-  const symbols = document.querySelector("#code-symbols");
-  const insight = document.querySelector("#code-insight");
-  if (symbols) symbols.hidden = tab !== "symbols";
-  if (insight) insight.hidden = tab === "symbols";
-}
-function syncCodeExploreEmpty(hasResults) {
-  const empty = document.querySelector("#code-explore-empty");
-  if (empty) empty.hidden = Boolean(hasResults);
-}
-function setCodeInsightTab(tab) {
-  state.codeInsightTab = tab;
-  syncCodeInsightTab();
-}
-async function runCodeInsight() {
-  const tab = state.codeInsightTab || "symbols";
-  if (tab === "symbols") await loadCodeSymbols();
-  else if (tab === "diagnostics") await loadCodeDiagnostics();
-  else if (tab === "hover") await loadCodeHover();
-  else if (tab === "references") await loadCodeReferences();
-}
 async function analyzeCodeProject() {
   const status = document.querySelector("#code-status-message");
   if (status) status.textContent = t("action.scanProject") + "...";
@@ -238,37 +211,6 @@ function installCommandHtml(command, serverId = "") {
   const id = escapeHtml(serverId || "");
   return `<div class="install-command"><strong>Missing/install:</strong><div class="command-row"><code title="${value}">${value}</code><div class="provider-actions install-actions">${serverId ? `<button data-code-install="${id}" type="button">${escapeHtml(t("code.lang.run"))}</button>` : `<button data-terminal-install-run="${value}" type="button">${escapeHtml(t("code.lang.run"))}</button>`}<button data-install-copy type="button" data-command="${value}">${escapeHtml(t("code.lang.copy"))}</button><button data-agent-install-command="${value}" type="button">Ask Agent</button></div></div></div>`;
 }
-function fillCodeFileFromSelection(overwrite = true) {
-  const input = document.querySelector("#code-file-path");
-  if (!input || !state.selectedFile) return false;
-  if (overwrite || !input.value.trim()) input.value = state.selectedFile;
-  syncCodeFileHint();
-  return true;
-}
-function syncCodeFileHint() {
-  const hint = document.querySelector("#code-selected-file-hint");
-  if (!hint) return;
-  hint.textContent = state.selectedFile
-    ? t("code.usingFile").replace("{path}", state.selectedFile)
-    : t("code.noFileSelected");
-}
-function toggleCodeAdvanced() {
-  const panel = document.querySelector(".code-lsp-advanced");
-  if (!panel) return;
-  panel.open = !panel.open;
-}
-function codeRequestPayload() {
-  const input = document.querySelector("#code-file-path");
-  const path = (input.value || state.selectedFile || "").trim();
-  if (input && path) input.value = path;
-  return {
-    project_id: state.projectId,
-    path,
-    line: Number(document.querySelector("#code-line")?.value || 0),
-    character: Number(document.querySelector("#code-character")?.value || 0),
-    query: document.querySelector("#code-reference-query")?.value || "",
-  };
-}
 async function loadCodeServers() {
   const [payload, languages] = await Promise.all([api("/api/code/servers"), api(`/api/code/languages?project_id=${projectParam()}`)]);
   state.codeServersCache = payload;
@@ -277,50 +219,7 @@ async function loadCodeServers() {
   renderCodeLanguageSupport(languageItems, payload.servers || []);
   renderCodeServerList(payload.servers || []);
 }
-async function loadCodeSymbols() {
-  const container = document.querySelector("#code-symbols");
-  const request = codeRequestPayload();
-  if (!request.path) { container.innerHTML = `<article class="result"><strong>${escapeHtml(t("code.noFileSelected"))}</strong></article>`; syncCodeExploreEmpty(false); return; }
-  container.innerHTML = '<article class="result"><strong>Analyzing</strong><p>...</p></article>';
-  syncCodeExploreEmpty(true);
-  try {
-    const payload = await api("/api/code/symbols", { method: "POST", body: JSON.stringify(request) });
-    const symbols = payload.symbols || [];
-    container.innerHTML = `<article class="result code-insight-summary"><strong>${escapeHtml(payload.language)} · ${symbols.length} symbol(s)</strong><p>${escapeHtml(payload.path)} · ${escapeHtml(payload.source || "lsp")}${payload.message ? ` · ${escapeHtml(payload.message)}` : ""}</p></article>` + (symbols.length ? symbols.map(symbol => `<article class="result code-symbol-row" style="margin-left:${Math.min(symbol.depth, 5) * 14}px"><div class="row"><strong>${escapeHtml(symbol.name)}</strong><span class="badge">${escapeHtml(symbol.kind)}</span></div><span class="badge">line ${escapeHtml(String(symbol.line))}</span>${symbol.detail ? `<span class="muted"> ${escapeHtml(symbol.detail)}</span>` : ""}</article>`).join("") : `<article class="result"><strong>No symbols returned</strong></article>`);
-    syncCodeExploreEmpty(true);
-  } catch (error) {
-    container.innerHTML = `<article class="result"><strong>Symbols failed</strong><p>${escapeHtml(error.message)}</p></article>`;
-    syncCodeExploreEmpty(true);
-  }
-}
-async function loadCodeHover() {
-  const container = document.querySelector("#code-insight");
-  const request = codeRequestPayload();
-  if (!request.path) { container.innerHTML = `<article class="result"><strong>${escapeHtml(t("code.noFileSelected"))}</strong></article>`; syncCodeExploreEmpty(false); return; }
-  syncCodeExploreEmpty(true);
-  const payload = await api("/api/code/hover", { method: "POST", body: JSON.stringify(request) });
-  container.innerHTML = `<article class="result code-insight-summary"><strong>Hover (${escapeHtml(payload.source || "lsp")})</strong><p>${escapeHtml(payload.path)}:${escapeHtml(String(Number(payload.line || 0) + 1))}:${escapeHtml(String(payload.character || 0))}</p><pre class="inline-pre">${escapeHtml(payload.hover || "No hover text.")}</pre></article>`;
-}
-async function loadCodeDiagnostics() {
-  const container = document.querySelector("#code-insight");
-  const request = codeRequestPayload();
-  if (!request.path) { container.innerHTML = `<article class="result"><strong>${escapeHtml(t("code.noFileSelected"))}</strong></article>`; syncCodeExploreEmpty(false); return; }
-  syncCodeExploreEmpty(true);
-  const payload = await api("/api/code/diagnostics", { method: "POST", body: JSON.stringify(request) });
-  const items = payload.diagnostics || [];
-  container.innerHTML = `<article class="result code-insight-summary"><strong>Diagnostics (${escapeHtml(payload.source || "basic")})</strong><p>${escapeHtml(payload.path)} · ${items.length} issue(s)</p></article>` + (items.length ? items.map(item => `<article class="result"><div class="row"><strong>${escapeHtml(item.severity || "info")}</strong><span class="badge">line ${escapeHtml(String(item.line || 1))}</span></div><p>${escapeHtml(item.message || "")}</p></article>`).join("") : '<article class="result"><strong>No diagnostics</strong></article>');
-}
-async function loadCodeReferences() {
-  const container = document.querySelector("#code-insight");
-  const request = codeRequestPayload();
-  if (!request.path) { container.innerHTML = `<article class="result"><strong>${escapeHtml(t("code.noFileSelected"))}</strong></article>`; syncCodeExploreEmpty(false); return; }
-  syncCodeExploreEmpty(true);
-  const payload = await api("/api/code/references", { method: "POST", body: JSON.stringify(request) });
-  const refs = payload.references || [];
-  container.innerHTML = `<article class="result code-insight-summary"><strong>References (${escapeHtml(payload.source || "lsp")})</strong><p>${escapeHtml(payload.query || "")} · ${refs.length} result(s)</p></article>` + (refs.length ? refs.map(ref => `<article class="result"><div class="row"><strong>${escapeHtml(ref.path || payload.path)}</strong><span class="badge">line ${escapeHtml(String(ref.line || 1))}</span></div><p>${escapeHtml(ref.preview || "")}</p></article>`).join("") : '<article class="result"><strong>No references</strong></article>');
-}
 
 export {
-  analyzeCodeProject, fillCodeFileFromSelection, installCodeLanguageServer,
-  loadCodeServers, runCodeInsight, setCodeInsightTab, syncCodeFileHint, syncCodeInsightTab,
+  analyzeCodeProject, installCodeLanguageServer, loadCodeServers,
 };

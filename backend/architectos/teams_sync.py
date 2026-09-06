@@ -86,7 +86,7 @@ class TeamsMeetingSyncMixin:
             body_parts.append("Transcript:\n" + transcript[:3500])
         text = "\n\n".join(body_parts)
         return {
-            "id": stable_id("teams", project_id, meeting_id, subject[:80]),
+            "id": stable_id("teams", project_id, meeting_id),
             "project_id": project_id,
             "source_type": "teams-meetings",
             "source_ref": meeting_id,

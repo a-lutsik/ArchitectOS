@@ -1,8 +1,8 @@
 /* Language/theme/density, errors, provider status helpers, result cards — extracted from app.js */
 import { api } from "./api-client.js";
 import { syncAskMode } from "./ask-ui.js";
-import { syncCodeFileHint } from "./code-intel.js";
 import { escapeHtml, labelPrefix, setButton, setPlaceholder, setText, setTextContent, showSnackbar, trapFocus } from "./dom-utils.js";
+import { syncGraphViewChrome } from "./graph.js";
 import { LANGUAGE_META, RTL_LANGUAGES, translations } from "./i18n.js";
 import { refreshWorkspace, runSearch } from "./projects.js";
 import { state, syncProjectTerminology, t, titleByView } from "./state.js";
@@ -35,6 +35,10 @@ function applyLanguage(language) {
     const key = el.dataset.i18n;
     if (key) el.textContent = t(key);
   });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
+    const key = el.dataset.i18nPlaceholder;
+    if (key) el.setAttribute("placeholder", t(key));
+  });
   document.querySelectorAll("[data-ask-mode]").forEach(btn => {
     const mode = btn.dataset.askMode;
     btn.textContent = t(`ask.mode.${mode}`);
@@ -53,17 +57,12 @@ function applyLanguage(language) {
   setText("#project-folder-subtitle", "folder.subtitle");
   setText("#project-folder-more-hint", "folder.moreHint");
   setButton("#context-form button", "action.build");
-  setButton("#refresh-files", "action.refresh");
   setButton("#build-file-context", "action.buildContext");
   setButton("#load-git-diff", "action.gitDiff");
   setPlaceholder("#project-name", "placeholder.projectName");
   setPlaceholder("#project-root-path", "placeholder.projectRoot");
   setPlaceholder("#context-query", "placeholder.context");
   setPlaceholder("#selected-file-path", "placeholder.selectedFile");
-  setText("#settings-view .panel:nth-of-type(1) h3", "settings.bundle");
-  setText("#settings-view .panel:nth-of-type(2) h3", "settings.ui");
-  setText("#settings-view .panel:nth-of-type(3) h3", "settings.embeddings");
-  setText("#settings-view .panel:nth-of-type(4) h3", "settings.security");
   labelPrefix("#theme-select", "settings.theme");
   labelPrefix("#density-select", "settings.density");
   labelPrefix("#settings-language-select", "settings.language");
@@ -71,34 +70,40 @@ function applyLanguage(language) {
   labelPrefix("#archive-after", "settings.archive");
   labelPrefix("#delete-after", "settings.delete");
   labelPrefix("#promote-after-hits", "settings.promote");
+  labelPrefix("#chat-memory-mode", "settings.chatMemoryMode");
+  labelPrefix("#chat-candidate-ttl", "settings.chatCandidateTtl");
+  labelPrefix("#chat-session-idle", "settings.chatSessionIdle");
   labelPrefix("#embedding-provider", "settings.embeddingProvider");
   labelPrefix("#embedding-model", "settings.embeddingModel");
   labelPrefix("#embedding-dimensions", "settings.embeddingDims");
+  labelPrefix("#embedding-account-id", "settings.embeddingAccountId");
+  labelPrefix("#embedding-base-url", "settings.embeddingBaseUrl");
+  labelPrefix("#embedding-api-key", "settings.embeddingApiKey");
   labelPrefix("#vector-pool", "settings.vectorPool");
   labelPrefix("#vector-min-score", "settings.vectorMinScore");
   labelPrefix("#vector-query-timeout", "settings.vectorTimeout");
+  labelPrefix("#search-relevance-floor", "settings.relevanceFloor");
   const embeddingsEnabledLabel = document.querySelector("#embeddings-enabled")?.closest("label");
-  if (embeddingsEnabledLabel) embeddingsEnabledLabel.lastChild.textContent = ` ${t("settings.embeddingsEnabled")}`;
-  const reindexStartupLabel = document.querySelector("#reindex-on-startup")?.closest("label");
-  if (reindexStartupLabel) reindexStartupLabel.lastChild.textContent = ` ${t("settings.reindexStartup")}`;
+  if (embeddingsEnabledLabel) {
+    const title = embeddingsEnabledLabel.querySelector(".setting-toggle-title");
+    if (title) title.textContent = t("settings.embeddingsEnabled");
+    else if (embeddingsEnabledLabel.lastChild?.nodeType === Node.TEXT_NODE) {
+      embeddingsEnabledLabel.lastChild.textContent = ` ${t("settings.embeddingsEnabled")}`;
+    }
+  }
   setButton("#embeddings-form button[type='submit']", "settings.saveEmbeddings");
+  setButton("#embeddings-connection-form button[type='submit']", "settings.saveEmbeddings");
+  setButton("#embeddings-test", "settings.embeddingTest");
   setButton("#embeddings-rebuild", "settings.rebuildEmbeddings");
-  const memoryLabel = document.querySelector("#memory-enabled")?.closest("label");
-  if (memoryLabel) memoryLabel.lastChild.textContent = ` ${t("settings.memory")}`;
-  const lifecycleLabel = document.querySelector("#lifecycle-enabled")?.closest("label");
-  if (lifecycleLabel) lifecycleLabel.lastChild.textContent = ` ${t("settings.lifecycle")}`;
-  const refreshLabel = document.querySelector("#refresh-on-access")?.closest("label");
-  if (refreshLabel) refreshLabel.lastChild.textContent = ` ${t("settings.refresh")}`;
-  const autoRescanLabel = document.querySelector("#auto-rescan-on-startup")?.closest("label");
-  if (autoRescanLabel) autoRescanLabel.lastChild.textContent = ` ${t("settings.autoRescan")}`;
+  setText("#vector-runtime-title", "settings.vectorRuntime");
+  setText("#vector-runtime-why", "settings.vectorRuntimeWhy");
+  setText("#vector-runtime-hint", "settings.vectorRuntimeHint");
+  setText("#vector-runtime-frozen", "settings.vectorRuntimeFrozen");
+  setButton("#vector-runtime-check", "settings.vectorRuntimeCheck");
+  setButton("#vector-runtime-fix", "settings.vectorRuntimeFix");
+  setButton("#settings-form button[type='submit']", "action.saveSettings");
   setButton("#ingest-memory", "autoscan.ingest");
   setButton("#rescan-memory-all", "autoscan.rescanAll");
-  setButton("#settings-form button", "action.saveSettings");
-  setText("#terminal-panel-title", "terminal.title");
-  setText("#terminal-panel-hint", "terminal.hint");
-  setButton("#terminal-open", "terminal.external");
-  setText("#terminal-view .panel:nth-of-type(2) h3", "terminal.history");
-  setText("#code-run-insight", "code.action.analyzeFile");
   setText("#code-analyze-project", "code.action.analyze");
   setText("#code-connect-folder", "action.connectFolder");
   const expandBtn = document.querySelector("#graph-expand");
@@ -111,9 +116,23 @@ function applyLanguage(language) {
   setText(".memory-lifecycle-heading h4", "lifecycle.title");
   setText(".memory-lifecycle-desc", "lifecycle.desc");
   setText("#run-memory-decay", "lifecycle.runDecay");
+  const toolbar = document.querySelector(".file-tree-toolbar");
+  if (toolbar) toolbar.setAttribute("aria-label", t("files.toolbar"));
+  const dotfilesBtn = document.querySelector("#toggle-dotfiles");
+  if (dotfilesBtn) {
+    dotfilesBtn.dataset.i18nTitle = state.showDotfiles ? "files.tip.hideDotfiles" : "files.tip.showDotfiles";
+  }
   document.querySelectorAll("[data-i18n-title]").forEach(el => {
-    el.title = t(el.dataset.i18nTitle);
+    const text = t(el.dataset.i18nTitle);
+    if (el.hasAttribute("data-tooltip")) {
+      el.setAttribute("data-tooltip", text);
+      el.setAttribute("aria-label", text);
+      el.removeAttribute("title");
+    } else {
+      el.title = text;
+    }
   });
+  syncGraphViewChrome();
   setText("#workspace-ask-title", "workspace.ask.title");
   document.querySelectorAll(".workspace-surface-btn [data-i18n]").forEach((el) => {
     const key = el.getAttribute("data-i18n");
@@ -121,7 +140,6 @@ function applyLanguage(language) {
   });
   setText("#editor-tab-empty-hint", "workspace.editor.empty");
   setPlaceholder("#file-editor", "workspace.editor.placeholder");
-  syncCodeFileHint();
   syncProjectTerminology();
   syncLanguageMenu();
 }
@@ -146,12 +164,17 @@ async function saveUiSettings(partial = {}) {
     theme: document.querySelector("#theme-select")?.value || state.theme || "system",
     density: document.querySelector("#density-select")?.value || "comfortable",
     memory_enabled: document.querySelector("#memory-enabled") ? document.querySelector("#memory-enabled").checked : true,
+    ask_memory_advice: document.querySelector("#ask-memory-advice")
+      ? document.querySelector("#ask-memory-advice").checked
+      : state.askMemoryAdvice !== false,
     language: state.language,
     onboarding_complete: state.onboardingComplete,
     ...partial,
   };
   if (partial.onboarding_complete !== undefined) state.onboardingComplete = partial.onboarding_complete;
+  if (ui.ask_memory_advice !== undefined) state.askMemoryAdvice = ui.ask_memory_advice !== false;
   await api("/api/settings", { method: "PATCH", body: JSON.stringify({ ui }) });
+  if (typeof window.syncAskMemoryAdviceBadge === "function") window.syncAskMemoryAdviceBadge();
 }
 async function saveWorkspaceSettings(partial = {}) {
   const workspace = {
@@ -166,11 +189,38 @@ function showError(error) {
   if (output) output.textContent = message;
   showSnackbar(message, "error");
 }
-function providerStatusClass(status, enabled) {
-  if (!enabled) return "disabled";
-  if (["configured", "ok"].includes(status)) return "ready";
+function providerIsReady(provider) {
+  if (!provider || !provider.enabled) return false;
+  const last = provider.last_check && typeof provider.last_check === "object" ? provider.last_check : null;
+  const errorStatuses = ["missing_credentials", "missing_endpoint", "missing_cli", "missing_command", "missing_model", "unreachable", "error"];
+  const readyStatuses = ["configured", "ok", "available", "ready", "fallback"];
+  if (last) {
+    const lastStatus = String(last.status || "").toLowerCase();
+    if (last.ready === false) return false;
+    if (errorStatuses.includes(lastStatus)) return false;
+    if (last.ready === true) return true;
+  }
+  const status = String(provider.status || "").toLowerCase();
+  if (errorStatuses.includes(status)) return false;
+  return readyStatuses.includes(status);
+}
+function providerStatusClass(provider) {
+  if (!provider || !provider.enabled) return "disabled";
+  if (providerIsReady(provider)) return "ready";
+  const last = provider.last_check || {};
+  const status = String(last.status || provider.status || "").toLowerCase();
   if (["missing_credentials", "missing_endpoint", "missing_cli", "missing_command", "missing_model", "unreachable", "error"].includes(status)) return "error";
   return "planned";
+}
+function providerStatusLabel(provider) {
+  const tone = providerStatusClass(provider);
+  if (tone === "ready") return t("providers.status.ready");
+  if (tone === "disabled") return t("providers.status.disabled");
+  const status = String((provider.last_check && provider.last_check.status) || provider.status || "");
+  if (status === "missing_credentials") return t("providers.status.missingCredentials");
+  if (status === "missing_model") return t("providers.status.missingModel");
+  if (tone === "error") return t("providers.status.error");
+  return t("providers.status.planned");
 }
 function providerHint(provider) {
   if (provider.last_check && provider.last_check.message) return provider.last_check.message;
@@ -278,6 +328,6 @@ if (typeof MutationObserver !== "undefined" && typeof document !== "undefined" &
 
 export {
   applyDensity, applyLanguage, applyTheme,
-  providerHint, providerLoginLabel, providerStatusClass,
+  providerHint, providerIsReady, providerLoginLabel, providerStatusClass, providerStatusLabel,
   renderResults, saveUiSettings, saveWorkspaceSettings, showError, syncLanguageMenu,
 };

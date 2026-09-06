@@ -1,13 +1,15 @@
 // Workspace Ask/chat panel. ES module.
 import { beginAgentActivity, finalizeAgentActivity, stopAgentActivityTimer, updateAgentActivity } from "./agent-activity.js";
 import { api } from "./api-client.js";
-import { autoGrowChatInput, handleFileSelect, switchView, syncAskMode } from "./ask-ui.js";
+import { confirmAskSend, setAskSecurityStatus, setBubbleSecurity } from "./ask-security.js";
+import { autoGrowChatInput, handleFileSelect, placeAskQuestionCards, switchView, syncAskMode } from "./ask-ui.js";
 import {
   fetchChat, getMessageTextElement, handleProviderErrorAction, isProviderError,
   providerErrorAction, providerLabel, renderAssistantRichContent, renderProviderErrorBubble,
-  sendChatMessage, setAgentActivityModel, setBubbleProvider, setBubbleUsage,
+  cancelActiveRun, sendChatMessage, setAgentActivityModel, setBubbleProvider, setBubbleUsage,
   startNewAskThread, usedExplicitProvider,
 } from "./chat.js";
+import { showAppConfirm } from "./app-dialog.js";
 import { escapeHtml, showSnackbar } from "./dom-utils.js";
 import { projectParam, state, t } from "./state.js";
 import { showError } from "./ui.js";
@@ -81,9 +83,13 @@ const workspaceChat = {
       plusBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         menu.hidden = !menu.hidden;
+        plusBtn.setAttribute("aria-expanded", String(!menu.hidden));
       });
       document.addEventListener("click", (e) => {
-        if (!e.target.closest(".chat-menu-wrap")) menu.hidden = true;
+        if (!e.target.closest(".composer-menu-wrap")) {
+          menu.hidden = true;
+          plusBtn.setAttribute("aria-expanded", "false");
+        }
       });
       menu.addEventListener("click", (e) => {
         const action = e.target.closest("[data-action]")?.dataset.action;
@@ -114,6 +120,16 @@ const workspaceChat = {
       e.stopPropagation();
       this.openInAsk();
     });
+
+    const stop = document.getElementById("workspace-chat-stop");
+    if (stop) stop.addEventListener("click", () => cancelActiveRun().catch(showError));
+
+    const workspaceThread = document.getElementById("workspace-chat-thread");
+    if (workspaceThread) {
+      workspaceThread.addEventListener("click", event => {
+        if (event.target.closest("[data-connect-provider]")) switchView("providers");
+      });
+    }
 
     const fileChip = document.getElementById("workspace-ask-focus-file");
     if (fileChip) {
@@ -201,7 +217,7 @@ const workspaceChat = {
 
   autoResizeInput(textarea) {
     textarea.style.height = "auto";
-    textarea.style.height = Math.min(textarea.scrollHeight, 160) + "px";
+    textarea.style.height = Math.min(textarea.scrollHeight, 240) + "px";
   },
 
   syncProviders() {
@@ -257,12 +273,19 @@ const workspaceChat = {
     if (this.isSending) return;
     const chatThread = document.getElementById("workspace-chat-thread");
     if (!chatThread) return;
+    const needsProvider = !state.apiProviderReady && state.askMode !== "memory";
+    const connect = needsProvider
+      ? `<button type="button" class="btn-primary chat-empty-connect" data-connect-provider>${escapeHtml(t("ask.empty.connect"))}</button>`
+      : "";
     chatThread.innerHTML = `
-      <div class="chat-empty-state">
-        <div class="chat-empty-icon">💬</div>
-        <div class="chat-empty-text">${escapeHtml(t("workspace.ask.empty"))}</div>
-        <div class="chat-empty-hint">${escapeHtml(t("workspace.ask.emptyHint"))}</div>
+      <div class="chat-empty">
+        <div class="chat-empty-inner">
+          <p class="chat-empty-title">${escapeHtml(t(needsProvider ? "ask.empty.needsProviderTitle" : "workspace.ask.empty"))}</p>
+          <p class="chat-empty-sub">${escapeHtml(t(needsProvider ? "ask.empty.needsProvider" : "workspace.ask.emptyHint"))}</p>
+          ${connect}
+        </div>
       </div>`;
+    placeAskQuestionCards();
   },
 
   renderFromChat(chat) {
@@ -290,7 +313,7 @@ const workspaceChat = {
     }
 
     const wrap = document.createElement("div");
-    wrap.className = "workspace-stream-block";
+    wrap.className = "ask-turn ask-turn-assistant workspace-stream-block";
 
     const persona = document.createElement("div");
     persona.className = "msg-persona";
@@ -313,7 +336,8 @@ const workspaceChat = {
       if (Array.isArray(message.tool_trace) && message.tool_trace.length) {
         finalizeAgentActivity(bubble, message.tool_trace);
       }
-      setBubbleUsage(bubble, message.usage);
+      setBubbleUsage(bubble, message.usage, message.token_economy);
+      setBubbleSecurity(bubble, message.security);
     }
     return wrap;
   },
@@ -342,10 +366,11 @@ const workspaceChat = {
     this.addMessage("user", userMessage);
     const chatThread = document.getElementById("workspace-chat-thread");
     if (!chatThread) return;
+    chatThread.querySelector(".chat-empty")?.remove();
     chatThread.querySelector(".chat-empty-state")?.remove();
 
     const wrap = document.createElement("div");
-    wrap.className = "workspace-stream-block";
+    wrap.className = "ask-turn ask-turn-assistant workspace-stream-block";
 
     const persona = document.createElement("div");
     persona.className = "msg-persona";
@@ -414,7 +439,11 @@ const workspaceChat = {
         const withStderr = event?.raw?.stderr ? `${finalText}\n\nstderr: ${event.raw.stderr}` : finalText;
         renderAssistantRichContent(this._streamEl, withStderr, event?.structured || null);
         finalizeAgentActivity(this._streamEl, event?.tool_trace);
-        if (event?.usage) setBubbleUsage(this._streamEl, event.usage);
+        if (event?.usage || event?.token_economy) setBubbleUsage(this._streamEl, event.usage, event.token_economy);
+        if (event?.security) {
+          setBubbleSecurity(this._streamEl, event.security);
+          setAskSecurityStatus(event.security);
+        }
       }
     }
     // Keep the live bubble with activity; only replace if we need full history sync.
@@ -451,13 +480,15 @@ const workspaceChat = {
   async sendMessage() {
     const input = document.getElementById("workspace-chat-input");
     if (!input) return;
-    const message = input.value.trim();
+    const message = input.value.trim() || (state.attachments.length ? "Look at the attached image." : "");
     if (!message || this.isSending) return;
 
     const previousSurface = this.surface;
     if (this.surface === "editor") this.applySurface("split");
 
     this.syncControlsToAsk();
+    const allowed = await confirmAskSend(message);
+    if (!allowed) return;
     const askInput = document.getElementById("chat-message");
     if (askInput) {
       askInput.value = message;
@@ -467,7 +498,7 @@ const workspaceChat = {
     this.autoResizeInput(input);
 
     try {
-      await sendChatMessage(new Event("submit"), { workspaceMirror: true });
+      await sendChatMessage(new Event("submit"), { workspaceMirror: true, securityConfirmed: true });
       if (previousSurface === "ask") this.applySurface("ask", { persist: true });
       else if (this.surface === "editor") this.applySurface("split", { persist: true });
     } catch (error) {
@@ -477,26 +508,44 @@ const workspaceChat = {
   },
 
   buildMessageElement(role, content, isError = false, provider = null) {
-    const messageEl = document.createElement("div");
-    messageEl.className = `chat-message-compact ${role}`;
-    const avatar = role === "user" ? "👤" : ((providerLabel(provider) || "AI").trim().charAt(0) || "A").toUpperCase();
-    const time = new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
-    messageEl.innerHTML = `
-      <div class="chat-avatar-compact">${this.escapeHtml(avatar)}</div>
-      <div class="chat-message-content-compact">
-        <div class="chat-bubble-compact ${isError ? "error" : ""}">${this.formatMessage(content)}</div>
-        <div class="chat-message-time">${time}</div>
-      </div>`;
-    return messageEl;
+    if (role === "user") {
+      const turn = document.createElement("div");
+      turn.className = "ask-turn ask-turn-user";
+      const el = document.createElement("div");
+      el.className = "message user";
+      const textNode = document.createElement("div");
+      textNode.className = "message-text";
+      textNode.textContent = content || "";
+      el.appendChild(textNode);
+      turn.appendChild(el);
+      return turn;
+    }
+    const wrap = document.createElement("div");
+    wrap.className = "ask-turn ask-turn-assistant workspace-stream-block";
+    const persona = document.createElement("div");
+    persona.className = "msg-persona";
+    wrap.appendChild(persona);
+    const bubble = document.createElement("div");
+    bubble.className = `message assistant workspace-ask-message${isError ? " is-error" : ""}`;
+    const textNode = document.createElement("div");
+    textNode.className = "message-text";
+    textNode.textContent = content || "";
+    bubble.appendChild(textNode);
+    bubble._persona = persona;
+    wrap.appendChild(bubble);
+    setBubbleProvider(bubble, provider);
+    return wrap;
   },
 
   addMessage(role, content, isError = false, provider = null, store = true) {
     const chatThread = document.getElementById("workspace-chat-thread");
     if (!chatThread) return;
+    chatThread.querySelector(".chat-empty")?.remove();
     chatThread.querySelector(".chat-empty-state")?.remove();
     chatThread.appendChild(this.buildMessageElement(role, content, isError, provider));
     if (isError && role === "assistant") this.addProviderErrorActions(content);
     chatThread.scrollTop = chatThread.scrollHeight;
+    placeAskQuestionCards();
   },
 
   addProviderErrorActions(text) {
@@ -546,26 +595,7 @@ const workspaceChat = {
 
   setThinking(thinking) {
     this.isThinking = thinking;
-    const chatThread = document.getElementById("workspace-chat-thread");
-    if (!chatThread) return;
-    chatThread.querySelector(".chat-thinking")?.closest(".chat-message-compact")?.remove();
-    if (!thinking) {
-      this.setStatus("Ready");
-      return;
-    }
-    const thinkingEl = document.createElement("div");
-    thinkingEl.className = "chat-message-compact assistant";
-    thinkingEl.innerHTML = `
-      <div class="chat-avatar-compact">AI</div>
-      <div class="chat-message-content-compact">
-        <div class="chat-thinking">
-          <div class="chat-thinking-dot"></div>
-          <div class="chat-thinking-dot"></div>
-          <div class="chat-thinking-dot"></div>
-        </div>
-      </div>`;
-    chatThread.appendChild(thinkingEl);
-    chatThread.scrollTop = chatThread.scrollHeight;
+    this.setStatus(thinking ? "Working…" : "Ready", thinking ? "thinking" : "");
   },
 
   openFilePicker() {
@@ -578,16 +608,20 @@ const workspaceChat = {
     if (!files.length) return;
     try {
       await handleFileSelect(files);
-      showSnackbar(`${files.length} file(s) attached in Ask composer.`, "info");
+      showSnackbar(`${files.length === 1 ? "File attached" : `${files.length} files attached`}`, "info");
       this.applySurface(this.surface === "editor" ? "split" : this.surface);
-      this.openInAsk();
     } catch (error) {
       showError(error);
     }
   },
 
-  clearChat() {
-    if (!confirm("Start a new Ask dialog? Current thread stays in Dialogs history.")) return;
+  async clearChat() {
+    const ok = await showAppConfirm({
+      title: t("ask.newDialogTitle"),
+      message: t("ask.newDialogConfirm"),
+      confirmLabel: t("ask.newDialog"),
+    });
+    if (!ok) return;
     startNewAskThread();
   },
 };

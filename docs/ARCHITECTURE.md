@@ -70,6 +70,7 @@ scan/file/inbox/chat candidate builders and composes the mixins.
 `ingestion_timeouts.py` / `ingestion_rescan.py` / `ingestion_candidates.py`
 own timeout budgets, background rescan, and list/promote/reject/batch;
 `ingestion_service.py` keeps ingest/add-memory and re-exports the engine.
+`candidate_identity.py` owns sticky origin keys (meetings, git, Ask/MCP fact atoms).
 `graph_code_service.py` and `graph_suggest_service.py` own code-graph queries
 and LLM link/consolidation suggestions; `graph_service.py` keeps the graph
 view and edit commands. Schema migrations and bundled MCP/LSP/provider seed
@@ -79,11 +80,17 @@ tasks/chats/settings live in `storage_search.py`, `storage_candidates.py`, and
 `mcp_detect.py` / `mcp_config.py` / `mcp_client.py` own Node/ADO detection,
 server config, and JSON-RPC clients; `mcp.py` keeps `MCPManager`.
 `embedding_providers.py` owns embedding backends; `embeddings.py` keeps
-lexical helpers and `MemoryEmbeddingEngine`. `lsp_fallback.py` owns regex
+lexical helpers and `MemoryEmbeddingEngine`. Vector KNN uses sqlite-vec when
+the extra is installed and the running Python can load SQLite extensions
+(`vecsql.py` / `vec_runtime.py`); otherwise the in-RAM numpy / Python cosine
+index. Settings can probe the interpreter and, after confirm, install sqlite-vec
+or Homebrew Python. Packaged builds probe the frozen binary at install
+(`architectos-server vector-runtime`) and collect sqlite-vec when the builder
+Python can load SQLite extensions. `lsp_fallback.py` owns regex
 fallbacks; `adapters_extract.py` owns HTTP response text helpers.
 
 `server.py` keeps all HTTP routing in one place. A single `_dispatch` pipeline walks
-the 106-entry `ROUTES` table (method + regex + handler, first match wins) and every
+the `ROUTES` table (method + regex + handler, first match wins) and every
 verb (`do_GET`/`do_POST`/`do_PATCH`) funnels through it: index shortcut, `/api/*`
 authorization, query parsing, JSON body, route match, static-file fallthrough for
 unmatched GETs. `_authorize_api` guards every `/api/*` call with the per-start
@@ -152,7 +159,7 @@ stored version and stamps `SCHEMA_VERSION` (currently 3).
 
 - Local-first Python HTTP app with static workspace UI.
 - SQLite memory, markdown evidence, scoped search, context builder, graph expansion, and bundle import/export.
-- MF0-style canvas graph with filters, focus, drag, actions, pinning, merge, edge creation, and path explanation.
+- Memory graph in two projections: **Map** (2D cluster canvas — drag nodes, empty-space pan, wheel zoom) and **Galaxy** (3D — drag to orbit, Shift/right/middle-drag to pan, wheel zoom), with filters, focus, pinning, merge, edge creation, Fit, and path explanation (`frontend/graph.js`, `frontend/graph-galaxy.js`).
 - Provider routing for local memory, OpenAI, Anthropic, OpenRouter, Ollama, Codex CLI, Claude Code, and Gemini CLI.
 - Smart AI Router: weighted cost/speed/quality/availability scoring, task-role classification, strategies, and a routing preview.
 - Multi-Agent orchestration: role agents (code/architecture/docs/review) with an optional synthesis pass, reusing routing and audit.
@@ -160,10 +167,11 @@ stored version and stamps `SCHEMA_VERSION` (currently 3).
 - Agent tools: OpenAI/Azure providers receive the tool catalog as native function schemas (`ProviderRequest.tools`) and their calls are replayed through the same `tool_calls` loop other providers reach via the text protocol. Azure DevOps ops go through `call_ado_tool`, which targets the current `@azure-devops/mcp` action-based tools (`wit_work_item`, `wit_query`, `repo_repository`, `repo_pull_request`, `wiki`) and retries the pre-consolidation names on older servers; empty payloads and `isError` results surface as tool failures instead of silent nulls.
 - Azure Repos in chat: `repo_search_commits`, `repo_pull_requests_for_commit`, `repo_get_pull_request`, `repo_list_pull_request_comments`, `repo_read_file_at`, and `repo_list_repositories` let the agent trace a commit hash to its pull request, changed files, linked work items, and the file content at that revision, then diff it against the working copy via `fs_read`. They ship with the Azure DevOps MCP server and are read-only.
 - MCP Memory Server: exposes the memory engine over MCP stdio so Cursor, Copilot, and Claude Desktop can search/read and add memory (`mcp_memory_server.py`; see `docs/MCP_MEMORY_SERVER.md`).
+- Agent hooks: client lifecycle hooks that capture a turn even when the agent calls no tool, normalized in `agent_hooks.py`. Capture reuses `capture_memory_turn`, so review, TTL, and redaction rules are the same as MCP's. Registration is the same installer whether you use Setup → Agent hooks, `architectos hook`, `architectos_hook.py`, or the frozen `architectos-server hook` / `architectos-mcp hook` subcommand (see `docs/AGENT_HOOKS.md`). The memory engine is also a pip-installable SDK (`from architectos import ArchitectOS`, `docs/SDK.md`).
 - Code Intelligence: real LSP stdio JSON-RPC client for Python, TypeScript, Go, Rust, and Java with document symbols and hover; no custom parsers.
 - Persistent code graph: `scan_project` runs `CodeGraphIngestor` (`code_graph.py`) to extract `Symbol` nodes (functions/methods/classes with signature + docstring) and code edges — `DEFINES`/`CONTAINS`/`IMPORTS` (EXTRACTED) and best-effort `CALLS` (INFERRED) — into the same `memory_nodes`/`memory_edges` graph, giving communities/PageRank/retrieval a real code substrate. Offline (Python `ast` + regex for JS/TS), idempotent, and pruned on re-scan. Agents query it via the `code_neighbors` and `code_impact` MCP tools; symbol embeddings are optional (`embed_symbols` policy). See `docs/CODE_GRAPH.md`.
 - Streaming responses, CLI approval/cancel/workdir safety, provider audit trail, model discovery, and setup checks.
-- Session-based chat memory: messages stay in `chat_sessions` while active; on manual End session or idle timeout (`chat_session_idle_minutes`) ArchitectOS summarizes durable facts into one `chat_session_summary` memory candidate (`POST /api/chats/{id}/finalize`).
+- Session-based Ask memory: messages stay in `chat_sessions` while active; on End session or idle timeout (`chat_session_idle_minutes`) ArchitectOS writes fact atoms (`chat_session_atom`, source_type `chat`, UI chip **Ask**) into the review queue and stores the session summary in `chat_context_summaries`. A `chat_session_summary` review card is used only as a digest fallback when no atoms were extracted; Ask finalize is skipped when the same facts are already queued as MCP (`POST /api/chats/{id}/finalize`). MCP `memory_turn` and agent hooks call `capture_memory_turn` (`source_type=mcp`, template `mcp_turn_atom`, UI chip **MCP**). `candidate_identity.candidate_origin_key` maps the same durable fact to one origin (`fact:…`); near-duplicate fact atoms are skipped instead of stacked in review; `storage_candidates` keeps the first of Ask vs MCP and does not recast the channel.
 - Workflow engine, memory ingestion/promotion, project workspace file browsing, selected-file context, and git diff.
 - Desktop-style launcher with browser open, port conflict handling, startup scripts, runtime state, and release package builder.
 - Security policy for prompt/result/audit/persistence redaction.

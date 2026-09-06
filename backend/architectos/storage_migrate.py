@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .mcp import detect_azure_devops_from_git
-from .models import Project, stable_id, utc_now
+from .models import Project, stable_id
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 from .storage_defaults import (
     MIGRATIONS,
@@ -23,6 +23,15 @@ from .storage_defaults import (
 )
 
 _LOG = logging.getLogger("architectos.storage")
+
+# Titles of the ArchitectOS development backlog that early builds seeded into every
+# install. Shipped builds must start with an empty task list, so these are removed
+# on upgrade unless the operator has linked memory to them.
+_LEGACY_SEED_TASK_TITLES = (
+    "Security layer",
+    "E2E tests and installer docs",
+    "Production hardening",
+)
 
 
 class StorageMigrateMixin:
@@ -163,6 +172,26 @@ class StorageMigrateMixin:
                 );
                 CREATE INDEX IF NOT EXISTS idx_retrieval_feedback_project
                     ON retrieval_feedback(project_id, created_at);
+                CREATE TABLE IF NOT EXISTS sources (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'generic',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_sources_project ON sources(project_id, name);
+                CREATE TABLE IF NOT EXISTS memory_node_events (
+                    id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT,
+                    timestamp TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_node_events_node
+                    ON memory_node_events(node_id, timestamp);
                 """
             )
             for version, migration in MIGRATIONS:
@@ -190,15 +219,8 @@ class StorageMigrateMixin:
 
         self._delete_empty_non_system_projects()
         self._delete_seed_memory()
+        self._delete_seed_tasks()
         self._repair_missing_project_roots()
-
-        if not self.list_tasks("architectos"):
-            for title, status, priority, detail in [
-                ("Security layer", "done", "high", "Add explicit approvals, prompt/result redaction, and no secret persistence checks."),
-                ("E2E tests and installer docs", "done", "medium", "Add E2E tests, fake adapter tests, installer/start script checks, and configuration docs."),
-                ("Production hardening", "done", "high", "Readiness checks, backups, security headers, release metadata, and production docs."),
-            ]:
-                self.upsert_task({"id": stable_id("task", "architectos", title), "project_id": "architectos", "title": title, "status": status, "priority": priority, "detail": detail, "linked_memory_ids": [], "created_at": utc_now()})
 
         if not self.list_providers():
             for provider_id, label, kind, model in [
@@ -211,10 +233,17 @@ class StorageMigrateMixin:
                 ("anthropic", "Anthropic", "api", ""),
                 ("openrouter", "OpenRouter", "api", ""),
             ]:
-                self.upsert_provider({"id": provider_id, "label": label, "provider_type": kind, "status": "planned", "enabled": False, "model": model, "notes": "", "command": _default_provider_command(provider_id), "timeout_seconds": 120, "approval_required": kind == "cli", "workdir_policy": "project-root", "workdir": ""})
+                self.upsert_provider({"id": provider_id, "label": label, "provider_type": kind, "status": "planned", "enabled": False, "model": model, "notes": "", "command": _default_provider_command(provider_id), "timeout_seconds": 120, "approval_required": kind == "cli" and provider_id != "gemini-cli", "workdir_policy": "project-root", "workdir": ""})
 
         if not self.get_setting("ui"):
-            self.set_setting("ui", {"theme": "system", "density": "comfortable", "memory_enabled": True, "language": "en", "onboarding_complete": False})
+            self.set_setting("ui", {
+                "theme": "system",
+                "density": "comfortable",
+                "memory_enabled": True,
+                "ask_memory_advice": True,
+                "language": "en",
+                "onboarding_complete": False,
+            })
         else:
             self._ensure_onboarding_flag()
         if not self.get_setting("security"):
@@ -234,6 +263,7 @@ class StorageMigrateMixin:
                 "chat_candidate_ttl_days": 7,
                 "chat_session_idle_minutes": 30,
                 "chat_store_facts_only": True,
+                "chat_auto_accept": True,
                 "long_term_types": ["Decision", "Constraint", "Requirement"],
                 "architecture_keywords": ["architecture", "adr", "decision", "constraint", "security", "provider", "routing"],
             })
@@ -298,8 +328,28 @@ class StorageMigrateMixin:
             except sqlite3.Error as exc:
                 _LOG.debug("seed cleanup skipped for memory_embeddings: %s", exc)
 
+    def _delete_seed_tasks(self) -> None:
+        stale_ids = []
+        for title in _LEGACY_SEED_TASK_TITLES:
+            task = self.get_task(stable_id("task", "architectos", title))
+            if task and task.get("title") == title and not task.get("linked_memory_ids"):
+                stale_ids.append(task["id"])
+        if not stale_ids:
+            return
+        placeholders = ", ".join("?" for _ in stale_ids)
+        with self._connect() as conn:
+            conn.execute(f"DELETE FROM tasks WHERE id IN ({placeholders})", stale_ids)
+
     def _delete_empty_non_system_projects(self) -> None:
-        stale_ids = [project.id for project in self.list_projects() if project.id != "architectos" and not project.root_path]
+        # Knowledge projects (project_kind set, no local folder by design) are
+        # intentional and must survive startup cleanup.
+        stale_ids = [
+            project.id
+            for project in self.list_projects()
+            if project.id != "architectos"
+            and not project.root_path
+            and not dict(project.config or {}).get("project_kind")
+        ]
         if not stale_ids:
             return
         placeholders = ", ".join("?" for _ in stale_ids)
@@ -357,9 +407,18 @@ class StorageMigrateMixin:
         org, project = self._discover_azure_devops_defaults()
         ado_ready = self._azure_devops_credentials_present()
         for server in servers:
-            if server.get("id") == "granola" and server.get("command") == ["npx", "-y", "mcp-granola"]:
-                server.update(_granola_remote_mcp_server())
-                changed = True
+            if server.get("id") == "granola":
+                command = [str(part) for part in (server.get("command") or [])]
+                transport = str(server.get("transport") or "").strip().lower()
+                url = str(server.get("url") or "").strip()
+                if command == ["npx", "-y", "mcp-granola"]:
+                    server.update(_granola_remote_mcp_server())
+                    changed = True
+                elif url.startswith("http") and transport not in {"http", "remote", "streamable-http"}:
+                    server["transport"] = "http"
+                    if not server.get("notes"):
+                        server["notes"] = _granola_remote_mcp_server()["notes"]
+                    changed = True
             if server.get("id") == "azure-devops" and self._azure_devops_needs_upgrade(server):
                 preserved = {
                     "enabled": bool(server.get("enabled")),

@@ -1,11 +1,10 @@
 /* Projects, onboarding, workspace files, search/context, tasks — extracted from app.js */
 import { api, ensureServerOnline } from "./api-client.js";
-import { fillCodeFileFromSelection, syncCodeFileHint } from "./code-intel.js";
 import { escapeHtml, setElementValue, setTextContent, showSnackbar } from "./dom-utils.js";
 import { fileEditor } from "./file-editor.js";
 import { fileFind } from "./file-find.js";
-import { renderFileTree } from "./file-tree.js";
-import { graphState, loadGraph, resizeGraphCanvas } from "./graph.js";
+import { dropTreeView, renderFileTree, renderFileTreeSkeleton } from "./file-tree.js";
+import { graphState, loadGraph, resizeGraphCanvas, resetGraphAutoLayoutFlags, applyGraphAutoLayout, wakeGraphAnimation } from "./graph.js";
 import { projectWizard } from "./project-wizard.js";
 import {
   currentProject, displayProjectName, isSystemWorkspace, projectParam,
@@ -70,13 +69,50 @@ function syncProjectFields() {
     currentProjectName.textContent = displayProjectName(project) || "No project selected";
   }
 }
+let folderSubmitting = false;
+
 function projectFolderModal() {
   return document.querySelector("#projectFolderModal");
+}
+function folderModalIsOpen() {
+  const modal = projectFolderModal();
+  return Boolean(modal && modal.classList.contains("active"));
+}
+function setFolderSubmitError(message) {
+  const errorEl = document.getElementById("project-folder-submit-error");
+  if (!errorEl) return;
+  if (message) {
+    errorEl.textContent = message;
+    errorEl.hidden = false;
+  } else {
+    errorEl.textContent = "";
+    errorEl.hidden = true;
+  }
+}
+function setFolderSubmitting(submitting) {
+  folderSubmitting = Boolean(submitting);
+  const saveBtn = document.querySelector("#save-project");
+  const initBtn = document.querySelector("#init-project");
+  const browseBtn = document.querySelector("#browse-project-folder");
+  if (saveBtn) {
+    saveBtn.disabled = folderSubmitting;
+    saveBtn.setAttribute("aria-busy", folderSubmitting ? "true" : "false");
+    saveBtn.textContent = folderSubmitting ? t("folder.connecting") : t("action.connectFolder");
+  }
+  if (initBtn) {
+    initBtn.disabled = folderSubmitting;
+    initBtn.setAttribute("aria-busy", folderSubmitting ? "true" : "false");
+    initBtn.textContent = folderSubmitting ? t("folder.connecting") : t("action.connectAndIndex");
+  }
+  if (browseBtn) browseBtn.disabled = folderSubmitting;
 }
 function openProjectFolderModal() {
   const modal = projectFolderModal();
   if (!modal) return;
   syncProjectFields();
+  setFolderSubmitError("");
+  setFolderSubmitting(false);
+  setProjectFolderStatus("");
   modal.classList.add("active");
   modal.setAttribute("aria-hidden", "false");
   document.querySelector("#project-root-path")?.focus();
@@ -86,6 +122,7 @@ function closeProjectFolderModal() {
   if (!modal) return;
   modal.classList.remove("active");
   modal.setAttribute("aria-hidden", "true");
+  setFolderSubmitting(false);
 }
 function setProjectFolderStatus(message, tone = "") {
   const status = document.querySelector("#project-folder-picker-status");
@@ -165,35 +202,70 @@ async function maybeShowOnboarding() {
 function resetGraphFilters() {
   document.querySelectorAll("#graph-task-filter,#graph-provider-filter").forEach(filter => { if (filter) delete filter.dataset.ready; });
   graphState.searchQuery = "";
+  graphState.neighborhoodId = "";
   graphState.groupFilter = "";
-  graphState.densityLevel = 2;
+  resetGraphAutoLayoutFlags();
   setElementValue("#graph-search", "");
   setElementValue("#graph-group-filter", "");
-  const density = document.querySelector("#graph-density-level");
-  if (density) density.value = "2";
-  const densityValue = document.querySelector("#graph-density-value");
-  if (densityValue) densityValue.textContent = "2";
+  // Restore auto defaults for the current stage once nodes load; seed sensible placeholders now.
+  applyGraphAutoLayout();
 }
-async function saveProjectFromFolder() {
+async function connectProjectFromFolder({ index = false } = {}) {
+  if (folderSubmitting) return;
   const current = currentProject();
   const root = (document.querySelector("#project-root-path")?.value || current?.root_path || "").trim();
   const name = (document.querySelector("#project-name")?.value || current?.name || "").trim() || root.split(/[\\/]/).filter(Boolean).pop() || "Project";
-  if (!root) throw new Error("Project folder path is required.");
-  const project = await api("/api/projects", { method: "POST", body: JSON.stringify({ name, root_path: root }) });
-  state.projectId = project.project_id || project.id || (project.project && project.project.id);
-  if (!state.projectId) throw new Error("Project was saved but no project id was returned.");
-  await saveWorkspaceSettings({ current_project_id: state.projectId });
-  state.selectedFile = "";
-  await markOnboardingComplete();
-  await loadProjects();
-  await refreshWorkspace();
-  await loadProjectFiles();
-  showSnackbar(project.message || `Project ${name} was saved.`, project.created === false ? "info" : "success");
-  return project;
+  if (!root) {
+    setFolderSubmitError(t("folder.validation"));
+    return;
+  }
+
+  setFolderSubmitError("");
+  setFolderSubmitting(true);
+
+  try {
+    const project = await api("/api/projects", { method: "POST", body: JSON.stringify({ name, root_path: root }) });
+    state.projectId = project.project_id || project.id || (project.project && project.project.id);
+    if (!state.projectId) throw new Error(t("error.invalidResponse"));
+    state.selectedFile = "";
+    const projectNameEl = document.getElementById("current-project-name");
+    if (projectNameEl) projectNameEl.textContent = name;
+
+    closeProjectFolderModal();
+
+    const successMessage = index
+      ? t("folder.connectedIndexing").replace("{name}", name)
+      : (project.message || t("folder.connected").replace("{name}", name));
+    showSnackbar(successMessage, project.created === false ? "info" : "success");
+
+    const followUp = async () => {
+      await saveWorkspaceSettings({ current_project_id: state.projectId });
+      await markOnboardingComplete();
+      await loadProjects();
+      await refreshWorkspace();
+      await loadProjectFiles();
+      if (!index) return;
+      try {
+        await runProjectIndex({ reindex: true, limit: 80, label: "Initial index" });
+      } catch (scanError) {
+        console.warn("Auto-index after connect failed:", scanError);
+        showSnackbar(t("folder.indexFailed"), "error");
+      }
+    };
+    followUp().catch(showError);
+    return project;
+  } catch (error) {
+    setFolderSubmitting(false);
+    const message = error && error.message ? error.message : t("error.unexpected");
+    if (folderModalIsOpen()) setFolderSubmitError(message);
+    else showError(error);
+  }
+}
+async function saveProjectFromFolder() {
+  return connectProjectFromFolder({ index: false });
 }
 async function initProjectFromFolder() {
-  await saveProjectFromFolder();
-  return runProjectIndex({ reindex: true, limit: 80, label: "Initial index" });
+  return connectProjectFromFolder({ index: true });
 }
 async function scanSelectedProject() {
   return runProjectIndex({ reindex: false, limit: 40, label: "Analyze" });
@@ -234,11 +306,13 @@ function scheduleGraphLoad() {
   if (!memoryView || !memoryView.classList.contains("active")) return;
   requestAnimationFrame(() => {
     resizeGraphCanvas();
+    wakeGraphAnimation();
     requestAnimationFrame(() => loadGraph().catch(showError));
   });
 }
 
 function renderFileTreeEmptyState(list, payload) {
+  dropTreeView();
   const status = payload.status || "";
   const configuredRoot = (payload.configured_root || "").trim();
 
@@ -284,12 +358,13 @@ async function loadProjectFiles() {
   if (!list) return;
 
   console.log('Loading files for project:', state.projectId);
-  list.innerHTML = '<div class="file-tree-empty">Loading project files...</div>';
+  renderFileTreeSkeleton(list);
 
   let payload;
   try {
     payload = await api(`/api/project/files?project_id=${projectParam()}&limit=5000`);
   } catch (error) {
+    dropTreeView();
     list.innerHTML = `<div class="file-tree-empty"><strong>Could not load files</strong><p>${escapeHtml(error.message || String(error))}</p></div>`;
     throw error;
   }
@@ -317,8 +392,6 @@ async function openProjectFile(path) {
   state.selectedFile = payload.path;
   setElementValue("#selected-file-path", payload.path);
   setElementValue("#file-preview", payload.readable === false ? (payload.message || "Preview unavailable for this file.") : payload.text);
-  fillCodeFileFromSelection(false);
-  syncCodeFileHint();
   if (payload.readable === false) showSnackbar(payload.message || "Preview unavailable for this file.", "info");
 }
 async function buildSelectedFileContext() {

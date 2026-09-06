@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import urllib.request
 import webbrowser
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -102,10 +103,12 @@ def open_app_window(url: str) -> dict[str, Any]:
     executable = find_app_browser()
     if not executable:
         fallback = open_default_browser(url)
-        fallback.update({
-            "status": "fallback",
-            "message": "Edge/Chrome app mode was not found; opened the default browser.",
-        })
+        fallback.update(
+            {
+                "status": "fallback",
+                "message": "Edge/Chrome app mode was not found; opened the default browser.",
+            }
+        )
         return fallback
 
     command = build_app_window_command(executable, url)
@@ -147,6 +150,52 @@ def clear_runtime_state(project_root: Path = PROJECT_ROOT) -> None:
         return
 
 
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:  # Windows may not support signal 0; treat as unknown → not alive
+        return False
+    return True
+
+
+def _is_architectos_listener(host: str, port: int, timeout: float = 1.5) -> bool:
+    """Best-effort probe: does the listener on host:port answer like ArchitectOS?"""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=timeout) as response:
+            body = response.read(64 * 1024)
+    except Exception:  # noqa: BLE001 - a probe failure only means "not ours"
+        return False
+    lowered = body.lower()
+    return b'name="architectos-token"' in lowered or b"architectos" in lowered
+
+
+def running_instance_url(host: str, port: int) -> str | None:
+    """URL of a live ArchitectOS instance already bound to host:port, else None.
+
+    Single-instance guard: when an ArchitectOS server already answers on the
+    requested port we return its URL so callers reuse it instead of starting a
+    second full process (which would duplicate background maintenance/ingest
+    against the same database).
+    """
+    if is_port_available(host, port):
+        return None  # nothing is listening on the requested port
+    state = read_runtime_state(PROJECT_ROOT) or {}
+    pid = state.get("pid")
+    state_port = int(state.get("port") or 0)
+    if isinstance(pid, int) and _pid_is_alive(pid) and state_port == port:
+        url = str(state.get("url") or "").strip()
+        return url or build_url(host, port)
+    if _is_architectos_listener(host, port):
+        return build_url(host, port)
+    return None
+
+
 def create_server(host: str, port: int) -> ArchitectOSHTTPServer:
     return ArchitectOSHTTPServer((host, port), ArchitectOSHandler)
 
@@ -159,12 +208,35 @@ def serve(
     port_attempts: int = DEFAULT_PORT_ATTEMPTS,
     app_window: bool = False,
 ) -> int:
+    existing_url = running_instance_url(host, port)
+    if existing_url is not None:
+        print(
+            f"[launcher] pid={os.getpid()} reusing already-running ArchitectOS instance "
+            f"at {existing_url}; NOT starting a second server (single-instance)."
+        )
+        if open_browser:
+            launch = open_app_window(existing_url) if app_window else open_default_browser(existing_url)
+            if launch["mode"] == "app-window":
+                print("Opened ArchitectOS in an app window.")
+            elif launch["status"] == "fallback":
+                print(launch["message"])
+        return 0
+
     if strict_port:
         if not is_port_available(host, port):
             raise RuntimeError(f"port {port} is already in use on {host}")
         selected_port = port
+        print(f"[launcher] pid={os.getpid()} strict: binding to port {selected_port}")
     else:
         selected_port = find_available_port(host, port, port_attempts)
+        if selected_port != port:
+            print(
+                f"[launcher] WARNING pid={os.getpid()}: preferred port {port} is occupied "
+                f"by a non-ArchitectOS process; starting on port {selected_port} instead. "
+                f"Stop that process to reclaim port {port}."
+            )
+        else:
+            print(f"[launcher] pid={os.getpid()}: port {port} free; binding to it")
 
     server = create_server(host, selected_port)
     from .server import ArchitectOSHandler
@@ -189,9 +261,9 @@ def serve(
         },
     )
 
-    print(f"ArchitectOS running at {url}")
+    print(f"[launcher] pid={os.getpid()} ArchitectOS running at {url}")
     if selected_port != port:
-        print(f"Preferred port {port} was busy; using {selected_port}.")
+        print(f"[launcher] Preferred port {port} was busy; using {selected_port}.")
     print(f"Runtime state: {RUNTIME_STATE_PATH}")
     print("Press Ctrl+C to stop.")
 
@@ -228,7 +300,19 @@ def main(argv: list[str] | None = None) -> int:
     from .ssl_util import configure_default_ssl
 
     configure_default_ssl()
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "hook":
+        from .agent_hooks import main as hook_main
+
+        return hook_main(raw[1:])
+    if raw and raw[0] in {"vector-runtime", "sqlite-vec"}:
+        from .vec_runtime import cli_vector_runtime
+
+        return cli_vector_runtime(raw[1:])
+    from .vec_runtime import maybe_reexec_preferred_python
+
+    maybe_reexec_preferred_python()
+    args = build_parser().parse_args(raw)
     return serve(
         host=args.host,
         port=args.port,

@@ -32,6 +32,8 @@ ingest/rescan и попадает в движок памяти как канди
 (md/txt/log/код/конфиги — см. `TEXT_LIKE_EXTENSIONS`), бинарные пропускаются.
 Во вкладке Sources плагина виден актуальный путь к inbox.
 
+Совместимость: IntelliJ IDEA / PyCharm **2024.3–2026.2** (build `243` and newer). Version `0.2.0` was capped at `243.*` and will not load on 2025/2026 IDEs — install **0.2.1+**.
+
 ## Сборка
 
 Требуется JDK 17 (все команды из каталога `ide/intellij`):

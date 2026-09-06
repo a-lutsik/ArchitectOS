@@ -43,6 +43,14 @@ else
   PYI=(python3 -m PyInstaller)
 fi
 
+echo "==> sqlite-vec build probe"
+python3 - <<'PY'
+import sys
+sys.path.insert(0, "backend")
+from architectos.vec_runtime import emit_builder_probe
+raise SystemExit(emit_builder_probe())
+PY
+
 echo "Building architectos-mcp ${VERSION} (${PLATFORM})..."
 "${PYI[@]}" \
   --noconfirm \

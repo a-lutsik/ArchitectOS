@@ -304,7 +304,7 @@ class AzureGitSyncMixin:
         if web_url:
             parts.append(f"URL: {web_url}")
         return {
-            "id": stable_id("candidate", project_id, "azure-git", "pr", str(pr_id_int), title[:80]),
+            "id": stable_id("candidate", project_id, "azure-git", "pr", str(pr_id_int)),
             "project_id": project_id,
             "source_type": "azure-git",
             "source_ref": web_url or str(pr_id_int),

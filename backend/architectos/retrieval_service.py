@@ -18,7 +18,19 @@ from typing import Any
 
 from .graph_analysis import personalized_pagerank
 from .models import SearchHit
-from .search import pack_memory_context
+from .embeddings import tokens
+from .search import (
+    DEFAULT_CONTEXT_CHAR_BUDGET,
+    RULE_LAYER_TYPES,
+    RULE_TYPE_PRIORITY,
+    STABLE_PACK_TYPES,
+    is_rule_layer_node,
+    is_stable_pack_node,
+    pack_memory_context,
+    parse_memory_identifiers,
+    search_query_terms,
+)
+from .usage import memory_token_economy
 
 _LOG = logging.getLogger(__name__)
 
@@ -83,6 +95,7 @@ class RetrievalServiceMixin:
         include_communities: bool = False,
         min_score: float | None = None,
         relevance_floor: float | None = None,
+        allowed_scopes: list[str] | set[str] | None = None,
     ) -> dict[str, Any]:
         # FTS + vector in parallel; vector is best-effort with a hard timeout.
         # Lifecycle access bump runs inline (cheap: notify=False, no re-embedding);
@@ -92,13 +105,23 @@ class RetrievalServiceMixin:
         # expand_graph=True (LLM context paths) also loads 1-hop graph neighbors of
         # the matched nodes so linked decisions/lessons join the pack even when they
         # do not match the query lexically. Interactive search keeps it off for latency.
+        # allowed_scopes (visibility enforcement): when given, nodes whose scope is
+        # outside the caller's permitted set are EXCLUDED from results (not just
+        # down-ranked). None (default) keeps the legacy no-restriction behavior.
         limit = max(1, min(int(limit or 8), 40))
         as_of = str(as_of or "").strip() or None
         normalized_filters = self._normalize_memory_filters(filters)
+        scope_gate = self._normalize_allowed_scopes(allowed_scopes)
         # List mode (or a filter-only call): pure metadata listing, no scoring and
         # no lifecycle access bump — browsing must not count as retrieval activity.
         if str(mode or "search").strip().lower() == "list" or (not str(query or "").strip() and normalized_filters):
-            return self._list_memory_nodes(project_id, scope, limit, normalized_filters)
+            return self._list_memory_nodes(project_id, scope, limit, normalized_filters, scope_gate)
+        idents = parse_memory_identifiers(query)
+        ident_ids = self.repository.search_memory_identifiers(
+            query, project_id=project_id, scope=scope, limit=max(16, limit)
+        )
+        skip_vector = bool(idents.identifier_only)
+        skip_fts = bool(idents.identifier_only and idents.node_ids and not idents.work_item_ids)
         pool = max(limit * 4, 32)
         score_cap = max(pool, 80)
         retrieval_settings = self.memory_embeddings.settings()
@@ -113,9 +136,11 @@ class RetrievalServiceMixin:
             self.search_strategy.set_feedback_scores({})
 
         # Kick vector early so Cloudflare latency overlaps with FTS.
+        # Identifier-only lookups (AB#123 / node_…) skip embeddings — semantic
+        # search of an id is slow and ranks chat noise over the exact node.
         vector_future = None
         vector_executor = None
-        if self.memory_embeddings.enabled():
+        if not skip_vector and self.memory_embeddings.enabled():
             vector_executor = ThreadPoolExecutor(max_workers=1)
             vector_future = vector_executor.submit(
                 self.memory_embeddings.search_scored,
@@ -125,21 +150,30 @@ class RetrievalServiceMixin:
                 limit=vector_pool,
             )
 
-        fts_ids = self.repository.search_memory_fts(query, project_id=project_id, scope=scope, limit=pool)
-        vector_scores, vector_ms, vector_timed_out = self._vector_search_memory_timed(
-            query,
-            project_id=project_id,
-            scope=scope,
-            limit=vector_pool,
-            timeout_s=timeout_s,
-            future=vector_future,
-            executor=vector_executor,
+        fts_ids = [] if skip_fts else self.repository.search_memory_fts(
+            query, project_id=project_id, scope=scope, limit=pool
         )
+        if skip_vector:
+            vector_scores, vector_ms, vector_timed_out = {}, 0.0, False
+        else:
+            vector_scores, vector_ms, vector_timed_out = self._vector_search_memory_timed(
+                query,
+                project_id=project_id,
+                scope=scope,
+                limit=vector_pool,
+                timeout_s=timeout_s,
+                future=vector_future,
+                executor=vector_executor,
+            )
         vector_ids = list(vector_scores.keys())
 
         mode = "full-scan"
-        keep: set[str] = set(fts_ids) | set(vector_ids)
-        if fts_ids and vector_ids:
+        keep: set[str] = set(ident_ids) | set(fts_ids) | set(vector_ids)
+        if ident_ids and (fts_ids or vector_ids):
+            mode = "identifier-hybrid" if fts_ids and vector_ids else ("identifier-fts" if fts_ids else "identifier-vector")
+        elif ident_ids:
+            mode = "identifier"
+        elif fts_ids and vector_ids:
             mode = "hybrid"
         elif fts_ids:
             mode = "fts-prefilter"
@@ -147,8 +181,8 @@ class RetrievalServiceMixin:
             mode = "vector-prefilter"
 
         if keep:
-            # Prefer exact retrieval hits; avoid loading the whole graph/edge table.
-            ordered = list(dict.fromkeys([*fts_ids, *vector_ids]))
+            # Prefer exact identifier hits, then FTS, then vector; avoid loading the whole graph.
+            ordered = list(dict.fromkeys([*ident_ids, *fts_ids, *vector_ids]))
             keep = set(ordered[:score_cap])
             nodes = self.repository.list_nodes_by_ids(list(keep))
         else:
@@ -162,6 +196,8 @@ class RetrievalServiceMixin:
                     "vector_hits": 0,
                     "vector_ms": vector_ms,
                     "vector_timed_out": vector_timed_out,
+                    "vector_skipped": skip_vector,
+                    "identifier_hits": 0,
                     "scored_nodes": 0,
                     "embeddings": self.memory_embeddings.provider_info(),
                 },
@@ -172,6 +208,8 @@ class RetrievalServiceMixin:
         # Bi-temporal visibility: hide superseded facts on live search; on an
         # as_of query show only what was actually true at that moment.
         nodes = [node for node in nodes if self._memory_node_visible_at(node, as_of)]
+        if scope_gate is not None:
+            nodes = [node for node in nodes if self._memory_node_scope_allowed(node, scope_gate)]
         if normalized_filters and not nodes:
             return {
                     "query": query,
@@ -182,6 +220,8 @@ class RetrievalServiceMixin:
                         "vector_hits": len(vector_ids),
                         "vector_ms": vector_ms,
                         "vector_timed_out": vector_timed_out,
+                        "vector_skipped": skip_vector,
+                        "identifier_hits": len(ident_ids),
                         "scored_nodes": 0,
                         "filters": normalized_filters,
                         "embeddings": self.memory_embeddings.provider_info(),
@@ -202,6 +242,8 @@ class RetrievalServiceMixin:
                 if normalized_filters:
                     neighbors = [node for node in neighbors if self._memory_node_matches_filters(node, normalized_filters)]
                 neighbors = [node for node in neighbors if self._memory_node_visible_at(node, as_of)]
+                if scope_gate is not None:
+                    neighbors = [node for node in neighbors if self._memory_node_scope_allowed(node, scope_gate)]
                 neighbor_nodes = {node.id: node for node in neighbors}
                 # Drop neighbors filtered out above; keep PageRank order for the rest.
                 neighbor_order = [nid for nid in neighbor_order if nid in neighbor_nodes]
@@ -281,6 +323,8 @@ class RetrievalServiceMixin:
                 "vector_hits": len(vector_ids),
                 "vector_ms": vector_ms,
                 "vector_timed_out": vector_timed_out,
+                "vector_skipped": skip_vector,
+                "identifier_hits": len(ident_ids),
                 "scored_nodes": len(nodes),
                 "graph_neighbors": sum(1 for hit in hits if "graph-neighbor" in (hit.reasons or [])),
                 **floor_info,
@@ -380,7 +424,20 @@ class RetrievalServiceMixin:
             return True
         return not invalid
 
-    _MEMORY_FILTER_ATTRS = {"id", "type", "scope", "status", "project_id", "label", "confidence"}
+    _MEMORY_FILTER_ATTRS = {"id", "type", "scope", "status", "project_id", "label", "confidence", "source_id"}
+
+    @staticmethod
+    def _normalize_allowed_scopes(allowed_scopes: list[str] | set[str] | None) -> set[str] | None:
+        """Caller-supplied visibility set; None disables enforcement (legacy)."""
+        if allowed_scopes is None:
+            return None
+        if not isinstance(allowed_scopes, (list, tuple, set)):
+            return None
+        return {str(scope or "").strip() for scope in allowed_scopes if str(scope or "").strip()}
+
+    @staticmethod
+    def _memory_node_scope_allowed(node: Any, allowed_scopes: set[str]) -> bool:
+        return str(getattr(node, "scope", "") or "") in allowed_scopes
 
     @staticmethod
     def _normalize_memory_filters(filters: dict[str, Any] | None) -> dict[str, Any]:
@@ -427,6 +484,7 @@ class RetrievalServiceMixin:
         scope: str | None,
         limit: int,
         filters: dict[str, Any],
+        allowed_scopes: set[str] | None = None,
     ) -> dict[str, Any]:
         nodes = [node for node in self.repository.list_nodes() if node.status == "active"]
         if project_id:
@@ -435,6 +493,8 @@ class RetrievalServiceMixin:
             nodes = [node for node in nodes if str(getattr(node, "scope", "") or "") == scope]
         if filters:
             nodes = [node for node in nodes if self._memory_node_matches_filters(node, filters)]
+        if allowed_scopes is not None:
+            nodes = [node for node in nodes if self._memory_node_scope_allowed(node, allowed_scopes)]
         total = len(nodes)
         hits = [SearchHit(node=node, score=0.0, matched_terms=[], reasons=["list"]) for node in nodes[:limit]]
         return {
@@ -516,11 +576,233 @@ class RetrievalServiceMixin:
         hit["node"] = node
         return hit
 
+    def memory_history(self, node_id: str, limit: int = 200) -> dict[str, Any]:
+        """Event history of a memory node (created/updated/superseded/accessed).
+
+        Events are recorded at the mutation points (add, supersede, merge, tool
+        reads) into the memory_node_events table; nodes created before history
+        tracking still get a synthetic ``created`` event from their timestamp.
+        """
+        node = self.repository.get_node(str(node_id or "").strip())
+        if not node:
+            raise ValueError(f"memory node not found: {node_id}")
+        events = self.repository.list_memory_events(node.id, limit=limit)
+        if not any(event.get("event_type") == "created" for event in events):
+            events.insert(0, {
+                "id": "",
+                "node_id": node.id,
+                "event_type": "created",
+                "actor": "",
+                "timestamp": node.created_at,
+                "details": {"synthetic": True, "type": node.type, "scope": node.scope},
+            })
+        return {"id": node.id, "label": node.label, "type": node.type, "events": events}
+
+    def _rank_rule_layer_nodes(
+        self,
+        nodes: list[Any],
+        *,
+        query: str = "",
+        vector_scores: dict[str, float] | None = None,
+    ) -> list[tuple[float, dict[str, Any]]]:
+        """Rank governing rules: pinned → type → vector → memory_score → weak lexical."""
+        query_terms = search_query_terms(query) if str(query or "").strip() else []
+        vector_scores = dict(vector_scores or {})
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for node in nodes:
+            payload = node.to_dict() if hasattr(node, "to_dict") else dict(node)
+            if not is_rule_layer_node(payload):
+                continue
+            metadata = dict(payload.get("metadata") or {})
+            node_id = str(payload.get("id") or "")
+            rank = 0.0
+            reasons = ["rule-layer"]
+            if metadata.get("pinned") or metadata.get("favorite"):
+                rank -= 100.0
+                reasons.append("pinned")
+            node_type = str(payload.get("type") or "")
+            rank += float(RULE_TYPE_PRIORITY.get(node_type, 9))
+            vector_score = float(vector_scores.get(node_id) or 0.0)
+            if vector_score > 0:
+                rank -= vector_score * 40.0
+                reasons.append(f"vector:{vector_score:.2f}")
+            rank -= float(metadata.get("memory_score") or 50.0) / 10.0
+            if query_terms:
+                label = str(payload.get("label") or "")
+                text = str(payload.get("text") or "")
+                haystack = set(tokens(f"{label} {text}"))
+                label_l = label.lower()
+                overlap = sum(1 for term in query_terms if term in haystack or term in label_l)
+                if overlap:
+                    rank -= overlap * 2.0
+                    reasons.append(f"lexical:{overlap}")
+            ranked.append((rank, {
+                "score": float(metadata.get("memory_score") or 50.0) + vector_score * 100.0,
+                "reasons": reasons,
+                "node": payload,
+            }))
+        ranked.sort(key=lambda item: item[0])
+        return ranked
+
+    def _vector_scores_for_query(
+        self,
+        query: str,
+        *,
+        project_id: str | None,
+        scope: str | None = None,
+        limit: int = 64,
+    ) -> dict[str, float]:
+        """Best-effort semantic scores for rule-layer ranking."""
+        if not str(query or "").strip():
+            return {}
+        engine = getattr(self, "memory_embeddings", None)
+        if engine is None or not engine.enabled():
+            return {}
+        try:
+            scored = engine.search_scored(
+                query,
+                project_id=project_id,
+                scope=scope,
+                limit=max(16, min(int(limit or 64), 200)),
+            )
+        except Exception as exc:  # noqa: BLE001 - ranking is best-effort
+            _LOG.warning("rule-layer vector ranking skipped: %s", exc)
+            return {}
+        return {str(node_id): float(score) for node_id, score in scored}
+
+    def list_rule_layer_memory(
+        self,
+        project_id: str | None = None,
+        limit: int = 8,
+        query: str = "",
+        scope: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """All active Constraint / Decision / Rule nodes, ranked for Ask advice."""
+        limit = max(1, min(int(limit or 8), 16))
+        nodes = self.repository.list_nodes(
+            project_id=project_id,
+            status="active",
+            include_shared=bool(project_id),
+            node_types=sorted(RULE_LAYER_TYPES),
+        )
+        vector_scores = self._vector_scores_for_query(
+            query,
+            project_id=project_id,
+            scope=scope,
+            limit=max(64, limit * 8),
+        )
+        ranked = self._rank_rule_layer_nodes(nodes, query=query, vector_scores=vector_scores)
+        return [item[1] for item in ranked[:limit]]
+
+    def list_stable_memory(
+        self,
+        project_id: str | None = None,
+        limit: int = 6,
+        query: str = "",
+        scope: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pinned / Constraint / Requirement / Decision for the always-on pack layer."""
+        limit = max(1, min(int(limit or 6), 12))
+        nodes = self.repository.list_nodes(
+            project_id=project_id,
+            status="active",
+            include_shared=bool(project_id),
+            node_types=sorted(STABLE_PACK_TYPES),
+        )
+        vector_scores = self._vector_scores_for_query(
+            query,
+            project_id=project_id,
+            scope=scope,
+            limit=max(64, limit * 8),
+        )
+        query_terms = search_query_terms(query) if str(query or "").strip() else []
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for node in nodes:
+            payload = node.to_dict() if hasattr(node, "to_dict") else dict(node)
+            if not is_stable_pack_node(payload):
+                continue
+            metadata = dict(payload.get("metadata") or {})
+            node_id = str(payload.get("id") or "")
+            rank = 0.0
+            reasons = ["stable"]
+            if metadata.get("pinned") or metadata.get("favorite"):
+                rank -= 100.0
+            node_type = str(payload.get("type") or "")
+            if node_type == "Constraint":
+                rank -= 20.0
+            elif node_type == "Decision":
+                rank -= 10.0
+            vector_score = float(vector_scores.get(node_id) or 0.0)
+            if vector_score > 0:
+                rank -= vector_score * 40.0
+                reasons.append(f"vector:{vector_score:.2f}")
+            rank -= float(metadata.get("memory_score") or 50.0) / 10.0
+            if query_terms:
+                label = str(payload.get("label") or "")
+                text = str(payload.get("text") or "")
+                haystack = set(tokens(f"{label} {text}"))
+                label_l = label.lower()
+                overlap = sum(1 for term in query_terms if term in haystack or term in label_l)
+                if overlap:
+                    rank -= overlap * 2.0
+                    reasons.append(f"lexical:{overlap}")
+            ranked.append((rank, {
+                "score": float(metadata.get("memory_score") or 50.0) + vector_score * 100.0,
+                "reasons": reasons,
+                "node": payload,
+            }))
+        ranked.sort(key=lambda item: item[0])
+        return [item[1] for item in ranked[:limit]]
+
+    def memory_briefing(
+        self,
+        *,
+        project_id: str | None = None,
+        cwd: str | None = None,
+        limit: int = 6,
+        char_budget: int = 2000,
+    ) -> dict[str, Any]:
+        """Stable-layer pack for session start, with no query to search against.
+
+        Used by the MCP startup instructions and by session-start agent hooks.
+        ``cwd`` picks the project when the caller only knows a working directory.
+        """
+        resolver = getattr(self, "project_id_for_path", None)
+        actual = str(project_id or (resolver(cwd) if callable(resolver) else None) or "").strip()
+        if not actual:
+            projects = self.projects() or []
+            ids = {str(item.get("id") or "") for item in projects}
+            if "architectos" in ids:
+                actual = "architectos"
+            elif projects:
+                actual = str(projects[0].get("id") or "architectos")
+            else:
+                actual = "architectos"
+        stable = self.list_stable_memory(project_id=actual, limit=limit)
+        context = ""
+        if stable:
+            context = pack_memory_context(
+                [],
+                project_id=actual,
+                stable_hits=stable,
+                char_budget=char_budget,
+                node_text_chars=160,
+                tools_available=True,
+            )
+        return {"project_id": actual, "context": context, "stable": stable}
+
     def context(self, query: str, project_id: str | None = None, scope: str | None = None, limit: int = 8, tools_available: bool = True) -> dict[str, Any]:
         search = self.search_memory(query, project_id=project_id, scope=scope, limit=max(limit, 10), expand_graph=True)
         tasks = [task for task in self.repository.list_tasks(project_id) if task["status"] != "done"][:5]
         providers = [provider for provider in self.repository.list_providers() if provider["enabled"]][:5]
         boards_ids = self._boards_ids_from_memory_hits(search["hits"])
+        stable_hits = self.list_stable_memory(project_id=project_id, limit=6, query=query, scope=scope)
+        rule_layer_hits = self.list_rule_layer_memory(project_id=project_id, limit=8, query=query, scope=scope)
+        pack_stable = list({
+            str((hit.get("node") or {}).get("id") or ""): hit
+            for hit in [*stable_hits, *rule_layer_hits]
+            if isinstance(hit, dict) and str((hit.get("node") or {}).get("id") or "")
+        }.values())
         packed = pack_memory_context(
             search["hits"],
             project_id=project_id,
@@ -529,13 +811,59 @@ class RetrievalServiceMixin:
             providers=providers,
             boards_ids=boards_ids,
             tools_available=tools_available,
+            stable_hits=pack_stable,
         )
         return {
             "query": query,
             "context": packed,
             "hits": search["hits"],
+            "stable_hits": stable_hits,
+            "rule_layer_hits": rule_layer_hits,
             "retrieval": search.get("retrieval") or {},
+            "token_economy": self._token_economy_for_pack(packed, project_id=project_id),
         }
+
+    def _memory_corpus_stats(self, project_id: str | None = None) -> dict[str, int]:
+        """Active memory corpus a dump-into-prompt baseline would send."""
+        nodes = self.repository.list_nodes(
+            project_id=project_id,
+            status="active",
+            include_shared=bool(project_id),
+        )
+        chars = 0
+        count = 0
+        for node in nodes:
+            label = str(getattr(node, "label", "") or "")
+            text = str(getattr(node, "text", "") or "")
+            chars += len(label) + len(text)
+            count += 1
+        return {"corpus_nodes": count, "corpus_chars": chars}
+
+    @staticmethod
+    def _packed_node_count(packed: str) -> int:
+        return sum(1 for line in str(packed or "").splitlines() if line.lstrip().startswith("- id="))
+
+    def _token_economy_for_pack(self, packed: str, *, project_id: str | None = None) -> dict[str, Any]:
+        corpus = self._memory_corpus_stats(project_id)
+        return memory_token_economy(
+            corpus_chars=corpus["corpus_chars"],
+            packed_chars=len(str(packed or "")),
+            corpus_nodes=corpus["corpus_nodes"],
+            packed_nodes=self._packed_node_count(packed),
+            pack_budget_chars=DEFAULT_CONTEXT_CHAR_BUDGET,
+        )
+
+    def memory_token_economy_snapshot(self, project_id: str | None = None) -> dict[str, Any]:
+        """Current graph vs the retrieval pack cap, without running a query."""
+        corpus = self._memory_corpus_stats(project_id)
+        packed_chars = min(int(corpus["corpus_chars"]), DEFAULT_CONTEXT_CHAR_BUDGET)
+        return memory_token_economy(
+            corpus_chars=corpus["corpus_chars"],
+            packed_chars=packed_chars,
+            corpus_nodes=corpus["corpus_nodes"],
+            packed_nodes=corpus["corpus_nodes"] if packed_chars == corpus["corpus_chars"] else 0,
+            pack_budget_chars=DEFAULT_CONTEXT_CHAR_BUDGET,
+        )
 
     def _select_graph_nodes_by_source_quota(
         self,

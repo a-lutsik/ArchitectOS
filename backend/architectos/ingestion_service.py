@@ -31,7 +31,7 @@ from .memory_ingestion import (
     _token_similarity,
 )
 from .models import utc_now
-from .teams_graph import TeamsGraphError
+from .source_service import SourceRegistryMixin
 
 # Re-exported for ArchitectOSService / graph_autolinker / older imports.
 __all__ = [
@@ -45,7 +45,7 @@ __all__ = [
 _LOG = logging.getLogger("architectos.service")
 
 
-class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, IngestionCandidatesMixin):
+class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, IngestionCandidatesMixin, SourceRegistryMixin):
     """Ingest scheduling, per-source timeout budgets, and rescan maintenance."""
 
     # Owned by ArchitectOSService.__init__; declared here so mypy can see the
@@ -101,9 +101,14 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 state = dict(self._memory_ingest_state)
                 state["logs"] = list(state.get("logs") or [])
                 return {"scheduled": False, "reason": "already_running", **state}
-            sources = self._normalize_ingestion_sources(
-                payload.get("sources") or ["docs", "code", "chat", "git", "adr", "issues", "prs", "meetings", "inbox"]
-            )
+            sources = payload.get("sources")
+            if not sources:
+                pid = str(payload.get("project_id") or "architectos")
+                self.ensure_project_sources(pid)
+                enabled = [item["id"] for item in self.list_project_sources(pid, enabled_only=True)]
+                sources = enabled or [item["id"] for item in self.list_project_sources(pid)]
+            else:
+                sources = self._normalize_ingestion_sources(sources) if isinstance(sources, list) and sources and not str(sources[0]).startswith("source_") else list(sources)
             project_id = str(payload.get("project_id") or "architectos")
             self._memory_ingest_state = {
                 "running": True,
@@ -149,237 +154,96 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
 
     def ingest_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
         project_id = str(payload.get("project_id") or "architectos")
-        sources = self._normalize_ingestion_sources(payload.get("sources") or ["docs", "code", "chat", "git", "adr", "issues", "prs", "meetings", "inbox"])
-        limit = max(1, int(payload.get("limit") or 20))
+        self.ensure_project_sources(project_id)
+        bindings = self._sources_for_ingest_request(project_id, payload)
+        prepare_limit = max(0, int(payload.get("limit") or 0))
         ingest_mode = self._normalize_ingest_mode(payload.get("ingest_mode") or payload.get("mode"))
         direct_to_memory = ingest_mode == "memory"
-        mcp_direct_to_memory = ingest_mode in {"memory", "mixed"}
-        project = self.repository.get_project(project_id)
+        source_labels = [str(item.get("name") or item.get("kind") or "") for item in bindings]
         with self._memory_ingest_lock:
             progress_owned = not bool(self._memory_ingest_state.get("running"))
         if progress_owned:
-            self._reset_ingest_progress(project_id=project_id, sources=sources, keep_running=True)
+            self._reset_ingest_progress(project_id=project_id, sources=source_labels, keep_running=True)
         else:
             with self._memory_ingest_lock:
                 self._memory_ingest_state["project_id"] = project_id
-                self._memory_ingest_state["sources"] = list(sources)
+                self._memory_ingest_state["sources"] = source_labels
                 self._memory_ingest_state["current"] = "starting"
         self._log_ingest(
-            f"Starting ingest · project={project_id} · limit={limit} · mode={ingest_mode} · sources={', '.join(sources)}",
+            f"Starting ingest · project={project_id} · mode={ingest_mode} · sources={', '.join(source_labels) or 'none'}",
             current="starting",
         )
         candidates: list[dict[str, Any]] = []
         warnings: list[str] = []
-        file_sources = {"docs", "code", "adr", "issues", "prs", "meetings"}
-        needs_project_root = any(source in sources for source in file_sources | {"git"})
-        root: Path | None = None
+        boards_imported: list[dict[str, Any]] = []
+        boards_updated = 0
+        azure_git_imported: list[dict[str, Any]] = []
+        azure_git_updated = 0
+        wiki_imported: list[dict[str, Any]] = []
+        wiki_updated = 0
         try:
-            if needs_project_root:
-                root_raw = str(payload.get("root_path") or (project.root_path if project and project.root_path else self.project_root))
-                if project_id == SYSTEM_PROJECT_ID and not str(payload.get("root_path") or (project.root_path if project else "")).strip() and self._is_architectos_source_root():
-                    raise ValueError("Choose or create a project folder before ingesting memory.")
-                root = Path(root_raw).resolve()
-                if not root.exists() or not root.is_dir():
-                    raise ValueError(f"project path does not exist: {root}")
-                self._log_ingest(f"Using project root {root}", source="files", current="files")
-            if any(source in sources for source in file_sources):
-                assert root is not None
-                wanted = [item for item in sources if item in file_sources]
-                self._log_ingest(f"Scanning project files for {', '.join(wanted)}…", source="files", current="files")
-                file_candidates = self._ingest_file_candidates(project_id, root, sources, limit * 2)
-                candidates.extend(file_candidates)
-                by_file = Counter(str(item.get("source_type") or "file") for item in file_candidates)
-                detail = ", ".join(f"{key}={value}" for key, value in sorted(by_file.items())) or "none"
-                self._log_ingest(f"File scan done · {len(file_candidates)} candidate(s) ({detail})", source="files")
-            if "chat" in sources:
-                self._log_ingest("Reading chat history…", source="chat", current="chat")
-                chat_candidates = self._ingest_chat_candidates(project_id, limit)
-                candidates.extend(chat_candidates)
-                self._log_ingest(f"Chat done · {len(chat_candidates)} candidate(s)", source="chat")
-            if "git" in sources:
-                assert root is not None
-                self._log_ingest("Scanning git history…", source="git", current="git")
-                git_candidates = self._ingest_git_candidates(project_id, root, limit)
-                candidates.extend(git_candidates)
-                self._log_ingest(f"Git done · {len(git_candidates)} candidate(s)", source="git")
-            if "inbox" in sources:
-                self._log_ingest("Scanning inbox folder…", source="inbox", current="inbox")
-                inbox_candidates = self._ingest_inbox_candidates(project_id, limit)
-                candidates.extend(inbox_candidates)
-                self._log_ingest(f"Inbox done · {len(inbox_candidates)} candidate(s)", source="inbox")
-            if "granola" in sources:
-                self._log_ingest("Calling Granola MCP…", source="granola", current="granola")
-                try:
-                    granola_result = self._run_source_with_timeout(
-                        "granola",
-                        payload,
-                        warnings,
-                        lambda timed: self._ingest_granola_candidates(project_id, limit, timed),
-                    )
-                    if granola_result is not None:
-                        granola_candidates = list(granola_result or [])
-                        candidates.extend(granola_candidates)
-                        self._log_ingest(f"Granola done · {len(granola_candidates)} candidate(s)", source="granola")
-                except MCPError as exc:
-                    warnings.append(f"Granola MCP skipped: {exc}")
-                    self._log_ingest(f"Granola skipped: {exc}", level="warn", source="granola")
-            boards_imported: list[dict[str, Any]] = []
-            boards_updated = 0
-            if "azure-boards" in sources:
-                self._log_ingest("Importing Azure Boards work items…", source="azure-boards", current="azure-boards")
-                try:
-                    if mcp_direct_to_memory:
-                        boards = self._run_source_with_timeout(
-                            "azure-boards",
-                            payload,
-                            warnings,
-                            lambda timed: self._import_azure_boards_to_memory(project_id, limit, timed),
-                        )
-                        if boards is not None:
-                            boards_imported = list(boards.get("imported") or [])
-                            boards_updated = int(boards.get("updated") or 0)
-                            message = f"Azure Boards done · {len(boards_imported)} written ({boards_updated} updated)"
-                            self._log_ingest(message, source="azure-boards")
-                    else:
-                        boards_candidates = self._run_source_with_timeout(
-                            "azure-boards",
-                            payload,
-                            warnings,
-                            lambda timed: self._ingest_azure_boards_candidates(project_id, limit, timed),
-                        )
-                        if boards_candidates is not None:
-                            candidates.extend(list(boards_candidates or []))
-                            message = f"Azure Boards done · {len(boards_candidates)} candidate(s)"
-                            self._log_ingest(message, source="azure-boards")
-                except MCPError as exc:
-                    warnings.append(f"Azure Boards MCP skipped: {exc}")
-                    self._log_ingest(f"Azure Boards skipped: {exc}", level="warn", source="azure-boards")
-                except ValueError as exc:
-                    warnings.append(f"Azure Boards skipped: {exc}")
-                    self._log_ingest(f"Azure Boards skipped: {exc}", level="warn", source="azure-boards")
-            azure_git_imported: list[dict[str, Any]] = []
-            azure_git_updated = 0
-            if "azure-git" in sources:
-                self._log_ingest("Importing Azure Git repos and pull requests…", source="azure-git", current="azure-git")
-                try:
-                    if mcp_direct_to_memory:
-                        azure_git = self._run_source_with_timeout(
-                            "azure-git",
-                            payload,
-                            warnings,
-                            lambda timed: self._import_azure_git_to_memory(project_id, limit, timed),
-                        )
-                        if azure_git is not None:
-                            azure_git_imported = list(azure_git.get("imported") or [])
-                            azure_git_updated = int(azure_git.get("updated") or 0)
-                            message = f"Azure Git done · {len(azure_git_imported)} written ({azure_git_updated} updated)"
-                            self._log_ingest(message, source="azure-git")
-                    else:
-                        def _git_candidates(timed: dict[str, Any]) -> list[dict[str, Any]]:
-                            ado_project = self._azure_boards_project(timed)
-                            server_id = str(timed.get("server_id") or "").strip() or self._azure_git_mcp_server_id()
-                            return self._ingest_azure_git_candidates(project_id, ado_project, server_id, limit, timed)
-
-                        azure_git_candidates = self._run_source_with_timeout("azure-git", payload, warnings, _git_candidates)
-                        if azure_git_candidates is not None:
-                            candidates.extend(list(azure_git_candidates or []))
-                            message = f"Azure Git done · {len(azure_git_candidates)} candidate(s)"
-                            self._log_ingest(message, source="azure-git")
-                except MCPError as exc:
-                    warnings.append(f"Azure Git MCP skipped: {exc}")
-                    self._log_ingest(f"Azure Git skipped: {exc}", level="warn", source="azure-git")
-                except ValueError as exc:
-                    warnings.append(f"Azure Git skipped: {exc}")
-                    self._log_ingest(f"Azure Git skipped: {exc}", level="warn", source="azure-git")
-            wiki_imported: list[dict[str, Any]] = []
-            wiki_updated = 0
-            if "azure-wiki" in sources:
-                self._log_ingest("Importing Azure Wiki pages…", source="azure-wiki", current="azure-wiki")
-                try:
-                    if mcp_direct_to_memory:
-                        wiki = self._run_source_with_timeout(
-                            "azure-wiki",
-                            payload,
-                            warnings,
-                            lambda timed: self._import_azure_wiki_to_memory(project_id, limit, timed),
-                        )
-                        if wiki is not None:
-                            wiki_imported = list(wiki.get("imported") or [])
-                            wiki_updated = int(wiki.get("updated") or 0)
-                            message = f"Azure Wiki done · {len(wiki_imported)} written ({wiki_updated} updated)"
-                            self._log_ingest(message, source="azure-wiki")
-                    else:
-                        wiki_candidates = self._run_source_with_timeout(
-                            "azure-wiki",
-                            payload,
-                            warnings,
-                            lambda timed: self._ingest_azure_wiki_candidates(project_id, limit, timed),
-                        )
-                        if wiki_candidates is not None:
-                            candidates.extend(list(wiki_candidates or []))
-                            message = f"Azure Wiki done · {len(wiki_candidates)} candidate(s)"
-                            self._log_ingest(message, source="azure-wiki")
-                except MCPError as exc:
-                    warnings.append(f"Azure Wiki MCP skipped: {exc}")
-                    self._log_ingest(f"Azure Wiki skipped: {exc}", level="warn", source="azure-wiki")
-                except ValueError as exc:
-                    warnings.append(f"Azure Wiki skipped: {exc}")
-                    self._log_ingest(f"Azure Wiki skipped: {exc}", level="warn", source="azure-wiki")
-            teams_imported: list[dict[str, Any]] = []
-            teams_updated = 0
-            if "teams-meetings" in sources:
-                self._log_ingest("Importing Teams meetings (Graph transcripts / AI Insights)…", source="teams-meetings", current="teams-meetings")
-                try:
-                    if mcp_direct_to_memory:
-                        teams = self._run_source_with_timeout(
-                            "teams-meetings",
-                            payload,
-                            warnings,
-                            lambda timed: self._import_teams_meetings_to_memory(project_id, limit, timed),
-                        )
-                        if teams is not None:
-                            teams_imported = list(teams.get("imported") or [])
-                            teams_updated = int(teams.get("updated") or 0)
-                            message = f"Teams done · {len(teams_imported)} written ({teams_updated} updated)"
-                            self._log_ingest(message, source="teams-meetings")
-                    else:
-                        teams_candidates = self._run_source_with_timeout(
-                            "teams-meetings",
-                            payload,
-                            warnings,
-                            lambda timed: self._ingest_teams_meeting_candidates(project_id, limit, timed),
-                        )
-                        if teams_candidates is not None:
-                            candidates.extend(list(teams_candidates or []))
-                            message = f"Teams done · {len(teams_candidates)} candidate(s)"
-                            self._log_ingest(message, source="teams-meetings")
-                except TeamsGraphError as exc:
-                    warnings.append(f"Teams Graph skipped: {exc}")
-                    self._log_ingest(f"Teams skipped: {exc}", level="warn", source="teams-meetings")
-                except ValueError as exc:
-                    warnings.append(f"Teams Graph skipped: {exc}")
-                    self._log_ingest(f"Teams skipped: {exc}", level="warn", source="teams-meetings")
-            self._log_ingest(f"Preparing {'memory writes' if direct_to_memory else 'review queue'} from {len(candidates)} raw candidate(s)…", current="prepare")
-            prepared = self.ingestion_engine.prepare_candidates(project_id, candidates, limit)
+            for binding in bindings:
+                name = str(binding.get("name") or binding.get("kind") or "source")
+                self._log_ingest(f"Scanning {name}…", source=name, current=name)
+                result = self.ingest_source_binding(binding, project_id, payload, warnings)
+                candidates.extend(list(result.get("candidates") or []))
+                imported = list(result.get("imported") or [])
+                adapter = str(dict(binding.get("config") or {}).get("adapter") or "")
+                if adapter == "azure-boards":
+                    boards_imported.extend(imported)
+                    boards_updated += int(result.get("updated") or 0)
+                elif adapter == "azure-git":
+                    azure_git_imported.extend(imported)
+                    azure_git_updated += int(result.get("updated") or 0)
+                elif adapter == "azure-wiki":
+                    wiki_imported.extend(imported)
+                    wiki_updated += int(result.get("updated") or 0)
+                count = len(result.get("candidates") or []) + len(imported)
+                self._log_ingest(f"{name} done · {count} item(s)", source=name)
+            self._log_ingest(
+                f"Preparing {'memory writes' if direct_to_memory else 'review queue'} from {len(candidates)} raw candidate(s)…",
+                current="prepare",
+            )
+            prepared = self.ingestion_engine.prepare_candidates(project_id, candidates, prepare_limit)
+            skipped_reviewed = int(getattr(self.ingestion_engine, "skipped_reviewed", 0) or 0)
+            if skipped_reviewed:
+                self._log_ingest(f"Skipped {skipped_reviewed} already-reviewed source(s)", current="prepare")
             if direct_to_memory:
                 written_nodes = self._write_candidates_directly_to_memory(project_id, prepared)
                 saved: list[dict[str, Any]] = []
             else:
                 written_nodes = []
                 saved = [self.repository.upsert_memory_candidate(candidate) for candidate in prepared]
+                if saved:
+                    self.ingestion_engine.refresh_candidate_duplicate_flags(project_id)
+                    saved = [
+                        self.repository.get_memory_candidate(str(item.get("id") or "")) or item
+                        for item in saved
+                    ]
+                    auto_nodes = self._auto_promote_code_revisions(project_id, saved)
+                    if auto_nodes:
+                        written_nodes.extend(auto_nodes)
+                        saved = [
+                            self.repository.get_memory_candidate(str(item.get("id") or "")) or item
+                            for item in saved
+                            if str(
+                                (self.repository.get_memory_candidate(str(item.get("id") or "")) or item).get("status")
+                                or ""
+                            )
+                            == "candidate"
+                        ]
             duplicates = sum(1 for candidate in saved if dict(candidate.get("metadata") or {}).get("duplicate"))
-            by_source = Counter(str(candidate.get("source_type") or "manual") for candidate in saved)
+            by_source = Counter(str(dict(candidate.get("metadata") or {}).get("source_name") or candidate.get("source_type") or "manual") for candidate in saved)
             if boards_imported:
-                by_source["azure-boards"] = by_source.get("azure-boards", 0) + len(boards_imported)
+                by_source["azure"] = by_source.get("azure", 0) + len(boards_imported)
             if azure_git_imported:
-                by_source["azure-git"] = by_source.get("azure-git", 0) + len(azure_git_imported)
+                by_source["azure"] = by_source.get("azure", 0) + len(azure_git_imported)
             if wiki_imported:
-                by_source["azure-wiki"] = by_source.get("azure-wiki", 0) + len(wiki_imported)
-            if teams_imported:
-                by_source["teams-meetings"] = by_source.get("teams-meetings", 0) + len(teams_imported)
+                by_source["azure"] = by_source.get("azure", 0) + len(wiki_imported)
             result = {
                 "project_id": project_id,
-                "sources": sources,
+                "sources": source_labels,
+                "source_ids": [str(item.get("id") or "") for item in bindings],
                 "ingest_mode": ingest_mode,
                 "candidates": saved,
                 "count": len(saved),
@@ -387,6 +251,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 "by_source": dict(sorted(by_source.items())),
                 "pending": len(self.repository.list_memory_candidates(project_id, "candidate", 500)),
                 "warnings": warnings,
+                "skipped_reviewed": skipped_reviewed,
                 "boards_imported": boards_imported,
                 "boards_count": len(boards_imported),
                 "boards_updated": boards_updated,
@@ -396,12 +261,12 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 "wiki_imported": wiki_imported,
                 "wiki_count": len(wiki_imported),
                 "wiki_updated": wiki_updated,
-                "teams_imported": teams_imported,
-                "teams_count": len(teams_imported),
-                "teams_updated": teams_updated,
+                "teams_imported": [],
+                "teams_count": 0,
+                "teams_updated": 0,
                 "direct_imported": [node.to_dict() for node in written_nodes],
                 "direct_count": len(written_nodes),
-                "memory_written": len(written_nodes) + len(boards_imported) + len(azure_git_imported) + len(wiki_imported) + len(teams_imported),
+                "memory_written": len(written_nodes) + len(boards_imported) + len(azure_git_imported) + len(wiki_imported),
             }
             self._log_ingest(
                 f"Ingest finished · {result['count']} candidate(s), {duplicates} duplicate hint(s), {result['memory_written']} memory writes",
@@ -424,6 +289,46 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                     self._memory_ingest_state["error"] = str(exc)
             raise
 
+    def _auto_promote_code_revisions(self, project_id: str, candidates: list[dict[str, Any]]) -> list[Any]:
+        """Auto-promote mechanical code/docs artifact revisions so Review is not flooded."""
+        from .memory_ingestion import REVISIONABLE_SOURCE_TYPES
+
+        written: list[Any] = []
+        for candidate in candidates:
+            meta = dict(candidate.get("metadata") or {})
+            if not meta.get("revision"):
+                continue
+            source_type = str(candidate.get("source_type") or meta.get("source_type") or "").strip().lower()
+            node_type = str(candidate.get("type") or "")
+            # Only mechanical file artifacts — human facts stay in Review.
+            if source_type not in REVISIONABLE_SOURCE_TYPES:
+                continue
+            if node_type not in {"Artifact", "Doc"} and source_type not in {"code", "docs"}:
+                continue
+            if str(meta.get("template") or "") in {
+                "chat_session_atom", "chat_fact_keeper", "chat_turn_keeper", "mcp_turn_atom",
+            }:
+                continue
+            cid = str(candidate.get("id") or "")
+            if not cid:
+                continue
+            try:
+                meta["auto_accepted"] = True
+                candidate["metadata"] = meta
+                self.repository.update_memory_candidate(candidate)
+                result = self.promote_memory_candidate(cid, refresh_duplicates=False)
+                memory = result.get("memory")
+                if memory and memory.get("id"):
+                    node = self.repository.get_node(str(memory["id"]))
+                    if node:
+                        written.append(node)
+            except Exception as exc:  # noqa: BLE001 - never fail the whole ingest on one file
+                _LOG = __import__("logging").getLogger("architectos.service")
+                _LOG.warning("auto-promote code revision failed for %s: %s", cid, exc)
+        if written:
+            self.ingestion_engine.refresh_candidate_duplicate_flags(project_id)
+        return written
+
     def _write_candidates_directly_to_memory(self, project_id: str, candidates: list[dict[str, Any]]) -> list[Any]:
         written = []
         for candidate in candidates:
@@ -432,20 +337,29 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             metadata["source"] = "autoscan_direct"
             metadata["ingest_mode"] = "memory"
             metadata["candidate_source_id"] = candidate.get("id")
+            source_id = str(dict(candidate.get("metadata") or {}).get("source_id") or candidate.get("source_id") or "").strip() or None
+            cand_meta = dict(candidate.get("metadata") or {})
+            is_revision = bool(cand_meta.get("revision"))
+            content_hash = str(cand_meta.get("content_hash") or "").strip()
+            interface_id = f"rev:{content_hash}" if is_revision and content_hash else None
             node = self.repository.add_node(
                 str(candidate.get("type") or "Lesson"),
                 str(candidate.get("label") or "AutoScan memory"),
                 scope,
                 str(candidate.get("text") or ""),
                 self._memory_project_id_for_scope(scope, project_id),
-                None,
+                interface_id,
                 float(candidate.get("confidence") or 0.72),
                 metadata,
+                source_id=source_id,
             )
             node = self.memory_lifecycle.initialize_node(node, "autoscan_direct")
             self.graph_auto_linker.link_node(node, project_id)
             if str(candidate.get("source_type") or "") == "azure-boards":
                 self._link_azure_boards_relations(node, candidate)
+            revision_of = str(cand_meta.get("revision_of") or "").strip()
+            if is_revision and revision_of and revision_of != node.id:
+                self._apply_revision_supersede(node, revision_of, candidate)
             written.append(node)
         return written
 
@@ -461,6 +375,9 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             raise ValueError("memory text is required")
         node_type = str(payload.get("type") or "Lesson")
         project_id = self._memory_project_id_for_scope(scope, payload.get("project_id") or "architectos")
+        source_id = str(payload.get("source_id") or "").strip() or None
+        if source_id and not self.repository.get_source(source_id):
+            raise ValueError(f"source not found: {source_id}")
 
         dedup_enabled = payload.get("dedup", True) is not False
         exact, near_id, near_score = (
@@ -480,14 +397,86 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             payload.get("interface_id"),
             float(payload.get("confidence") or 0.8),
             {"source": str(payload.get("source") or "ui"), "source_type": str(payload.get("source_type") or payload.get("source") or "manual")},
+            source_id=source_id,
         )
         node = self.memory_lifecycle.initialize_node(node, "ui")
+        try:
+            self.repository.record_memory_event(
+                node.id,
+                "created",
+                actor=str(payload.get("source") or "ui"),
+                details={"type": node.type, "scope": node.scope, "project_id": node.project_id, "source_id": source_id or ""},
+            )
+        except Exception as exc:  # history is best-effort, never blocks ingestion
+            _LOG.warning("memory created event skipped: %s", exc)
         if near_id and near_score >= self.NEAR_DUPLICATE_SIMILARITY:
             node.metadata["possible_duplicate_of"] = near_id
             node.metadata["possible_duplicate_score"] = round(near_score, 3)
             node = self.repository.upsert_node(node)
         self.graph_auto_linker.link_node(node, payload.get("project_id") or "architectos")
         return node.to_dict()
+
+    def add_memory_from_agent(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist an explicit MCP memory_add, splitting multi-fact blobs into nodes."""
+        from .chat_memory import facts_from_memory_blob
+
+        facts = facts_from_memory_blob(str(payload.get("text") or ""))
+        if len(facts) < 2:
+            return self.add_memory(payload)
+        created: list[dict[str, Any]] = []
+        for index, fact in enumerate(facts):
+            item = dict(payload)
+            item["text"] = fact["text"]
+            item["type"] = fact["type"]
+            item["label"] = str(payload.get("label") or "").strip() if index == 0 else fact["text"][:72]
+            created.append(self.add_memory(item))
+        primary = dict(created[0])
+        primary["also_created"] = [node.get("id") for node in created[1:] if node.get("id")]
+        return primary
+
+    BULK_ADD_MAX_ITEMS = 200
+
+    def add_memory_bulk(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Store a batch of memory nodes in one call (News→Event-style pipelines).
+
+        Each item goes through the regular ``add_memory`` path (redaction,
+        exact/near dedup, lifecycle init, auto-link, embedding queue). Items are
+        isolated: a failing item is reported in ``results`` and never aborts the
+        batch. Unlike ``add_memory_from_agent`` no multi-fact splitting happens —
+        one item is one node. Top-level project_id/scope/source_id/type/confidence
+        act as defaults that individual items may override.
+        """
+        raw_items: Any = payload.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("items must be a non-empty list")
+        items = raw_items[: self.BULK_ADD_MAX_ITEMS]
+        defaults = {
+            key: payload.get(key)
+            for key in ("project_id", "scope", "source_id", "type", "confidence", "source", "source_type")
+            if payload.get(key) is not None
+        }
+        results: list[dict[str, Any]] = []
+        stats = {"created": 0, "deduplicated": 0, "errors": 0}
+        ids: list[str] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                results.append({"index": index, "status": "error", "error": "item must be an object"})
+                stats["errors"] += 1
+                continue
+            try:
+                node = self.add_memory({**defaults, **item})
+            except Exception as exc:  # noqa: BLE001 - per-item isolation is the contract
+                results.append({"index": index, "status": "error", "error": str(exc)})
+                stats["errors"] += 1
+                continue
+            status = "deduplicated" if node.get("dedup_merged") else "created"
+            stats[status] += 1
+            if status == "created" and node.get("id"):
+                ids.append(node["id"])
+            results.append({"index": index, "status": status, "id": node.get("id"), "label": node.get("label")})
+        stats["received"] = len(raw_items)
+        stats["processed"] = len(items)
+        return {"ids": ids, "results": results, "stats": stats}
 
     def _ingest_dedup_scan(
         self, label: str, text: str, node_type: str, scope: str, project_id: str | None

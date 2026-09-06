@@ -95,6 +95,53 @@ class ProviderAdapter:
         )
 
 
+LOCAL_MEMORY_NO_HITS = (
+    "This is Local Memory fallback, not a language model. I found no matching memory for that question.\n\n"
+    "Enable a provider in Providers so Agent can think, then scan the project or add memory and ask again."
+)
+
+LOCAL_MEMORY_CANNOT_INSTALL = (
+    "Local Memory cannot run commands or install MCP servers. This reply is not from a language model — "
+    "ArchitectOS only searched local memory, which does not execute npx.\n\n"
+    "Install Confluence and Jira from SETUP → MCP (catalog entries already use "
+    "`npx -y mcp-confluence` and `npx -y mcp-jira`). For a one-shot command, use SETUP → Run command.\n\n"
+    "To have Agent reason about this, enable a provider in Providers (Azure OpenAI, OpenAI, Anthropic, and so on) "
+    "and keep the Agent tab selected."
+)
+
+_CLI_INSTALL_MARKERS = (
+    "npx ",
+    "npx\t",
+    "npm install",
+    "mcp-confluence",
+    "mcp-jira",
+    "install mcp",
+    "install the mcp",
+    "execute command",
+    "run command",
+    "run this command",
+    "run the command",
+    "please execute",
+    "just install",
+)
+
+
+def looks_like_cli_install(message: str) -> bool:
+    lowered = (message or "").lower()
+    if any(marker in lowered for marker in _CLI_INSTALL_MARKERS):
+        return True
+    if "mcp" in lowered and any(word in lowered for word in ("install", "add", "setup", "enable", "npx", "jira", "confluence")):
+        return True
+    return False
+
+
+def is_local_memory_stub_text(text: str) -> bool:
+    value = (text or "").strip()
+    if not value:
+        return False
+    return value.startswith("This is Local Memory fallback") or value.startswith("Local Memory cannot run commands") or value.startswith("Local context is ready") or value.startswith("Local Memory (not a language model)")
+
+
 class LocalMemoryAdapter(ProviderAdapter):
     provider_id = "local-memory"
 
@@ -110,6 +157,8 @@ class LocalMemoryAdapter(ProviderAdapter):
         }
 
     def run(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> dict[str, Any]:
+        if looks_like_cli_install(request.message):
+            return {"provider_id": self.provider_id, "status": "fallback", "text": LOCAL_MEMORY_CANNOT_INSTALL, "raw": None}
         lines = [line for line in request.context.splitlines() if line.startswith("- [")]
         labels = []
         for line in lines[:4]:
@@ -117,10 +166,9 @@ class LocalMemoryAdapter(ProviderAdapter):
             labels.append(head.replace("- ", ""))
         if labels:
             text = (
-                f"Local context is ready for: {request.message}. "
-                f"Strongest memory matches: {', '.join(labels)}. "
-                "Use the Context tab for the full pack."
+                f"Local Memory (not a language model) found related notes for: {request.message}. "
+                f"Strongest matches: {', '.join(labels)}. "
+                "Use the Context tab for the full pack. Connect a model in Providers for Agent to reason beyond retrieval."
             )
-        else:
-            text = "Local context is ready, but I found no matching memory yet. Scan the project or add memory, then ask again."
-        return {"provider_id": self.provider_id, "status": "ok", "text": text, "raw": None}
+            return {"provider_id": self.provider_id, "status": "ok", "text": text, "raw": None}
+        return {"provider_id": self.provider_id, "status": "fallback", "text": LOCAL_MEMORY_NO_HITS, "raw": None}

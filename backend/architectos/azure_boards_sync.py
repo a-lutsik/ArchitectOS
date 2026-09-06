@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
@@ -200,6 +201,7 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
                         ado_project,
                         work_item_id,
                         item_timeout=item_timeout,
+                        payload=payload,
                     )
                     results[idx] = candidate
                     if candidate:
@@ -230,12 +232,11 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
             while pending:
                 remaining = self._ingest_deadline_remaining(payload)
                 if remaining is not None and remaining <= 0:
-                    self._log_ingest(
-                        f"Azure Boards source timeout — cancelling {len(pending)} remaining item(s).",
-                        level="warn",
-                        source="azure-boards",
-                        current="azure-boards",
-                    )
+                    message = f"Azure Boards source timeout — cancelling {len(pending)} remaining item(s)."
+                    self._log_ingest(message, level="warn", source="azure-boards", current="azure-boards")
+                    extra = payload.get("_ingest_warnings")
+                    if isinstance(extra, list):
+                        extra.append(message)
                     for future in pending:
                         future.cancel()
                     self._abort_ingest_source("azure-boards")
@@ -291,6 +292,9 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
                         source="azure-boards",
                         current="azure-boards",
                     )
+                    extra = payload.get("_ingest_warnings")
+                    if isinstance(extra, list):
+                        extra.append(f"azure-boards item wait exceeded {wait_for:g}s")
                     self._abort_ingest_source("azure-boards")
                     # Drop one stuck future if possible so the loop can progress.
                     stuck = next(iter(pending), None)
@@ -355,14 +359,27 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
             return []
         if self._ingest_deadline_expired(payload, "azure-boards"):
             return []
+        deadline = payload.get("_ingest_source_deadline")
+        call_timeout = self._ingest_call_timeout(payload, item_timeout)
         if all_items:
-            add_ids(self._azure_boards_ids_from_wiql(ado_project, max(limit * 2, 50), types, timeout=item_timeout))
+            add_ids(self._azure_boards_ids_from_wiql(
+                ado_project, max(limit * 2, 50), types, timeout=call_timeout, deadline=deadline,
+            ))
         else:
-            add_ids(self._azure_boards_ids_from_my_work(ado_project, max(limit * 2, 20), timeout=item_timeout))
+            add_ids(self._azure_boards_ids_from_my_work(
+                ado_project, max(limit * 2, 20), timeout=call_timeout, deadline=deadline,
+            ))
 
         if len(collected) < limit and not self._ingest_deadline_expired(payload, "azure-boards"):
             search_text = str(payload.get("search_text") or payload.get("query") or "a OR e OR i OR o OR u").strip() or "a OR e"
-            add_ids(self._azure_boards_ids_from_search(ado_project, search_text, types, max(limit * 2, 20), timeout=item_timeout))
+            add_ids(self._azure_boards_ids_from_search(
+                ado_project,
+                search_text,
+                types,
+                max(limit * 2, 20),
+                timeout=self._ingest_call_timeout(payload, item_timeout),
+                deadline=deadline,
+            ))
         return collected
 
     def _normalize_azure_boards_work_item_types(self, raw: Any) -> list[str]:
@@ -387,6 +404,7 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
         work_item_types: list[str],
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> list[int]:
         self._log_ingest("Running WIQL query to fetch latest project work items...", source="azure-boards", current="azure-boards")
         escaped_types = ", ".join(f"'{item.replace("'", "''")}'" for item in work_item_types)
@@ -401,6 +419,7 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
                     "top": max(1, int(top)),
                 },
                 timeout=timeout or ADO_ITEM_TIMEOUT,
+                deadline=deadline,
             )
         except MCPError as exc:
             self._log_ingest(f"WIQL query failed: {exc}", level="warn", source="azure-boards", current="azure-boards")
@@ -409,7 +428,14 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
         self._log_ingest(f"WIQL query returned {len(ids)} item ID(s).", source="azure-boards", current="azure-boards")
         return ids
 
-    def _azure_boards_ids_from_my_work(self, ado_project: str, top: int, *, timeout: float | None = None) -> list[int]:
+    def _azure_boards_ids_from_my_work(
+        self,
+        ado_project: str,
+        top: int,
+        *,
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> list[int]:
         self._log_ingest("Fetching work items assigned to me...", source="azure-boards", current="azure-boards")
         try:
             result = call_ado_tool(
@@ -417,6 +443,7 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
                 "my_work",
                 {"project": ado_project, "type": "assignedtome", "top": top, "includeCompleted": True},
                 timeout=timeout or ADO_ITEM_TIMEOUT,
+                deadline=deadline,
             )
         except MCPError as exc:
             self._log_ingest(f"my work items query failed: {exc}", level="warn", source="azure-boards", current="azure-boards")
@@ -433,11 +460,14 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
         top: int,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> list[int]:
         self._log_ingest(f"Searching work items matching '{search_text}'...", source="azure-boards", current="azure-boards")
         ids: list[int] = []
         call_timeout = timeout or ADO_ITEM_TIMEOUT
         for work_item_type in work_item_types:
+            if deadline is not None and float(deadline) - time.monotonic() <= 0:
+                break
             self._log_ingest(f"Searching type {work_item_type}...", source="azure-boards", current="azure-boards")
             try:
                 result = call_ado_tool(
@@ -451,6 +481,7 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
                         "skip": 0,
                     },
                     timeout=call_timeout,
+                    deadline=deadline,
                 )
             except MCPError:
                 continue
@@ -473,17 +504,19 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
         work_item_id: int,
         *,
         item_timeout: float | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         # Prefer relations over expand=all: "all" pulls revisions/attachments and can
         # hang the Azure DevOps MCP stdio process on hub items.
-        timeout = float(item_timeout if item_timeout is not None else ADO_ITEM_TIMEOUT)
-        timeout = max(5.0, min(timeout, 600.0))
+        timeout = self._ingest_call_timeout(payload, item_timeout if item_timeout is not None else ADO_ITEM_TIMEOUT)
+        deadline = (payload or {}).get("_ingest_source_deadline")
         try:
             detailed = call_ado_tool(
                 self.mcp_manager,
                 "get_item",
                 {"id": work_item_id, "project": ado_project, "expand": "relations"},
                 timeout=timeout,
+                deadline=deadline,
             )
         except MCPError as exc:
             self._log_ingest(
@@ -494,7 +527,7 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
             )
             # Timed-out/hung MCP calls leave the stdio process wedged; restart so the
             # next item is not blocked behind the dead request.
-            if "timed out" in str(exc).lower():
+            if "timed out" in str(exc).lower() or "source timeout" in str(exc).lower():
                 try:
                     self.mcp_manager.close_session("azure-devops")
                     self._log_ingest(
@@ -519,11 +552,12 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
                     "list_comments",
                     {"project": ado_project, "workItemId": work_item_id, "top": 20},
                     timeout=min(timeout, 15.0),
+                    deadline=deadline,
                 )
                 comments = self._azure_boards_comments_from_payload(comments_result.get("result") or comments_result)
             except MCPError as exc:
                 comments = []
-                if "timed out" in str(exc).lower():
+                if "timed out" in str(exc).lower() or "source timeout" in str(exc).lower():
                     try:
                         self.mcp_manager.close_session("azure-devops")
                     except Exception:
@@ -578,7 +612,7 @@ class AzureBoardsSyncMixin(AzureBoardsParseMixin):
         )
         memory_type = ADO_BOARD_MEMORY_TYPES.get(wi_type.lower(), "Requirement" if "req" in wi_type.lower() else "Artifact")
         return {
-            "id": stable_id("candidate", project_id, "azure-boards", str(work_item_id), title[:80]),
+            "id": stable_id("candidate", project_id, "azure-boards", str(work_item_id)),
             "project_id": project_id,
             "source_type": "azure-boards",
             "source_ref": str(work_item_id),

@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from .candidate_identity import candidate_origin_key
 from .chat_memory import (
     DEFAULT_CHAT_CANDIDATE_TTL_DAYS,
     DEFAULT_CHAT_MEMORY_MODE,
@@ -38,7 +39,7 @@ DEFAULT_MEMORY_LIFECYCLE = {
     "candidate_rejected_purge_days": 30,
     "candidate_promoted_purge_days": 90,
     "chat_store_facts_only": True,
-    "chat_auto_accept": False,
+    "chat_auto_accept": True,
     "long_term_types": ["Decision", "Constraint", "Requirement"],
     "architecture_keywords": ["architecture", "adr", "decision", "constraint", "security", "provider", "routing"],
 }
@@ -57,7 +58,7 @@ class MemoryLifecycleEngine:
         settings["auto_rescan_on_startup"] = bool(settings.get("auto_rescan_on_startup", True))
         settings["auto_rescan_all_projects"] = bool(settings.get("auto_rescan_all_projects", True))
         settings["chat_store_facts_only"] = bool(settings.get("chat_store_facts_only", True))
-        settings["chat_auto_accept"] = bool(settings.get("chat_auto_accept", False))
+        settings["chat_auto_accept"] = bool(settings.get("chat_auto_accept", True))
         settings["chat_memory_mode"] = normalize_chat_memory_mode(settings.get("chat_memory_mode"))
         for key in ("short_term_ttl_days", "archive_after_days", "delete_after_days", "promote_after_hits", "auto_rescan_limit", "chat_candidate_ttl_days", "chat_session_idle_minutes", "candidate_rejected_purge_days", "candidate_promoted_purge_days"):
             settings[key] = max(0, int(settings.get(key) or 0))
@@ -222,10 +223,12 @@ class MemoryLifecycleEngine:
             source_type = str(candidate.get("source_type") or "").lower()
             meta = dict(candidate.get("metadata") or {})
             template = str(meta.get("template") or "")
-            if source_type not in {"chat", "chat_favorite", "rules_keeper"} and template not in {
+            if source_type not in {"chat", "chat_favorite", "rules_keeper", "mcp"} and template not in {
                 "chat_turn_keeper",
                 "chat_fact_keeper",
                 "chat_session_summary",
+                "chat_session_atom",
+                "mcp_turn_atom",
                 "rules_keeper",
                 "assistant_favorite",
             }:
@@ -265,6 +268,8 @@ class MemoryLifecycleEngine:
                 continue
             decided_key = "rejected_at" if status == "rejected" else "promoted_at"
             for candidate in self.repository.list_memory_candidates(project_id, status, None):
+                if candidate_origin_key(candidate):
+                    continue
                 raw = str(candidate.get(decided_key) or candidate.get("updated_at") or candidate.get("created_at") or "")
                 then = self._parse_time(raw) if raw else now
                 age_days = max(0, int((now - then).total_seconds() // 86400))

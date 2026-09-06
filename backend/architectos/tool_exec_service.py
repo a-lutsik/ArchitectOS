@@ -16,10 +16,11 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from .constants import (
     FS_READ_MAX_CHARS,
@@ -30,6 +31,7 @@ from .constants import (
     TERMINAL_DESTRUCTIVE_CONFIRM,
     TERMINAL_SHELLS,
 )
+from .permissions import PermissionRequired
 
 _LOG = logging.getLogger("architectos.service")
 
@@ -83,12 +85,37 @@ class ToolExecServiceMixin:
                 pass
         return self.project_root
 
-    def _tool_fs_read(self, args: dict[str, Any]) -> dict[str, Any]:
-        project_id = str(args.get("project_id") or "architectos")
-        reference = args.get("path") or args.get("file") or args.get("class") or args.get("class_name") or ""
-        path = self._resolve_project_file_ref(project_id, str(reference))
-        result = self.project_file(project_id, path)
-        lines = str(result.get("text") or "").splitlines()
+    def _path_outside_project(self, project_id: str, reference: str) -> Path | None:
+        raw = str(reference or "").strip().strip("\"'")
+        if not raw:
+            return None
+        root = self._project_root(project_id).resolve()
+        expanded = Path(raw).expanduser()
+        looks_escape = expanded.is_absolute() or raw.startswith("..") or "/../" in raw.replace("\\", "/")
+        try:
+            candidate = expanded.resolve() if looks_escape else (root / raw).resolve()
+            candidate.relative_to(root)
+            return None
+        except (ValueError, OSError):
+            try:
+                return expanded.resolve() if looks_escape else (root / raw).resolve()
+            except OSError:
+                return expanded if looks_escape else None
+
+    def _require_sandbox_permission(self, path: Path, action: str) -> None:
+        target = str(path)
+        broker = getattr(self, "permissions", None)
+        if broker is not None and broker.is_allowed("sandbox", action, target):
+            return
+        raise PermissionRequired(
+            "sandbox",
+            action,
+            target,
+            f"This path is outside the project folder: {target}",
+        )
+
+    def _file_window_from_text(self, text: str, args: dict[str, Any], *, path_label: str, size: int) -> dict[str, Any]:
+        lines = str(text or "").splitlines()
         total = len(lines)
         start = max(1, int(args.get("start_line") or args.get("from_line") or 1))
         end_arg = args.get("end_line") or args.get("to_line")
@@ -105,17 +132,45 @@ class ToolExecServiceMixin:
             window.append(numbered)
         end = max(start - 1, min(end, total))
         return {
-            "path": result.get("path"),
+            "path": path_label,
             "text": "\n".join(window),
             "start_line": start,
             "end_line": end,
             "total_lines": total,
-            # Tell the model exactly how to continue instead of leaving it guessing.
             "next_start_line": end + 1 if end < total else 0,
             "truncated": end < total,
-            "size": result.get("size"),
-            "readable": result.get("readable"),
+            "size": size,
+            "readable": True,
         }
+
+    def _tool_fs_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(args.get("project_id") or "architectos")
+        reference = args.get("path") or args.get("file") or args.get("class") or args.get("class_name") or ""
+        outside = self._path_outside_project(project_id, str(reference))
+        if outside is not None:
+            self._require_sandbox_permission(outside, "read")
+            if not outside.is_file():
+                raise ValueError(f"file is not readable: {outside}")
+            preview = self._read_text_preview(outside)
+            payload = self._file_window_from_text(
+                str(preview.get("text") or ""),
+                args,
+                path_label=str(outside),
+                size=outside.stat().st_size,
+            )
+            payload["readable"] = bool(preview.get("readable", True))
+            payload["outside"] = True
+            return payload
+        path = self._resolve_project_file_ref(project_id, str(reference))
+        result = self.project_file(project_id, path)
+        payload = self._file_window_from_text(
+            str(result.get("text") or ""),
+            args,
+            path_label=str(result.get("path") or path),
+            size=int(result.get("size") or 0),
+        )
+        payload["readable"] = result.get("readable")
+        return payload
 
     def _resolve_project_file_ref(self, project_id: str, reference: str) -> str:
         """Resolve what a model or user typed into a project-relative file path.
@@ -255,13 +310,26 @@ class ToolExecServiceMixin:
             self.memory_lifecycle.refresh_nodes([node.id], "memory_get")
         except Exception:
             pass
+        try:
+            self.repository.record_memory_event(node.id, "accessed", actor="tool", details={"include_neighbors": include_neighbors})
+        except Exception:
+            pass  # history is best-effort, never blocks reads
         return payload
 
     def _tool_fs_list(self, args: dict[str, Any]) -> dict[str, Any]:
         project_id = str(args.get("project_id") or "architectos")
         limit = max(1, min(int(args.get("limit") or 80), 200))
-        listed = self.project_files(project_id, limit=limit)
         relative = str(args.get("path") or "").strip().strip("./")
+        outside = self._path_outside_project(project_id, relative) if relative else None
+        if outside is not None:
+            self._require_sandbox_permission(outside, "list")
+            if not outside.is_dir():
+                raise ValueError(f"directory is not readable: {outside}")
+            files = []
+            for item in sorted(outside.iterdir(), key=lambda path: path.name.lower())[:limit]:
+                files.append({"path": str(item), "name": item.name, "dir": item.is_dir()})
+            return {"project_id": project_id, "root": str(outside), "path": str(outside), "files": files, "count": len(files), "outside": True}
+        listed = self.project_files(project_id, limit=limit)
         files = list(listed.get("files") or [])
         if relative:
             prefix = relative.replace("\\", "/").rstrip("/") + "/"
@@ -298,7 +366,14 @@ class ToolExecServiceMixin:
         text = args.get("text")
         if text is None:
             text = args.get("content")
-        return self.save_project_file({"project_id": project_id, "path": path, "text": str(text if text is not None else "")})
+        body = str(text if text is not None else "")
+        outside = self._path_outside_project(project_id, path)
+        if outside is not None:
+            self._require_sandbox_permission(outside, "write")
+            outside.parent.mkdir(parents=True, exist_ok=True)
+            outside.write_text(body, encoding="utf-8")
+            return {"success": True, "project_id": project_id, "path": str(outside), "size": outside.stat().st_size, "outside": True}
+        return self.save_project_file({"project_id": project_id, "path": path, "text": body})
 
 
     # --- Terminal ----------------------------------------------------------
@@ -333,24 +408,22 @@ class ToolExecServiceMixin:
         shell = self._terminal_shell_command(shell_id)
         timeout = min(max(int(payload.get("timeout_seconds") or 20), 1), 120)
         started = datetime.now(timezone.utc)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        popen_kwargs: dict[str, Any] = {
+            "cwd": str(root),
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "env": env,
+            "shell": False,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
         try:
-            proc = subprocess.run([*shell, command], cwd=str(root), text=True, capture_output=True, timeout=timeout, shell=False)
-            duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        except subprocess.TimeoutExpired as exc:
-            stdout, stdout_redacted = self.security_policy.redact_text(cast(str, exc.stdout or "")[:80_000])
-            stderr, stderr_redacted = self.security_policy.redact_text(cast(str, exc.stderr or "")[:20_000])
-            return {
-                "project_id": project_id,
-                "root": str(root),
-                "command": command,
-                "shell": shell_id,
-                "status": "timeout",
-                "returncode": None,
-                "stdout": stdout,
-                "stderr": stderr or f"Command timed out after {timeout}s.",
-                "duration_ms": timeout * 1000,
-                "redacted": stdout_redacted or stderr_redacted,
-            }
+            proc = subprocess.Popen([*shell, command], **popen_kwargs)
         except OSError as exc:
             return {
                 "project_id": project_id,
@@ -364,18 +437,51 @@ class ToolExecServiceMixin:
                 "duration_ms": 0,
                 "redacted": False,
             }
-        stdout, stdout_redacted = self.security_policy.redact_text((proc.stdout or "")[:80_000])
-        stderr, stderr_redacted = self.security_policy.redact_text((proc.stderr or "")[:20_000])
+        timed_out = False
+        returncode: int | None
+        try:
+            stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            self._terminal_kill_tree(proc)
+            try:
+                drained_out, drained_err = proc.communicate(timeout=2)
+            except Exception:
+                self._terminal_abandon_pipes(proc)
+                drained_out, drained_err = "", ""
+            stdout_raw = f"{self._terminal_pipe_text(exc.stdout)}{self._terminal_pipe_text(drained_out)}"
+            stderr_raw = f"{self._terminal_pipe_text(exc.stderr)}{self._terminal_pipe_text(drained_err)}"
+            returncode = None
+        duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        stdout_raw = self._terminal_pipe_text(stdout_raw)
+        stderr_raw = self._terminal_pipe_text(stderr_raw)
+        if timed_out and not stderr_raw.strip():
+            stderr_raw = f"Command timed out after {timeout}s."
+        if timed_out and self._terminal_looks_like_mcp_stdio(command) and not stdout_raw.strip():
+            stderr_raw = (
+                f"{stderr_raw.rstrip()}\n"
+                "MCP stdio servers (npx …/server-filesystem) wait for JSON-RPC on stdin "
+                "and usually print nothing here. Use SETUP → MCP → Test, or Open external shell."
+            )
+        stdout, stdout_redacted = self.security_policy.redact_text(stdout_raw[:80_000])
+        stderr, stderr_redacted = self.security_policy.redact_text(stderr_raw[:20_000])
+        if timed_out:
+            status = "timeout"
+        elif returncode == 0:
+            status = "ok"
+        else:
+            status = "error"
         return {
             "project_id": project_id,
             "root": str(root),
             "command": command,
             "shell": shell_id,
-            "status": "ok" if proc.returncode == 0 else "error",
-            "returncode": proc.returncode,
+            "status": status,
+            "returncode": returncode,
             "stdout": stdout,
             "stderr": stderr,
-            "duration_ms": duration_ms,
+            "duration_ms": duration_ms if not timed_out else timeout * 1000,
             "redacted": stdout_redacted or stderr_redacted,
         }
 
@@ -406,6 +512,55 @@ class ToolExecServiceMixin:
         if not executable:
             raise OSError(f"shell executable not found: {command[0]}")
         return [executable, *command[1:]]
+
+    @staticmethod
+    def _terminal_kill_tree(proc: subprocess.Popen[str]) -> None:
+        """Kill the shell and any npx/node grandchildren that inherited the pipes."""
+        if proc.poll() is not None:
+            return
+        pid = proc.pid
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=8,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _terminal_abandon_pipes(proc: subprocess.Popen[str]) -> None:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _terminal_pipe_text(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    @staticmethod
+    def _terminal_looks_like_mcp_stdio(command: str) -> bool:
+        lowered = command.lower()
+        return "mcp" in lowered or "modelcontextprotocol" in lowered or "server-filesystem" in lowered
 
     def _terminal_command_risk(self, command: str) -> str:
         normalized = command.strip()

@@ -54,6 +54,11 @@ if (-not $env:ARCHITECTOS_TARGET_TRIPLE -and (Get-Command rustc -ErrorAction Sil
   }
 }
 
+Write-Host "==> sqlite-vec build probe"
+$env:PYTHONPATH = Join-Path $Root "backend"
+python -c "from architectos.vec_runtime import emit_builder_probe; raise SystemExit(emit_builder_probe())"
+if ($LASTEXITCODE -ne 0) { Die "sqlite-vec is required for this build (ARCHITECTOS_REQUIRE_SQLITE_VEC=1)." }
+
 Write-Host "==> Building architectos-server sidecar ($Version, $TargetTriple)"
 New-Item -ItemType Directory -Force -Path $BinariesDir, $DistDir, $WorkDir | Out-Null
 if (Test-Path $WorkDir) { Remove-Item -Recurse -Force $WorkDir }

@@ -74,6 +74,35 @@ class CouncilOrchestratorTests(unittest.TestCase):
         })
         self.assertEqual(result["models"], ["openai", "anthropic"])
 
+    def test_skips_not_ready_models_from_payload(self) -> None:
+        run_ai, _calls = self._fake_run_ai()
+        council = CouncilOrchestrator(run_ai, self._panel)
+        result = council.run({
+            "project_id": "architectos",
+            "message": "help",
+            "models": ["openai", "azure-openai", "anthropic"],
+        })
+        self.assertEqual(result["models"], ["openai", "anthropic"])
+        self.assertEqual({a["provider_id"] for a in result["answers"]}, {"openai", "anthropic"})
+
+    def test_error_answers_do_not_become_local_memory_synthesis(self) -> None:
+        def run_ai(payload: dict[str, Any]) -> dict[str, Any]:
+            provider_id = payload.get("provider_id")
+            return {
+                "text": "ANTHROPIC_API_KEY is not set.",
+                "provider": {"id": provider_id, "status": "error"},
+                "run_id": "run-err",
+            }
+
+        council = CouncilOrchestrator(run_ai, self._panel)
+        result = council.run({
+            "project_id": "architectos",
+            "message": "install confluence mcp",
+            "models": ["openai", "anthropic"],
+        })
+        self.assertEqual(result["synthesis"], "")
+        self.assertTrue(all(answer["status"] == "error" for answer in result["answers"]))
+
     def test_empty_message_raises(self) -> None:
         run_ai, _calls = self._fake_run_ai()
         council = CouncilOrchestrator(run_ai, self._panel)

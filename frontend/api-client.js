@@ -8,15 +8,27 @@ function authHeaders(extra = {}) {
 }
 
 async function api(path, options = {}) {
+  const { timeoutMs, ...fetchOptions } = options;
+  const controller = Number(timeoutMs) > 0 ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), Number(timeoutMs)) : null;
   let response;
   try {
-    response = await fetch(path, { ...options, headers: authHeaders({ "Content-Type": "application/json", ...(options.headers || {}) }) });
+    response = await fetch(path, {
+      ...fetchOptions,
+      signal: controller ? controller.signal : fetchOptions.signal,
+      headers: authHeaders({ "Content-Type": "application/json", ...(fetchOptions.headers || {}) }),
+    });
   } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(t("error.requestTimeout"));
+    }
     const message = error?.message || "network error";
     if (/failed to fetch|networkerror|load failed/i.test(message)) {
       throw new Error(t("error.serverUnreachable"));
     }
     throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   let payload = {};
   try {

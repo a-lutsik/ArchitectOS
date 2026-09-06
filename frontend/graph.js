@@ -1,8 +1,34 @@
 /* Memory graph engine: state, physics, canvas, detail/actions — extracted from app.js */
 import { api } from "./api-client.js";
-import { switchView } from "./ask-ui.js";
-import { escapeHtml, on, setElementValue, trapFocus } from "./dom-utils.js";
+import { queueAskFollowUp, switchView } from "./ask-ui.js";
+import { escapeHtml, on, setElementValue, showSnackbar, trapFocus } from "./dom-utils.js";
 import { fileEditor } from "./file-editor.js";
+import {
+  GRAPH_VIEW_GALAXY,
+  GRAPH_VIEW_MAP,
+  canvasPointFromEvent,
+  createGalaxyCamera,
+  dollyGalaxyCamera,
+  drawGalaxy,
+  fitGalaxyCamera,
+  galaxyHasPositions,
+  hitGalaxyNode,
+  orbitGalaxyCamera,
+  panGalaxyCamera,
+  persistGraphView,
+  prefersGraphReducedMotion,
+  readSavedGraphView,
+  scaleGalaxyPositions,
+  seedGalaxyPositions,
+  stepGalaxyPhysics,
+  parseGraphColor,
+} from "./graph-galaxy.js";
+import {
+  FORCE_ALPHA_MIN,
+  graphForceParams,
+  seedForcePositions,
+  stepForceSimulation,
+} from "./graph-force.js";
 import { switchMemoryTab } from "./memory-panel.js";
 import { runSearch } from "./projects.js";
 import { projectParam, state, t } from "./state.js";
@@ -60,21 +86,36 @@ async function suggestGraphLinks() {
     checkbox.addEventListener("change", () => {
       applyButton.disabled = !list.querySelector("input[type=checkbox]:checked");
     });
+    const kind = document.createElement("span");
+    kind.className = "graph-suggest-kind";
+    const type = document.createElement("span");
+    type.className = "graph-suggest-type";
+    type.textContent = String(item.edge_type || "related");
+    const conf = document.createElement("span");
+    conf.className = "graph-suggest-conf";
+    const confidence = Number(item.confidence);
+    conf.textContent = Number.isFinite(confidence) ? confidence.toFixed(2) : "";
+    kind.append(type, conf);
     const body = document.createElement("span");
     body.className = "graph-suggest-body";
-    body.textContent = `${item.source_label} ↔ ${item.target_label}`;
-    const meta = document.createElement("span");
-    meta.className = "graph-suggest-meta";
-    meta.textContent = `${item.edge_type} · conf ${item.confidence}${item.reason ? ` · ${item.reason}` : ""}`;
-    row.appendChild(checkbox);
-    row.appendChild(body);
-    row.appendChild(meta);
+    body.textContent = `${item.source_label || "?"} ↔ ${item.target_label || "?"}`;
+    body.title = body.textContent;
+    row.append(checkbox, kind, body);
+    const reason = String(item.reason || "").trim();
+    if (reason) {
+      const why = document.createElement("span");
+      why.className = "graph-suggest-reason";
+      why.textContent = reason;
+      why.title = reason;
+      row.appendChild(why);
+    }
     list.appendChild(row);
   });
   applyButton.disabled = false;
 }
 
 async function applySuggestedLinks() {
+  const panel = document.querySelector("#graph-suggest-panel");
   const list = document.querySelector("#graph-suggest-list");
   const status = document.querySelector("#graph-suggest-status");
   const applyButton = document.querySelector("#graph-suggest-apply");
@@ -99,7 +140,34 @@ async function applySuggestedLinks() {
   status.textContent = t("graph.suggest.applied").replace("{count}", String(created));
   list.innerHTML = "";
   graphSuggestions = [];
+  if (panel) panel.hidden = true;
   await loadGraph();
+}
+
+let graphLoadGeneration = 0;
+
+function setGraphLoading(loading) {
+  const canvas = document.querySelector("#graph-canvas");
+  const stage = canvas?.closest(".graph-stage, .graph-expand-stage") || document.querySelector(".memory-graph-section .graph-stage");
+  if (!stage) return;
+  let el = document.querySelector("#graph-loading");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "graph-loading";
+    el.className = "graph-loading";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.innerHTML = `
+      <span class="graph-loading-spinner" aria-hidden="true"></span>
+      <span class="graph-loading-label">${escapeHtml(t("graph.loading"))}</span>`;
+  }
+  if (el.parentElement !== stage) {
+    stage.appendChild(el);
+  }
+  const label = el.querySelector(".graph-loading-label");
+  if (label) label.textContent = t("graph.loading");
+  el.hidden = !loading;
+  stage.classList.toggle("is-loading", Boolean(loading));
 }
 
 const graphState = {
@@ -113,6 +181,7 @@ const graphState = {
   draggingId: "",
   dragMoved: false,
   modalOpen: false,
+  modalControlsBound: false,
   scale: 1,
   offsetX: 0,
   offsetY: 0,
@@ -124,11 +193,124 @@ const graphState = {
   physicsTicks: 0,
   physicsMax: 90,
   physicsActive: true,
+  simAlpha: 1,
+  simAlphaTarget: 0,
+  fittedAfterSettle: false,
   searchQuery: "",
   searchTimer: 0,
+  neighborhoodId: "",
   groupFilter: "",
-  densityLevel: 2,
+  densityLevel: 40,
+  nodeSize: 5,
+  nodeSpread: 1,
+  densityAuto: true,
+  sizeAuto: true,
+  spreadAuto: true,
+  view: readSavedGraphView(),
+  galaxyCamera: createGalaxyCamera(),
+  orbiting: false,
+  galaxyPan: false,
+  mapPanning: false,
+  orbitLastX: 0,
+  orbitLastY: 0,
+  galaxyHitId: "",
+  galaxyLaidSpread: 1,
 };
+
+function wantsGalaxyPan(event) {
+  return Boolean(event.shiftKey || event.altKey || event.metaKey || event.button === 1 || event.button === 2);
+}
+
+function isGalaxyView() {
+  return graphState.view === GRAPH_VIEW_GALAXY;
+}
+
+function graphStageVisible() {
+  const memory = document.querySelector("#memory-view");
+  if (memory && !memory.classList.contains("active")) return false;
+  const listTab = document.querySelector("#memory-tab-list");
+  if (listTab?.classList.contains("active")) return false;
+  if (typeof document !== "undefined" && document.hidden) return false;
+  return true;
+}
+
+function ensureGalaxyLayout({ force = false } = {}) {
+  if (!isGalaxyView() || !graphState.particles.length) return;
+  const ready = galaxyHasPositions(graphState.particles);
+  if (!force && ready) return;
+  seedGalaxyPositions(graphState.particles, { force: true });
+  const spread = graphNodeSpread();
+  if (spread !== 1) scaleGalaxyPositions(graphState.particles, spread);
+  graphState.galaxyLaidSpread = spread;
+}
+
+function frameGalaxy({ resetOrientation = false, ease = false } = {}) {
+  const canvas = document.querySelector("#graph-canvas");
+  fitGalaxyCamera(graphState.particles, graphState.galaxyCamera, {
+    width: canvas?.width || 800,
+    height: canvas?.height || 600,
+    resetOrientation,
+    ease,
+  });
+}
+
+function syncGraphViewChrome() {
+  const galaxy = isGalaxyView();
+  document.querySelectorAll(".graph-view-toggle").forEach(group => {
+    group.setAttribute("aria-label", t("graph.view.group"));
+  });
+  document.querySelectorAll("[data-graph-view]").forEach(button => {
+    const on = button.getAttribute("data-graph-view") === graphState.view;
+    button.setAttribute("aria-pressed", on ? "true" : "false");
+    button.classList.toggle("is-active", on);
+  });
+  document.querySelectorAll(".graph-stage").forEach(stage => {
+    stage.classList.toggle("is-galaxy", galaxy);
+    stage.classList.toggle("is-orbiting", Boolean(galaxy && graphState.orbiting && !graphState.galaxyPan));
+    stage.classList.toggle("is-panning", Boolean(galaxy && graphState.orbiting && graphState.galaxyPan));
+  });
+  const hint = document.querySelector("#graph-inspect-hint");
+  if (hint) {
+    const key = galaxy ? "graph.inspectHintGalaxy" : "graph.inspectHint";
+    hint.dataset.i18n = key;
+    hint.textContent = t(key);
+  }
+  const expandHint = document.querySelector("#graph-expand-overlay .graph-expand-toolbar p");
+  if (expandHint) {
+    const key = galaxy ? "graph.expandHintGalaxy" : "graph.expandHint";
+    expandHint.dataset.i18n = key;
+    expandHint.textContent = t(key);
+  }
+}
+
+function setGraphView(view) {
+  const next = view === GRAPH_VIEW_GALAXY ? GRAPH_VIEW_GALAXY : GRAPH_VIEW_MAP;
+  if (graphState.view === next) {
+    syncGraphViewChrome();
+    return;
+  }
+  graphState.view = next;
+  persistGraphView(next);
+  graphState.orbiting = false;
+  graphState.galaxyPan = false;
+  graphState.mapPanning = false;
+  graphState.draggingId = "";
+  graphState.userZoomed = false;
+  graphState.physicsTicks = 0;
+  graphState.physicsActive = true;
+  graphState.simAlpha = 1;
+  graphState.simAlphaTarget = 0;
+  graphState.fittedAfterSettle = false;
+  if (next === GRAPH_VIEW_GALAXY) {
+    resizeGraphCanvas();
+    ensureGalaxyLayout({ force: !galaxyHasPositions(graphState.particles) });
+    frameGalaxy({ resetOrientation: true });
+  } else {
+    reheatGraphForce(1);
+  }
+  syncGraphViewChrome();
+  wakeGraphAnimation();
+}
 
 const graphGroupPalette = {
   Projects: "#60a5fa",
@@ -188,6 +370,8 @@ function graphNodeGroup(node) {
 /** Canonical ingest/source key for a memory node (mirrors backend _source_key_for_node). */
 function graphNodeSourceKey(node) {
   const meta = node?.metadata || {};
+  if (meta.source_id) return String(meta.source_id);
+  if (meta.source_key && String(meta.source_key).startsWith("source_")) return String(meta.source_key);
   if (meta.source_key) return String(meta.source_key).toLowerCase();
   const raw = String(meta.source_type || meta.source || node?.source_type || "").trim().toLowerCase();
   if (!raw || raw === "source_hub" || raw === "scope_root" || raw === "project_profile") return "other";
@@ -242,17 +426,126 @@ function enrichGraphNode(node) {
 }
 
 /** Density budget: large graphs show a readable subset, fair-split by source. */
+function graphDensityPercent(densityLevel = graphState.densityLevel) {
+  const raw = Number(densityLevel);
+  const value = Number.isFinite(raw) ? raw : 40;
+  return Math.max(5, Math.min(100, Math.round(value / 5) * 5));
+}
+
 function graphVisibleBudget(total, densityLevel = graphState.densityLevel) {
-  const level = Math.max(1, Math.min(5, Number(densityLevel) || 2));
-  if (level >= 5) return Math.min(total, 500);
-  if (level === 4) return Math.min(total, 350);
-  if (level === 3) return Math.min(total, 280);
-  if (level === 2) return Math.min(total, 200);
-  return Math.min(total, 100);
+  const count = Math.max(0, Number(total) || 0);
+  if (!count) return 0;
+  const percent = graphDensityPercent(densityLevel);
+  if (percent >= 100) return count;
+  return Math.max(1, Math.round(count * percent / 100));
 }
 
 function graphBackendLimit() {
-  return { 1: 100, 2: 200, 3: 280, 4: 360, 5: 520 }[Math.max(1, Math.min(5, Number(graphState.densityLevel) || 2))] || 200;
+  return Math.max(Number(graphState.totalNodesCount) || 0, 10000);
+}
+
+function graphDensityLabel(densityLevel = graphState.densityLevel) {
+  const percent = graphDensityPercent(densityLevel);
+  return percent >= 100 ? "all" : `${percent}%`;
+}
+
+/** Stage area → target visible node budget (hubs + leaves). */
+function graphAutoTargetBudget(width, height) {
+  const area = Math.max(1, Number(width) || 800) * Math.max(1, Number(height) || 600);
+  // ~65 on a 640×560 stage — small/medium graphs prefer showing everything.
+  return Math.max(24, Math.min(90, Math.round(area / 5500)));
+}
+
+/** Node radius from visible count and stage area — denser graphs get smaller dots. */
+function graphAutoNodeSize(visible, width, height) {
+  const area = Math.max(1, Number(width) || 800) * Math.max(1, Number(height) || 600);
+  const stageScale = Math.sqrt(area) / 300;
+  const count = Math.max(1, Number(visible) || 1);
+  // ~58 visible → size 10; fewer → up to 12; crowded → toward 5–6.
+  const size = Math.round(14 - count / 14 + stageScale * 0.2);
+  return Math.max(5, Math.min(12, size));
+}
+
+/** Pick readable density / node size / spacing from graph size and stage area. */
+function graphAutoLayout({ total = 0, width = 0, height = 0 } = {}) {
+  const canvas = document.querySelector("#graph-canvas");
+  const w = Math.max(1, Number(width) || canvas?.width || 800);
+  const h = Math.max(1, Number(height) || canvas?.height || 600);
+  const count = Math.max(0, Number(total) || 0);
+  const targetBudget = graphAutoTargetBudget(w, h);
+  let density = 100;
+  if (count > targetBudget) {
+    density = graphDensityPercent(Math.max(5, Math.round((targetBudget / count) * 100)));
+  }
+  const visible = graphVisibleBudget(count, density);
+  const nodeSize = graphAutoNodeSize(visible, w, h);
+  return { density, nodeSize, nodeSpread: 1, targetBudget, visible };
+}
+
+function syncGraphAutoControls({ density, nodeSize, nodeSpread } = {}) {
+  if (density != null) {
+    graphState.densityLevel = graphDensityPercent(density);
+    const input = document.querySelector("#graph-density-level");
+    const value = document.querySelector("#graph-density-value");
+    if (input) input.value = String(graphState.densityLevel);
+    if (value) value.textContent = graphDensityLabel(graphState.densityLevel);
+  }
+  if (nodeSize != null) {
+    graphState.nodeSize = Math.max(3, Math.min(12, Number(nodeSize) || 5));
+    const input = document.querySelector("#graph-node-size");
+    const value = document.querySelector("#graph-node-size-value");
+    if (input) input.value = String(graphState.nodeSize);
+    if (value) value.textContent = String(graphState.nodeSize);
+  }
+  if (nodeSpread != null) {
+    graphState.nodeSpread = Math.max(1, Math.min(20, Number(nodeSpread) || 1));
+    const input = document.querySelector("#graph-node-spread");
+    const value = document.querySelector("#graph-node-spread-value");
+    if (input) input.value = String(graphState.nodeSpread);
+    if (value) value.textContent = String(graphState.nodeSpread);
+  }
+}
+
+/** Apply auto density/size/spread for any flag still in auto mode. Returns true if layout inputs changed. */
+function applyGraphAutoLayout({ reseed = false } = {}) {
+  if (!graphState.densityAuto && !graphState.sizeAuto && !graphState.spreadAuto) return false;
+  const canvas = document.querySelector("#graph-canvas");
+  const total = graphState.totalNodesCount || graphState.allNodes.length || 0;
+  const auto = graphAutoLayout({
+    total,
+    width: canvas?.width,
+    height: canvas?.height,
+  });
+  const prev = {
+    density: graphState.densityLevel,
+    size: graphState.nodeSize,
+    spread: graphState.nodeSpread,
+  };
+  const next = {};
+  if (graphState.densityAuto) next.density = auto.density;
+  if (graphState.sizeAuto) next.nodeSize = auto.nodeSize;
+  if (graphState.spreadAuto) next.nodeSpread = auto.nodeSpread;
+  syncGraphAutoControls(next);
+  const changed =
+    prev.density !== graphState.densityLevel
+    || prev.size !== graphState.nodeSize
+    || prev.spread !== graphState.nodeSpread;
+  if (changed && reseed && graphState.allNodes.length) {
+    const layoutChanged = prev.density !== graphState.densityLevel || prev.spread !== graphState.nodeSpread;
+    if (!isGalaxyView() || layoutChanged) {
+      applyGraphVisibility();
+      seedGraphParticles({ relayout: true });
+      if (!graphState.userZoomed) fitGraphToView();
+    }
+    wakeGraphAnimation();
+  }
+  return changed;
+}
+
+function resetGraphAutoLayoutFlags() {
+  graphState.densityAuto = true;
+  graphState.sizeAuto = true;
+  graphState.spreadAuto = true;
 }
 
 function selectVisibleGraphNodes(nodes, edges, budget, selectedId) {
@@ -279,7 +572,8 @@ function selectVisibleGraphNodes(nodes, edges, budget, selectedId) {
       node.type === "Project"
       || node.pinned
       || node.id === selectedId
-      || neighborIds.has(node.id);
+      || neighborIds.has(node.id)
+      || isGraphParentNode(node);
     if (isMust) {
       must.push(node);
       continue;
@@ -343,6 +637,37 @@ function selectVisibleGraphNodes(nodes, edges, budget, selectedId) {
   return out.slice(0, hardCap);
 }
 
+function graphNeighborhoodIds(seedIds) {
+  const seeds = new Set((seedIds || []).filter(Boolean));
+  if (!seeds.size) return seeds;
+  const keep = new Set(seeds);
+  const edges = graphState.allEdges.length ? graphState.allEdges : graphState.edges;
+  for (const edge of edges) {
+    if (seeds.has(edge.source)) keep.add(edge.target);
+    if (seeds.has(edge.target)) keep.add(edge.source);
+  }
+  return keep;
+}
+
+function exactGraphFocusIds(query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return [];
+  const workMatch = q.match(/^(?:ab#|#)?(\d{3,7})$/i);
+  const workId = workMatch ? workMatch[1] : "";
+  const ids = [];
+  for (const node of graphState.allNodes) {
+    const nodeId = String(node.id || "").toLowerCase();
+    if (nodeId === q || (q.startsWith("node_") && nodeId.startsWith(q))) {
+      ids.push(node.id);
+      continue;
+    }
+    const meta = node.metadata || {};
+    const nodeWork = String(meta.work_item_id || meta.workItemId || "").trim();
+    if (workId && nodeWork === workId) ids.push(node.id);
+  }
+  return ids;
+}
+
 function applyGraphVisibility() {
   const query = graphState.searchQuery.trim().toLowerCase();
   const group = graphState.groupFilter || "";
@@ -362,8 +687,13 @@ function applyGraphVisibility() {
     }
     baseNodes = graphState.allNodes.filter(node => keep.has(node.id));
   }
+  const focusSeeds = [];
+  if (graphState.neighborhoodId) focusSeeds.push(graphState.neighborhoodId);
+  focusSeeds.push(...exactGraphFocusIds(query));
+  const neighborhood = focusSeeds.length ? graphNeighborhoodIds(focusSeeds) : null;
   const filteredNodes = baseNodes.filter(node => {
-    if (group && group !== "Projects" && node.group !== group) return false;
+    if (group && group !== "Projects" && node.group !== group && node.id !== graphState.neighborhoodId) return false;
+    if (neighborhood) return neighborhood.has(node.id);
     if (!query) return true;
     const meta = node.metadata || {};
     const haystack = [
@@ -403,20 +733,35 @@ function updateGraphDensityHint() {
   if (!total || shown >= total) {
     el.hidden = true;
     el.textContent = "";
+    el.removeAttribute("title");
     return;
   }
   el.hidden = false;
-  el.textContent = `Showing ${shown} of ${total} node(s) · density ${graphState.densityLevel}/5 · fair by source`;
+  const text = `${shown} of ${total} · ${graphDensityLabel()}`;
+  el.textContent = text;
+  el.title = `Showing ${shown} of ${total} nodes (${graphDensityLabel()}).`;
 }
 
 async function loadGraph() {
+  const loadId = ++graphLoadGeneration;
+  setGraphLoading(true);
+  try {
   await syncGraphFilters();
   const taskFilterValue = document.querySelector("#graph-task-filter")?.value || "";
   const providerFilterValue = document.querySelector("#graph-provider-filter")?.value || "";
   const pinnedOnly = document.querySelector("#graph-pinned-filter")?.checked;
   graphState.searchQuery = document.querySelector("#graph-search")?.value || "";
   graphState.groupFilter = document.querySelector("#graph-group-filter")?.value || "";
-  graphState.densityLevel = Number(document.querySelector("#graph-density-level")?.value || graphState.densityLevel || 2);
+  // Manual overrides only: auto density/size/spread are applied after the payload arrives.
+  if (!graphState.densityAuto) {
+    graphState.densityLevel = graphDensityPercent(document.querySelector("#graph-density-level")?.value || graphState.densityLevel || 40);
+  }
+  if (!graphState.sizeAuto) {
+    graphState.nodeSize = Number(document.querySelector("#graph-node-size")?.value || graphState.nodeSize || 5);
+  }
+  if (!graphState.spreadAuto) {
+    graphState.nodeSpread = Number(document.querySelector("#graph-node-spread")?.value || graphState.nodeSpread || 1);
+  }
   const sourceFilter = document.querySelector("#graph-source-filter");
   const scopeFilter = document.querySelector("#graph-scope-filter");
   const selectedSource = sourceFilter ? sourceFilter.value : "";
@@ -433,6 +778,7 @@ async function loadGraph() {
   params.push(`limit=${graphBackendLimit()}`);
   
   const payload = await api(`/api/graph?${params.join("&")}`);
+  if (loadId !== graphLoadGeneration) return;
   const sourceOptions = Array.isArray(payload.sources) ? payload.sources : [];
   if (sourceFilter) {
     const current = sourceFilter.value;
@@ -460,16 +806,32 @@ async function loadGraph() {
     .filter(node => !selectedScope || node.scope === selectedScope);
   const allVisible = new Set(graphState.allNodes.map(node => node.id));
   graphState.allEdges = payload.edges.filter(edge => allVisible.has(edge.source) && allVisible.has(edge.target));
-  if (graphState.selectedId && !allVisible.has(graphState.selectedId)) graphState.selectedId = "";
+  if (graphState.neighborhoodId && allVisible.has(graphState.neighborhoodId)) {
+    graphState.selectedId = graphState.neighborhoodId;
+  } else if (graphState.selectedId && !allVisible.has(graphState.selectedId)) {
+    graphState.selectedId = "";
+  }
+  resizeGraphCanvas();
+  applyGraphAutoLayout();
+  syncGraphFiltersDisclosure();
   applyGraphVisibility();
   graphState.physicsTicks = 0;
   graphState.physicsMax = Math.max(50, Math.round(140 / Math.sqrt(Math.max(1, graphState.nodes.length) / 50)));
   graphState.physicsActive = true;
-  seedGraphParticles();
+  graphState.simAlpha = 1;
+  graphState.simAlphaTarget = 0;
+  graphState.fittedAfterSettle = false;
+  seedGraphParticles({ relayout: true });
   bindGraphOnce();
   const needle = searchQuery.toLowerCase();
   let focusNode = null;
-  if (needle) {
+  if (graphState.neighborhoodId) {
+    focusNode =
+      graphState.nodes.find(node => node.id === graphState.neighborhoodId)
+      || graphState.allNodes.find(node => node.id === graphState.neighborhoodId)
+      || null;
+  }
+  if (!focusNode && needle) {
     focusNode =
       graphState.nodes.find(node => String(node.id || "").toLowerCase() === needle)
       || graphState.allNodes.find(node => String(node.id || "").toLowerCase() === needle)
@@ -481,60 +843,92 @@ async function loadGraph() {
   if (focusNode) {
     graphState.selectedId = focusNode.id;
     applyGraphVisibility();
-    seedGraphParticles();
+    seedGraphParticles({ relayout: true });
     renderGraphSelection(focusNode);
   } else {
-    renderGraphSelection(graphState.nodes.find(node => node.id === graphState.selectedId) || graphState.nodes[0] || null);
+    renderGraphSelection(graphState.nodes.find(node => node.id === graphState.selectedId) || null);
   }
   startGraphAnimation();
   graphState.userZoomed = false;
-  requestAnimationFrame(() => {
-    fitGraphToView();
-    requestAnimationFrame(() => fitGraphToView());
-  });
+  syncGraphViewChrome();
+  if (isGalaxyView()) {
+    requestAnimationFrame(() => {
+      fitGraphToView();
+      requestAnimationFrame(() => fitGraphToView());
+    });
+  } else {
+    graphState.scale = 1;
+    graphState.offsetX = 0;
+    graphState.offsetY = 0;
+    graphState.fittedAfterSettle = false;
+  }
+  } finally {
+    if (loadId === graphLoadGeneration) setGraphLoading(false);
+  }
 }
 
-function seedGraphParticles() {
+function reheatGraphForce(alpha = 0.9) {
+  if (isGalaxyView()) return;
+  graphState.simAlpha = Math.max(graphState.simAlpha || 0, Number(alpha) || 0.9);
+  graphState.simAlphaTarget = 0;
+  graphState.physicsActive = true;
+  graphState.physicsTicks = 0;
+  graphState.fittedAfterSettle = false;
+  wakeGraphAnimation();
+}
+
+function scaleMapLayout(factor) {
+  const list = graphState.particles;
+  const scale = Number(factor);
+  if (!list.length || !Number.isFinite(scale) || scale === 1 || scale <= 0) return;
+  let cx = 0;
+  let cy = 0;
+  for (const particle of list) {
+    cx += particle.x;
+    cy += particle.y;
+  }
+  const n = list.length;
+  cx /= n;
+  cy /= n;
+  for (const particle of list) {
+    particle.x = cx + (particle.x - cx) * scale;
+    particle.y = cy + (particle.y - cy) * scale;
+    particle.vx = 0;
+    particle.vy = 0;
+  }
+}
+
+function seedGraphParticles({ relayout = false } = {}) {
   const canvas = document.querySelector("#graph-canvas");
   const width = canvas?.width || 800;
   const height = canvas?.height || 600;
   const existing = new Map(graphState.particles.map(item => [item.id, item]));
-  const byType = new Map();
-  for (const node of graphState.nodes) {
-    const key = node.group || node.type || "Other";
-    if (!byType.has(key)) byType.set(key, []);
-    byType.get(key).push(node);
-  }
-  const typeKeys = [...byType.keys()];
-  const cx = width / 2;
-  const cy = height / 2;
-  const groupRadius = Math.min(width, height) * 0.28;
-  const next = [];
-  typeKeys.forEach((type, typeIndex) => {
-    const group = byType.get(type) || [];
-    const baseAngle = (typeIndex / Math.max(typeKeys.length, 1)) * Math.PI * 2;
-    const gx = cx + Math.cos(baseAngle) * groupRadius;
-    const gy = cy + Math.sin(baseAngle) * groupRadius;
-    group.forEach((node, index) => {
-      const old = existing.get(node.id);
-      if (old && Number.isFinite(old.x) && Number.isFinite(old.y)) {
-        next.push({ ...old, node, vx: 0, vy: 0 });
-        return;
-      }
-      const angle = (index / Math.max(group.length, 1)) * Math.PI * 2;
-      const radius = 28 + (index % 9) * 10;
-      next.push({
-        id: node.id,
-        node,
-        x: gx + Math.cos(angle) * radius,
-        y: gy + Math.sin(angle) * radius,
-        z: ((index % 7) - 3) / 3,
-        vx: 0,
-        vy: 0,
-      });
-    });
+  graphState.particles = graphState.nodes.map((node, index) => {
+    const old = existing.get(node.id);
+    const keep = !relayout && old && Number.isFinite(old.x) && Number.isFinite(old.y);
+    return {
+      id: node.id,
+      node,
+      x: keep ? old.x : undefined,
+      y: keep ? old.y : undefined,
+      z: old && Number.isFinite(old.z) ? old.z : ((index % 7) - 3) / 3,
+      vx: keep && Number.isFinite(old.vx) ? old.vx : 0,
+      vy: keep && Number.isFinite(old.vy) ? old.vy : 0,
+      fx: undefined,
+      fy: undefined,
+      gx: old && Number.isFinite(old.gx) ? old.gx : undefined,
+      gy: old && Number.isFinite(old.gy) ? old.gy : undefined,
+      gz: old && Number.isFinite(old.gz) ? old.gz : undefined,
+      gvx: 0,
+      gvy: 0,
+      gvz: 0,
+    };
   });
-  graphState.particles = next;
+  seedForcePositions(graphState.particles, { width, height, force: relayout });
+  graphState.simAlpha = relayout ? 1 : Math.max(graphState.simAlpha || 0, 0.4);
+  graphState.simAlphaTarget = 0;
+  graphState.fittedAfterSettle = false;
+  if (isGalaxyView()) ensureGalaxyLayout({ force: !galaxyHasPositions(graphState.particles) });
 }
 
 function syncGraphFiltersDisclosure() {
@@ -546,9 +940,8 @@ function syncGraphFiltersDisclosure() {
   const provider = document.querySelector("#graph-provider-filter")?.value || "";
   const pinned = Boolean(document.querySelector("#graph-pinned-filter")?.checked);
   const colorMode = document.querySelector("#graph-color-mode")?.value || "community";
-  const density = Number(document.querySelector("#graph-density-level")?.value || 2);
-  const active = Boolean(source || scope || task || provider || pinned || colorMode !== "community" || density !== 2);
-  if (active) details.open = true;
+  const manualLayout = !graphState.densityAuto || !graphState.sizeAuto || !graphState.spreadAuto;
+  const active = Boolean(source || scope || task || provider || pinned || colorMode !== "community" || manualLayout);
   const summary = details.querySelector(".graph-filters-summary");
   if (summary) summary.textContent = active ? "More filters · on" : "More filters";
 }
@@ -566,11 +959,18 @@ function bindGraphOnce() {
   const groupFilter = document.querySelector("#graph-group-filter");
   const searchInput = document.querySelector("#graph-search");
   const densityInput = document.querySelector("#graph-density-level");
+  const nodeSizeInput = document.querySelector("#graph-node-size");
+  const nodeSpreadInput = document.querySelector("#graph-node-spread");
   const fitButton = document.querySelector("#graph-fit");
   const expandButton = document.querySelector("#graph-expand");
   const rebuildButton = document.querySelector("#graph-rebuild-links");
   const inspectHint = document.querySelector("#graph-inspect-hint");
-  if (inspectHint) inspectHint.textContent = t("graph.inspectHint");
+  if (inspectHint) inspectHint.textContent = t(isGalaxyView() ? "graph.inspectHintGalaxy" : "graph.inspectHint");
+  bindGraphNodeModalControls();
+  syncGraphViewChrome();
+  document.querySelectorAll("[data-graph-view]").forEach(button => {
+    button.addEventListener("click", () => setGraphView(button.getAttribute("data-graph-view")));
+  });
   const colorModeSelect = document.querySelector("#graph-color-mode");
   on(colorModeSelect, "change", () => {
     // Color depends only on data already in the payload — recolor, don't refetch.
@@ -604,18 +1004,21 @@ function bindGraphOnce() {
     graphState.physicsTicks = 0;
     graphState.physicsActive = true;
     applyGraphVisibility();
-    seedGraphParticles();
+    seedGraphParticles({ relayout: true });
     fitGraphToView();
     wakeGraphAnimation();
   });
   on(searchInput, "input", () => {
     graphState.searchQuery = searchInput.value || "";
+    if (graphState.neighborhoodId && searchInput.value.trim() !== graphState.neighborhoodId) {
+      graphState.neighborhoodId = "";
+    }
     graphState.physicsTicks = 0;
     graphState.physicsActive = true;
     // Local filter for already-loaded nodes (label/text), then debounced backend
     // fetch so ID search can find nodes outside the density budget.
     applyGraphVisibility();
-    seedGraphParticles();
+    seedGraphParticles({ relayout: true });
     fitGraphToView();
     wakeGraphAnimation();
     clearTimeout(graphState.searchTimer);
@@ -631,32 +1034,113 @@ function bindGraphOnce() {
   });
   if (densityInput) {
     const densityValue = document.querySelector("#graph-density-value");
-    const syncDensityBadge = () => { if (densityValue) densityValue.textContent = String(densityInput.value || "2"); };
+    const syncDensityBadge = () => {
+      if (!densityValue) return;
+      graphState.densityLevel = graphDensityPercent(densityInput.value || 40);
+      densityValue.textContent = graphDensityLabel();
+    };
+    const applyDensity = () => {
+      graphState.densityAuto = false;
+      syncDensityBadge();
+      syncGraphFiltersDisclosure();
+      if (!graphState.allNodes.length) {
+        loadGraph().catch(showError);
+        return;
+      }
+      applyGraphVisibility();
+      seedGraphParticles({ relayout: true });
+      if (!graphState.userZoomed) fitGraphToView();
+      wakeGraphAnimation();
+    };
     syncDensityBadge();
-    on(densityInput, "input", () => {
-      syncDensityBadge();
+    on(densityInput, "input", applyDensity);
+    on(densityInput, "change", applyDensity);
+  }
+  if (nodeSizeInput) {
+    const nodeSizeValue = document.querySelector("#graph-node-size-value");
+    const syncNodeSize = () => {
+      graphState.nodeSize = Number(nodeSizeInput.value || 5);
+      if (nodeSizeValue) nodeSizeValue.textContent = String(graphState.nodeSize);
+    };
+    syncNodeSize();
+    on(nodeSizeInput, "input", () => {
+      graphState.sizeAuto = false;
+      syncNodeSize();
       syncGraphFiltersDisclosure();
+      graphState.physicsActive = true;
+      wakeGraphAnimation();
+      drawGraph();
     });
-    on(densityInput, "change", () => {
-      syncDensityBadge();
+    on(nodeSizeInput, "change", () => {
+      graphState.sizeAuto = false;
+      syncNodeSize();
       syncGraphFiltersDisclosure();
-      loadGraph().catch(showError);
+      graphState.physicsActive = true;
+      wakeGraphAnimation();
+      drawGraph();
+    });
+  }
+  if (nodeSpreadInput) {
+    const nodeSpreadValue = document.querySelector("#graph-node-spread-value");
+    const syncNodeSpread = () => {
+      graphState.nodeSpread = Number(nodeSpreadInput.value || 1);
+      if (nodeSpreadValue) nodeSpreadValue.textContent = String(graphState.nodeSpread);
+    };
+    syncNodeSpread();
+    on(nodeSpreadInput, "input", () => {
+      graphState.spreadAuto = false;
+      const previous = Math.max(1, Number(graphState.nodeSpread) || 1);
+      syncNodeSpread();
+      syncGraphFiltersDisclosure();
+      const next = Math.max(1, Number(graphState.nodeSpread) || 1);
+      if (isGalaxyView()) {
+        scaleGalaxyPositions(graphState.particles, next / previous);
+        graphState.galaxyLaidSpread = next;
+        if (!graphState.userZoomed) frameGalaxy();
+      }
+      graphState.physicsActive = true;
+      if (!isGalaxyView()) reheatGraphForce(0.85);
+      wakeGraphAnimation();
+      drawGraph();
+    });
+    on(nodeSpreadInput, "change", () => {
+      graphState.spreadAuto = false;
+      syncNodeSpread();
+      syncGraphFiltersDisclosure();
+      graphState.physicsActive = true;
+      wakeGraphAnimation();
     });
   }
   syncGraphFiltersDisclosure();
+  const filtersMore = document.querySelector(".graph-filters-more");
+  const closeGraphFiltersMore = event => {
+    if (!filtersMore?.open) return;
+    if (event.type === "keydown" && event.key !== "Escape") return;
+    if (event.type !== "keydown" && filtersMore.contains(event.target)) return;
+    filtersMore.open = false;
+  };
+  document.addEventListener("click", closeGraphFiltersMore);
+  document.addEventListener("keydown", closeGraphFiltersMore);
   on(fitButton, "click", () => {
     graphState.userZoomed = false;
+    if (isGalaxyView()) {
+      frameGalaxy();
+      wakeGraphAnimation();
+      return;
+    }
     fitGraphToView();
   });
   on(expandButton, "click", () => toggleGraphExpand(true));
   on("#graph-fit-expanded", "click", () => {
     graphState.userZoomed = false;
+    if (isGalaxyView()) {
+      frameGalaxy();
+      wakeGraphAnimation();
+      return;
+    }
     fitGraphToView();
   });
   on("#graph-close-expand", "click", () => toggleGraphExpand(false));
-  document.querySelectorAll("[data-close-graph-node-modal]").forEach(el => {
-    el.addEventListener("click", () => closeGraphNodeModal());
-  });
   on(rebuildButton, "click", async () => {
     const summary = document.querySelector("#graph-link-summary");
     if (summary) {
@@ -676,15 +1160,42 @@ function bindGraphOnce() {
     const panel = document.querySelector("#graph-suggest-panel");
     if (panel) panel.hidden = true;
   });
+  canvas.addEventListener("contextmenu", event => {
+    if (isGalaxyView() || graphState.mapPanning) event.preventDefault();
+  });
   canvas.addEventListener("pointerdown", event => {
+    if (isGalaxyView()) {
+      const hit = hitGraphNode(event);
+      graphState.dragMoved = false;
+      graphState.draggingId = "";
+      graphState.galaxyHitId = event.button === 0 && !wantsGalaxyPan(event) && hit ? hit.id : "";
+      graphState.galaxyPan = wantsGalaxyPan(event);
+      graphState.orbiting = true;
+      graphState.orbitLastX = event.clientX;
+      graphState.orbitLastY = event.clientY;
+      canvas.setPointerCapture(event.pointerId);
+      syncGraphViewChrome();
+      wakeGraphAnimation();
+      return;
+    }
     const hit = hitGraphNode(event);
-    if (hit) {
+    if (hit && event.button === 0 && !event.shiftKey) {
       graphState.draggingId = hit.id;
       graphState.dragMoved = false;
+      hit.fx = hit.x;
+      hit.fy = hit.y;
+      graphState.simAlphaTarget = 0.3;
+      graphState.physicsActive = true;
       selectGraphNode(hit.node, { openModal: false });
       canvas.setPointerCapture(event.pointerId);
       wakeGraphAnimation();
+      return;
     }
+    graphState.mapPanning = true;
+    graphState.dragMoved = false;
+    graphState.orbitLastX = event.clientX;
+    graphState.orbitLastY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
   });
   canvas.addEventListener("pointermove", event => {
     const hit = hitGraphNode(event);
@@ -692,6 +1203,41 @@ function bindGraphOnce() {
     if (nextHoverId !== graphState.hoverId) {
       graphState.hoverId = nextHoverId;
       wakeGraphAnimation();
+    }
+    if (isGalaxyView() && graphState.orbiting) {
+      const dx = event.clientX - graphState.orbitLastX;
+      const dy = event.clientY - graphState.orbitLastY;
+      if (Math.hypot(dx, dy) > 8) {
+        graphState.dragMoved = true;
+        graphState.userZoomed = true;
+      }
+      graphState.orbitLastX = event.clientX;
+      graphState.orbitLastY = event.clientY;
+      if (graphState.galaxyPan) {
+        const rect = canvas.getBoundingClientRect();
+        const sx = canvas.width / Math.max(rect.width, 1);
+        const sy = canvas.height / Math.max(rect.height, 1);
+        panGalaxyCamera(graphState.galaxyCamera, dx * sx, dy * sy, canvas.width, canvas.height);
+      } else {
+        orbitGalaxyCamera(graphState.galaxyCamera, dx, dy);
+      }
+      wakeGraphAnimation();
+      return;
+    }
+    if (graphState.mapPanning) {
+      const dx = event.clientX - graphState.orbitLastX;
+      const dy = event.clientY - graphState.orbitLastY;
+      if (Math.hypot(dx, dy) > 8) {
+        graphState.dragMoved = true;
+        graphState.userZoomed = true;
+      }
+      graphState.orbitLastX = event.clientX;
+      graphState.orbitLastY = event.clientY;
+      const rect = canvas.getBoundingClientRect();
+      graphState.offsetX += dx * (canvas.width / Math.max(rect.width, 1));
+      graphState.offsetY += dy * (canvas.height / Math.max(rect.height, 1));
+      wakeGraphAnimation();
+      return;
     }
     if (graphState.draggingId) {
       const point = graphPointer(event);
@@ -702,6 +1248,8 @@ function bindGraphOnce() {
         if (Math.hypot(dx, dy) > 2) graphState.dragMoved = true;
         particle.x = point.x;
         particle.y = point.y;
+        particle.fx = point.x;
+        particle.fy = point.y;
         particle.vx = 0;
         particle.vy = 0;
       }
@@ -713,8 +1261,43 @@ function bindGraphOnce() {
     wakeGraphAnimation();
   });
   canvas.addEventListener("pointerup", event => {
+    const wasMapPanning = graphState.mapPanning;
+    const noDrag = !graphState.dragMoved;
+    const galaxyClick = isGalaxyView() && graphState.orbiting && !graphState.galaxyPan && noDrag && event.button === 0;
+    const hitId = graphState.galaxyHitId;
     graphState.draggingId = "";
+    graphState.orbiting = false;
+    graphState.galaxyPan = false;
+    graphState.mapPanning = false;
+    graphState.galaxyHitId = "";
+    graphState.simAlphaTarget = 0;
+    for (const particle of graphState.particles) {
+      particle.fx = undefined;
+      particle.fy = undefined;
+    }
     try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+    if (galaxyClick) {
+      const particle = hitId ? graphState.particles.find(item => item.id === hitId) : null;
+      selectGraphNode(particle?.node || null);
+    } else if (!isGalaxyView() && wasMapPanning && noDrag && event.button === 0) {
+      selectGraphNode(null);
+    }
+    syncGraphViewChrome();
+    wakeGraphAnimation();
+  });
+  canvas.addEventListener("pointercancel", () => {
+    graphState.draggingId = "";
+    graphState.orbiting = false;
+    graphState.galaxyPan = false;
+    graphState.mapPanning = false;
+    graphState.galaxyHitId = "";
+    graphState.simAlphaTarget = 0;
+    for (const particle of graphState.particles) {
+      particle.fx = undefined;
+      particle.fy = undefined;
+    }
+    syncGraphViewChrome();
+    wakeGraphAnimation();
   });
   canvas.addEventListener("dblclick", event => {
     event.preventDefault();
@@ -726,6 +1309,19 @@ function bindGraphOnce() {
     event.preventDefault();
     const canvasEl = document.querySelector("#graph-canvas");
     if (!canvasEl) return;
+    if (isGalaxyView()) {
+      if (event.shiftKey) {
+        const rect = canvasEl.getBoundingClientRect();
+        const sx = canvasEl.width / Math.max(rect.width, 1);
+        const sy = canvasEl.height / Math.max(rect.height, 1);
+        panGalaxyCamera(graphState.galaxyCamera, -event.deltaX * sx, -event.deltaY * sy, canvasEl.width, canvasEl.height);
+      } else {
+        dollyGalaxyCamera(graphState.galaxyCamera, event.deltaY);
+      }
+      graphState.userZoomed = true;
+      wakeGraphAnimation();
+      return;
+    }
     const rect = canvasEl.getBoundingClientRect();
     const ratioX = canvasEl.width / Math.max(rect.width, 1);
     const ratioY = canvasEl.height / Math.max(rect.height, 1);
@@ -742,18 +1338,13 @@ function bindGraphOnce() {
     wakeGraphAnimation();
   }, { passive: false });
   window.addEventListener("resize", () => {
-    resizeGraphCanvas();
+    const resized = resizeGraphCanvas();
+    if (resized) applyGraphAutoLayout({ reseed: true });
     if (!graphState.userZoomed) fitGraphToView();
     wakeGraphAnimation();
   });
-  document.addEventListener("keydown", event => {
-    if (event.key !== "Escape") return;
-    if (graphState.modalOpen) {
-      closeGraphNodeModal();
-      event.preventDefault();
-      return;
-    }
-    if (graphState.expanded) toggleGraphExpand(false);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) wakeGraphAnimation();
   });
   observeGraphStage();
 }
@@ -767,11 +1358,15 @@ function toggleGraphExpand(open) {
   graphState.expanded = open;
   if (open) {
     expandStage.appendChild(canvas);
+    const loading = document.querySelector("#graph-loading");
+    if (loading) expandStage.appendChild(loading);
     overlay.removeAttribute("hidden");
     document.body.style.overflow = "hidden";
     releaseGraphExpandFocus = trapFocus(overlay);
   } else {
     normalStage.appendChild(canvas);
+    const loading = document.querySelector("#graph-loading");
+    if (loading) normalStage.appendChild(loading);
     overlay.setAttribute("hidden", "");
     document.body.style.overflow = "";
     if (releaseGraphExpandFocus) {
@@ -781,19 +1376,23 @@ function toggleGraphExpand(open) {
   }
   resizeGraphCanvas();
   graphState.userZoomed = false;
+  applyGraphAutoLayout({ reseed: true });
+  if (!graphState.densityAuto && !graphState.sizeAuto && !graphState.spreadAuto) {
+    seedGraphParticles({ relayout: true });
+  }
   fitGraphToView();
 }
 
 function resizeGraphCanvas() {
   const canvas = document.querySelector("#graph-canvas");
   const stage = canvas?.closest(".graph-stage, .graph-expand-stage");
-  if (!canvas || !stage) return;
+  if (!canvas || !stage) return false;
   const rect = stage.getBoundingClientRect();
-  if (rect.width < 8 || rect.height < 8) return;
+  if (rect.width < 8 || rect.height < 8) return false;
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(320, Math.floor(rect.width * ratio));
   const height = Math.max(240, Math.floor(rect.height * ratio));
-  if (canvas.width === width && canvas.height === height) return;
+  if (canvas.width === width && canvas.height === height) return false;
   canvas.width = width;
   canvas.height = height;
   if (graphState.particles.length && !graphState.userZoomed) {
@@ -801,12 +1400,14 @@ function resizeGraphCanvas() {
   } else if (!graphState.particles.length) {
     seedGraphParticles();
   }
+  return true;
 }
 
 function observeGraphStage() {
   if (graphState.stageObserver) return;
   graphState.stageObserver = new ResizeObserver(() => {
-    resizeGraphCanvas();
+    const resized = resizeGraphCanvas();
+    if (resized) applyGraphAutoLayout({ reseed: true });
     if (!graphState.userZoomed) fitGraphToView();
   });
   const normal = document.querySelector(".memory-graph-section .graph-stage");
@@ -822,15 +1423,26 @@ function sanitizeGraphParticles() {
       broken = true;
       break;
     }
+    if (isGalaxyView() && ![particle.gx, particle.gy, particle.gz].every(Number.isFinite)) {
+      broken = true;
+      break;
+    }
   }
   if (broken) {
-    seedGraphParticles();
+    seedGraphParticles({ relayout: true });
     return true;
   }
   return false;
 }
 
 function fitGraphToView() {
+  if (isGalaxyView()) {
+    resizeGraphCanvas();
+    ensureGalaxyLayout();
+    frameGalaxy();
+    wakeGraphAnimation();
+    return;
+  }
   resizeGraphCanvas();
   const canvas = document.querySelector("#graph-canvas");
   if (!canvas || !graphState.particles.length) {
@@ -846,11 +1458,11 @@ function fitGraphToView() {
   let maxX = -Infinity;
   let maxY = -Infinity;
   for (const particle of graphState.particles) {
-    const pad = graphNodeRadius(particle) + 14;
+    const pad = graphNodeRadius(particle) + 36;
     minX = Math.min(minX, particle.x - pad);
     maxX = Math.max(maxX, particle.x + pad);
     minY = Math.min(minY, particle.y - pad);
-    maxY = Math.max(maxY, particle.y + pad + 12);
+    maxY = Math.max(maxY, particle.y + pad);
   }
   if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
     seedGraphParticles();
@@ -867,7 +1479,7 @@ function fitGraphToView() {
   const availW = Math.max(1, canvas.width - padding * 2);
   const availH = Math.max(1, canvas.height - padding * 2);
   const fitScale = Math.min(availW / graphW, availH / graphH, 2.6);
-  const scale = Math.max(0.12, Number.isFinite(fitScale) ? fitScale : 1);
+  const scale = Math.max(0.04, Number.isFinite(fitScale) ? fitScale : 1);
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
   graphState.scale = scale;
@@ -894,12 +1506,26 @@ function graphPointer(event) {
 }
 
 function hitGraphNode(event) {
+  if (isGalaxyView()) {
+    const canvas = document.querySelector("#graph-canvas");
+    if (!canvas) return null;
+    const point = canvasPointFromEvent(event, canvas);
+    return hitGalaxyNode(
+      point.x,
+      point.y,
+      graphState.particles,
+      graphState.galaxyCamera,
+      canvas.width,
+      canvas.height,
+      graphState.nodeSize,
+    );
+  }
   const point = graphPointer(event);
   for (const particle of [...graphState.particles].reverse()) {
-    const radius = graphNodeRadius(particle);
+    const radius = graphNodeWorldRadius(particle);
     const dx = point.x - particle.x;
     const dy = point.y - particle.y;
-    if (Math.sqrt(dx * dx + dy * dy) <= radius + 6) return particle;
+    if (Math.sqrt(dx * dx + dy * dy) <= radius + 14 / Math.max(graphState.scale, 0.001)) return particle;
   }
   return null;
 }
@@ -910,23 +1536,48 @@ function startGraphAnimation() {
   resizeGraphCanvas();
   const tick = () => {
     graphState.animationId = 0;
-    // MF0-style cooldown: simulate briefly, then freeze so the view stays readable.
-    if (graphState.physicsActive || graphState.draggingId) {
-      stepGraphPhysics();
-      if (!graphState.draggingId) {
+    if (!graphStageVisible()) return;
+    const reduced = prefersGraphReducedMotion();
+    if (isGalaxyView()) {
+      if (!reduced || graphState.physicsActive || graphState.draggingId) {
+        ensureGalaxyLayout();
+        stepGalaxyPhysics(graphState.particles, graphState.edges, {
+          draggingId: graphState.draggingId,
+          live: !reduced,
+        });
         graphState.physicsTicks += 1;
-        if (graphState.physicsTicks >= graphState.physicsMax) {
+        if (!graphState.userZoomed && !graphState.orbiting && !graphState.draggingId) {
+          frameGalaxy({ ease: true });
+        }
+        if (reduced && !graphState.draggingId) {
+          if (graphState.physicsTicks >= Math.min(36, graphState.physicsMax)) graphState.physicsActive = false;
+        } else graphState.physicsActive = true;
+      }
+    } else {
+      const running = graphState.particles.length
+        && (graphState.physicsActive || graphState.draggingId || graphState.simAlpha > FORCE_ALPHA_MIN);
+      if (running) {
+        const settled = stepGraphPhysics({ live: !reduced });
+        if (!graphState.userZoomed && graphState.simAlpha > 0.02 && !graphState.draggingId) {
+          graphState.physicsTicks += 1;
+          if (graphState.physicsTicks % 10 === 0) fitGraphToView();
+        }
+        if (settled && !graphState.draggingId) {
           graphState.physicsActive = false;
-          if (!graphState.userZoomed) fitGraphToView();
+          if (!graphState.userZoomed && !graphState.fittedAfterSettle) {
+            graphState.fittedAfterSettle = true;
+            fitGraphToView();
+          }
+        } else {
+          graphState.physicsActive = true;
         }
       }
     }
     drawGraph();
-    // Keep ticking only while there is visible work: active physics, a drag,
-    // or a hovered node. Otherwise the canvas is static — no idle CPU burn.
-    if (graphState.physicsActive || graphState.draggingId || graphState.hoverId) {
-      graphState.animationId = requestAnimationFrame(tick);
-    }
+    const keep = isGalaxyView()
+      ? (!reduced || graphState.physicsActive || graphState.draggingId || graphState.hoverId || graphState.orbiting)
+      : (graphState.physicsActive || graphState.draggingId || graphState.hoverId || graphState.mapPanning || graphState.simAlpha > FORCE_ALPHA_MIN);
+    if (keep) graphState.animationId = requestAnimationFrame(tick);
   };
   tick();
 }
@@ -935,214 +1586,283 @@ function wakeGraphAnimation() {
   if (!graphState.animationId) startGraphAnimation();
 }
 
-function stepGraphPhysics() {
+function stepGraphPhysics({ live = true } = {}) {
   const canvas = document.querySelector("#graph-canvas");
-  if (!canvas) return;
+  if (!canvas) return true;
   const particles = graphState.particles;
-  if (!particles.length) return;
+  if (!particles.length) {
+    graphState.simAlpha = 0;
+    return true;
+  }
   sanitizeGraphParticles();
   const centerX = canvas.width / 2;
   const centerY = canvas.height / 2;
-  const byId = new Map(particles.map(item => [item.id, item]));
-  const n = particles.length;
-  // MF0 adaptive charge: consistent density across graph sizes.
-  const charge = -140 * Math.sqrt(Math.max(1, n) / 100);
-  const linkDistance = n > 80 ? 90 : 110;
-  if (n <= 140) {
-    for (let i = 0; i < n; i++) {
-      const a = particles[i];
-      for (let j = i + 1; j < n; j++) {
-        const b = particles[j];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const distance = Math.max(24, Math.sqrt(dx * dx + dy * dy));
-        const force = Math.abs(charge) / (distance * distance);
-        const fx = (dx / distance) * force;
-        const fy = (dy / distance) * force;
-        a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
-      }
-    }
-  } else {
-    const windowSize = 16;
-    for (let i = 0; i < n; i++) {
-      const a = particles[i];
-      const limit = Math.min(n, i + 1 + windowSize);
-      for (let j = i + 1; j < limit; j++) {
-        const b = particles[j];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const distance = Math.max(24, Math.sqrt(dx * dx + dy * dy));
-        const force = Math.abs(charge) * 0.55 / (distance * distance);
-        const fx = (dx / distance) * force;
-        const fy = (dy / distance) * force;
-        a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
-      }
-    }
+  const layoutEdges = graphState.edges || [];
+  const params = graphForceParams({
+    nodeSpread: graphNodeSpread(),
+    nodeCount: particles.length,
+  });
+  const ticks = live ? 1 : 24;
+  let settled = false;
+  for (let i = 0; i < ticks; i += 1) {
+    const result = stepForceSimulation(particles, layoutEdges, {
+      alpha: graphState.simAlpha,
+      alphaTarget: graphState.simAlphaTarget,
+      draggingId: graphState.draggingId,
+      centerX,
+      centerY,
+      params,
+      radiusOf: graphNodeRadius,
+    });
+    graphState.simAlpha = result.alpha;
+    settled = result.settled;
   }
-  for (const edge of graphState.edges) {
-    const a = byId.get(edge.source);
-    const b = byId.get(edge.target);
-    if (!a || !b) continue;
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-    if (!Number.isFinite(distance)) continue;
-    const force = (distance - linkDistance) * 0.01;
-    const fx = (dx / distance) * force;
-    const fy = (dy / distance) * force;
-    a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
-  }
-  // MF0 uses velocity decay ~0.22; here we apply per tick after integration.
-  const damp = 0.78;
+  const span = Math.max(canvas.width, canvas.height) * 8;
   for (const particle of particles) {
-    if (particle.id !== graphState.draggingId) {
-      particle.vx += (centerX - particle.x) * 0.00045;
-      particle.vy += (centerY - particle.y) * 0.00045;
-      particle.x += particle.vx;
-      particle.y += particle.vy;
-      particle.vx *= damp;
-      particle.vy *= damp;
-    }
     if (!Number.isFinite(particle.x) || !Number.isFinite(particle.y)) {
       particle.x = centerX;
       particle.y = centerY;
       particle.vx = 0;
       particle.vy = 0;
     } else {
-      const span = Math.max(canvas.width, canvas.height) * 4;
       particle.x = Math.max(centerX - span, Math.min(centerX + span, particle.x));
       particle.y = Math.max(centerY - span, Math.min(centerY + span, particle.y));
-      particle.vx = Math.max(-28, Math.min(28, particle.vx));
-      particle.vy = Math.max(-28, Math.min(28, particle.vy));
+      particle.vx = Math.max(-40, Math.min(40, particle.vx));
+      particle.vy = Math.max(-40, Math.min(40, particle.vy));
     }
-    particle.z = Math.max(-1, Math.min(1, Number.isFinite(particle.z) ? particle.z : 0));
   }
+  return settled && !graphState.draggingId;
 }
 
 function isDarkTheme() { return document.documentElement.dataset.theme === "dark"; }
 function graphColors() {
   if (isDarkTheme()) {
     return {
-      bg0: "#172033", bg1: "#090d17", grid: "rgba(148, 163, 184, 0.08)",
-      edge: "rgba(148, 163, 184, 0.24)", edgeActive: "rgba(125, 211, 252, 0.86)",
-      nodeStroke: "rgba(255,255,255,0.72)", nodeStrokeActive: "#e0f2fe",
-      nodeShadow: "rgba(15, 23, 42, 0.55)", nodeShadowActive: "rgba(125, 211, 252, 0.78)",
-      label: "#f8fafc", labelShadow: "rgba(0,0,0,0.55)",
+      bg0: "#07070a", bg1: "#000000",
+      edge: "rgba(180, 190, 210, 0.22)", edgeActive: "rgba(255, 255, 255, 0.92)",
+      nodeStroke: "rgba(255,255,255,0.18)", nodeStrokeActive: "rgba(255,255,255,0.95)",
+      nodeShadow: "rgba(255,255,255,0.18)", nodeShadowActive: "rgba(255,255,255,0.35)",
+      label: "rgba(245,245,247,0.92)", labelShadow: "rgba(0,0,0,0.85)",
     };
   }
   return {
-    bg0: "#ffffff", bg1: "#e7ecf6", grid: "rgba(71, 85, 105, 0.09)",
-    edge: "rgba(71, 85, 105, 0.30)", edgeActive: "rgba(99, 102, 241, 0.85)",
-    nodeStroke: "rgba(255,255,255,0.95)", nodeStrokeActive: "#6366f1",
-    nodeShadow: "rgba(15, 23, 42, 0.20)", nodeShadowActive: "rgba(99, 102, 241, 0.5)",
-    label: "#1e293b", labelShadow: "rgba(255,255,255,0.85)",
+    bg0: "#f4f4f5", bg1: "#ececee",
+    edge: "rgba(24, 24, 27, 0.18)", edgeActive: "rgba(24, 24, 27, 0.72)",
+    nodeStroke: "rgba(24,24,27,0.12)", nodeStrokeActive: "rgba(24,24,27,0.7)",
+    nodeShadow: "rgba(24,24,27,0.12)", nodeShadowActive: "rgba(24,24,27,0.22)",
+    label: "#18181b", labelShadow: "rgba(255,255,255,0.75)",
   };
 }
 
 function drawGraph() {
   const canvas = document.querySelector("#graph-canvas");
   if (!canvas) return;
+  if (isGalaxyView()) {
+    ensureGalaxyLayout();
+    const ctx = canvas.getContext("2d");
+    drawGalaxy(ctx, canvas, {
+      particles: graphState.particles,
+      edges: graphState.edges,
+      camera: graphState.galaxyCamera,
+      selectedId: graphState.selectedId,
+      hoverId: graphState.hoverId,
+      nodeColor: graphNodeColor,
+      nodeSize: graphState.nodeSize,
+      labelText: graphLabelText,
+      alwaysLabel: graphLabelAlwaysVisible,
+      reducedMotion: prefersGraphReducedMotion(),
+    });
+    return;
+  }
   const ctx = canvas.getContext("2d");
   const colors = graphColors();
   const scale = Math.max(graphState.scale, 0.001);
   const inv = 1 / scale;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const gradient = ctx.createRadialGradient(canvas.width * 0.52, canvas.height * 0.45, 20, canvas.width * 0.5, canvas.height * 0.5, canvas.width * 0.75);
-  gradient.addColorStop(0, colors.bg0);
-  gradient.addColorStop(1, colors.bg1);
-  ctx.fillStyle = gradient;
+  ctx.fillStyle = colors.bg1;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  drawGraphGrid(ctx, canvas, colors);
+  const glow = ctx.createRadialGradient(canvas.width * 0.5, canvas.height * 0.48, 12, canvas.width * 0.5, canvas.height * 0.5, Math.max(canvas.width, canvas.height) * 0.7);
+  glow.addColorStop(0, colors.bg0);
+  glow.addColorStop(1, colors.bg1);
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
   if (![scale, graphState.offsetX, graphState.offsetY].every(Number.isFinite)) return;
   ctx.setTransform(scale, 0, 0, scale, graphState.offsetX, graphState.offsetY);
   const byId = new Map(graphState.particles.map(item => [item.id, item]));
+  const focusId = graphState.hoverId;
+  const linked = new Set(focusId ? [focusId] : []);
+  if (focusId) {
+    for (const edge of graphState.edges) {
+      if (edge.source === focusId) linked.add(edge.target);
+      if (edge.target === focusId) linked.add(edge.source);
+    }
+  }
+  const isolating = Boolean(focusId);
   for (const edge of graphState.edges) {
     const a = byId.get(edge.source);
     const b = byId.get(edge.target);
     if (!a || !b) continue;
-    const active = graphState.selectedId && (edge.source === graphState.selectedId || edge.target === graphState.selectedId);
-    // Machine-inferred links (similarity/auto/LLM) render dashed and faint so
-    // they read as "guessed", explicit relationships as solid.
-    const inferred = edge.provenance === "INFERRED";
+    const inferred = String(edge.provenance || "").toUpperCase() === "INFERRED";
+    const hot = graphState.selectedId && (edge.source === graphState.selectedId || edge.target === graphState.selectedId);
+    const active = (focusId && (edge.source === focusId || edge.target === focusId)) || hot;
+    if (inferred && !active) continue;
+    const rgb = mixGraphEdgeColor(graphNodeColor(a.node), graphNodeColor(b.node));
+    let alpha = active ? 0.92 : inferred ? 0.18 : 0.38;
+    if (isolating && !active) alpha *= 0.12;
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
-    ctx.strokeStyle = active ? colors.edgeActive : (graphCodeEdgeColors[edge.type] || colors.edge);
-    // Keep strokes screen-constant so zoom/fit never produces a thick blur smear.
-    ctx.lineWidth = (active ? 2.2 : inferred ? 0.7 : 1.1) * inv;
-    ctx.globalAlpha = active ? 1 : inferred ? 0.5 : 0.85;
-    ctx.setLineDash(inferred && !active ? [4 * inv, 4 * inv] : []);
+    ctx.strokeStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${alpha})`;
+    ctx.lineWidth = (active ? 1.7 : 0.9) * inv;
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
     ctx.stroke();
   }
   ctx.globalAlpha = 1;
-  ctx.setLineDash([]);
-  for (const particle of [...graphState.particles].sort((a, b) => a.z - b.z)) {
-    drawGraphNode(ctx, particle, colors, inv);
+  for (const particle of graphState.particles) {
+    drawGraphNode(ctx, particle, colors, inv, isolating && !linked.has(particle.id));
   }
+  drawGraphLabels(ctx, graphState.particles, colors, scale, inv);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 
-function drawGraphGrid(ctx, canvas, colors) {
+function mixGraphEdgeColor(a, b) {
+  const left = parseGraphColor(a);
+  const right = parseGraphColor(b);
+  return {
+    r: Math.round((left.r + right.r) / 2),
+    g: Math.round((left.g + right.g) / 2),
+    b: Math.round((left.b + right.b) / 2),
+  };
+}
+
+function graphNodeRadius(particle) {
+  const size = Math.max(3, Math.min(12, Number(graphState.nodeSize) || 5));
+  const degree = Number(particle?.node?.degree) || 0;
+  const hub = particle?.node?.type === "Project" ? 1.35 : 1;
+  return Math.max(2.1, size * hub * (0.3 + Math.log1p(degree) * 0.18));
+}
+
+function graphNodeWorldRadius(particle) {
+  return graphNodeRadius(particle);
+}
+
+function graphNodeSpread() {
+  return Math.max(1, Math.min(20, Number(graphState.nodeSpread) || 1));
+}
+
+function isGraphParentNode(node) {
+  const meta = node?.metadata || {};
+  return Boolean(meta.hub || meta.scope_root || meta.synthetic)
+    || node?.type === "Project"
+    || node?.type === "Task"
+    || node?.type === "Provider";
+}
+
+function drawGraphNode(ctx, particle, colors, inv = 1, dim = false) {
+  colors = colors || graphColors();
+  const node = particle.node;
+  const radius = graphNodeWorldRadius(particle);
+  const color = graphNodeColor(node);
+  const active = particle.id === graphState.selectedId;
+  const hover = particle.id === graphState.hoverId;
+  const superseded = Boolean(node.superseded || node?.metadata?.invalid_at);
   ctx.save();
-  ctx.strokeStyle = colors.grid;
-  ctx.lineWidth = 1;
-  const gap = 64;
-  for (let x = canvas.width % gap; x < canvas.width; x += gap) {
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+  ctx.globalAlpha = dim ? 0.16 : superseded ? 0.32 : 1;
+  if (!dim && (active || hover)) {
+    ctx.beginPath();
+    ctx.arc(particle.x, particle.y, radius * (active ? 2.4 : 1.9), 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.globalAlpha = active ? 0.28 : 0.18;
+    ctx.fill();
+    ctx.globalAlpha = dim ? 0.16 : 1;
   }
-  for (let y = canvas.height % gap; y < canvas.height; y += gap) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(particle.x, particle.y, radius + (hover ? 0.6 * inv : 0), 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  if (active) {
+    ctx.lineWidth = 1.4 * inv;
+    ctx.strokeStyle = colors.nodeStrokeActive;
+    ctx.stroke();
   }
   ctx.restore();
 }
 
-function graphNodeRadius(particle) {
-  const node = particle.node;
-  // Symbols are numerous and fine-grained: draw them smaller than knowledge
-  // nodes (classes a touch larger than functions) so files/decisions still lead.
-  const symbolBase = (node.metadata && node.metadata.kind === "Class") ? 8 : 6;
-  const base = node.type === "Project" ? 18 : node.type === "Symbol" ? symbolBase : node.pinned ? 14 : 10;
-  // God-node sizing: the more connected a node, the bigger it reads.
-  const degree = Math.max(0, Number(node.degree) || 0);
-  const degreeBoost = Math.min(9, Math.sqrt(degree) * 2.2);
-  return base + degreeBoost + particle.z * 2;
+function graphLabelText(node) {
+  const raw = String(node?.label || "");
+  return raw.length > 22 ? `${raw.slice(0, 21)}…` : raw;
 }
 
-function drawGraphNode(ctx, particle, colors, inv = 1) {
-  colors = colors || graphColors();
+function graphLabelFontPx(inv) {
+  return Math.max(10, 11 * Math.min(inv, 1.35));
+}
+
+/** Main hubs keep a persistent label; leaves only appear on hover/selection. */
+function graphLabelAlwaysVisible(node) {
+  return Boolean(node?.pinned) || isGraphParentNode(node);
+}
+
+function graphLabelPriority(particle) {
   const node = particle.node;
-  const radius = graphNodeRadius(particle);
-  const color = graphNodeColor(node);
-  const active = particle.id === graphState.selectedId;
-  const hover = particle.id === graphState.hoverId;
-  ctx.save();
-  if (active || hover) {
-    ctx.shadowColor = active ? colors.nodeShadowActive : colors.nodeShadow;
-    ctx.shadowBlur = (active ? 14 : 8) * inv;
+  if (particle.id === graphState.selectedId) return 100;
+  if (particle.id === graphState.hoverId) return 90;
+  if (node.type === "Project") return 80;
+  if (node.pinned) return 70;
+  if (isGraphParentNode(node)) return 60;
+  return 0;
+}
+
+function graphLabelBoxesOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function drawGraphLabels(ctx, particles, colors, scale, inv) {
+  if (!particles.length) return;
+  const fontPx = graphLabelFontPx(inv);
+  const fade = scale;
+  const candidates = particles.filter(particle => {
+    const id = particle.id;
+    if (id === graphState.selectedId || id === graphState.hoverId) return true;
+    if (graphLabelAlwaysVisible(particle.node)) return fade >= 1.15;
+    return fade >= 1.85;
+  }).map(particle => {
+    const text = graphLabelText(particle.node);
+    const radius = graphNodeWorldRadius(particle);
+    const pad = 5 * inv;
+    const lx = particle.x;
+    const ly = particle.y + radius + pad;
+    const textW = Math.max(16, text.length * fontPx * 0.72) + 8;
+    const textH = fontPx * 1.45;
+    return {
+      particle,
+      text,
+      lx,
+      ly,
+      align: "center",
+      baseline: "top",
+      priority: graphLabelPriority(particle),
+      box: { x: lx - textW / 2, y: ly, w: textW, h: textH },
+    };
+  });
+  candidates.sort((a, b) => b.priority - a.priority || String(a.text).localeCompare(String(b.text)));
+  const placed = [];
+  for (const item of candidates) {
+    // Hover/selection always wins; hubs skip collisions against lower-priority leaves only.
+    const force = item.priority >= 90;
+    if (!force && placed.some(other => graphLabelBoxesOverlap(item.box, other.box))) continue;
+    placed.push(item);
   }
-  // Superseded facts (retired by a newer one) read as dimmed history.
-  const superseded = Boolean(node.superseded || node?.metadata?.invalid_at);
-  ctx.beginPath();
-  ctx.arc(particle.x, particle.y, radius + (hover ? 2 : 0), 0, Math.PI * 2);
-  ctx.fillStyle = color;
-  ctx.globalAlpha = superseded ? 0.3 : 0.9;
-  ctx.fill();
-  ctx.globalAlpha = 1;
-  ctx.lineWidth = (active ? 3 : 1.5) * inv;
-  ctx.strokeStyle = active ? colors.nodeStrokeActive : colors.nodeStroke;
-  ctx.stroke();
-  const denseGraph = graphState.nodes.length > 55;
-  const showLabel = !denseGraph || active || hover || node.type === "Project" || node.pinned;
-  if (showLabel) {
-    ctx.shadowColor = "transparent";
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = colors.label;
-    ctx.font = `${Math.max(10, 11 * Math.min(inv, 1.4))}px Segoe UI, Arial`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "top";
-    const label = node.label.length > 22 ? `${node.label.slice(0, 21)}…` : node.label;
-    ctx.fillText(label, particle.x, particle.y + radius + 5);
+  ctx.save();
+  ctx.font = `${fontPx}px Segoe UI, Arial`;
+  ctx.fillStyle = colors.label;
+  ctx.shadowColor = colors.labelShadow;
+  ctx.shadowBlur = 3 * inv;
+  for (const item of placed) {
+    ctx.textAlign = item.align;
+    ctx.textBaseline = item.baseline;
+    ctx.fillText(item.text, item.lx, item.ly);
   }
   ctx.restore();
 }
@@ -1256,20 +1976,119 @@ function isGraphNodeModalOpen() {
   return Boolean(modal && !modal.hasAttribute("hidden"));
 }
 
-function openGraphNodeModal(node) {
+// Close/Esc must work even when the card is opened from Search before the
+// graph canvas has ever been initialized (bindGraphOnce waits on loadGraph).
+function bindGraphNodeModalControls() {
+  if (graphState.modalControlsBound) return;
+  const modal = document.querySelector("#graph-node-modal");
+  if (!modal || typeof modal.addEventListener !== "function") return;
+  graphState.modalControlsBound = true;
+  modal.addEventListener("click", event => {
+    if (!event.target.closest("[data-close-graph-node-modal]")) return;
+    event.preventDefault();
+    closeGraphNodeModal();
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key !== "Escape") return;
+    if (graphState.modalOpen) {
+      event.preventDefault();
+      closeGraphNodeModal();
+      return;
+    }
+    if (graphState.expanded) {
+      event.preventDefault();
+      toggleGraphExpand(false);
+      return;
+    }
+    if (graphState.selectedId && graphStageVisible()) {
+      event.preventDefault();
+      selectGraphNode(null);
+    }
+  });
+}
+
+function mergeGraphPayload(payload) {
+  const incoming = Array.isArray(payload?.nodes) ? payload.nodes.map(enrichGraphNode) : [];
+  if (!incoming.length) return;
+  const byId = new Map(graphState.allNodes.map(node => [node.id, node]));
+  for (const node of incoming) {
+    if (node?.id) byId.set(node.id, node);
+  }
+  graphState.allNodes = [...byId.values()];
+  const edgeKey = edge => edge.id || `${edge.source}|${edge.target}|${edge.type || ""}`;
+  const seen = new Set(graphState.allEdges.map(edgeKey));
+  for (const edge of payload.edges || []) {
+    const key = edgeKey(edge);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    graphState.allEdges.push(edge);
+  }
+}
+
+async function prefetchGraphNeighborhood(nodeId) {
+  const id = String(nodeId || "").trim();
+  if (!id) return null;
+  const payload = await api(`/api/graph?project_id=${projectParam()}&q=${encodeURIComponent(id)}&limit=80`);
+  mergeGraphPayload(payload);
+  return graphState.allNodes.find(node => node.id === id) || null;
+}
+
+async function openMemoryNodeCard(nodeId, fallbackNode) {
+  const id = String(nodeId || fallbackNode?.id || "").trim();
+  if (!id) return;
+  const existing =
+    graphState.allNodes.find(node => node.id === id)
+    || graphState.nodes.find(node => node.id === id)
+    || fallbackNode;
+  if (existing) openGraphNodeModal(existing, { skipGraphUpdate: true });
+  const fetched = await prefetchGraphNeighborhood(id).catch(() => null);
+  const node = fetched || existing;
   if (!node) return;
+  if (graphState.selectedId && graphState.selectedId !== id && graphState.selectedId !== node.id) return;
+  if (existing && !isGraphNodeModalOpen()) return;
+  openGraphNodeModal(node, { skipGraphUpdate: true });
+}
+
+async function showNodeInMemoryGraph(nodeId) {
+  const id = String(nodeId || "").trim();
+  if (!id) return;
+  closeGraphNodeModal();
+  graphState.neighborhoodId = id;
+  graphState.selectedId = id;
+  graphState.searchQuery = id;
+  setElementValue("#graph-search", id);
+  setElementValue("#graph-source-filter", "");
+  setElementValue("#graph-scope-filter", "");
+  setElementValue("#graph-group-filter", "");
+  const pinned = document.querySelector("#graph-pinned-filter");
+  if (pinned) pinned.checked = false;
+  graphState.groupFilter = "";
+  switchMemoryTab("graph");
+  switchView("memory");
+  await loadGraph();
+}
+
+function openGraphNodeModal(node, options = {}) {
+  if (!node) return;
+  bindGraphNodeModalControls();
+  const skipGraphUpdate = Boolean(options.skipGraphUpdate);
   const prevSelected = graphState.selectedId;
   graphState.selectedId = node.id;
-  graphState.physicsActive = true;
-  graphState.physicsTicks = Math.min(graphState.physicsTicks, Math.floor(graphState.physicsMax * 0.6));
-  if (prevSelected !== node.id || !graphState.particles.some(item => item.id === node.id)) {
-    applyGraphVisibility();
-    seedGraphParticles();
-    graphState.physicsTicks = 0;
+  if (!skipGraphUpdate) {
     graphState.physicsActive = true;
-    graphState.userZoomed = false;
+    graphState.physicsTicks = Math.min(graphState.physicsTicks, Math.floor(graphState.physicsMax * 0.6));
+    if (prevSelected !== node.id || !graphState.particles.some(item => item.id === node.id)) {
+      const prevIds = graphState.nodes.map(item => item.id).join("\0");
+      applyGraphVisibility();
+      const nextIds = graphState.nodes.map(item => item.id).join("\0");
+      if (prevIds !== nextIds || !graphState.particles.some(item => item.id === node.id)) {
+        seedGraphParticles();
+      }
+      graphState.physicsTicks = 0;
+      graphState.physicsActive = true;
+    }
+    wakeGraphAnimation();
   }
-  wakeGraphAnimation();
   renderGraphDetail(node);
   const modal = document.querySelector("#graph-node-modal");
   if (!modal) return;
@@ -1291,22 +2110,25 @@ function closeGraphNodeModal() {
   }
 }
 
+function restoreGraphVisibility() {
+  const prevIds = graphState.nodes.map(item => item.id).join("\0");
+  applyGraphVisibility();
+  const nextIds = graphState.nodes.map(item => item.id).join("\0");
+  if (prevIds === nextIds) return;
+  seedGraphParticles();
+  if (!graphState.userZoomed) fitGraphToView();
+}
+
 function selectGraphNode(node, options = {}) {
   if (!node) {
+    const hadSelection = Boolean(graphState.selectedId);
     graphState.selectedId = "";
+    if (hadSelection) restoreGraphVisibility();
+    wakeGraphAnimation();
     return;
   }
-  const prevSelected = graphState.selectedId;
   graphState.selectedId = node.id;
   graphState.physicsActive = true;
-  graphState.physicsTicks = Math.min(graphState.physicsTicks, Math.floor(graphState.physicsMax * 0.6));
-  if (prevSelected !== node.id || !graphState.particles.some(item => item.id === node.id)) {
-    applyGraphVisibility();
-    seedGraphParticles();
-    graphState.physicsTicks = 0;
-    graphState.physicsActive = true;
-    graphState.userZoomed = false;
-  }
   wakeGraphAnimation();
   if (options.openModal) {
     openGraphNodeModal(node);
@@ -1393,11 +2215,7 @@ function renderMemoryMarkdown(lines, node) {
 
 function renderMemoryBodyHtml(node) {
   const raw = String((node && node.text) || "").replace(/\r\n/g, "\n").trim();
-  const links = memorySourceLinks(node);
-  const linksHtml = links.length
-    ? `<div class="mem-source-links">${links.map(link => `<a class="mem-source-link mem-source-${link.kind}" href="${escapeHtml(link.href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)} <span aria-hidden="true">↗</span></a>`).join("")}</div>`
-    : "";
-  if (!raw) return linksHtml + `<p class="mem-empty">${escapeHtml(t("graph.node.noDescription"))}</p>`;
+  if (!raw) return `<p class="mem-empty">${escapeHtml(t("graph.node.noDescription"))}</p>`;
   const blocks = [];
   let current = { label: "", lines: [] };
   const flush = () => { if (current.label || current.lines.length) blocks.push(current); current = { label: "", lines: [] }; };
@@ -1408,14 +2226,102 @@ function renderMemoryBodyHtml(node) {
     current.lines.push(line);
   }
   flush();
-  const body = blocks.map(block => {
+  return blocks.map(block => {
     const inner = renderMemoryMarkdown(block.lines, node);
     if (!inner.trim() && !block.label) return "";
     const labelHtml = block.label ? `<div class="mem-label">${escapeHtml(block.label)}</div>` : "";
     const cls = block.label ? `mem-block mem-block-${block.label.toLowerCase()}` : "mem-block";
     return `<div class="${cls}">${labelHtml}<div class="mem-content">${inner}</div></div>`;
   }).join("");
-  return linksHtml + body;
+}
+
+function formatGraphNodeDate(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw.slice(0, 10);
+  return date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+function graphNodeConfidencePct(node) {
+  const value = Number(node?.confidence);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.round(value <= 1 ? value * 100 : value);
+}
+
+function graphNodeBadgeClass(kind, value = "") {
+  const text = String(value || "").toLowerCase();
+  if (kind === "status" && (text === "active" || text === "done" || text === "closed")) return "graph-node-pill graph-node-pill-ok";
+  if (kind === "confidence") return "graph-node-pill graph-node-pill-ok";
+  if (kind === "ado") return "badge badge-azure";
+  if (kind === "code") return "badge badge-code";
+  if (kind === "type") {
+    if (/(bug|issue|defect)/.test(text)) return "graph-node-pill graph-node-pill-warn";
+    if (/(rule|decision|constraint)/.test(text)) return "graph-node-pill graph-node-pill-accent";
+    if (/(meeting|granola)/.test(text)) return "graph-node-pill graph-node-pill-cyan";
+  }
+  return "graph-node-pill";
+}
+
+function graphNodeMetaCells(node) {
+  const meta = node?.metadata || {};
+  const cells = [];
+  const push = (label, valueHtml) => {
+    if (!valueHtml) return;
+    cells.push({ label, valueHtml });
+  };
+  if (meta.assigned_to) {
+    push(t("graph.node.assignee"), `<span class="graph-node-meta-person">${escapeHtml(String(meta.assigned_to))}</span>`);
+  }
+  if (meta.iteration_path) push(t("graph.node.iteration"), escapeHtml(String(meta.iteration_path)));
+  if (meta.area_path) push(t("graph.node.area"), escapeHtml(String(meta.area_path)));
+  const created = formatGraphNodeDate(node?.created_at);
+  if (created) push(t("graph.node.created"), escapeHtml(created));
+  return cells;
+}
+
+function setSectionHidden(selector, hidden) {
+  const el = document.querySelector(selector);
+  if (!el) return;
+  if (hidden) el.setAttribute("hidden", "");
+  else el.removeAttribute("hidden");
+}
+
+async function copyGraphNodeText(text, okMessage) {
+  const value = String(text || "");
+  if (!value) return;
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+    else {
+      const area = document.createElement("textarea");
+      area.value = value;
+      area.setAttribute("readonly", "");
+      area.style.position = "absolute";
+      area.style.left = "-9999px";
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    showSnackbar(okMessage, "success");
+  } catch (error) {
+    showSnackbar(error?.message || t("graph.node.copyFailed"), "error");
+  }
+}
+
+function askAboutGraphNode(node) {
+  if (!node) return;
+  const snippet = String(node.text || "").replace(/\s+/g, " ").trim().slice(0, 500);
+  const lines = [
+    t("graph.node.askPromptIntro"),
+    `Title: ${node.label || ""}`,
+    `Type: ${node.type || ""}`,
+    `Scope: ${node.scope || ""}`,
+    `ID: ${node.id || ""}`,
+  ];
+  if (snippet) lines.push(`Content: ${snippet}`);
+  closeGraphNodeModal();
+  queueAskFollowUp(lines.join("\n"), { send: false }).catch(showError);
 }
 
 function bindMemoryBodyRefs(container, node) {
@@ -1442,59 +2348,137 @@ function renderGraphDetail(node) {
   const actions = document.querySelector("#graph-actions");
   const neighbors = document.querySelector("#graph-neighbors");
   const filesEl = document.querySelector("#graph-related-files");
+  const kickerType = document.querySelector("#graph-detail-kicker-type");
+  const metaStrip = document.querySelector("#graph-detail-meta-strip");
+  const sourcesEl = document.querySelector("#graph-detail-sources");
+  const footer = document.querySelector("#graph-node-footer");
+  const copyIdBtn = document.querySelector("#graph-node-copy-id");
+  const pinBtn = document.querySelector("#graph-node-pin");
+  const openSource = document.querySelector("#graph-node-open-source");
+  const askBtn = document.querySelector("#graph-node-ask-ai");
+  const openGraphBtn = document.querySelector("#graph-node-open-graph");
+  const copyJsonBtn = document.querySelector("#graph-node-copy-json");
   if (!title || !text || !meta || !actions || !neighbors) return;
+
   if (!node) {
     title.textContent = t("graph.empty.title");
-    text.textContent = t("graph.empty.hint");
+    text.innerHTML = `<p class="mem-empty">${escapeHtml(t("graph.empty.hint"))}</p>`;
     meta.innerHTML = "";
     actions.innerHTML = "";
     neighbors.innerHTML = "";
     if (filesEl) filesEl.innerHTML = "";
+    if (metaStrip) metaStrip.innerHTML = "";
+    if (sourcesEl) sourcesEl.innerHTML = "";
+    if (kickerType) kickerType.textContent = "";
+    setSectionHidden("#graph-node-meta-section", true);
+    setSectionHidden("#graph-node-linked-section", true);
+    setSectionHidden("#graph-node-files-section", true);
+    setSectionHidden("#graph-node-advanced-section", true);
+    setSectionHidden("#graph-node-footer", true);
+    if (copyIdBtn) copyIdBtn.hidden = true;
+    if (pinBtn) pinBtn.hidden = true;
+    if (openSource) openSource.hidden = true;
     return;
   }
-  title.textContent = node.label;
-  text.innerHTML = renderMemoryBodyHtml(node);
-  bindMemoryBodyRefs(text, node);
+
   const synthetic = Boolean(node.metadata && node.metadata.synthetic);
   const pinned = Boolean(node.metadata && (node.metadata.favorite || node.metadata.pinned));
   const wi = node.metadata || {};
-  const abBadges = wi.work_item_id
-    ? `<span class="badge badge-azure">ADO #${escapeHtml(wi.work_item_id)}</span>${wi.work_item_state ? `<span class="badge">${escapeHtml(wi.work_item_state)}</span>` : ""}`
-    : "";
   const edgeSource = graphState.allEdges.length ? graphState.allEdges : graphState.edges;
   const nodeSource = graphState.allNodes.length ? graphState.allNodes : graphState.nodes;
   const linked = edgeSource.filter(edge => edge.source === node.id || edge.target === node.id);
+  const confidence = graphNodeConfidencePct(node);
+  const sourceLinks = memorySourceLinks(node);
+  const metaCells = graphNodeMetaCells(node);
+  const files = graphNodeRelatedFiles(node);
+
+  title.textContent = node.label;
+  if (kickerType) kickerType.textContent = String(node.type || "").toUpperCase();
+
+  text.innerHTML = renderMemoryBodyHtml(node);
+  bindMemoryBodyRefs(text, node);
+
   let codeBadges = "";
   if (node.type === "Symbol") {
     const where = wi.line ? `${wi.path || ""}:${wi.line}` : (wi.path || "");
     const callers = linked.filter(edge => edge.type === "CALLS" && edge.target === node.id).length;
     const callees = linked.filter(edge => edge.type === "CALLS" && edge.source === node.id).length;
     codeBadges =
-      `${wi.kind ? `<span class="badge badge-code">${escapeHtml(wi.kind)}</span>` : ""}` +
-      `${where ? `<span class="badge badge-code">${escapeHtml(where)}</span>` : ""}` +
-      `<span class="badge badge-code">${callers} caller${callers === 1 ? "" : "s"}</span>` +
-      `<span class="badge badge-code">${callees} call${callees === 1 ? "" : "s"}</span>`;
+      `${wi.kind ? `<span class="${graphNodeBadgeClass("code")}">${escapeHtml(wi.kind)}</span>` : ""}` +
+      `${where ? `<span class="${graphNodeBadgeClass("code")}">${escapeHtml(where)}</span>` : ""}` +
+      `<span class="${graphNodeBadgeClass("code")}">${callers} caller${callers === 1 ? "" : "s"}</span>` +
+      `<span class="${graphNodeBadgeClass("code")}">${callees} call${callees === 1 ? "" : "s"}</span>`;
   }
-  meta.innerHTML = `<span class="badge">${escapeHtml(node.type)}</span><span class="badge">${escapeHtml(node.scope)}</span><span class="badge">${linked.length} links</span>${pinned ? '<span class="badge">pinned</span>' : ""}${codeBadges}${abBadges}`;
-  const options = graphNodeOptions(node.id);
-  actions.innerHTML = synthetic
-    ? `<div class="provider-test">${escapeHtml(t("graph.node.synthetic"))}</div>`
-    : `<div class="provider-actions graph-node-primary-actions"><button data-graph-open="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.openInSearch"))}</button><button data-graph-pin="${escapeHtml(node.id)}" type="button">${pinned ? escapeHtml(t("graph.node.unpin")) : escapeHtml(t("graph.node.pin"))}</button></div><details class="graph-node-advanced"><summary>${escapeHtml(t("graph.node.advancedEdges"))}</summary><label>${escapeHtml(t("graph.node.targetLabel"))}<select data-graph-target><option value="">${escapeHtml(t("graph.node.selectNode"))}</option>${options}</select></label><label>${escapeHtml(t("graph.node.edgeLabel"))}<select data-graph-edge-type><option>RELATED_TO</option><option>SUPPORTS</option><option>DEPENDS_ON</option><option>IMPLEMENTS</option><option>DOCUMENTED_IN</option></select></label><div class="provider-actions"><button data-graph-edge="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.createEdge"))}</button><button data-graph-path="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.explainPath"))}</button><button data-graph-merge="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.merge"))}</button></div></details><div class="provider-test" data-graph-action-result></div>`;
-  bindGraphActions(actions, node);
-  neighbors.innerHTML = linked.length
-    ? ""
-    : `<div class="result"><strong>${escapeHtml(t("graph.node.noLinks"))}</strong><p>${escapeHtml(t("graph.node.noLinksHint"))}</p></div>`;
+
+  const pills = [
+    `<span class="${graphNodeBadgeClass("type", node.type)}">${escapeHtml(node.type)}</span>`,
+    `<span class="graph-node-pill">${escapeHtml(t("graph.node.scopeLabel").replace("{scope}", String(node.scope || "")))}</span>`,
+    `<span class="graph-node-pill">${escapeHtml(t("graph.node.edgesCount").replace("{count}", String(linked.length)))}</span>`,
+  ];
+  if (confidence) pills.push(`<span class="${graphNodeBadgeClass("confidence")}">${confidence}% ${escapeHtml(t("graph.node.confidence"))}</span>`);
+  if (pinned) pills.push(`<span class="graph-node-pill">${escapeHtml(t("graph.node.pinned"))}</span>`);
+  if (wi.invalid_at || node.superseded) {
+    const predecessor = String(wi.superseded_by || "").trim();
+    pills.push(`<span class="${graphNodeBadgeClass("status", "superseded")}">superseded</span>`);
+    if (predecessor) {
+      pills.push(`<button type="button" class="graph-node-pill graph-node-pill-link" data-open-predecessor="${escapeHtml(predecessor)}">← predecessor</button>`);
+    }
+  } else if (wi.revision_of) {
+    pills.push(`<span class="graph-node-pill">revision</span>`);
+    pills.push(`<button type="button" class="graph-node-pill graph-node-pill-link" data-open-predecessor="${escapeHtml(String(wi.revision_of))}">← previous</button>`);
+  }
+  if (wi.work_item_id) {
+    pills.push(`<span class="${graphNodeBadgeClass("ado")}">ADO #${escapeHtml(wi.work_item_id)}</span>`);
+  }
+  const statusLabel = String(wi.work_item_state || node.status || "").trim();
+  if (statusLabel) pills.push(`<span class="${graphNodeBadgeClass("status", statusLabel)}">${escapeHtml(statusLabel)}</span>`);
+  if (Array.isArray(wi.tags)) {
+    for (const tag of wi.tags.slice(0, 4)) {
+      if (tag) pills.push(`<span class="graph-node-pill">#${escapeHtml(String(tag))}</span>`);
+    }
+  }
+  meta.innerHTML = pills.join("") + codeBadges;
+  meta.querySelectorAll("[data-open-predecessor]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-open-predecessor");
+      if (!id) return;
+      const target = (graphState.allNodes.length ? graphState.allNodes : graphState.nodes).find(n => n.id === id);
+      if (target) openGraphNodeModal(target);
+    });
+  });
+
+  const hasMeta = metaCells.length > 0 || sourceLinks.length > 0;
+  if (metaStrip) {
+    metaStrip.innerHTML = metaCells.length
+      ? metaCells.map(cell => `<div class="graph-node-meta-cell"><span class="graph-node-meta-label">${escapeHtml(cell.label)}</span><span class="graph-node-meta-value">${cell.valueHtml}</span></div>`).join("")
+      : "";
+  }
+  if (sourcesEl) {
+    sourcesEl.innerHTML = sourceLinks.length
+      ? sourceLinks.map(link => `<a class="mem-source-link mem-source-${link.kind}" href="${escapeHtml(link.href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)} <span aria-hidden="true">↗</span></a>`).join("")
+      : "";
+  }
+  setSectionHidden("#graph-node-meta-section", !hasMeta);
+
+  neighbors.innerHTML = "";
   const byId = new Map(nodeSource.map(item => [item.id, item]));
+  let neighborCount = 0;
   for (const edge of linked) {
     const other = byId.get(edge.source === node.id ? edge.target : edge.source);
     if (!other) continue;
+    neighborCount += 1;
     const item = document.createElement("article");
     item.className = "result graph-link-card";
     item.tabIndex = 0;
     const label = graphEdgeLabel(edge.type);
-    const direction = graphEdgeDirection(edge, node, other);
-    const confidence = edge.confidence ? Math.round(Number(edge.confidence) * 100) : 0;
-    item.innerHTML = `<div class="row"><strong>${escapeHtml(other.label)}</strong><span class="badge">${escapeHtml(label)}</span></div><p>${direction}</p><span class="badge">${escapeHtml(other.type)}</span><span class="badge">${escapeHtml(other.scope)}</span>${confidence ? `<span class="badge">${confidence}% confidence</span>` : ""}`;
+    const edgeConfidence = edge.confidence ? Math.round(Number(edge.confidence) * 100) : 0;
+    const outbound = edge.source === node.id;
+    item.innerHTML =
+      `<div class="row"><strong>${escapeHtml(other.label)}</strong><span class="badge">${escapeHtml(label)}</span></div>` +
+      `<p class="graph-link-direction" aria-hidden="true">${outbound ? "→" : "←"}</p>` +
+      `<span class="badge">${escapeHtml(other.type)}</span>` +
+      `<span class="badge">${escapeHtml(other.scope)}</span>` +
+      `${edgeConfidence ? `<span class="badge graph-node-pill-ok">${edgeConfidence}% ${escapeHtml(t("graph.node.confidence"))}</span>` : ""}`;
     const openLinked = () => openGraphNodeModal(other);
     item.addEventListener("click", openLinked);
     item.addEventListener("keydown", event => {
@@ -1505,17 +2489,22 @@ function renderGraphDetail(node) {
     });
     neighbors.appendChild(item);
   }
+  setSectionHidden("#graph-node-linked-section", neighborCount === 0);
+
   if (filesEl) {
-    const files = graphNodeRelatedFiles(node);
     if (!files.length) {
-      filesEl.innerHTML = `<div class="result"><strong>${escapeHtml(t("graph.node.noFiles"))}</strong><p>${escapeHtml(t("graph.node.noFilesHint"))}</p></div>`;
+      filesEl.innerHTML = "";
     } else {
       filesEl.innerHTML = files.map(file => {
-        const kind = file.kind === "evidence" ? "Evidence" : file.kind === "source" ? "Source" : "File";
+        const kind = file.kind === "evidence"
+          ? t("graph.node.fileEvidence")
+          : file.kind === "source"
+            ? t("graph.node.fileSource")
+            : t("graph.node.filePath");
         if (file.openable) {
-          return `<button type="button" class="graph-file-row" data-graph-file="${escapeHtml(file.path)}"><span class="badge">${kind}</span><span class="graph-file-path">${escapeHtml(file.path)}</span></button>`;
+          return `<button type="button" class="graph-file-row" data-graph-file="${escapeHtml(file.path)}"><span class="badge">${escapeHtml(kind)}</span><span class="graph-file-path">${escapeHtml(file.path)}</span></button>`;
         }
-        return `<div class="graph-file-row is-static"><span class="badge">${kind}</span><span class="graph-file-path">${escapeHtml(file.path)}</span></div>`;
+        return `<div class="graph-file-row is-static"><span class="badge">${escapeHtml(kind)}</span><span class="graph-file-path">${escapeHtml(file.path)}</span></div>`;
       }).join("");
       filesEl.querySelectorAll("[data-graph-file]").forEach(button => {
         button.addEventListener("click", () => {
@@ -1530,6 +2519,61 @@ function renderGraphDetail(node) {
       });
     }
   }
+  setSectionHidden("#graph-node-files-section", files.length === 0);
+
+  if (copyIdBtn) {
+    copyIdBtn.hidden = !node.id;
+    copyIdBtn.onclick = () => copyGraphNodeText(node.id, t("graph.node.idCopied"));
+  }
+  if (pinBtn) {
+    pinBtn.hidden = synthetic;
+    pinBtn.title = pinned ? t("graph.node.unpin") : t("graph.node.pin");
+    pinBtn.setAttribute("aria-pressed", pinned ? "true" : "false");
+    pinBtn.classList.toggle("is-active", pinned);
+    pinBtn.onclick = async () => {
+      await api(`/api/graph/nodes/${node.id}/pin`, { method: "POST", body: "{}" });
+      await loadGraph();
+    };
+  }
+  if (openSource) {
+    const firstLink = sourceLinks[0];
+    if (firstLink) {
+      openSource.hidden = false;
+      openSource.href = firstLink.href;
+    } else {
+      openSource.hidden = true;
+      openSource.removeAttribute("href");
+    }
+  }
+
+  if (footer) footer.hidden = false;
+  if (askBtn) {
+    askBtn.hidden = synthetic;
+    askBtn.onclick = () => askAboutGraphNode(node);
+  }
+  if (openGraphBtn) {
+    openGraphBtn.onclick = () => showNodeInMemoryGraph(node.id).catch(showError);
+  }
+  if (copyJsonBtn) {
+    copyJsonBtn.onclick = () => copyGraphNodeText(JSON.stringify(node, null, 2), t("graph.node.jsonCopied"));
+  }
+
+  if (synthetic) {
+    actions.innerHTML = `<div class="provider-test">${escapeHtml(t("graph.node.synthetic"))}</div>`;
+    setSectionHidden("#graph-node-advanced-section", false);
+  } else {
+    const options = graphNodeOptions(node.id);
+    actions.innerHTML =
+      `<details class="graph-node-advanced"><summary>${escapeHtml(t("graph.node.advancedEdges"))}</summary>` +
+      `<label>${escapeHtml(t("graph.node.targetLabel"))}<select data-graph-target><option value="">${escapeHtml(t("graph.node.selectNode"))}</option>${options}</select></label>` +
+      `<label>${escapeHtml(t("graph.node.edgeLabel"))}<select data-graph-edge-type><option>RELATED_TO</option><option>SUPPORTS</option><option>DEPENDS_ON</option><option>IMPLEMENTS</option><option>DOCUMENTED_IN</option></select></label>` +
+      `<div class="provider-actions"><button data-graph-edge="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.createEdge"))}</button>` +
+      `<button data-graph-path="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.explainPath"))}</button>` +
+      `<button data-graph-merge="${escapeHtml(node.id)}" type="button">${escapeHtml(t("graph.node.merge"))}</button></div></details>` +
+      `<div class="provider-test" data-graph-action-result></div>`;
+    setSectionHidden("#graph-node-advanced-section", false);
+  }
+  bindGraphActions(actions, node);
 }
 
 function bindGraphActions(container, node) {
@@ -1537,15 +2581,6 @@ function bindGraphActions(container, node) {
   const targetSelect = container.querySelector("[data-graph-target]");
   const edgeType = container.querySelector("[data-graph-edge-type]");
   const setResult = (message, ok = true) => { if (result) { result.className = `provider-test ${ok ? "ok" : "error"}`; result.textContent = message; } };
-  const open = container.querySelector("[data-graph-open]");
-  if (open) open.addEventListener("click", () => {
-    closeGraphNodeModal();
-    switchView("memory");
-    setElementValue("#search-query", node.label);
-    runSearch(node.label).catch(showError);
-  });
-  const pin = container.querySelector("[data-graph-pin]");
-  if (pin) pin.addEventListener("click", async () => { await api(`/api/graph/nodes/${node.id}/pin`, { method: "POST", body: "{}" }); await loadGraph(); });
   const createEdge = container.querySelector("[data-graph-edge]");
   if (createEdge) createEdge.addEventListener("click", async () => {
     if (!targetSelect.value) return setResult(t("graph.node.selectTarget"), false);
@@ -1569,4 +2604,7 @@ function bindGraphActions(container, node) {
   });
 }
 
-export { graphState, loadGraph, openGraphNodeModal, resizeGraphCanvas };
+
+bindGraphNodeModalControls();
+
+export { graphState, loadGraph, openGraphNodeModal, openMemoryNodeCard, showNodeInMemoryGraph, resizeGraphCanvas, resetGraphAutoLayoutFlags, applyGraphAutoLayout, wakeGraphAnimation, syncGraphViewChrome };

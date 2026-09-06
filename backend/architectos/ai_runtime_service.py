@@ -16,7 +16,17 @@ from collections.abc import Iterator
 from typing import Any
 
 from .adapters import ProviderRequest
+from .ask_advice import (
+    ask_memory_advice_enabled,
+    build_advice_judge_prompt,
+    collect_advice_candidates,
+    format_advice_context_block,
+    merge_advice_into_structured,
+    parse_advice_verdict,
+    should_skip_advice_turn,
+)
 from .models import stable_id, utc_now
+from .permissions import PERMISSION_WAIT_SECONDS
 from .rich_response import RESPONSE_FORMAT_POLICY, split_rich_response
 from .routing import classify_role
 from .tool_gateway import (
@@ -55,12 +65,14 @@ class AiRuntimeServiceMixin:
         else:
             result = self.provider_router.route(self.repository.list_providers(), request, provider_id)
             tool_trace = []
+        result = self._stamp_token_economy(result, context)
         response = self._route_response(project_id, message, context["context"], result)
         run = self._start_provider_run(request.run_id, project_id, message, result)
         self._finish_provider_run(run["id"], str(result.get("status") or "unknown"), result)
         response["run_id"] = run["id"]
         response["memory_hit_ids"] = self._hit_ids_from_context(context)
         response["retrieval"] = context.get("retrieval") or {}
+        response["advice"] = list(context.get("advice") or [])
         if tool_trace:
             response["tool_trace"] = tool_trace
             response["tool_trace_label"] = compact_tool_trace_label(tool_trace)
@@ -92,6 +104,22 @@ class AiRuntimeServiceMixin:
         }
         prepared = dict(payload)
         prepared["run_id"] = run_id
+        ui = dict(self.repository.get_setting("ui") or {})
+        advice_on = ask_memory_advice_enabled(ui)
+        role_hint = str(prepared.get("role") or "").strip().lower()
+        if (
+            advice_on
+            and "advice" not in prepared
+            and role_hint not in {"council", "review"}
+            and str(prepared.get("provider_id") or "").strip().lower() != "local-memory"
+        ):
+            yield {
+                "type": "progress",
+                "phase": "advice",
+                "status": "Checking tickets, meetings, and decisions…",
+                "step_id": "prep:advice",
+                "kind": "status",
+            }
         project_id, message, context, request = self._provider_request(prepared)
         hit_ids = self._hit_ids_from_context(context)
         hit_count = len(hit_ids)
@@ -104,6 +132,21 @@ class AiRuntimeServiceMixin:
             "kind": "status",
             "memory_hit_ids": hit_ids,
         }
+        if context.get("advice_checked"):
+            advice_n = len(context.get("advice") or [])
+            yield {
+                "type": "progress",
+                "phase": "advice_done",
+                "status": (
+                    f"Memory advice: {advice_n} finding{'s' if advice_n != 1 else ''}"
+                    if advice_n
+                    else "Memory advice: no conflicts"
+                ),
+                "step_id": "prep:advice",
+                "ok": True,
+                "kind": "status",
+                "advice": list(context.get("advice") or []),
+            }
         self._sync_router_settings()
         provider_id = self._resolve_ai_provider_id(prepared)
         planned_provider = self._lookup_provider(provider_id)
@@ -157,8 +200,9 @@ class AiRuntimeServiceMixin:
             for event in self._run_ai_with_tools(
                 project_id, message, context, request, provider_id,
                 include_writes=include_writes, memory_only=memory_only,
+                interactive=True, chat_id=str(prepared.get("chat_id") or ""),
             ):
-                if event.get("type") == "progress":
+                if event.get("type") in {"progress", "permission"}:
                     yield event
                 elif event.get("type") == "result":
                     result = event["result"]
@@ -170,10 +214,12 @@ class AiRuntimeServiceMixin:
             final_text = str(result.get("text") or "")
             if final_text:
                 yield {"type": "delta", "text": final_text}
+            result = self._stamp_token_economy(result, context)
             response = self._route_response(project_id, message, context["context"], result)
             response["run_id"] = run_id
             response["memory_hit_ids"] = hit_ids
             response["retrieval"] = context.get("retrieval") or {}
+            response["advice"] = list(context.get("advice") or [])
             if tool_trace:
                 response["tool_trace"] = tool_trace
                 response["tool_trace_label"] = compact_tool_trace_label(tool_trace)
@@ -208,11 +254,12 @@ class AiRuntimeServiceMixin:
                     ),
                 }
             elif event.get("type") == "done":
-                result = dict(event.get("result") or {})
+                result = self._stamp_token_economy(dict(event.get("result") or {}), context)
                 response = self._route_response(project_id, message, context["context"], result)
                 response["run_id"] = run_id
                 response["memory_hit_ids"] = hit_ids
                 response["retrieval"] = context.get("retrieval") or {}
+                response["advice"] = list(context.get("advice") or [])
                 if audit_started:
                     self._finish_provider_run(run_id, str(result.get("status") or "unknown"), result)
                 yield {
@@ -229,7 +276,9 @@ class AiRuntimeServiceMixin:
 
     def stream_chat_message(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         project_id = str(payload.get("project_id") or "architectos")
-        message = str(payload.get("message") or "").strip()
+        raw_message = str(payload.get("message") or "").strip()
+        message_security = self.security_policy.inspect_text(raw_message)
+        message = str(message_security["text"])
         if not message:
             raise ValueError("message is required")
         chat = self.repository.get_chat(str(payload.get("chat_id") or "")) if payload.get("chat_id") else None
@@ -237,7 +286,10 @@ class AiRuntimeServiceMixin:
             now = utc_now()
             chat = {"id": stable_id("chat", project_id, message[:60], now), "project_id": project_id, "title": message[:60] or "New dialog", "messages": [], "favorite": False, "created_at": now, "last_activity_at": now, "session_status": "active", "session_revision": 1}
         chat = self._activate_chat_session(chat)
-        chat["messages"].append({"role": "user", "text": message, "created_at": utc_now()})
+        user_message: dict[str, Any] = {"role": "user", "text": message, "created_at": utc_now()}
+        if message_security["redacted"]:
+            user_message["security"] = {"redacted": True, "findings": message_security["findings"]}
+        chat["messages"].append(user_message)
         response_chunks: list[str] = []
         final_result: dict[str, Any] | None = None
         stream_payload = {
@@ -252,6 +304,8 @@ class AiRuntimeServiceMixin:
             "ask_mode": payload.get("ask_mode"),
             "enable_tools": payload.get("enable_tools"),
         }
+        if "advice" in payload:
+            stream_payload["advice"] = payload.get("advice")
         for event in self.stream_ai(stream_payload):
             if event.get("type") == "delta":
                 response_chunks.append(str(event.get("text") or ""))
@@ -266,6 +320,12 @@ class AiRuntimeServiceMixin:
             final_result = {"text": "".join(response_chunks), "context": "", "provider": {"id": "unknown", "status": "error"}}
         response = str(final_result.get("text") or "".join(response_chunks))
         display_text, structured = split_rich_response(response)
+        structured = merge_advice_into_structured(structured, final_result.get("advice"))
+        security = dict(final_result.get("security") or {})
+        if message_security["redacted"]:
+            security["redacted"] = True
+            security["message_redacted"] = True
+            security["message_findings"] = message_security["findings"]
         chat["messages"].append({
             "role": "assistant",
             "text": display_text or response,
@@ -275,11 +335,13 @@ class AiRuntimeServiceMixin:
             "context": final_result.get("context") or "",
             "provider": final_result.get("provider") or {},
             "usage": final_result.get("usage") or {},
+            "token_economy": final_result.get("token_economy") or {},
             "tool_trace": final_result.get("tool_trace") or [],
             "tool_trace_label": final_result.get("tool_trace_label") or "",
             "memory_hit_ids": list(final_result.get("memory_hit_ids") or []),
             "run_id": final_result.get("run_id") or "",
             "query": message,
+            "security": security,
         })
         chat["last_activity_at"] = utc_now()
         chat = self.repository.upsert_chat(chat)
@@ -295,10 +357,13 @@ class AiRuntimeServiceMixin:
             "context": final_result.get("context") or "",
             "provider": final_result.get("provider") or {},
             "usage": final_result.get("usage") or {},
+            "token_economy": final_result.get("token_economy") or {},
             "raw": final_result.get("raw"),
             "tool_trace": final_result.get("tool_trace") or [],
             "tool_trace_label": final_result.get("tool_trace_label") or "",
             "memory_hit_ids": list(final_result.get("memory_hit_ids") or []),
+            "advice": list(final_result.get("advice") or []),
+            "security": security,
         }
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
@@ -306,12 +371,28 @@ class AiRuntimeServiceMixin:
             raise ValueError("run id is required")
         with self._cancelled_runs_lock:
             self.cancelled_runs.add(run_id)
+        if hasattr(self, "permissions"):
+            self.permissions.deny_run(run_id)
         existing = next((run for run in self.repository.list_provider_runs(limit=100) if run["id"] == run_id), None)
         if existing:
             existing["status"] = "cancel_requested"
             existing["cancel_requested_at"] = utc_now()
             self.repository.upsert_provider_run(existing)
         return {"run_id": run_id, "cancel_requested": True}
+
+    def decide_run_permission(self, run_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        request_id = str(payload.get("request_id") or "").strip()
+        if not request_id:
+            raise ValueError("request_id is required")
+        if str(run_id or "").strip() and hasattr(self, "permissions"):
+            self.permissions.bind_run(str(run_id), chat_id=str(payload.get("chat_id") or ""))
+        allow = bool(payload.get("allow") or payload.get("approved"))
+        scope = str(payload.get("scope") or "once").strip().lower()
+        if scope not in {"once", "session", "run"}:
+            scope = "once"
+        decision = self.permissions.decide(request_id, allow=allow, scope=scope)
+        return {"run_id": run_id, "request_id": request_id, **decision}
 
     def _is_run_cancelled(self, run_id: str) -> bool:
         with self._cancelled_runs_lock:
@@ -411,6 +492,7 @@ class AiRuntimeServiceMixin:
         context = dict(context)
         context["context"] = context_text
         context["retrieval_query"] = retrieval_query
+        self._apply_ask_advice(payload, message, context, project_id=project_id)
         if history_text:
             context["context"] = f"{history_text}\n\n{context['context']}".strip()
         attachments = [str(item) for item in (payload.get("attachments") or []) if str(item).strip()]
@@ -483,6 +565,86 @@ class AiRuntimeServiceMixin:
         blended = " | ".join([*reversed(priors), current])
         return blended[:500]
 
+    def _apply_ask_advice(
+        self,
+        payload: dict[str, Any],
+        message: str,
+        context: dict[str, Any],
+        *,
+        project_id: str,
+    ) -> None:
+        """Optionally run the memory-advice judge and inject findings into context."""
+        ui = dict(self.repository.get_setting("ui") or {})
+        enabled = ask_memory_advice_enabled(ui)
+        precomputed = payload.get("advice") if isinstance(payload.get("advice"), list) else None
+        if "advice" in payload and precomputed is None:
+            # Explicit empty / non-list: treat as already handled (council reuse).
+            precomputed = []
+        role = str(payload.get("role") or "").strip().lower()
+        provider_id = str(payload.get("provider_id") or "").strip()
+        if should_skip_advice_turn(
+            message=message,
+            role=role,
+            provider_id=provider_id,
+            precomputed=precomputed,
+            enabled=enabled,
+        ):
+            advice = list(precomputed or [])
+            context["advice"] = advice
+            context["advice_checked"] = precomputed is not None and enabled
+            if advice:
+                block = format_advice_context_block(advice)
+                if block:
+                    context["context"] = f"{context['context']}\n\n{block}".strip()
+            return
+
+        candidates = collect_advice_candidates(
+            context.get("hits") if isinstance(context.get("hits"), list) else [],
+            context.get("stable_hits") if isinstance(context.get("stable_hits"), list) else [],
+            context.get("rule_layer_hits") if isinstance(context.get("rule_layer_hits"), list) else [],
+        )
+        if not candidates:
+            context["advice"] = []
+            context["advice_checked"] = True
+            return
+
+        advice = self._run_ask_advice_judge(message, candidates, project_id=project_id, provider_id=provider_id or None)
+        context["advice"] = advice
+        context["advice_checked"] = True
+        if advice:
+            block = format_advice_context_block(advice)
+            if block:
+                context["context"] = f"{context['context']}\n\n{block}".strip()
+
+    def _run_ask_advice_judge(
+        self,
+        message: str,
+        candidates: list[dict[str, Any]],
+        *,
+        project_id: str,
+        provider_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        prompt = build_advice_judge_prompt(message, candidates)
+        request = ProviderRequest(
+            message=prompt,
+            context="",
+            project_id=project_id,
+            role="review",
+        )
+        try:
+            result = self.provider_router.route(
+                self.repository.list_providers(),
+                request,
+                provider_id if provider_id and provider_id not in {"", "auto", "local-memory"} else "auto",
+            )
+        except Exception as exc:  # noqa: BLE001 - advice is best-effort
+            _LOG.warning("ask memory advice judge failed: %s", exc)
+            return []
+        text = str(result.get("text") or "")
+        if not text.strip():
+            return []
+        return parse_advice_verdict(text, candidates=candidates)
+
     def _tools_enabled_for_payload(self, payload: dict[str, Any], *, include_writes: bool = False) -> bool:
         if payload.get("enable_tools") is False:
             return False
@@ -523,6 +685,8 @@ class AiRuntimeServiceMixin:
         *,
         include_writes: bool = False,
         memory_only: bool = False,
+        interactive: bool = False,
+        chat_id: str = "",
     ) -> Iterator[dict[str, Any]]:
         tool_trace: list[dict[str, Any]] = []
         run_step_seq = 0
@@ -539,6 +703,9 @@ class AiRuntimeServiceMixin:
             cancel_requested=request.cancel_requested,
         )
         result: dict[str, Any] = {}
+        writes_allowed = bool(include_writes)
+        if hasattr(self, "permissions"):
+            self.permissions.bind_run(str(working.run_id or ""), chat_id=str(chat_id or ""))
         for round_idx in range(MAX_TOOL_ROUNDS + 1):
             if working.cancel_requested and working.cancel_requested():
                 break
@@ -653,10 +820,73 @@ class AiRuntimeServiceMixin:
                 executed = self.tool_gateway.execute(
                     tool_name,
                     call_args,
-                    include_writes=include_writes,
+                    include_writes=writes_allowed,
                     memory_only=memory_only,
                     project_id=project_id,
                 )
+                attempts = 0
+                while executed.get("needs_permission") and attempts < 4:
+                    attempts += 1
+                    perm = dict(executed.get("permission") or {})
+                    kind = str(perm.get("kind") or "sandbox")
+                    action = str(perm.get("action") or "read")
+                    target = str(perm.get("target") or "")
+                    reason = str(perm.get("reason") or executed.get("error") or "Permission required")
+                    broker = getattr(self, "permissions", None)
+                    if broker is not None and broker.is_allowed(kind, action, target):
+                        if kind == "write":
+                            writes_allowed = True
+                        executed = self.tool_gateway.execute(
+                            tool_name,
+                            call_args,
+                            include_writes=writes_allowed,
+                            memory_only=memory_only,
+                            project_id=project_id,
+                        )
+                        continue
+                    if not interactive or broker is None:
+                        executed = {
+                            "ok": False,
+                            "name": tool_name,
+                            "error": f"{reason} Approve this in Ask to continue.",
+                            "summary": "",
+                        }
+                        break
+                    request = broker.create_request(kind, action, target, reason, run_id=str(working.run_id or ""))
+                    yield {
+                        "type": "progress",
+                        "phase": "permission",
+                        "status": "Waiting for your permission…",
+                        "tool_name": tool_name,
+                        "arguments": call_args,
+                        "step_id": step_id,
+                        "round": round_idx + 1,
+                        "kind": "status",
+                    }
+                    yield {"type": "permission", **request}
+                    decision = broker.wait(
+                        request["request_id"],
+                        timeout=PERMISSION_WAIT_SECONDS,
+                        cancel_requested=working.cancel_requested,
+                    )
+                    if not decision.get("allow"):
+                        denied = "Permission request timed out." if decision.get("timed_out") else "User denied permission."
+                        executed = {
+                            "ok": False,
+                            "name": tool_name,
+                            "error": f"{denied} {reason}".strip(),
+                            "summary": "",
+                        }
+                        break
+                    if kind == "write":
+                        writes_allowed = True
+                    executed = self.tool_gateway.execute(
+                        tool_name,
+                        call_args,
+                        include_writes=writes_allowed,
+                        memory_only=memory_only,
+                        project_id=project_id,
+                    )
                 entry = {
                     "step_id": step_id,
                     "name": executed.get("name") or tool_name,
@@ -778,8 +1008,14 @@ class AiRuntimeServiceMixin:
             run["usage"] = usage
             if usage.get("cost_usd") is not None:
                 run["cost_usd"] = usage.get("cost_usd")
+        economy = result.get("token_economy") if isinstance(result.get("token_economy"), dict) else None
+        if economy:
+            run["token_economy"] = economy
         run["selected_provider"] = selected or run.get("selected_provider") or {}
         run["routing"] = result.get("routing") or run.get("routing") or {}
+        remember = getattr(self, "remember_provider_runtime_status", None)
+        if callable(remember):
+            remember(result)
         return self.repository.upsert_provider_run(run)
 
     def _route_response(self, project_id: str, message: str, context: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -789,6 +1025,7 @@ class AiRuntimeServiceMixin:
         clean_raw, raw_redacted = self.security_policy.redact_payload(result.get("raw"))
         clean_selected, provider_redacted = self.security_policy.redact_payload(result.get("selected_provider"))
         usage = usage_from_result(result)
+        economy = result.get("token_economy") if isinstance(result.get("token_economy"), dict) else {}
         return {
             "project_id": project_id,
             "message": clean_message,
@@ -802,6 +1039,7 @@ class AiRuntimeServiceMixin:
             },
             "routing": result.get("routing") or {},
             "usage": usage or {},
+            "token_economy": economy or {},
             "text": clean_text,
             "raw": None if clean_raw is None else clean_raw,
             "security": {
@@ -812,4 +1050,12 @@ class AiRuntimeServiceMixin:
                 "raw_redacted": raw_redacted,
             },
         }
+
+    @staticmethod
+    def _stamp_token_economy(result: dict[str, Any] | None, context: dict[str, Any] | None) -> dict[str, Any]:
+        stamped = dict(result or {})
+        economy = context.get("token_economy") if isinstance(context, dict) else None
+        if isinstance(economy, dict) and economy:
+            stamped["token_economy"] = economy
+        return stamped
 

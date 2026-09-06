@@ -1,13 +1,15 @@
-"""Background memory rescan scheduling and status."""
+"""Background memory rescan scheduling and per-source interval ticker."""
+
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from typing import Any
 
-from .constants import ALL_LOCAL_INGESTION_SOURCES, SYSTEM_PROJECT_ID
+from .constants import SYSTEM_PROJECT_ID
 from .models import Project, utc_now
-from .teams_graph import teams_graph_configured
 
 _LOG = logging.getLogger("architectos.service")
 
@@ -17,44 +19,60 @@ class IngestionRescanMixin:
         with self._memory_rescan_lock:
             return dict(self._memory_rescan_state)
 
-    def _default_rescan_sources(self, include_mcp: bool = True) -> list[str]:
-        sources = list(ALL_LOCAL_INGESTION_SOURCES)
-        if not include_mcp:
-            return sources
-        granola = self.mcp_manager.get_server("granola")
-        if granola and granola.enabled:
-            sources.append("granola")
-        ado = self.mcp_manager.get_server("azure-devops")
-        if ado and ado.enabled:
-            sources.append("azure-boards")
-            sources.append("azure-wiki")
-        ado_git = self.mcp_manager.get_server("azure-devops-git")
-        if (ado and ado.enabled) or (ado_git and ado_git.enabled):
-            sources.append("azure-git")
-        if teams_graph_configured():
-            sources.append("teams-meetings")
-        return sources
-
-    def _memory_rescan_settings(self) -> dict[str, Any]:
+    def _source_scheduler_settings(self) -> dict[str, Any]:
         life = dict(self.repository.get_setting("memory_lifecycle") or {})
         return {
             "auto_rescan_on_startup": bool(life.get("auto_rescan_on_startup", True)),
-            "auto_rescan_limit": max(1, int(life.get("auto_rescan_limit") or 24)),
             "auto_rescan_all_projects": bool(life.get("auto_rescan_all_projects", True)),
+            "scheduler_enabled": life.get("source_scheduler_enabled", True) is not False,
+            "scheduler_tick_minutes": max(1, int(life.get("source_scheduler_tick_minutes") or 5)),
+            "default_interval_minutes": max(5, int(life.get("source_default_interval_minutes") or 60)),
         }
+
+    def _memory_rescan_settings(self) -> dict[str, Any]:
+        settings = self._source_scheduler_settings()
+        return {
+            "auto_rescan_on_startup": settings["auto_rescan_on_startup"],
+            "auto_rescan_limit": 0,
+            "auto_rescan_all_projects": settings["auto_rescan_all_projects"],
+        }
+
+    def _default_rescan_bindings(self, project_id: str) -> list[dict[str, Any]]:
+        self.ensure_project_sources(project_id)
+        return [
+            item for item in self.list_project_sources(project_id)
+            if dict(item.get("config") or {}).get("enabled")
+        ]
+
+    def _bindings_due_for_scan(self, project_id: str) -> list[dict[str, Any]]:
+        now = time.time()
+        due: list[dict[str, Any]] = []
+        for binding in self.list_project_sources(project_id):
+            cfg = dict(binding.get("config") or {})
+            if not cfg.get("enabled"):
+                continue
+            schedule = dict(cfg.get("schedule") or {})
+            if not schedule.get("enabled", cfg.get("enabled")):
+                continue
+            interval = max(5, int(schedule.get("interval_minutes") or self._source_scheduler_settings()["default_interval_minutes"])) * 60
+            last_raw = str(cfg.get("last_run_at") or "")
+            if not last_raw:
+                due.append(binding)
+                continue
+            try:
+                from datetime import datetime
+
+                last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00"))
+                elapsed = now - last_dt.timestamp()
+            except ValueError:
+                elapsed = interval + 1
+            if elapsed >= interval:
+                due.append(binding)
+        return due
 
     def rescan_memory_sources(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         settings = self._memory_rescan_settings()
-        include_mcp = payload.get("include_mcp")
-        if include_mcp is None:
-            include_mcp = True
-        sources = payload.get("sources")
-        if not sources or sources == "all" or sources == ["all"]:
-            sources = self._default_rescan_sources(include_mcp=bool(include_mcp))
-        else:
-            sources = self._normalize_ingestion_sources(sources)
-        limit = max(1, int(payload.get("limit") or settings["auto_rescan_limit"]))
         all_projects = bool(payload.get("all_projects", settings["auto_rescan_all_projects"]))
         project_id = str(payload.get("project_id") or "").strip()
         projects = self._projects_for_memory_rescan(project_id or None, all_projects=all_projects)
@@ -66,20 +84,25 @@ class IngestionRescanMixin:
         boards_count = 0
         azure_git_count = 0
         wiki_count = 0
-        teams_count = 0
         for project in projects:
+            bindings = self._default_rescan_bindings(project.id)
+            if payload.get("sources") and payload.get("sources") not in ("all", ["all"]):
+                bindings = self._sources_for_ingest_request(project.id, payload)
+            elif payload.get("due_only"):
+                bindings = self._bindings_due_for_scan(project.id)
+            source_ids = [str(item.get("id") or "") for item in bindings]
             try:
                 self._log_ingest(
-                    f"Rescan project {project.name or project.id} · sources={', '.join(sources)}",
+                    f"Rescan project {project.name or project.id} · sources={len(bindings)}",
                     current=f"project:{project.id}",
                 )
                 ingest = self.ingest_memory({
                     "project_id": project.id,
-                    "sources": sources,
-                    "limit": limit,
+                    "sources": source_ids or "all",
                     "root_path": project.root_path,
                     "all_items": payload.get("all_items"),
                     "ingest_mode": payload.get("ingest_mode") or payload.get("mode"),
+                    "limit": 0,
                 })
             except ValueError as exc:
                 warnings.append(f"{project.name or project.id}: {exc}")
@@ -91,7 +114,6 @@ class IngestionRescanMixin:
             boards_count += int(ingest.get("boards_count") or 0)
             azure_git_count += int(ingest.get("azure_git_count") or 0)
             wiki_count += int(ingest.get("wiki_count") or 0)
-            teams_count += int(ingest.get("teams_count") or 0)
             results.append({
                 "project_id": project.id,
                 "name": project.name,
@@ -103,12 +125,11 @@ class IngestionRescanMixin:
                 "boards_count": ingest.get("boards_count") or 0,
                 "azure_git_count": ingest.get("azure_git_count") or 0,
                 "wiki_count": ingest.get("wiki_count") or 0,
-                "teams_count": ingest.get("teams_count") or 0,
             })
         return {
             "ok": True,
-            "sources": sources,
-            "limit": limit,
+            "sources": [str(item.get("name") or "") for item in (bindings if projects else [])],
+            "limit": 0,
             "projects": results,
             "count": total,
             "duplicates": duplicates,
@@ -116,7 +137,7 @@ class IngestionRescanMixin:
             "boards_count": boards_count,
             "azure_git_count": azure_git_count,
             "wiki_count": wiki_count,
-            "teams_count": teams_count,
+            "teams_count": 0,
             "warnings": warnings,
             "pending": sum(int(item.get("pending") or 0) for item in results),
         }
@@ -136,8 +157,6 @@ class IngestionRescanMixin:
             root = str(project.root_path or "").strip()
             if project.id == SYSTEM_PROJECT_ID and not root:
                 continue
-            if not root:
-                continue
             projects.append(project)
         return projects
 
@@ -145,17 +164,26 @@ class IngestionRescanMixin:
         """Spawn embedding warmup/backfill threads. Called by the HTTP entry
         points, not __init__, so tests and short-lived service instances never
         race daemon threads against tempdir cleanup."""
+        spawned: list[str] = []
         if self.memory_embeddings.enabled() and bool((self.repository.get_setting("memory_retrieval") or {}).get("reindex_on_startup", True)):
-            # Never block HTTP startup on embedding backfill — local Ollama/bge-m3 can
-            # take minutes across thousands of nodes.
+            spawned.append("embed-backfill")
             threading.Thread(target=self._backfill_embeddings_safe, name="embed-backfill", daemon=True).start()
         if self.memory_embeddings.enabled():
+            spawned.append("embed-warmup")
             threading.Thread(target=self._warmup_embeddings_safe, name="embed-warmup", daemon=True).start()
         if self.memory_embeddings.enabled() and not self._embedding_worker_started:
             self._embedding_worker_started = True
+            spawned.append("embed-index")
             threading.Thread(target=self._embedding_index_worker, name="embed-index", daemon=True).start()
+        spawned.extend(["memory-decay", "chat-session-idle", "source-scheduler"])
         threading.Thread(target=self._memory_decay_loop, name="memory-decay", daemon=True).start()
         threading.Thread(target=self._chat_session_idle_loop, name="chat-session-idle", daemon=True).start()
+        threading.Thread(target=self._source_scheduler_loop, name="source-scheduler", daemon=True).start()
+        _LOG.info(
+            "start_background_maintenance pid=%s: spawned %s",
+            os.getpid(),
+            ", ".join(spawned),
+        )
 
     def schedule_startup_memory_rescan(self) -> dict[str, Any]:
         settings = self._memory_rescan_settings()
@@ -164,7 +192,7 @@ class IngestionRescanMixin:
         return self.schedule_memory_rescan({
             "trigger": "startup",
             "all_projects": settings["auto_rescan_all_projects"],
-            "limit": settings["auto_rescan_limit"],
+            "limit": 0,
             "include_mcp": True,
         })
 
@@ -212,7 +240,29 @@ class IngestionRescanMixin:
         threading.Thread(target=worker, name=f"architectos-memory-rescan-{trigger}", daemon=True).start()
         return {"scheduled": True, "trigger": trigger, **self.memory_rescan_status()}
 
-    # Ingest-time hygiene: an exact restatement of an existing fact updates it in
-    # place instead of spawning a duplicate; a close-but-not-identical fact is
-    # flagged (never silently merged) so a value change like "cap 5k -> 9k" stays a
-    # distinct fact the consolidation/supersede path can reason about.
+    def _source_scheduler_loop(self) -> None:
+        while True:
+            settings = self._source_scheduler_settings()
+            tick = max(60, settings["scheduler_tick_minutes"] * 60)
+            time.sleep(tick)
+            if not settings["scheduler_enabled"]:
+                continue
+            with self._memory_ingest_lock:
+                if self._memory_ingest_state.get("running"):
+                    continue
+            try:
+                workspace = dict(self.repository.get_setting("workspace") or {})
+                project_id = str(workspace.get("current_project_id") or "")
+                if not project_id:
+                    continue
+                due = self._bindings_due_for_scan(project_id)
+                if not due:
+                    continue
+                self.schedule_memory_ingest({
+                    "project_id": project_id,
+                    "sources": [str(item.get("id") or "") for item in due],
+                    "limit": 0,
+                    "trigger": "scheduler",
+                })
+            except Exception as exc:  # noqa: BLE001
+                _LOG.debug("source scheduler tick skipped: %s", exc)

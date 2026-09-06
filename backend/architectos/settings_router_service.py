@@ -15,7 +15,7 @@ import queue
 import threading
 from typing import Any
 
-from .embeddings import MemoryEmbeddingEngine, build_embedding_provider
+from .embeddings import MemoryEmbeddingEngine, build_embedding_provider, probe_embedding_provider
 from .models import utc_now
 from .routing import RouterPolicy, classify_role
 
@@ -155,10 +155,82 @@ class SettingsRouterServiceMixin:
         settings.setdefault("memory_lifecycle", self.memory_lifecycle.settings())
         settings.setdefault("memory_retrieval", self.memory_embeddings.settings())
         settings["memory_embeddings"] = self.memory_embeddings_status()
+        settings["vector_runtime"] = self.vector_runtime_status(discover=False)
+        settings["integrations"] = self.integration_credentials()
         return self._public_settings(settings)
+
+    def vector_runtime_status(self, *, discover: bool = True) -> dict[str, Any]:
+        from .vec_runtime import vector_runtime_status
+
+        return vector_runtime_status(discover=discover)
+
+    def repair_vector_runtime(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        from .vec_runtime import apply_vector_runtime_repair
+
+        return apply_vector_runtime_repair(payload)
 
     def memory_embeddings_status(self, project_id: str | None = None) -> dict[str, Any]:
         return self.memory_embeddings.status(project_id)
+
+    def test_memory_embeddings(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = dict(payload or {})
+        current = dict(self.repository.get_setting("memory_retrieval") or {})
+        for key in ("embedding_provider", "embedding_model", "embedding_dimensions", "embedding_base_url", "embedding_account_id"):
+            if key in payload and payload[key] is not None:
+                current[key] = payload[key]
+        self._apply_embedding_secrets(payload)
+        result = probe_embedding_provider(current)
+        last_check = {
+            "ready": bool(result.get("ready")),
+            "status": str(result.get("status") or "unknown"),
+            "message": str(result.get("message") or ""),
+            "hint": str(result.get("hint") or ""),
+            "provider": str(result.get("provider") or ""),
+            "requested_provider": str(result.get("requested_provider") or current.get("embedding_provider") or "auto"),
+            "model": str(result.get("model") or ""),
+            "dimensions": int(result.get("dimensions") or 0),
+            "latency_ms": int(result.get("latency_ms") or 0),
+            "checked_at": utc_now(),
+        }
+        current["embedding_last_check"] = last_check
+        if payload.get("save") or result.get("ready"):
+            self.repository.set_setting("memory_retrieval", current)
+            if payload.get("save"):
+                self._reload_embedding_engine(rebuild=False)
+        return {**result, "last_check": last_check, "settings": {key: current.get(key) for key in ("embedding_provider", "embedding_model", "embedding_dimensions", "embedding_base_url", "embedding_account_id")}}
+
+    def _apply_embedding_secrets(self, payload: dict[str, Any]) -> None:
+        provider = str(payload.get("embedding_provider") or (self.repository.get_setting("memory_retrieval") or {}).get("embedding_provider") or "auto").strip().lower()
+        env_map = {
+            "cloudflare": {"api_key": "CLOUDFLARE_API_TOKEN", "account_id": "CLOUDFLARE_ACCOUNT_ID"},
+            "gemini": {"api_key": "GEMINI_API_KEY"},
+            "openai": {"api_key": "OPENAI_API_KEY"},
+            "azure-openai": {"api_key": "AZURE_OPENAI_API_KEY"},
+            "azure": {"api_key": "AZURE_OPENAI_API_KEY"},
+        }
+        updates: dict[str, str] = {}
+        mapping = env_map.get(provider, {})
+        api_key = str(payload.get("api_key") or payload.get("embedding_api_key") or "").strip()
+        account_id = str(payload.get("account_id") or payload.get("embedding_account_id") or "").strip()
+        base_url = str(payload.get("base_url") or payload.get("embedding_base_url") or "").strip()
+        if api_key and mapping.get("api_key"):
+            updates[mapping["api_key"]] = api_key
+        if account_id:
+            if mapping.get("account_id"):
+                updates[mapping["account_id"]] = account_id
+            if provider in {"cloudflare", "cf", "workers-ai", "auto"}:
+                updates.setdefault("CLOUDFLARE_ACCOUNT_ID", account_id)
+        if base_url:
+            if provider in {"openai"}:
+                updates["OPENAI_BASE_URL"] = base_url
+            elif provider in {"gemini", "google"}:
+                updates["GEMINI_API_BASE"] = base_url
+            elif provider in {"azure", "azure-openai"}:
+                updates["AZURE_OPENAI_ENDPOINT"] = base_url
+            elif provider == "ollama":
+                updates["OLLAMA_HOST"] = base_url
+        if updates:
+            self._upsert_env_local(updates)
 
     def rebuild_memory_embeddings(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
@@ -187,13 +259,18 @@ class SettingsRouterServiceMixin:
                 raise ValueError("settings values must be objects")
             if key in {"memory_lifecycle", "ui", "security", "workspace", "router", "memory_retrieval"}:
                 current = dict(self.repository.get_setting(key) or {})
-                current.update(value)
+                incoming = dict(value)
+                if key == "memory_retrieval":
+                    self._apply_embedding_secrets({**current, **incoming})
+                    for secret in ("api_key", "embedding_api_key", "api_token", "cloudflare_token"):
+                        incoming.pop(secret, None)
+                current.update(incoming)
                 self.repository.set_setting(key, current)
             else:
                 self.repository.set_setting(key, value)
         if "memory_retrieval" in payload:
             # Rebuild only when the embedding identity changes — timeout/pool/min_score are live.
-            identity_keys = ("embeddings_enabled", "embedding_provider", "embedding_model", "embedding_dimensions")
+            identity_keys = ("embeddings_enabled", "embedding_provider", "embedding_model", "embedding_dimensions", "embedding_base_url", "embedding_account_id")
             next_retrieval = dict(self.repository.get_setting("memory_retrieval") or {})
             needs_rebuild = any(
                 str(prev_retrieval.get(key) or "") != str(next_retrieval.get(key) or "")

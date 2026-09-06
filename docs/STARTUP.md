@@ -41,16 +41,16 @@ The launcher looks for Edge or Chrome-compatible browsers and opens `--app=http:
 
 ## Port Handling
 
-The preferred port is `8765`. If it is busy, the launcher picks the next available port and prints the actual URL.
+The preferred port is `8766`. If it is busy, the launcher picks the next available port and prints the actual URL.
 
 ```powershell
-python .\run_architectos.py --port 8765
+python .\run_architectos.py --port 8766
 ```
 
 Use strict mode when another process on the preferred port should be treated as an error:
 
 ```powershell
-python .\run_architectos.py --port 8765 --strict-port
+python .\run_architectos.py --port 8766 --strict-port
 ```
 
 ## Runtime State

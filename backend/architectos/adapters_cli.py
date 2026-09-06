@@ -25,6 +25,53 @@ from typing import Any
 from .adapters_base import ProviderAdapter, ProviderRequest
 
 
+def _cli_extra_path_dirs() -> list[str]:
+    """User/tool bins that login services (LaunchAgent) often omit from PATH."""
+    home = Path.home()
+    candidates = [
+        str(home / ".local" / "bin"),
+        str(home / ".antigravity-ide" / "antigravity-ide" / "bin"),
+        str(home / ".npm-global" / "bin"),
+        str(home / ".cargo" / "bin"),
+        str(home / "go" / "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        str(home / "AppData" / "Roaming" / "npm"),
+        str(home / "AppData" / "Local" / "Programs"),
+    ]
+    dirs: list[str] = []
+    for item in candidates:
+        if item and item not in dirs and Path(item).is_dir():
+            dirs.append(item)
+    return dirs
+
+
+def _cli_search_path() -> str:
+    parts = [item for item in (os.environ.get("PATH") or "").split(os.pathsep) if item]
+    for extra in _cli_extra_path_dirs():
+        if extra not in parts:
+            parts.insert(0, extra)
+    return os.pathsep.join(parts)
+
+
+def _cli_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PATH"] = _cli_search_path()
+    return env
+
+
+def _which_cli(name: str) -> str | None:
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    expanded = Path(raw).expanduser()
+    if expanded.is_absolute() or "/" in raw.replace("\\", "/"):
+        if expanded.is_file() and os.access(expanded, os.X_OK):
+            return str(expanded)
+        return None
+    return shutil.which(raw, path=_cli_search_path())
+
+
 class CliAdapter(ProviderAdapter):
     def __init__(self, provider_id: str, default_command: list[str]) -> None:
         self.provider_id = provider_id
@@ -42,14 +89,14 @@ class CliAdapter(ProviderAdapter):
                 "actions": ["Set command", "Run provider test again"],
                 "details": {},
             }
-        executable = shutil.which(command[0])
+        executable = _which_cli(command[0])
         if not executable:
             return {
                 "provider_id": self.provider_id,
                 "ready": False,
                 "status": "missing_cli",
                 "message": f"CLI executable not found: {command[0]}",
-                "hint": f"Install {command[0]} or update the command to an executable on PATH.",
+                "hint": f"Install {command[0]} (often ~/.local/bin) or put the full path in Configuration. Login autostart does not inherit your shell PATH.",
                 "actions": [f"Install {command[0]}", "Update command", "Restart ArchitectOS if PATH changed"],
                 "details": {"command": command},
             }
@@ -71,14 +118,14 @@ class CliAdapter(ProviderAdapter):
         command = _provider_command(provider, self.default_command)
         if not command:
             return {"provider_id": self.provider_id, "ok": False, "status": "missing_command", "message": "CLI command is not configured."}
-        executable = shutil.which(command[0])
+        executable = _which_cli(command[0])
         if not executable:
             return {
                 "provider_id": self.provider_id,
                 "ok": False,
                 "status": "missing_cli",
                 "message": f"CLI executable not found: {command[0]}",
-                "hint": f"Install {command[0]} first, then sign in again.",
+                "hint": f"Install {command[0]} first (often to ~/.local/bin), then sign in again. ArchitectOS login items do not see a terminal-only PATH.",
             }
         if self.provider_id == "gemini-cli":
             return self._start_gemini_login(executable, project_root)
@@ -108,11 +155,11 @@ class CliAdapter(ProviderAdapter):
             email = str(auth.get("email") or "")
             if method == "google-account":
                 who = f" as {email}" if email else ""
-                message = f"Antigravity CLI (agy) is signed in with Google{who}."
-                hint = "Google account session is ready for ArchitectOS chats. Gemini CLI API keys are no longer required."
+                message = f"Antigravity is signed in with Google{who}."
+                hint = "Keep agy closed. Ask uses headless `agy -p` with the saved Google session (OS keyring / ~/.gemini), then exits."
             else:
-                message = "Antigravity CLI can use an environment API token, but Google sign-in is preferred."
-                hint = "Prefer Sign in with Google. GEMINI_API_KEY is ignored by agy."
+                message = "Antigravity can use a Gemini API key, but Google sign-in is preferred."
+                hint = "Prefer Sign in with Google. A Gemini API key needs modelProvider=gemini in ~/.gemini/antigravity-cli/settings.json."
             return {
                 "provider_id": self.provider_id,
                 "ready": True,
@@ -126,17 +173,35 @@ class CliAdapter(ProviderAdapter):
             "provider_id": self.provider_id,
             "ready": False,
             "status": "missing_credentials",
-            "message": "Antigravity CLI (agy) is installed, but no Google account session was found.",
-            "hint": "Click Sign in with Google, choose Google OAuth in the terminal, paste the browser code, then Test again.",
+            "message": "Antigravity CLI (agy) is on PATH, but no Google account session was found.",
+            "hint": "Click Sign in with Google once. The first `agy` run opens a browser (or prints a URL on SSH). After that close the TUI — Ask does not need a running agy.",
             "actions": ["Sign in with Google", "Run provider test again"],
             "details": details,
         }
 
     def _start_gemini_login(self, executable: str, project_root: Path) -> dict[str, Any]:
+        auth = _gemini_session_auth_state()
+        if auth.get("ready"):
+            email = str(auth.get("email") or "").strip()
+            who = f" as {email}" if email else ""
+            return {
+                "provider_id": self.provider_id,
+                "ok": True,
+                "status": "already_signed_in",
+                "message": f"Antigravity is already signed in with Google{who}. You do not need to launch the agy TUI.",
+                "hint": "Ask calls headless `agy -p` with the saved session and exits. You do not need a running agy TUI.",
+                "details": {
+                    "auth_method": str(auth.get("method") or "google-account"),
+                    "auth_email": email,
+                    "supports_login": True,
+                    "login_label": "Sign in with Google",
+                    "cli": "antigravity",
+                },
+            }
         launched = _launch_cli_login_terminal(
             shell_command=(
                 f'cd {shlex.quote(str(project_root))} && '
-                f'echo "Antigravity login: choose Google OAuth, then paste the browser code if asked." && '
+                f'echo "Antigravity has no separate login command. First `agy` run opens Google in the browser, then you can close the TUI." && '
                 f'{shlex.quote(executable)}'
             ),
             title="Antigravity Sign in with Google",
@@ -146,7 +211,7 @@ class CliAdapter(ProviderAdapter):
             "ok": bool(launched.get("ok")),
             "status": "login_started" if launched.get("ok") else "login_failed",
             "message": launched.get("message") or "Started Antigravity Google sign-in.",
-            "hint": "In the opened terminal choose Google OAuth, finish the browser flow (paste the code if prompted), then click Test in ArchitectOS.",
+            "hint": "Finish Google sign-in in the browser, then close the agy TUI and click Test. ArchitectOS will not keep agy running.",
             "details": {
                 "auth_method": "google-account",
                 "supports_login": True,
@@ -231,6 +296,7 @@ class CliAdapter(ProviderAdapter):
                 capture_output=True,
                 cwd=str(guard["workdir"]),
                 timeout=int(provider.get("timeout_seconds") or 180),
+                env=_cli_subprocess_env(),
                 shell=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -273,6 +339,7 @@ class CliAdapter(ProviderAdapter):
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=str(guard["workdir"]),
+                env=_cli_subprocess_env(),
                 shell=False,
             )
             assert proc.stdin is not None
@@ -326,13 +393,28 @@ class CliAdapter(ProviderAdapter):
         yield {"type": "done", "result": {"provider_id": self.provider_id, "status": status, "text": text, "raw": {"returncode": returncode, "stderr": stderr, "command": command, "workdir": str(guard["workdir"])}}}
 
 
+def _is_antigravity_cli(provider: dict[str, Any]) -> bool:
+    """True for the Antigravity provider (`agy`). Print mode is a one-shot model call, not a live TUI."""
+    if str(provider.get("id") or "") == "gemini-cli":
+        return True
+    command = _provider_command(provider, [])
+    if not command:
+        return False
+    name = Path(str(command[0])).name.lower()
+    return name in {"agy", "agy.exe"}
+
+
 def _cli_guard(provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> dict[str, Any]:
-    if bool(provider.get("approval_required", True)) and not request.approved:
+    # Official Antigravity auth lives in the OS keyring after one interactive sign-in.
+    # Headless `agy -p` uses that session and exits — it must not require a running TUI
+    # or ArchitectOS "require approval" (that flag is for Codex/Claude-style agent CLIs).
+    needs_approval = bool(provider.get("approval_required", True)) and not _is_antigravity_cli(provider)
+    if needs_approval and not request.approved:
         return {"error": True, "status": "approval_required", "text": "CLI run approval is required before ArchitectOS can execute this provider.", "approval_required": True}
     command = _provider_command(provider, [])
     if not command:
         return {"error": True, "status": "error", "text": "CLI command is not configured."}
-    executable = shutil.which(command[0])
+    executable = _which_cli(command[0])
     if not executable:
         return {"error": True, "status": "error", "text": f"CLI executable not found: {command[0]}", "command": command}
     command[0] = executable
@@ -534,7 +616,7 @@ def _cli_command_with_prompt_arg(command: list[str], prompt: str, timeout_second
     if not cleaned:
         cleaned = ["agy", "-p"]
     # Migrate legacy gemini executable to agy when present on PATH.
-    if cleaned[0] in {"gemini", "gemini-cli"} and shutil.which("agy"):
+    if cleaned[0] in {"gemini", "gemini-cli"} and _which_cli("agy"):
         cleaned[0] = "agy"
     flags = {"-p", "--print", "--prompt"}
     out: list[str] = []
@@ -579,7 +661,7 @@ def _normalize_cli_command(command: list[str], default_command: list[str]) -> li
         return list(default_command)
     # Auto-migrate stored Gemini CLI commands to Antigravity (agy).
     if command[0] in {"gemini", "gemini-cli"}:
-        if shutil.which("agy"):
+        if _which_cli("agy"):
             rest = [part for part in command[1:] if part != "-"]
             if not rest or rest == ["-p"] or rest == ["-p", "-"]:
                 return ["agy", "-p"]

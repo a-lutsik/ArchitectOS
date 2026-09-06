@@ -6,7 +6,7 @@ from pathlib import Path
 
 from backend.architectos.adapters import _result_with_usage
 from backend.architectos.service import ArchitectOSService
-from backend.architectos.usage import estimate_cost_usd, normalize_usage, usage_from_result
+from backend.architectos.usage import estimate_cost_usd, memory_token_economy, normalize_usage, usage_from_result
 
 
 class UsageNormalizeTests(unittest.TestCase):
@@ -128,6 +128,7 @@ class ProviderUsageAnalyticsTests(unittest.TestCase):
             self.assertEqual(routed["usage"]["prompt_tokens"], 12)
             self.assertEqual(routed["usage"]["completion_tokens"], 3)
             self.assertIn("cost_usd", routed["usage"])
+            self.assertEqual(routed.get("token_economy") or {}, {})
 
     def test_usage_from_result_reads_raw(self) -> None:
         usage = usage_from_result(
@@ -138,6 +139,67 @@ class ProviderUsageAnalyticsTests(unittest.TestCase):
         )
         self.assertEqual(usage["prompt_tokens"], 5)
         self.assertEqual(usage["completion_tokens"], 7)
+
+
+class MemoryTokenEconomyTests(unittest.TestCase):
+    def test_empty_corpus_is_zero(self) -> None:
+        eco = memory_token_economy(corpus_chars=0, packed_chars=400)
+        self.assertEqual(eco["saved_pct"], 0.0)
+        self.assertEqual(eco["saved_tokens"], 0)
+        self.assertEqual(eco["baseline"], "full_memory_dump")
+
+    def test_pack_larger_than_corpus_does_not_claim_savings(self) -> None:
+        eco = memory_token_economy(corpus_chars=800, packed_chars=1200)
+        self.assertEqual(eco["saved_pct"], 0.0)
+        self.assertEqual(eco["saved_tokens"], 0)
+
+    def test_large_corpus_vs_pack_budget(self) -> None:
+        eco = memory_token_economy(corpus_chars=40_000, packed_chars=6_000, corpus_nodes=40, packed_nodes=8)
+        self.assertEqual(eco["corpus_tokens"], 10_000)
+        self.assertEqual(eco["packed_tokens"], 1_500)
+        self.assertEqual(eco["saved_tokens"], 8_500)
+        self.assertEqual(eco["saved_pct"], 85.0)
+
+    def test_context_and_analytics_report_savings(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            service = ArchitectOSService(Path(tmp))
+            service.repository.set_setting("memory_retrieval", {"embeddings_enabled": False, "reindex_on_startup": False})
+            body = "Project billing rule: discounts apply before tax on the invoice total. " * 30
+            for index in range(18):
+                service.add_memory({
+                    "project_id": "architectos",
+                    "label": f"Billing fact {index}",
+                    "type": "Lesson",
+                    "scope": "project",
+                    "text": f"{body} unique-{index}",
+                    "source": "manual",
+                })
+            ctx = service.context("billing discounts tax", project_id="architectos")
+            eco = ctx["token_economy"]
+            self.assertGreater(eco["corpus_tokens"], eco["packed_tokens"])
+            self.assertGreater(eco["saved_pct"], 50.0)
+            self.assertEqual(eco["baseline"], "full_memory_dump")
+
+            analytics = service.analytics("architectos")
+            snap = analytics["memory_token_economy"]
+            self.assertGreater(snap["saved_pct"], 50.0)
+            self.assertGreater(snap["corpus_nodes"], 10)
+            self.assertEqual(snap["from_asks"]["runs"], 0)
+
+            service.repository.upsert_provider_run({
+                "id": "run_econ",
+                "project_id": "architectos",
+                "provider_id": "openai",
+                "provider_label": "OpenAI",
+                "status": "ok",
+                "model": "gpt-4.1-mini",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "token_economy": eco,
+                "selected_provider": {"id": "openai", "model": "gpt-4.1-mini"},
+            })
+            measured = service.analytics("architectos")["memory_token_economy"]["from_asks"]
+            self.assertEqual(measured["runs"], 1)
+            self.assertEqual(measured["avg_saved_pct"], eco["saved_pct"])
 
 
 if __name__ == "__main__":

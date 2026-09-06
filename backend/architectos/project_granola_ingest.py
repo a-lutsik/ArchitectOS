@@ -207,7 +207,7 @@ class ProjectGranolaIngestMixin:
         richness = self._granola_meeting_body_richness(meeting) + min(len(transcript), 800)
         confidence = 0.86 if richness >= 400 else 0.74 if richness >= 180 else 0.58
         return {
-            "id": stable_id("candidate", project_id, "granola", meeting_id, text[:500]),
+            "id": stable_id("candidate", project_id, "granola", meeting_id),
             "project_id": project_id,
             "source_type": "granola",
             "source_ref": source_ref,
@@ -234,7 +234,7 @@ class ProjectGranolaIngestMixin:
     def _granola_text_candidate(self, project_id: str, source_ref: str, title: str, text: str) -> dict[str, Any]:
         body = f"Granola meeting import: {title}\n\n{text}"
         return {
-            "id": stable_id("candidate", project_id, "granola", source_ref, body[:500]),
+            "id": stable_id("candidate", project_id, "granola", source_ref),
             "project_id": project_id,
             "source_type": "granola",
             "source_ref": source_ref,

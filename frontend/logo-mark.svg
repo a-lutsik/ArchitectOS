@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="100%" height="100%" fill="none" role="img" aria-label="ArchitectOS">
+  <defs>
+    <linearGradient id="lm-brain" x1="56" y1="48" x2="200" y2="168" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="42%" stop-color="#67e8f9"/>
+      <stop offset="58%" stop-color="#e879f9"/>
+      <stop offset="100%" stop-color="#d946ef"/>
+    </linearGradient>
+    <linearGradient id="lm-rim" x1="48" y1="168" x2="208" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#d946ef"/>
+    </linearGradient>
+    <radialGradient id="lm-ambient" cx="50%" cy="42%" r="52%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.28"/>
+      <stop offset="55%" stop-color="#d946ef" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#07070a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="lm-glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="#07070a"/>
+  <circle cx="128" cy="108" r="108" fill="url(#lm-ambient)"/>
+  <g filter="url(#lm-glow)">
+    <path fill="url(#lm-brain)" opacity="0.95" d="M127 36c-28 0-52 16-61 40-10 26-3 52 14 70 11 12 26 19 42 19h3v2c-6 3-10 9-10 16 0 10 8 18 18 18h14c10 0 18-8 18-18 0-7-4-13-10-16v-2h3c16 0 31-7 42-19 17-18 24-44 14-70-9-24-33-40-61-40h-26z"/>
+    <path fill="none" stroke="url(#lm-rim)" stroke-width="7" stroke-linejoin="round" d="M64 176 128 210l64-34-64-34z"/>
+  </g>
+</svg>

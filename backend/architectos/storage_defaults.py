@@ -36,6 +36,14 @@ def _migration_003_mcp_server_defaults(repository: Any, conn: sqlite3.Connection
     repository._upgrade_mcp_server_defaults()
 
 
+def _migration_004_memory_node_source_id(repository: Any, conn: sqlite3.Connection) -> None:
+    """Add memory_nodes.source_id (nullable) linking nodes to a sources row."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_nodes)")}
+    if "source_id" not in columns:
+        conn.execute("ALTER TABLE memory_nodes ADD COLUMN source_id TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_nodes_source ON memory_nodes(source_id, status)")
+
+
 # Ordered (version, fn) steps; _migrate applies every step above the database's
 # PRAGMA user_version. Keep ids monotonically increasing and every step idempotent.
 # ``repository`` is the composed ``SQLiteMemoryRepository`` (via StorageMigrateMixin).
@@ -43,6 +51,7 @@ MIGRATIONS: list[tuple[int, Callable[[Any, sqlite3.Connection], None]]] = [
     (1, _migration_001_memory_nodes_updated_at_index),
     (2, _migration_002_memory_lifecycle_defaults),
     (3, _migration_003_mcp_server_defaults),
+    (4, _migration_004_memory_node_source_id),
 ]
 
 
@@ -50,6 +59,7 @@ def _default_mcp_servers() -> list[dict[str, Any]]:
     return [
         {"id": "filesystem", "label": "Filesystem", "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."], "enabled": True, "approval_required": True, "status": "configured", "transport": "stdio", "env": {}, "notes": "Read/write files within the active project folder via MCP. Agent tools: fs_read / fs_list / fs_search / fs_write (writes need approval)."},
         {"id": "github", "label": "GitHub", "command": ["npx", "-y", "@modelcontextprotocol/server-github"], "enabled": False, "approval_required": True, "status": "planned", "transport": "stdio", "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": ""}, "notes": "Issues, PRs, and repository access. Requires GITHUB_PERSONAL_ACCESS_TOKEN."},
+        _gitlab_mcp_server(),
         _azure_devops_mcp_server(),
         _azure_devops_git_mcp_server(),
         {"id": "jira", "label": "Jira", "command": ["npx", "-y", "mcp-jira"], "enabled": False, "approval_required": True, "status": "planned", "transport": "stdio", "env": {}, "notes": "Jira issues and boards."},
@@ -94,6 +104,20 @@ def _azure_devops_git_mcp_server(org: str = "$ADO_ORG", project: str = "") -> di
         "headers": {},
         "env": env,
         "notes": "Repos and pull requests only (domains: core, repositories). Set ADO_ORG and ADO_MCP_AUTH_TOKEN in .env. AutoScan: Azure Git.",
+    }
+
+
+def _gitlab_mcp_server() -> dict[str, Any]:
+    return {
+        "id": "gitlab",
+        "label": "GitLab",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-gitlab"],
+        "enabled": False,
+        "approval_required": True,
+        "status": "planned",
+        "transport": "stdio",
+        "env": {"GITLAB_PERSONAL_ACCESS_TOKEN": "", "GITLAB_API_URL": "https://gitlab.com/api/v4"},
+        "notes": "GitLab issues, merge requests, and wiki via MCP. Set GITLAB_PERSONAL_ACCESS_TOKEN.",
     }
 
 

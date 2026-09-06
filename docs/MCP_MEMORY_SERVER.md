@@ -8,6 +8,12 @@ Copilot (Agent mode)**, and **Claude Desktop**. Those tools can then *search* an
 This is the mirror of the built-in MCP Hub: the Hub makes ArchitectOS a *client*
 of other MCP servers; this feature makes ArchitectOS a *server* for other agents.
 
+> MCP only fires when the model decides to call a tool, so an agent that stays
+> silent contributes nothing. For Cursor, Claude Code and Codex CLI you can also
+> install lifecycle hooks that capture every turn regardless — see
+> [AGENT_HOOKS.md](AGENT_HOOKS.md). Hooks and MCP share one store and one set of
+> review rules, and are meant to run together.
+
 ## How it works
 
 - Entry point: `mcp_memory_server.py` (repo root).
@@ -23,18 +29,30 @@ of other MCP servers; this feature makes ArchitectOS a *server* for other agents
 | --- | --- | --- |
 | `memory_search` | Return scored memory hits for a query | `query`, `project_id?`, `scope?`, `limit?`, `mode?` (`search`/`list`), `filters?` (exact, `!=X`, `a\|b`, lists) |
 | `memory_context` | Build a ready-to-inject briefing (memory + open tasks + providers) | `query` (required), `project_id?`, `scope?`, `limit?` |
-| `memory_add` | Persist a new memory (secrets auto-redacted) | `label` (required), `text` (required), `type?`, `scope?`, `project_id?`, `confidence?` |
+| `memory_turn` | Per-turn pack + fact capture (call at the start of every user message) | `user_text` (required), `assistant_text?`, `project_id?`, `scope?`, `limit?` |
+| `memory_add` | Persist a new memory; multi-fact dumps are split. Secrets auto-redacted | `label` (required), `text` (required), `type?`, `scope?`, `project_id?`, `confidence?` |
 | `memory_get` | Fetch one memory node in full by id (untruncated text, metadata, evidence, neighbors) | `id` (required), `include_neighbors?` |
 | `memory_feedback` | Rate retrieved hits so ranking improves over time | `rating` (1 or -1, required), `hit_ids?`, `query?`, `note?`, `project_id?` |
 | `memory_list_projects` | List projects for scoping | – |
+| `project_create` | Create a project; without `root_path` a knowledge-only project (no local folder) | `name?`, `root_path?`, `description?` (name or root_path required) |
+| `memory_link` | Create a typed edge between two memory nodes (`SUPERSEDES` is bi-temporal) | `source`, `target`, `type` (required), `scope?`, `confidence?` |
+| `source_create` | Register an external data source for a project (idempotent by name) | `project_id`, `name` (required), `kind?`, `config?` |
+| `source_list` | List registered data sources | `project_id?` |
+| `memory_history` | Event history of a node (created/updated/superseded/accessed) | `id` (required) |
+| `memory_add_bulk` | Store a batch of nodes in one call; per-item errors don't abort the batch | `items` (required), `project_id?`, `scope?`, `source_id?`, `type?` |
 
-Typical agent loop: `memory_search` → `memory_get` for the full record → answer →
-`memory_feedback` on the hits that were (not) useful → `memory_add` for new lessons.
+Typical agent loop: initialize `instructions` already include a short stable-memory briefing.
+At the start of every user message call `memory_turn` with that message (pack + fact
+capture). Still use `memory_search` / `memory_get` to narrow; `memory_add` for an
+explicit lesson; `memory_feedback` to rate hits. Low-risk Lessons from `memory_turn`
+auto-write to short-term memory; Decisions/Constraints stay in the review queue (7-day TTL)
+with source **MCP** (not Ask). The same durable fact from an Ask dialog is not queued twice.
 
 ### Exposed resources (management views)
 
 | URI | Content |
 | --- | --- |
+| `memory://briefing` | Stable memory (pinned, constraints, long-term) plus startup instructions — inject at session start so the agent does not wait for `memory_search` |
 | `memory://projects` | Projects available for scoping (JSON) |
 | `memory://review` | Memory candidates awaiting review (promote/reject) |
 | `memory://nodes/{id}` | Resource template: full node + evidence + neighbors |
@@ -89,8 +107,8 @@ Use absolute paths.
 ```
 
 Reload Cursor. In Settings → MCP you should see `architectos-memory` with its
-tools. In chat the agent can now call e.g. `memory_search` before answering, or
-`memory_add` to remember a decision.
+tools. In chat the agent should call `memory_turn` at the start of each user
+message; `memory_add` still persists an explicit lesson or decision.
 
 ## Register in Claude Code
 

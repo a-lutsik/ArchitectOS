@@ -5,7 +5,7 @@
   "identifier": "app.architectos.desktop",
   "build": {
     "frontendDist": "../ui",
-    "devUrl": "http://127.0.0.1:8765",
+    "devUrl": "http://127.0.0.1:8766",
     "beforeDevCommand": "",
     "beforeBuildCommand": ""
   },

@@ -164,7 +164,7 @@ const KNOWN_CYCLES = [
     "agent-activity.js", "ask-ui.js", "chat.js", "code-intel.js",
     "file-editor.js", "file-find.js", "graph.js", "memory-ingest.js",
     "memory-panel.js", "project-wizard.js", "projects.js", "providers.js",
-    "search-palette.js", "settings.js", "terminal.js", "ui.js",
+    "search-palette.js", "settings.js", "ui.js",
     "workspace-chat.js",
   ],
 ];

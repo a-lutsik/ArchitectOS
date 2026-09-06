@@ -18,6 +18,7 @@ from .config import APP_ENV, APP_NAME, APP_VERSION, BACKUP_RETENTION
 from .council import CouncilOrchestrator
 from .embeddings import MemoryEmbeddingEngine, build_embedding_provider
 from .files import FileStore
+from .permissions import PermissionBroker
 from .graph_service import GraphAutoLinker, GraphServiceMixin
 from .ingestion_service import IngestionServiceMixin
 from .integrations_service import IntegrationsServiceMixin
@@ -25,6 +26,8 @@ from .lifecycle_service import LifecycleServiceMixin, MemoryLifecycleEngine
 from .lsp import CodeIntelligenceManager
 from .mcp import MCPManager
 from .memory_ingestion import MemoryIngestionEngine
+from .memory_wipe_service import MemoryWipeMixin
+from .paths import is_frozen, resolve_frontend_root
 from .project_scan_service import ProjectScanServiceMixin
 from .providers_council_service import ProvidersCouncilServiceMixin
 from .release import release_manifest
@@ -41,7 +44,7 @@ from .tool_gateway import (
 _LOG = logging.getLogger("architectos.service")
 
 
-class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, ProvidersCouncilServiceMixin, IntegrationsServiceMixin, ToolExecServiceMixin, ProjectScanServiceMixin, AzureSyncServiceMixin, IngestionServiceMixin, ChatSessionServiceMixin, ChatServiceMixin, RetrievalServiceMixin, GraphServiceMixin, LifecycleServiceMixin):
+class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, ProvidersCouncilServiceMixin, IntegrationsServiceMixin, ToolExecServiceMixin, ProjectScanServiceMixin, AzureSyncServiceMixin, IngestionServiceMixin, ChatSessionServiceMixin, ChatServiceMixin, RetrievalServiceMixin, GraphServiceMixin, LifecycleServiceMixin, MemoryWipeMixin):
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         # Per-instance API token: the HTTP layer requires it for every /api/*
@@ -96,6 +99,7 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         self.cancelled_runs: set[str] = set()
         # Guards cancelled_runs: request threads add, provider threads poll.
         self._cancelled_runs_lock = threading.Lock()
+        self.permissions = PermissionBroker()
         self.repository.seed_if_empty()
         self._memory_rescan_lock = threading.Lock()
         self._memory_rescan_state: dict[str, Any] = {
@@ -137,29 +141,92 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
             except OSError:
                 continue
 
+    def _upsert_env_local(self, updates: dict[str, str]) -> None:
+        """Write non-empty keys into ``.env.local`` and the process environment."""
+        cleaned = {str(key).strip(): str(value).strip() for key, value in updates.items() if str(key).strip() and str(value).strip()}
+        if not cleaned:
+            return
+        path = self.project_root / ".env.local"
+        lines: list[str] = []
+        if path.is_file():
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                lines = []
+        skip = set(cleaned)
+        kept: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                kept.append(line)
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key in skip:
+                continue
+            kept.append(line)
+        for key, value in cleaned.items():
+            kept.append(f"{key}={value}")
+            os.environ[key] = value
+        path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+    def _frontend_root(self) -> Path:
+        if is_frozen():
+            return resolve_frontend_root()
+        return self.project_root / "frontend"
+
+    def _frontend_check(self) -> dict[str, Any]:
+        frontend_root = self._frontend_root()
+        required = ("index.html", "app.js", "styles.css")
+        missing = [name for name in required if not (frontend_root / name).is_file()]
+        return {
+            "status": "ok" if not missing else "error",
+            "files": list(required),
+            "root": str(frontend_root),
+            "missing": missing,
+        }
+
+    def _release_check(self) -> dict[str, Any]:
+        if is_frozen():
+            return {
+                "status": "ok",
+                "mode": "packaged",
+                "checks": {"packaged_runtime": True},
+            }
+        manifest = release_manifest(self.project_root)
+        return {
+            "status": "ok" if manifest["ready"] else "error",
+            "mode": "source",
+            "checks": manifest["checks"],
+            "file_count": manifest["file_count"],
+        }
+
     def health(self) -> dict[str, Any]:
         return {"ok": True, "app": APP_NAME, "version": APP_VERSION, "environment": APP_ENV, "root": str(self.project_root)}
 
     def version(self) -> dict[str, Any]:
-        manifest = release_manifest(self.project_root)
+        release = self._release_check()
+        release_payload: dict[str, Any] = {
+            "ready": release["status"] == "ok",
+            "mode": release["mode"],
+            "checks": release["checks"],
+        }
+        if "file_count" in release:
+            release_payload["file_count"] = release["file_count"]
         return {
             "app": APP_NAME,
             "version": APP_VERSION,
             "environment": APP_ENV,
             "root": str(self.project_root),
-            "release": {"ready": manifest["ready"], "file_count": manifest["file_count"], "checks": manifest["checks"]},
+            "release": release_payload,
         }
 
     def readiness(self) -> dict[str, Any]:
-        frontend = {
-            "status": "ok" if all((self.project_root / "frontend" / name).exists() for name in ("index.html", "app.js", "styles.css")) else "error",
-            "files": ["index.html", "app.js", "styles.css"],
-        }
+        frontend = self._frontend_check()
         database = self.repository.health_check()
         security = {"status": "ok" if self.repository.get_setting("security") else "error", "policy": self.repository.get_setting("security") or {}}
-        release = release_manifest(self.project_root)
+        release = self._release_check()
         providers = {"status": "ok" if self.repository.list_providers() else "error", "count": len(self.repository.list_providers())}
-        checks = {"database": database, "frontend": frontend, "security": security, "release": {"status": "ok" if release["ready"] else "error", "checks": release["checks"]}, "providers": providers}
+        checks = {"database": database, "frontend": frontend, "security": security, "release": release, "providers": providers}
         ok = all(item.get("status") == "ok" for item in checks.values())
         return {"ok": ok, "app": APP_NAME, "version": APP_VERSION, "environment": APP_ENV, "checks": checks}
 
@@ -210,5 +277,20 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
             payload["provider_usage"] = {
                 "totals": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "runs_with_usage": 0},
                 "by_model": [],
+                "memory_token_economy": {"runs": 0, "avg_saved_pct": 0.0, "saved_tokens": 0, "corpus_tokens": 0, "packed_tokens": 0},
+            }
+        try:
+            snapshot = self.memory_token_economy_snapshot(project_id)
+            from_asks = (payload.get("provider_usage") or {}).get("memory_token_economy") or {}
+            payload["memory_token_economy"] = {**snapshot, "from_asks": from_asks}
+        except Exception as exc:
+            _LOG.warning("analytics memory token economy skipped: %s", exc)
+            payload["memory_token_economy"] = {
+                "baseline": "full_memory_dump",
+                "saved_pct": 0.0,
+                "corpus_tokens": 0,
+                "packed_tokens": 0,
+                "corpus_nodes": 0,
+                "from_asks": {},
             }
         return payload

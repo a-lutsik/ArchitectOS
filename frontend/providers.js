@@ -1,21 +1,12 @@
 /* Providers status/cards/runs + analytics — extracted from app.js */
 import { api } from "./api-client.js";
 import { loadCouncil, syncAskMode } from "./ask-ui.js";
-import { formatTokenCount, formatUsageCost, formatUsageLabel } from "./chat.js";
+import { formatSavedPct, formatTokenCount, formatUsageCost, formatUsageLabel } from "./chat.js";
 import { escapeHtml, showSnackbar } from "./dom-utils.js";
-import { projectParam, t } from "./state.js";
-import { providerHint, providerLoginLabel, providerStatusClass } from "./ui.js";
+import { projectParam, state, t } from "./state.js";
+import { fillEmbeddingsSettings } from "./settings.js";
+import { providerHint, providerIsReady, providerLoginLabel, providerStatusClass, providerStatusLabel } from "./ui.js";
 
-function providerStatusLabel(status, enabled) {
-  const tone = providerStatusClass(status, enabled);
-  const labels = {
-    ready: t("providers.status.ready"),
-    error: t("providers.status.error"),
-    disabled: t("providers.status.disabled"),
-    planned: t("providers.status.planned"),
-  };
-  return labels[tone] || tone;
-}
 function renderProvidersStatus(providers) {
   const message = document.querySelector("#providers-status-message");
   const badge = document.querySelector("#providers-status-badge");
@@ -24,7 +15,7 @@ function renderProvidersStatus(providers) {
     if (badge) { badge.textContent = t("providers.readiness.idle"); badge.dataset.tone = "idle"; }
     return;
   }
-  const ready = providers.filter(provider => providerStatusClass(provider.status, provider.enabled) === "ready").length;
+  const ready = providers.filter(provider => providerIsReady(provider)).length;
   const enabled = providers.filter(provider => provider.enabled).length;
   if (message) {
     message.textContent = t("providers.status.summary")
@@ -54,6 +45,8 @@ async function connectEnvProviders() {
   showSnackbar(payload.message || "Environment providers checked.", payload.connected.length ? "success" : "info");
   await loadProviders();
   await loadCouncil();
+  const settings = await api("/api/settings");
+  fillEmbeddingsSettings(settings);
 }
 async function testAllProviders() {
   const summary = document.querySelector("#provider-summary");
@@ -63,11 +56,41 @@ async function testAllProviders() {
   if (summary) summary.textContent = `${ready}/${payload.checks.length} ready`;
   await loadProviders();
 }
+function providerCredentialsHtml(provider) {
+  const cred = provider.credentials || {};
+  if (!cred.accepts_api_key && !cred.accepts_base_url && !cred.accepts_model) return "";
+  const fields = [];
+  if (cred.accepts_api_key) {
+    const hint = provider.credentials_set ? t("providers.keySet") : t("providers.keyMissing");
+    fields.push(`<label class="provider-cred-field">${escapeHtml(t("providers.apiKey"))}<input data-provider-api-key="${escapeHtml(provider.id)}" type="password" autocomplete="new-password"><small class="field-hint">${escapeHtml(hint)}</small></label>`);
+  }
+  if (cred.accepts_base_url) {
+    const placeholder = provider.id === "ollama" ? "http://127.0.0.1:11434" : "https://";
+    fields.push(`<label class="provider-cred-field">${escapeHtml(t("providers.endpoint"))}<input data-provider-endpoint="${escapeHtml(provider.id)}" value="${escapeHtml(cred.base_url || provider.base_url || "")}" autocomplete="off" spellcheck="false" placeholder="${escapeHtml(placeholder)}"></label>`);
+  }
+  if (cred.accepts_model) {
+    fields.push(`<label class="provider-cred-field">${escapeHtml(t("providers.deployment"))}<input data-provider-deployment="${escapeHtml(provider.id)}" value="${escapeHtml(cred.model || provider.model || "")}" autocomplete="off" spellcheck="false" placeholder="deployment-name"></label>`);
+  }
+  return `<fieldset class="provider-credentials"><legend>${escapeHtml(t("providers.credentials"))}</legend><div class="provider-credentials-grid">${fields.join("")}</div></fieldset>`;
+}
+
+function readProviderCredentialPayload(card, providerId) {
+  const apiKey = card.querySelector(`[data-provider-api-key="${CSS.escape(providerId)}"]`)?.value || "";
+  const endpoint = card.querySelector(`[data-provider-endpoint="${CSS.escape(providerId)}"]`)?.value || "";
+  const deployment = card.querySelector(`[data-provider-deployment="${CSS.escape(providerId)}"]`)?.value || "";
+  const payload = {};
+  if (apiKey.trim()) payload.api_key = apiKey.trim();
+  if (endpoint.trim()) payload.base_url = endpoint.trim();
+  if (deployment.trim()) payload.model = deployment.trim();
+  return payload;
+}
+
 function buildProviderCard(provider) {
   const command = Array.isArray(provider.command) ? provider.command.join(" ") : (provider.command || "");
-  const statusClass = providerStatusClass(provider.status, provider.enabled);
-  const statusLabel = providerStatusLabel(provider.status, provider.enabled);
+  const statusClass = providerStatusClass(provider);
+  const statusLabel = providerStatusLabel(provider);
   const lastCheck = provider.last_check ? `<span class="provider-last-check">last check: ${escapeHtml(provider.last_check.status)} at ${escapeHtml(provider.last_check.checked_at || "")}</span>` : "";
+  const credentials = providerCredentialsHtml(provider);
   const modelOptions = (provider.available_models || []).map(model => `<option value="${escapeHtml(model.name)}">${escapeHtml(model.name)}</option>`).join("");
   const hasModelPicker = provider.id === "ollama" || (provider.id === "openrouter" && provider.available_models && provider.available_models.length);
   const modelControl = hasModelPicker
@@ -79,17 +102,21 @@ function buildProviderCard(provider) {
   const loginAction = loginLabel
     ? `<button data-login-provider="${escapeHtml(provider.id)}" type="button" class="btn-secondary">${escapeHtml(loginLabel)}</button>`
     : "";
-  return `<div class="provider-head"><div><strong>${escapeHtml(provider.label)}</strong><p>${escapeHtml(provider.provider_type)} · ${escapeHtml(statusLabel)}</p></div><span class="provider-status ${statusClass}">${escapeHtml(statusLabel)}</span></div><p class="provider-hint">${escapeHtml(providerHint(provider))}</p>${lastCheck}${modelMeta}<div class="provider-card-actions"><label class="inline-check"><input type="checkbox" data-provider="${escapeHtml(provider.id)}" ${provider.enabled ? "checked" : ""}> enabled</label><label class="inline-check"><input type="checkbox" data-approval-required="${escapeHtml(provider.id)}" ${provider.approval_required ? "checked" : ""}> require approval</label>${loginAction}<button data-test-provider="${escapeHtml(provider.id)}" type="button" class="btn-secondary">Test</button>${modelActions}<span class="provider-test" data-test-result></span></div><details class="provider-advanced"><summary>Configuration</summary><div class="provider-advanced-body">${modelControl}<label>Command<input data-command="${escapeHtml(provider.id)}" value="${escapeHtml(command)}" placeholder="command"></label><label>Workdir policy<select data-workdir-policy="${escapeHtml(provider.id)}"><option value="project-root">project-root</option><option value="custom">custom under project</option></select></label><label>Workdir<input data-workdir="${escapeHtml(provider.id)}" value="${escapeHtml(provider.workdir || "")}" placeholder="optional project subdirectory"></label><label>Base URL<input data-base-url="${escapeHtml(provider.id)}" value="${escapeHtml(provider.base_url || "")}" placeholder="http://127.0.0.1:11434"></label><label>API key env<input data-api-key-env="${escapeHtml(provider.id)}" value="${escapeHtml(provider.api_key_env || "")}" placeholder="${provider.id === "gemini-cli" ? "GEMINI_API_KEY" : "OPENAI_API_KEY"}"></label><label>Timeout<input data-timeout="${escapeHtml(provider.id)}" type="number" min="1" value="${escapeHtml(provider.timeout_seconds || 120)}"></label></div></details><div class="provider-actions-list" data-action-list></div>`;
+  const approvalCheck = provider.id === "gemini-cli"
+    ? ""
+    : `<label class="inline-check"><input type="checkbox" data-approval-required="${escapeHtml(provider.id)}" ${provider.approval_required ? "checked" : ""}> require approval</label>`;
+  return `<div class="provider-head"><div><strong>${escapeHtml(provider.label)}</strong><p>${escapeHtml(provider.provider_type)} · ${escapeHtml(statusLabel)}</p></div><span class="provider-status ${statusClass}">${escapeHtml(statusLabel)}</span></div><p class="provider-hint">${escapeHtml(providerHint(provider))}</p>${credentials}${lastCheck}${modelMeta}<div class="provider-card-actions"><label class="inline-check"><input type="checkbox" data-provider="${escapeHtml(provider.id)}" ${provider.enabled ? "checked" : ""}> enabled</label>${approvalCheck}${loginAction}<button data-test-provider="${escapeHtml(provider.id)}" type="button" class="btn-secondary">Test</button>${modelActions}<span class="provider-test" data-test-result></span></div><details class="provider-advanced"><summary>Configuration</summary><div class="provider-advanced-body">${modelControl}<label>Command<input data-command="${escapeHtml(provider.id)}" value="${escapeHtml(command)}" placeholder="command"></label><label>Workdir policy<select data-workdir-policy="${escapeHtml(provider.id)}"><option value="project-root">project-root</option><option value="custom">custom under project</option></select></label><label>Workdir<input data-workdir="${escapeHtml(provider.id)}" value="${escapeHtml(provider.workdir || "")}" placeholder="optional project subdirectory"></label><label>Base URL<input data-base-url="${escapeHtml(provider.id)}" value="${escapeHtml(provider.base_url || "")}" placeholder="http://127.0.0.1:11434"></label><label>API key env<input data-api-key-env="${escapeHtml(provider.id)}" value="${escapeHtml(provider.api_key_env || "")}" placeholder="${provider.id === "gemini-cli" ? "GEMINI_API_KEY" : "OPENAI_API_KEY"}"></label><label>Timeout<input data-timeout="${escapeHtml(provider.id)}" type="number" min="1" value="${escapeHtml(provider.timeout_seconds || 120)}"></label></div></details><div class="provider-actions-list" data-action-list></div>`;
 }
 async function loadProviders() {
   const payload = await api("/api/providers");
+  state.apiProviderReady = (payload.providers || []).some(provider => provider.id !== "local-memory" && isProviderSelectable(provider));
   syncChatProviderSelect(payload.providers);
   renderProvidersStatus(payload.providers);
   const list = document.querySelector("#provider-list");
   list.innerHTML = "";
   for (const provider of payload.providers) {
     const el = document.createElement("article");
-    el.className = `provider provider-card-compact ${providerStatusClass(provider.status, provider.enabled)}`;
+    el.className = `provider provider-card-compact ${providerStatusClass(provider)}`;
     el.innerHTML = buildProviderCard(provider);
     list.appendChild(el);
     const modelSelect = el.querySelector("select[data-model]");
@@ -129,7 +156,8 @@ async function loadProviders() {
     result.textContent = "checking...";
     actions.innerHTML = "";
     try {
-      const payload = await api(`/api/providers/${button.dataset.testProvider}/test`, { method: "POST", body: "{}" });
+      const body = readProviderCredentialPayload(card, button.dataset.testProvider);
+      const payload = await api(`/api/providers/${button.dataset.testProvider}/test`, { method: "POST", body: JSON.stringify(body) });
       result.className = `provider-test ${payload.provider.ready ? "ok" : "error"}`;
       result.textContent = payload.hint ? `${payload.message} ${payload.hint}` : payload.message;
       actions.innerHTML = (payload.actions || []).map(action => `<span class="badge">${escapeHtml(action)}</span>`).join("");
@@ -158,9 +186,7 @@ async function loadProviders() {
   }));
 }
 function isProviderSelectable(provider) {
-  if (!provider || !provider.enabled) return false;
-  if (provider.last_check && provider.last_check.ready) return true;
-  return providerStatusClass(provider.status, provider.enabled) === "ready";
+  return providerIsReady(provider);
 }
 function syncChatProviderSelect(providers) {
   const selects = [document.querySelector("#chat-provider"), document.querySelector("#workspace-chat-provider")].filter(Boolean);
@@ -212,6 +238,9 @@ async function loadAnalytics() {
   const byModel = Array.isArray(usage.by_model) ? usage.by_model : [];
   const tokenTotal = Number(totals.total_tokens || 0);
   const costTotal = totals.cost_usd != null ? Number(totals.cost_usd) : null;
+  const economy = payload.memory_token_economy || {};
+  const fromAsks = economy.from_asks || {};
+  const savingsCard = renderMemorySavingsCard(economy, fromAsks);
   const metrics = [
     ["Nodes", payload.nodes],
     ["Edges", payload.edges],
@@ -234,10 +263,35 @@ async function loadAnalytics() {
     return `<div class="usage-model-row"><strong>${escapeHtml(name || "unknown")}</strong><span>${escapeHtml(String(row.runs || 0))} runs · ${escapeHtml(tokens)} tok · ${escapeHtml(cost)}</span></div>`;
   }).join("");
   const html = [
+    savingsCard,
     ...metrics.map(([label, value]) => `<article class="metric"><strong>${value}</strong><span>${label}</span></article>`),
     `<article class="metric metric-wide usage-by-model"><strong>${t("usage.byModel")}</strong><div class="usage-model-list">${modelRows || `<div class="usage-model-empty">${t("usage.empty")}</div>`}</div></article>`,
   ].join("");
   for (const grid of grids) grid.innerHTML = html;
+}
+
+function renderMemorySavingsCard(economy, fromAsks) {
+  const pct = Number(economy.saved_pct || 0);
+  const nodes = Number(economy.corpus_nodes || 0);
+  const corpusTok = formatTokenCount(economy.corpus_tokens || 0);
+  const packedTok = formatTokenCount(economy.packed_tokens || 0);
+  let hint;
+  if (!nodes) {
+    hint = t("usage.memorySavedHintEmpty");
+  } else if (pct <= 0) {
+    hint = t("usage.memorySavedHintSmall");
+  } else {
+    hint = t("usage.memorySavedHint")
+      .replace("{nodes}", String(nodes))
+      .replace("{corpus}", corpusTok)
+      .replace("{packed}", packedTok);
+  }
+  const measuredRuns = Number(fromAsks.runs || 0);
+  const measuredPct = Number(fromAsks.avg_saved_pct);
+  const measured = measuredRuns > 0 && Number.isFinite(measuredPct)
+    ? `<span class="memory-savings-measured">${escapeHtml(t("usage.memorySavedMeasured").replace("{runs}", String(measuredRuns)).replace("{pct}", formatSavedPct(measuredPct)))}</span>`
+    : "";
+  return `<article class="metric metric-wide memory-savings"><strong>${escapeHtml(formatSavedPct(pct))}%</strong><span>${escapeHtml(t("usage.memorySavedMetric"))}</span><span class="memory-savings-hint">${escapeHtml(hint)}</span>${measured}<span class="memory-savings-note">${escapeHtml(t("usage.memorySavedNote"))}</span></article>`;
 }
 
 export { connectEnvProviders, loadAnalytics, loadProviderRuns, loadProviders, testAllProviders };

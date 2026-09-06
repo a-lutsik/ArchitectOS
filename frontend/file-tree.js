@@ -1,5 +1,5 @@
 /* Workspace file-tree rendering — extracted from app.js */
-import { state } from "./state.js";
+import { state, t } from "./state.js";
 import { createVirtualList } from "./virtual-list.js";
 
 // The tree is flattened into a row model and windowed (see virtual-list.js):
@@ -90,7 +90,6 @@ function buildRowElement(row, selectedPath) {
 
     const icon = document.createElement('span');
     icon.className = 'file-tree-icon';
-    icon.textContent = '📂';
     item.appendChild(icon);
   } else {
     const spacer = document.createElement('span');
@@ -101,7 +100,6 @@ function buildRowElement(row, selectedPath) {
 
     const icon = document.createElement('span');
     icon.className = 'file-tree-icon';
-    icon.textContent = '📄';
     item.appendChild(icon);
   }
 
@@ -156,6 +154,56 @@ function dropTreeView() {
   treeView = null;
 }
 
+// Placeholder rows match live tree geometry (row height, chevron+icon, indent)
+// so the sidebar width stays put while files load.
+const SKELETON_ROWS = [
+  { indent: 0, width: 74 },
+  { indent: 0, width: 86 },
+  { indent: 0, width: 68 },
+  { indent: 0, width: 81 },
+  { indent: 0, width: 59 },
+  { indent: 0, width: 77 },
+  { indent: 0, width: 83 },
+  { indent: 0, width: 64 },
+  { indent: 0, width: 71 },
+  { indent: 0, width: 88 },
+  { indent: 0, width: 55 },
+  { indent: 0, width: 79 },
+  { indent: 0, width: 66 },
+  { indent: 0, width: 84 },
+];
+
+function renderFileTreeSkeleton(container) {
+  dropTreeView();
+  const tree = document.createElement("div");
+  tree.className = "file-tree file-tree-skeleton";
+  tree.setAttribute("role", "status");
+  tree.setAttribute("aria-busy", "true");
+  tree.setAttribute("aria-live", "polite");
+  tree.setAttribute("aria-label", t("workspace.files.loading"));
+
+  SKELETON_ROWS.forEach((row, index) => {
+    const item = document.createElement("div");
+    item.className = "file-tree-item file-tree-skeleton-row";
+    item.style.paddingLeft = `${row.indent * INDENT_STEP + INDENT_BASE}px`;
+    item.style.setProperty("--skeleton-delay", `${index * 70}ms`);
+    item.setAttribute("aria-hidden", "true");
+
+    const chevron = document.createElement("span");
+    chevron.className = "file-tree-skeleton-chevron";
+    const icon = document.createElement("span");
+    icon.className = "file-tree-skeleton-icon";
+    const name = document.createElement("span");
+    name.className = "file-tree-skeleton-name";
+    name.style.width = `${row.width}%`;
+
+    item.append(chevron, icon, name);
+    tree.appendChild(item);
+  });
+
+  container.replaceChildren(tree);
+}
+
 function ensureTreeView(container, onSelect) {
   if (treeView && treeView.container === container) {
     treeView.onSelect = onSelect;
@@ -202,4 +250,4 @@ function renderFileTree(files, container, onSelect) {
   refreshTreeRows(view);
 }
 
-export { getFileExtension, renderFileTree };
+export { dropTreeView, getFileExtension, renderFileTree, renderFileTreeSkeleton };
