@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from backend.architectos.candidate_identity import candidate_origin_key, origin_key_from_memory_node
+from backend.architectos.memory_ingestion import candidate_fingerprint, fingerprint_from_tokens
 
 
 class CandidateOriginKeyTests(unittest.TestCase):
@@ -83,3 +84,45 @@ class CandidateOriginKeyTests(unittest.TestCase):
             metadata={"source_type": "granola", "meeting_id": "m1", "source_ref": "m1"},
         )
         self.assertEqual(origin_key_from_memory_node(node), "granola:m1")
+
+
+class CandidateFingerprintTests(unittest.TestCase):
+    LABEL = "Billing pipeline rollout"
+    BODY = "The billing pipeline rollout covers metering and invoicing for Q3."
+
+    def test_fingerprint_token_order_is_sorted_not_set_order(self) -> None:
+        # Insertion order must not leak into the value: set iteration order
+        # depends on PYTHONHASHSEED, so the same text would otherwise
+        # fingerprint differently in every process.
+        self.assertEqual(fingerprint_from_tokens({"gamma", "alpha", "beta"}), "alpha|beta|gamma")
+        self.assertEqual(fingerprint_from_tokens({"beta", "gamma", "alpha"}), "alpha|beta|gamma")
+
+    def test_fingerprint_keeps_at_most_eighteen_tokens(self) -> None:
+        tokens = {f"token{index:03d}" for index in range(40)}
+        self.assertEqual(len(fingerprint_from_tokens(tokens).split("|")), 18)
+
+    def test_identical_text_fingerprints_identically(self) -> None:
+        self.assertEqual(
+            candidate_fingerprint(self.LABEL, self.BODY, {}),
+            candidate_fingerprint(self.LABEL, self.BODY, None),
+        )
+
+    def test_meeting_and_work_item_ids_prefix_the_fingerprint(self) -> None:
+        plain = candidate_fingerprint(self.LABEL, self.BODY, {})
+        self.assertEqual(
+            candidate_fingerprint(self.LABEL, self.BODY, {"meeting_id": "mtg-1"}),
+            f"meeting:mtg-1|{plain}",
+        )
+        self.assertEqual(
+            candidate_fingerprint(self.LABEL, self.BODY, {"work_item_id": "15710"}),
+            f"ado:15710|{plain}",
+        )
+        self.assertEqual(
+            candidate_fingerprint(self.LABEL, self.BODY, {"meeting_id": "mtg-1", "work_item_id": "15710"}),
+            f"ado:15710|meeting:mtg-1|{plain}",
+        )
+
+    def test_same_wording_in_different_meetings_does_not_collide(self) -> None:
+        first = candidate_fingerprint(self.LABEL, self.BODY, {"meeting_id": "mtg-1"})
+        second = candidate_fingerprint(self.LABEL, self.BODY, {"meeting_id": "mtg-2"})
+        self.assertNotEqual(first, second)

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from backend.architectos.memory_ingestion import FINGERPRINT_VERSION, candidate_fingerprint
 from backend.architectos.models import MemoryNode
 from backend.architectos.service import ArchitectOSService
 from backend.architectos.storage import SCHEMA_VERSION, SQLiteMemoryRepository
@@ -181,6 +182,66 @@ class SchemaMigrationTests(unittest.TestCase):
             repository._migrate()
             self.assertEqual(self._user_version(repository), SCHEMA_VERSION)
             self.assertIn("idx_memory_nodes_updated_at", self._memory_node_indexes(repository))
+
+    def test_migrate_recomputes_stored_candidate_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SQLiteMemoryRepository(Path(tmp))
+            plain = {
+                "id": "cand-plain",
+                "project_id": "architectos",
+                "source_type": "docs",
+                "source_ref": "a.md",
+                "label": "Billing pipeline rollout",
+                "type": "Lesson",
+                "scope": "project",
+                "text": "The billing pipeline rollout covers metering and invoicing.",
+                "status": "candidate",
+                "metadata": {"fingerprint": "stale|order|from|old|build"},
+            }
+            meeting = {
+                **plain,
+                "id": "cand-meeting",
+                "source_ref": "b.md",
+                "metadata": {"fingerprint": "stale|value", "meeting_id": "mtg-42"},
+            }
+            work_item = {
+                **plain,
+                "id": "cand-ado",
+                "source_ref": "c.md",
+                "metadata": {"fingerprint": "stale|value", "work_item_id": "15710"},
+            }
+            for candidate in (plain, meeting, work_item):
+                repository.upsert_memory_candidate(candidate)
+            # Pretend the rows were written by a build before the version stamp.
+            with repository._connect() as conn:
+                conn.execute("PRAGMA user_version=4")
+            stored_before = {
+                item["id"]: item for item in repository.list_memory_candidates("architectos", "candidate", 50)
+            }
+
+            repository._migrate()
+
+            self.assertEqual(self._user_version(repository), SCHEMA_VERSION)
+            after = {
+                item["id"]: item for item in repository.list_memory_candidates("architectos", "candidate", 50)
+            }
+            expected = candidate_fingerprint(plain["label"], plain["text"], {})
+            self.assertEqual(after["cand-plain"]["metadata"]["fingerprint"], expected)
+            # Identity prefixes survive the rewrite, so distinct meetings and work
+            # items still cannot collide on wording alone.
+            self.assertEqual(after["cand-meeting"]["metadata"]["fingerprint"], f"meeting:mtg-42|{expected}")
+            self.assertEqual(after["cand-ado"]["metadata"]["fingerprint"], f"ado:15710|{expected}")
+            for candidate_id in after:
+                self.assertEqual(after[candidate_id]["metadata"]["fingerprint_version"], FINGERPRINT_VERSION)
+                # A derived-index repair must not look like an edit to the queue.
+                self.assertEqual(after[candidate_id]["updated_at"], stored_before[candidate_id]["updated_at"])
+
+            # Re-running leaves the rows exactly as they are.
+            repository._migrate()
+            repeated = {
+                item["id"]: item for item in repository.list_memory_candidates("architectos", "candidate", 50)
+            }
+            self.assertEqual(repeated, after)
 
 
 if __name__ == "__main__":

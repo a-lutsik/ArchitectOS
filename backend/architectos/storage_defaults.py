@@ -6,9 +6,13 @@ class module. ``storage`` re-imports the public names it needs at runtime.
 """
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from collections.abc import Callable
 from typing import Any
+
+_LOG = logging.getLogger("architectos.storage")
 
 
 def _migration_001_memory_nodes_updated_at_index(repository: Any, conn: sqlite3.Connection) -> None:
@@ -44,6 +48,43 @@ def _migration_004_memory_node_source_id(repository: Any, conn: sqlite3.Connecti
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_nodes_source ON memory_nodes(source_id, status)")
 
 
+def _migration_005_candidate_fingerprint_v2(repository: Any, conn: sqlite3.Connection) -> None:
+    """Recompute stored candidate fingerprints in the deterministic format.
+
+    Values written before this step came from ``Counter.most_common`` over a
+    token *set*, so their order followed PYTHONHASHSEED and changed on every
+    restart. A stored fingerprint therefore never matched a freshly computed
+    one, which killed the exact-match fast path and left duplicate detection to
+    the slow similarity scan. Rewriting them in place repairs existing rows.
+    """
+    # Imported here, not at module scope: memory_ingestion imports storage,
+    # which imports this module.
+    from .memory_ingestion import FINGERPRINT_VERSION, candidate_fingerprint
+
+    updates: list[tuple[str, str]] = []
+    for row in conn.execute("SELECT id, payload FROM memory_candidates").fetchall():
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if int(metadata.get("fingerprint_version") or 0) >= FINGERPRINT_VERSION:
+            continue
+        metadata["fingerprint"] = candidate_fingerprint(
+            str(payload.get("label") or ""), str(payload.get("text") or ""), metadata
+        )
+        metadata["fingerprint_version"] = FINGERPRINT_VERSION
+        updates.append((json.dumps(payload, sort_keys=True), str(row["id"])))
+    if not updates:
+        return
+    # updated_at stays untouched: this repairs a derived index, it is not an
+    # edit to the candidate, and the review queue orders by that column.
+    conn.executemany("UPDATE memory_candidates SET payload = ? WHERE id = ?", updates)
+    _LOG.info("candidate fingerprint migration rewrote %s row(s)", len(updates))
+
+
 # Ordered (version, fn) steps; _migrate applies every step above the database's
 # PRAGMA user_version. Keep ids monotonically increasing and every step idempotent.
 # ``repository`` is the composed ``SQLiteMemoryRepository`` (via StorageMigrateMixin).
@@ -52,6 +93,7 @@ MIGRATIONS: list[tuple[int, Callable[[Any, sqlite3.Connection], None]]] = [
     (2, _migration_002_memory_lifecycle_defaults),
     (3, _migration_003_mcp_server_defaults),
     (4, _migration_004_memory_node_source_id),
+    (5, _migration_005_candidate_fingerprint_v2),
 ]
 
 

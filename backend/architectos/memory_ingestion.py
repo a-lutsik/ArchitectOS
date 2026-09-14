@@ -47,6 +47,11 @@ REVISIONABLE_SOURCE_TYPES = frozenset({
     "code", "docs", "adr", "issue", "pr", "meeting", "inbox",
 })
 
+# Bumped when the stored fingerprint format changes, so metadata written by an
+# older build can be recomputed instead of silently never matching. v2 is the
+# first deterministic format; v1 values depended on PYTHONHASHSEED.
+FINGERPRINT_VERSION = 2
+
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_\-/#.]{2,}", re.IGNORECASE)
 
 DUPLICATE_STOPWORDS = {
@@ -91,6 +96,40 @@ def _token_set(text: str, stopwords: set[str], *, min_len: int = 1, strip_chars:
             continue
         tokens.add(token)
     return tokens
+
+
+def fingerprint_from_tokens(tokens: set[str]) -> str:
+    """Deterministic top-token fingerprint.
+
+    ``_token_set`` returns a set, so an earlier ``Counter.most_common`` here saw
+    every tally as 1 and fell back to set iteration order — which Python
+    randomises per process via PYTHONHASHSEED. Identical text then fingerprinted
+    differently after each restart, so stored fingerprints never matched freshly
+    computed ones. Sorting makes the value stable across processes.
+    """
+    return "|".join(sorted(tokens)[:18])
+
+
+def candidate_fingerprint(label: str, body: str, metadata: dict[str, Any] | None = None) -> str:
+    """Stored fingerprint of a candidate, including its identity prefixes.
+
+    Meeting and work-item ids prefix the token fingerprint so two distinct
+    Granola notes (or Azure Boards items) can never collide on wording alone.
+    This is the single definition of that format: the ingest path and the
+    stored-fingerprint migration must not drift apart.
+    """
+    meta = dict(metadata or {})
+    fingerprint = fingerprint_from_tokens(
+        _token_set(_fingerprintable_text(label, body, meta), DUPLICATE_STOPWORDS)
+    )
+    meeting_id = str(meta.get("meeting_id") or "").strip()
+    work_item_id = str(meta.get("work_item_id") or "").strip()
+    if meeting_id:
+        fingerprint = f"meeting:{meeting_id}|{fingerprint}"
+    if work_item_id:
+        fingerprint = f"ado:{work_item_id}|{fingerprint}"
+    return fingerprint
+
 
 def _token_similarity(left: set[str], right: set[str], *, containment_weight: float) -> float:
     if not left or not right:
@@ -265,7 +304,7 @@ class MemoryIngestionEngine:
                 "label": node.label,
                 "kind": "memory",
                 "tokens": tokens,
-                "fingerprint": self._fingerprint_from_tokens(tokens),
+                "fingerprint": fingerprint_from_tokens(tokens),
                 "meeting_id": str(meta.get("meeting_id") or ""),
                 "work_item_id": str(meta.get("work_item_id") or ""),
                 "source_type": str(meta.get("source") or meta.get("source_type") or ""),
@@ -303,13 +342,14 @@ class MemoryIngestionEngine:
             if dup_of and dup_of in by_id:
                 union(cid, dup_of)
             # Also link via similarity against other pending (exact fingerprint).
+            # The fallback must keep the meeting/work-item prefix: recomputing a
+            # bare token fingerprint here would union two distinct meetings that
+            # merely share wording.
             fp = str(
                 meta.get("fingerprint")
-                or self._fingerprint(_fingerprintable_text(
-                    str(item.get("label") or ""),
-                    str(item.get("text") or ""),
-                    dict(item.get("metadata") or {}),
-                ))
+                or candidate_fingerprint(
+                    str(item.get("label") or ""), str(item.get("text") or ""), meta
+                )
             ).strip()
             if fp:
                 fingerprint_groups.setdefault(fp, []).append(cid)
@@ -378,13 +418,18 @@ class MemoryIngestionEngine:
                 if k not in CANDIDATE_DUPLICATE_KEYS
             }
             probe_meta["duplicate"] = False
-            fp_text = _fingerprintable_text(
-                str(item.get("label") or ""),
-                str(item.get("text") or ""),
-                dict(item.get("metadata") or {}),
-            )
-            probe_meta.setdefault("fingerprint", self._fingerprint(fp_text))
-            probe_meta.setdefault("tokens", sorted(self._tokens(fp_text)))
+            item_label = str(item.get("label") or "")
+            item_text = str(item.get("text") or "")
+            item_meta = dict(item.get("metadata") or {})
+            # Explicit checks rather than setdefault: its default argument is
+            # evaluated even when the key is present, which would re-tokenise
+            # every member of every cluster on each pass.
+            if not probe_meta.get("fingerprint"):
+                probe_meta["fingerprint"] = candidate_fingerprint(item_label, item_text, item_meta)
+            if not probe_meta.get("tokens"):
+                probe_meta["tokens"] = sorted(
+                    self._tokens(_fingerprintable_text(item_label, item_text, item_meta))
+                )
             probe["metadata"] = probe_meta
             hit = self._find_duplicate(probe, memory_refs, by_fingerprint)
             if hit:
@@ -704,7 +749,7 @@ class MemoryIngestionEngine:
                 "label": node.label,
                 "kind": "memory",
                 "tokens": tokens,
-                "fingerprint": self._fingerprint_from_tokens(tokens),
+                "fingerprint": fingerprint_from_tokens(tokens),
                 "meeting_id": str(meta.get("meeting_id") or ""),
                 "work_item_id": str(meta.get("work_item_id") or ""),
                 "source_type": str(meta.get("source") or meta.get("source_type") or ""),
@@ -727,7 +772,12 @@ class MemoryIngestionEngine:
             "label": str(candidate.get("label") or ""),
             "kind": "candidate",
             "tokens": set(metadata.get("tokens") or self._tokens(fp_text)),
-            "fingerprint": str(metadata.get("fingerprint") or self._fingerprint(fp_text)),
+            "fingerprint": str(
+                metadata.get("fingerprint")
+                or candidate_fingerprint(
+                    str(candidate.get("label") or ""), str(candidate.get("text") or ""), metadata
+                )
+            ),
             "meeting_id": str(metadata.get("meeting_id") or ""),
             "work_item_id": str(metadata.get("work_item_id") or ""),
             "source_type": str(candidate.get("source_type") or metadata.get("source") or ""),
@@ -780,15 +830,14 @@ class MemoryIngestionEngine:
         metadata = dict(enriched.get("metadata") or {})
         fp_text = _fingerprintable_text(str(enriched.get("label") or ""), str(enriched.get("text") or ""), metadata)
         tokens = sorted(self._tokens(fp_text))
-        meeting_id = str(metadata.get("meeting_id") or "").strip()
-        work_item_id = str(metadata.get("work_item_id") or "").strip()
-        fingerprint = self._fingerprint(fp_text)
-        if meeting_id:
-            # Meeting identity must dominate fingerprint so distinct Granola notes never collide.
-            fingerprint = f"meeting:{meeting_id}|{fingerprint}"
-        if work_item_id:
-            fingerprint = f"ado:{work_item_id}|{fingerprint}"
-        metadata.setdefault("fingerprint", fingerprint)
+        # Not setdefault: a fingerprint carried over from an older build is
+        # stale rather than authoritative, so re-stamp anything below the
+        # current version instead of trusting it.
+        if not metadata.get("fingerprint") or int(metadata.get("fingerprint_version") or 0) < FINGERPRINT_VERSION:
+            metadata["fingerprint"] = candidate_fingerprint(
+                str(enriched.get("label") or ""), str(enriched.get("text") or ""), metadata
+            )
+            metadata["fingerprint_version"] = FINGERPRINT_VERSION
         metadata.setdefault("tokens", tokens[:24])
         metadata.setdefault("duplicate", False)
         enriched["metadata"] = metadata
@@ -802,13 +851,13 @@ class MemoryIngestionEngine:
     ) -> dict[str, Any] | None:
         metadata = dict(candidate.get("metadata") or {})
         candidate_tokens = set(metadata.get("tokens") or [])
-        candidate_fingerprint = str(metadata.get("fingerprint") or "")
+        candidate_fp = str(metadata.get("fingerprint") or "")
         candidate_meeting_id = str(metadata.get("meeting_id") or "").strip()
         candidate_work_item_id = str(metadata.get("work_item_id") or "").strip()
         candidate_source = str(candidate.get("source_type") or metadata.get("source") or "")
-        if by_fingerprint is not None and candidate_fingerprint:
+        if by_fingerprint is not None and candidate_fp:
             # Fast path: exact fingerprint match without scanning every reference.
-            exact = by_fingerprint.get(candidate_fingerprint)
+            exact = by_fingerprint.get(candidate_fp)
             if exact and not self._is_same_queue_item(candidate, exact):
                 return self._duplicate_hit(exact, 1.0)
         best: dict[str, Any] | None = None
@@ -827,7 +876,7 @@ class MemoryIngestionEngine:
                 continue
             if candidate_work_item_id and ref_work_item_id and candidate_work_item_id == ref_work_item_id:
                 return self._duplicate_hit(reference, 1.0, "same Azure Boards work item id")
-            if by_fingerprint is None and reference.get("fingerprint") == candidate_fingerprint:
+            if by_fingerprint is None and reference.get("fingerprint") == candidate_fp:
                 score = 1.0
             else:
                 ref_tokens = reference.get("tokens")
@@ -842,19 +891,7 @@ class MemoryIngestionEngine:
         return _token_set(text, DUPLICATE_STOPWORDS)
 
     def _fingerprint(self, text: str) -> str:
-        return self._fingerprint_from_tokens(self._tokens(text))
-
-    @staticmethod
-    def _fingerprint_from_tokens(tokens: set[str]) -> str:
-        """Deterministic top-token fingerprint.
-
-        ``_tokens`` returns a set, so every Counter tally here was 1 and
-        ``most_common`` fell back to set iteration order — which Python
-        randomises per process via PYTHONHASHSEED. That made the fingerprint of
-        identical text differ on every restart, so stored fingerprints never
-        matched freshly computed ones and the exact-match fast path was dead.
-        """
-        return "|".join(sorted(tokens)[:18])
+        return fingerprint_from_tokens(self._tokens(text))
 
     def _similarity(self, left: set[str], right: set[str]) -> float:
         return _token_similarity(left, right, containment_weight=0.85)

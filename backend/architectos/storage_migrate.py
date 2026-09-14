@@ -10,7 +10,7 @@ from typing import Any
 from .mcp import detect_azure_devops_from_git
 from .models import Project, stable_id
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 from .storage_defaults import (
     MIGRATIONS,
