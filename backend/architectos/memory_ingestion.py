@@ -8,7 +8,6 @@ carries the fingerprint/similarity engine. ``graph_autolinker`` and
 from __future__ import annotations
 
 import re
-from collections import Counter
 from typing import Any
 
 from .candidate_identity import (
@@ -260,12 +259,13 @@ class MemoryIngestionEngine:
                 continue
             meta = dict(node.metadata or {})
             fp_text = _fingerprintable_text(str(node.label or ""), str(node.text or ""), meta)
+            tokens = self._tokens(fp_text)
             ref = {
                 "id": node.id,
                 "label": node.label,
                 "kind": "memory",
-                "tokens": self._tokens(fp_text),
-                "fingerprint": self._fingerprint(fp_text),
+                "tokens": tokens,
+                "fingerprint": self._fingerprint_from_tokens(tokens),
                 "meeting_id": str(meta.get("meeting_id") or ""),
                 "work_item_id": str(meta.get("work_item_id") or ""),
                 "source_type": str(meta.get("source") or meta.get("source_type") or ""),
@@ -348,10 +348,19 @@ class MemoryIngestionEngine:
                 continue
             clusters.setdefault(find(cid), []).append(item)
 
+        # Score every cluster before writing: _cluster_memory_hits is the
+        # expensive scan and must not run while the write lock is held.
+        scored = [
+            (members, self._cluster_memory_hits(members, memory_refs, by_fingerprint))
+            for members in clusters.values()
+        ]
         updated = 0
-        for members in clusters.values():
-            memory_hits = self._cluster_memory_hits(members, memory_refs, by_fingerprint)
-            updated += self._apply_cluster_duplicate_tags(members, memory_hits)
+        # One transaction for all tag writes. Each changed candidate used to
+        # open its own connection and commit, so a refresh could append to the
+        # WAL hundreds of times for what is logically a single update.
+        with self.repository.transaction():
+            for members, memory_hits in scored:
+                updated += self._apply_cluster_duplicate_tags(members, memory_hits)
         return updated
 
     def _cluster_memory_hits(
@@ -689,12 +698,13 @@ class MemoryIngestionEngine:
             if meta.get("invalid_at"):
                 continue
             fp_text = _fingerprintable_text(str(node.label or ""), str(node.text or ""), meta)
+            tokens = self._tokens(fp_text)
             items.append({
                 "id": node.id,
                 "label": node.label,
                 "kind": "memory",
-                "tokens": self._tokens(fp_text),
-                "fingerprint": self._fingerprint(fp_text),
+                "tokens": tokens,
+                "fingerprint": self._fingerprint_from_tokens(tokens),
                 "meeting_id": str(meta.get("meeting_id") or ""),
                 "work_item_id": str(meta.get("work_item_id") or ""),
                 "source_type": str(meta.get("source") or meta.get("source_type") or ""),
@@ -802,6 +812,9 @@ class MemoryIngestionEngine:
             if exact and not self._is_same_queue_item(candidate, exact):
                 return self._duplicate_hit(exact, 1.0)
         best: dict[str, Any] | None = None
+        # Short Granola stubs are mostly metadata; demand a stricter match.
+        # Depends only on the candidate, so it is hoisted out of the scan.
+        threshold = 0.82 if candidate_source == "granola" and len(candidate_tokens) < 16 else 0.68
         for reference in references:
             if self._is_same_queue_item(candidate, reference):
                 continue
@@ -817,9 +830,10 @@ class MemoryIngestionEngine:
             if by_fingerprint is None and reference.get("fingerprint") == candidate_fingerprint:
                 score = 1.0
             else:
-                score = self._similarity(candidate_tokens, set(reference.get("tokens") or []))
-            # Short Granola stubs are mostly metadata; demand a stricter match.
-            threshold = 0.82 if candidate_source == "granola" and len(candidate_tokens) < 16 else 0.68
+                ref_tokens = reference.get("tokens")
+                if not isinstance(ref_tokens, set):
+                    ref_tokens = set(ref_tokens or ())
+                score = self._similarity(candidate_tokens, ref_tokens)
             if score >= threshold and (not best or score > float(best["duplicate_score"])):
                 best = self._duplicate_hit(reference, score)
         return best
@@ -828,8 +842,19 @@ class MemoryIngestionEngine:
         return _token_set(text, DUPLICATE_STOPWORDS)
 
     def _fingerprint(self, text: str) -> str:
-        counts = Counter(self._tokens(text))
-        return "|".join(token for token, _count in counts.most_common(18))
+        return self._fingerprint_from_tokens(self._tokens(text))
+
+    @staticmethod
+    def _fingerprint_from_tokens(tokens: set[str]) -> str:
+        """Deterministic top-token fingerprint.
+
+        ``_tokens`` returns a set, so every Counter tally here was 1 and
+        ``most_common`` fell back to set iteration order — which Python
+        randomises per process via PYTHONHASHSEED. That made the fingerprint of
+        identical text differ on every restart, so stored fingerprints never
+        matched freshly computed ones and the exact-match fast path was dead.
+        """
+        return "|".join(sorted(tokens)[:18])
 
     def _similarity(self, left: set[str], right: set[str]) -> float:
         return _token_similarity(left, right, containment_weight=0.85)

@@ -6,10 +6,14 @@ inherits ``IngestionCandidatesMixin``.
 """
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Any
 
 from .candidate_identity import candidate_origin_key
 from .models import utc_now
+
+_LOG = logging.getLogger(__name__)
 
 
 class IngestionCandidatesMixin:
@@ -151,7 +155,7 @@ class IngestionCandidatesMixin:
         candidate["promoted_at"] = utc_now()
         candidate = self.repository.update_memory_candidate(candidate)
         if refresh_duplicates:
-            self._refresh_candidate_duplicate_flags(candidate)
+            self._schedule_candidate_duplicate_refresh(candidate)
         return {"candidate": candidate, "memory": node.to_dict()}
 
     def _apply_revision_supersede(self, new_node: Any, old_id: str, candidate: dict[str, Any]) -> None:
@@ -342,7 +346,7 @@ class IngestionCandidatesMixin:
         candidate["reject_reason"] = str((payload or {}).get("reason") or "")
         updated = self.repository.update_memory_candidate(candidate)
         if refresh_duplicates:
-            self._refresh_candidate_duplicate_flags(updated)
+            self._schedule_candidate_duplicate_refresh(updated)
         return {"candidate": updated}
 
     def _refresh_candidate_duplicate_flags(self, candidate: dict[str, Any] | None = None, project_id: str | None = None) -> int:
@@ -351,6 +355,42 @@ class IngestionCandidatesMixin:
             return 0
         pid = str(project_id or (candidate or {}).get("project_id") or "architectos")
         return int(engine.refresh_candidate_duplicate_flags(pid) or 0)
+
+    def _schedule_candidate_duplicate_refresh(
+        self, candidate: dict[str, Any] | None = None, project_id: str | None = None
+    ) -> None:
+        """Coalesce the duplicate-flag recomputes fired by single accept/reject.
+
+        One recompute costs a full project rescan, so a burst of Accept clicks
+        must collapse into a single pass instead of one pass per click. Falls
+        back to running inline when the background worker is not enabled.
+        """
+        pid = str(project_id or (candidate or {}).get("project_id") or "architectos")
+        if not getattr(self, "_dup_refresh_async", False):
+            self._refresh_candidate_duplicate_flags(project_id=pid)
+            return
+        with self._dup_refresh_lock:
+            self._dup_refresh_pending.add(pid)
+            if self._dup_refresh_thread is not None and self._dup_refresh_thread.is_alive():
+                return
+            self._dup_refresh_thread = threading.Thread(
+                target=self._drain_candidate_duplicate_refresh,
+                name="candidate-dup-refresh",
+                daemon=True,
+            )
+            self._dup_refresh_thread.start()
+
+    def _drain_candidate_duplicate_refresh(self) -> None:
+        while True:
+            with self._dup_refresh_lock:
+                if not self._dup_refresh_pending:
+                    self._dup_refresh_thread = None
+                    return
+                pid = self._dup_refresh_pending.pop()
+            try:
+                self._refresh_candidate_duplicate_flags(project_id=pid)
+            except Exception:  # noqa: BLE001 - background worker must not die on one project
+                _LOG.exception("candidate duplicate refresh failed for project %s", pid)
 
     def batch_update_memory_candidates(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}

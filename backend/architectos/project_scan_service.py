@@ -477,28 +477,43 @@ class ProjectScanServiceMixin(ProjectGranolaIngestMixin, ProjectGitIngestMixin, 
 
     def _iter_importable_files(self, root: Path, limit: int, exclude_patterns: list[str] | None = None) -> list[Path]:
         patterns = [str(item).strip() for item in (exclude_patterns or []) if str(item).strip()]
+        # Prune excluded trees during the walk instead of filtering their entries
+        # afterwards: a post-hoc filter still stat()s every file under .venv /
+        # node_modules / data, which starves the GIL and stalls HTTP handlers.
+        if any(part in DEFAULT_EXCLUDES for part in root.parts):
+            return []
         files: list[Path] = []
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if any(part in DEFAULT_EXCLUDES for part in path.parts):
-                continue
-            relative = str(path.relative_to(root)).replace("\\", "/")
-            if any(self._path_matches_exclude(relative, pattern) for pattern in patterns):
-                continue
-            if self._is_noise_file_name(path.name):
-                continue
-            suffix = path.suffix.lower()
-            max_size = CODE_FILE_MAX_BYTES if suffix in CODE_EXTENSIONS else GENERIC_FILE_MAX_BYTES
-            try:
-                size = path.stat().st_size
-            except OSError:
-                continue
-            if size > max_size:
-                continue
-            if suffix not in TEXT_EXTENSIONS and suffix not in CODE_EXTENSIONS and suffix not in DOC_EXTENSIONS and not self._path_looks_text(path):
-                continue
-            files.append(path)
+        for current_root, dir_names, file_names in os.walk(root):
+            current = Path(current_root)
+            kept_dirs: list[str] = []
+            for name in dir_names:
+                if name in DEFAULT_EXCLUDES:
+                    continue
+                relative = str((current / name).relative_to(root)).replace("\\", "/")
+                if any(self._path_matches_exclude(relative, pattern) for pattern in patterns):
+                    continue
+                kept_dirs.append(name)
+            dir_names[:] = kept_dirs
+            for name in file_names:
+                if name in DEFAULT_EXCLUDES or self._is_noise_file_name(name):
+                    continue
+                path = current / name
+                relative = str(path.relative_to(root)).replace("\\", "/")
+                if any(self._path_matches_exclude(relative, pattern) for pattern in patterns):
+                    continue
+                suffix = path.suffix.lower()
+                max_size = CODE_FILE_MAX_BYTES if suffix in CODE_EXTENSIONS else GENERIC_FILE_MAX_BYTES
+                try:
+                    if not path.is_file():
+                        continue
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                if size > max_size:
+                    continue
+                if suffix not in TEXT_EXTENSIONS and suffix not in CODE_EXTENSIONS and suffix not in DOC_EXTENSIONS and not self._path_looks_text(path):
+                    continue
+                files.append(path)
         files.sort(
             key=lambda item: (
                 0 if item.suffix.lower() in CODE_EXTENSIONS else 1 if item.suffix.lower() in DOC_EXTENSIONS else 2,

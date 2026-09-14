@@ -62,6 +62,14 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         self._embedding_index_queue: queue.Queue[str] = queue.Queue()
         self._embedding_worker_started = False
         self.repository.register_node_upsert_listener(self._enqueue_embedding_index)
+        # Refreshing duplicate flags rescans every active node in the project, so
+        # a single Accept must not pay for it inline. Same opt-in as above: stay
+        # synchronous until start_background_maintenance() flips it, so tests and
+        # short-lived instances keep deterministic ordering.
+        self._dup_refresh_lock = threading.Lock()
+        self._dup_refresh_pending: set[str] = set()
+        self._dup_refresh_thread: threading.Thread | None = None
+        self._dup_refresh_async = False
         self.provider_router = ProviderRouter(project_root)
         self.security_policy = SecurityPolicy()
         self.ingestion_engine = MemoryIngestionEngine(self.repository)

@@ -175,6 +175,8 @@ class IngestionRescanMixin:
             self._embedding_worker_started = True
             spawned.append("embed-index")
             threading.Thread(target=self._embedding_index_worker, name="embed-index", daemon=True).start()
+        # Single accept/reject may now hand its duplicate refresh to a worker.
+        self._dup_refresh_async = True
         spawned.extend(["memory-decay", "chat-session-idle", "source-scheduler"])
         threading.Thread(target=self._memory_decay_loop, name="memory-decay", daemon=True).start()
         threading.Thread(target=self._chat_session_idle_loop, name="chat-session-idle", daemon=True).start()
