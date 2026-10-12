@@ -1013,6 +1013,9 @@
                   aria-selected="true">Graph</button>
                 <button id="memory-tab-list" type="button" class="memory-view-tab" role="tab"
                   aria-selected="false">List</button>
+                <button id="memory-tab-duplicates" type="button" class="memory-view-tab" role="tab"
+                  aria-selected="false"><span data-i18n="dup.tab">Duplicates</span><span id="memory-dup-badge"
+                    class="memory-view-tab-badge" hidden></span></button>
               </div>
               <div class="graph-controls">
                 <input id="graph-search" class="graph-search-input" type="search" placeholder="Search graph..."
@@ -1224,6 +1227,22 @@
                 <span id="memory-list-count" class="memory-list-count muted"></span>
               </div>
               <div id="memory-list-items" class="memory-list-items"></div>
+            </div>
+
+            <!-- Duplicates review: dedup gate flags, compaction and undo -->
+            <div id="memory-duplicates-panel" class="memory-list-panel memory-dup-panel" hidden>
+              <div class="memory-list-filters memory-dup-toolbar">
+                <span id="memory-dup-summary" class="memory-list-count muted"></span>
+                <button id="memory-dup-preview" type="button" class="candidate-action"
+                  data-i18n="dup.preview">What can be merged</button>
+                <button id="memory-dup-compact" type="button" class="candidate-action candidate-action-accept"
+                  data-i18n="dup.compact">Merge covered facts</button>
+              </div>
+              <div id="memory-dup-compaction" class="memory-dup-compaction" hidden></div>
+              <h4 class="memory-dup-heading" data-i18n="dup.review">To review</h4>
+              <div id="memory-dup-items" class="memory-dup-items"></div>
+              <h4 class="memory-dup-heading" data-i18n="dup.recent">Recent decisions</h4>
+              <div id="memory-dup-recent" class="memory-dup-recent"></div>
             </div>
 
             <!-- Memory Lifecycle at bottom of graph -->

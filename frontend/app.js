@@ -16,7 +16,7 @@ import {
   persistSourceSettingsFromTable, renderMemorySourcesSettings, submitAddSourceModal, testAddSourceConnection, toggleAllSources,
 } from "./memory-sources.js";
 import {
-  batchUpdateCandidates, candidateBatchFilterFromUi, candidateSourceFromUi,
+  batchUpdateCandidates, bindMemoryDuplicates, candidateBatchFilterFromUi, candidateSourceFromUi,
   handleMemoryFileSelect, importMemoryFiles,
   loadMemoryCandidates, loadMemoryLifecycle, loadMemoryLifecycleItems,
   loadMemoryList, renderMemoryFiles, shiftCandidatePage, switchMemoryTab, syncCandidateBatchActions,
@@ -130,6 +130,8 @@ function bindEvents() {
   on("#refresh-candidates", "click", () => loadMemoryCandidates().catch(showError));
   on("#memory-tab-graph", "click", () => switchMemoryTab("graph"));
   on("#memory-tab-list", "click", () => switchMemoryTab("list"));
+  on("#memory-tab-duplicates", "click", () => switchMemoryTab("duplicates"));
+  bindMemoryDuplicates();
   on("#memory-list-tier", "change", () => loadMemoryList().catch(showError));
   on("#memory-list-state", "change", () => loadMemoryList().catch(showError));
   let memoryListSearchTimer = null;

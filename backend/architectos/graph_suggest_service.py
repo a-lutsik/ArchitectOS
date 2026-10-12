@@ -246,10 +246,16 @@ class GraphSuggestServiceMixin:
                 if suggestion["source_id"] in merged_away or suggestion["target_id"] in merged_away:
                     continue
                 try:
+                    # The judge picked the more complete node as keeper: keep its
+                    # text instead of appending the duplicate to it.
                     if suggestion["keep"] == "A":
-                        result = self.merge_graph_nodes(suggestion["target_id"], {"target_id": suggestion["source_id"]})
+                        result = self.merge_graph_nodes(
+                            suggestion["target_id"], {"target_id": suggestion["source_id"], "strategy": "keep_best"}
+                        )
                     else:
-                        result = self.merge_graph_nodes(suggestion["source_id"], {"target_id": suggestion["target_id"]})
+                        result = self.merge_graph_nodes(
+                            suggestion["source_id"], {"target_id": suggestion["target_id"], "strategy": "keep_best"}
+                        )
                     merged.append({"kept": result["target"]["id"], "merged": result["source"]["id"], "labels": [suggestion["source_label"], suggestion["target_label"]]})
                     merged_away.add(result["source"]["id"])
                 except ValueError:

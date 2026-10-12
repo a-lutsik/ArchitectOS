@@ -317,6 +317,15 @@ class SettingsRouterServiceMixin:
                     _LOG.info("memory decay done · changed=%s", result.get("changed"))
             except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
                 _LOG.warning("memory decay failed: %s", exc)
+            try:
+                report = self.run_scheduled_compaction()
+                if report is not None:
+                    _LOG.info(
+                        "memory compaction done · merged=%s would_merge=%s",
+                        report.get("merged"), report.get("would_merge"),
+                    )
+            except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
+                _LOG.warning("memory compaction failed: %s", exc)
             if self._decay_stop.wait(interval_s):
                 return
 

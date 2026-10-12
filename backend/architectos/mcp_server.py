@@ -291,6 +291,22 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_compact",
+        "description": (
+            "Preview memory compaction (read-only): stored facts whose content is fully "
+            "covered by a fuller stored fact under the same subject, grouped per keeper. "
+            "Nothing is merged — merges are applied by the daily background pass or from "
+            "the Duplicates view, where they can be undone."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Limit to one project (omit for all)."},
+                "max_clusters": {"type": "integer", "description": "Max keeper groups to report (default 50)."},
+            },
+        },
+    },
+    {
         "name": "memory_themes",
         "description": (
             "List the high-level themes (graph communities) in ArchitectOS memory — a "
@@ -378,6 +394,7 @@ class MemoryMCPServer:
             "source_list": self._tool_source_list,
             "memory_history": self._tool_memory_history,
             "memory_add_bulk": self._tool_memory_add_bulk,
+            "memory_compact": self._tool_memory_compact,
             "memory_themes": self._tool_themes,
             "memory_explain_path": self._tool_explain_path,
             "code_neighbors": self._tool_code_neighbors,
@@ -625,6 +642,18 @@ class MemoryMCPServer:
         if extras:
             summary += f" Split into {1 + len(extras)} fact(s)."
         return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id"), "source_id": node.get("source_id"), "also_created": extras, "dedup": dedup})
+
+    def _tool_memory_compact(self, args: dict[str, Any]) -> dict[str, Any]:
+        report = self.service.compact_memory({
+            "project_id": args.get("project_id") or None,
+            "max_clusters": args.get("max_clusters"),
+            "dry_run": True,
+        })
+        summary = (
+            f'Compaction preview: {report["would_merge"]} stored fact(s) are covered by a fuller fact '
+            f'in {len(report["clusters"])} group(s). Nothing was merged.'
+        )
+        return _tool_result(summary, report)
 
     def _tool_memory_add_bulk(self, args: dict[str, Any]) -> dict[str, Any]:
         raw_items: Any = args.get("items")

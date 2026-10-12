@@ -277,6 +277,9 @@ DEFAULT_MEMORY_DEDUP: dict[str, Any] = {
     "llm_provider_id": "",
     "llm_max_candidates": 2,
     "llm_min_confidence": 0.75,
+    # Daily background compaction of stored facts (applies only in mode auto).
+    "compaction_enabled": True,
+    "compaction_max_clusters": 50,
 }
 
 
@@ -296,6 +299,11 @@ def dedup_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         settings["llm_max_candidates"] = max(0, min(int(settings["llm_max_candidates"]), 5))
     except (TypeError, ValueError):
         settings["llm_max_candidates"] = DEFAULT_MEMORY_DEDUP["llm_max_candidates"]
+    try:
+        settings["compaction_max_clusters"] = max(1, min(int(settings["compaction_max_clusters"]), 500))
+    except (TypeError, ValueError):
+        settings["compaction_max_clusters"] = DEFAULT_MEMORY_DEDUP["compaction_max_clusters"]
+    settings["compaction_enabled"] = bool(settings["compaction_enabled"])
     settings["llm_judge"] = bool(settings["llm_judge"])
     settings["llm_provider_id"] = str(settings["llm_provider_id"] or "")
     return settings

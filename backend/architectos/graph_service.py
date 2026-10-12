@@ -686,30 +686,45 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
             raise ValueError("source and target graph nodes are required")
         if source.type == "Project" or target.type == "Project":
             raise ValueError("project root node cannot be merged")
+        # "append" (default, manual merges) concatenates the source text into the
+        # target; "keep_best" keeps the target text as is — the caller picked the
+        # fuller/better node, and the source stays in the store as status=merged.
+        strategy = str(payload.get("strategy") or "append").strip().lower()
+        if strategy not in {"append", "keep_best"}:
+            raise ValueError("strategy must be append or keep_best")
         # Fetch neighborhood outside the write lock — list_edges() under BEGIN IMMEDIATE
         # held the lock for a full table scan.
         touching = self.repository.list_edges_touching([source.id])
+        existing_edge_ids = {edge.id for edge in self.repository.list_edges_touching([target.id])}
+        added_edge_ids: list[str] = []
         # Edge relinks + node updates must commit as one unit (no half-merged graphs).
         with self.repository.transaction():
-            merged_text = f"{target.text}\n\nMerged from {source.label}:\n{source.text}"
-            target.text = merged_text[:6000]
+            if strategy == "append":
+                merged_text = f"{target.text}\n\nMerged from {source.label}:\n{source.text}"
+                target.text = merged_text[:6000]
             target.metadata["merged_from"] = list(dict.fromkeys([*(target.metadata.get("merged_from") or []), source.id]))
             target.metadata["pinned"] = bool(target.metadata.get("pinned") or source.metadata.get("pinned") or source.metadata.get("favorite"))
             for edge in touching:
                 if edge.source == source.id and edge.target != target.id:
-                    self.repository.add_edge(target.id, edge.target, edge.type, edge.scope, edge.confidence)
+                    added = self.repository.add_edge(target.id, edge.target, edge.type, edge.scope, edge.confidence)
                 elif edge.target == source.id and edge.source != target.id:
-                    self.repository.add_edge(edge.source, target.id, edge.type, edge.scope, edge.confidence)
+                    added = self.repository.add_edge(edge.source, target.id, edge.type, edge.scope, edge.confidence)
+                else:
+                    continue
+                if added.id not in existing_edge_ids:
+                    added_edge_ids.append(added.id)
             source.status = "merged"
             source.metadata["merged_into"] = target.id
             source.metadata["merged_at"] = utc_now()
             target = self.repository.upsert_node(target)
             source = self.repository.upsert_node(source)
         try:
-            self.repository.record_memory_event(target.id, "updated", details={"merged_from": source.id})
+            self.repository.record_memory_event(
+                target.id, "updated", details={"merged_from": source.id, "strategy": strategy},
+            )
         except Exception:  # history is best-effort
             pass
-        return {"target": target.to_dict(), "source": source.to_dict()}
+        return {"target": target.to_dict(), "source": source.to_dict(), "added_edge_ids": added_edge_ids}
 
     def apply_graph_command(self, payload: dict[str, Any]) -> dict[str, Any]:
         action = str(payload.get("action") or payload.get("command") or "").strip().lower()

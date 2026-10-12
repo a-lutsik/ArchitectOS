@@ -245,6 +245,12 @@ class MemoryWipeMixin:
                 try:
                     for table in ("memory_dedup_stems", "memory_dedup_index"):
                         self._delete_in_chunks(conn, f"DELETE FROM {table} WHERE node_id IN ({{ph}})", node_ids)
+                    self._delete_in_chunks(
+                        conn,
+                        "DELETE FROM dedup_rejected_pairs WHERE left_id IN ({ph}) OR right_id IN ({ph})",
+                        node_ids,
+                        double=True,
+                    )
                 except sqlite3.Error as exc:
                     _LOG.debug("wipe skipped memory_dedup_index: %s", exc)
                 try:

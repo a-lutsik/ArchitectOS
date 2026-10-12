@@ -1,5 +1,6 @@
 /* Memory panel: lifecycle, list, candidates, files — extracted from app.js */
 import { api } from "./api-client.js";
+import { showAppConfirm } from "./app-dialog.js";
 import { formatBytes, readFileAsDataUrl } from "./ask-ui.js";
 import { escapeHtml, showSnackbar } from "./dom-utils.js";
 import { openMemoryNodeCard, wakeGraphAnimation } from "./graph.js";
@@ -104,7 +105,7 @@ function memoryItemOpenAttrs(item) {
 }
 
 function openMemoryItemFromEvent(event) {
-  const card = event.target.closest?.(".memory-lifecycle-item[data-node-id], .memory-list-item[data-node-id]");
+  const card = event.target.closest?.(".memory-lifecycle-item[data-node-id], .memory-list-item[data-node-id], .memory-dup-open[data-node-id]");
   if (!card) return;
   const id = String(card.dataset.nodeId || "").trim();
   if (!id) return;
@@ -117,7 +118,7 @@ function bindMemoryItemOpener() {
   document.addEventListener("click", openMemoryItemFromEvent);
   document.addEventListener("keydown", event => {
     if (event.key !== "Enter" && event.key !== " ") return;
-    const card = event.target.closest?.(".memory-lifecycle-item[data-node-id], .memory-list-item[data-node-id]");
+    const card = event.target.closest?.(".memory-lifecycle-item[data-node-id], .memory-list-item[data-node-id], .memory-dup-open[data-node-id]");
     if (!card || event.target !== card) return;
     event.preventDefault();
     openMemoryItemFromEvent({ target: card });
@@ -157,21 +158,38 @@ function memoryTypeIcon(type) {
   return MEMORY_TYPE_ICONS[type] || "📝";
 }
 
+const MEMORY_VIEW_TABS = {
+  graph: "#memory-tab-graph",
+  list: "#memory-tab-list",
+  duplicates: "#memory-tab-duplicates",
+};
+
 function switchMemoryTab(tab) {
-  const graphTab = document.querySelector("#memory-tab-graph");
-  const listTab = document.querySelector("#memory-tab-list");
   const graphLayout = document.querySelector(".memory-graph-section .graph-layout");
   const listPanel = document.querySelector("#memory-list-panel");
-  if (!graphTab || !listTab || !graphLayout || !listPanel) return;
-  const showList = tab === "list";
-  graphTab.classList.toggle("active", !showList);
-  graphTab.setAttribute("aria-selected", String(!showList));
-  listTab.classList.toggle("active", showList);
-  listTab.setAttribute("aria-selected", String(showList));
+  const dupPanel = document.querySelector("#memory-duplicates-panel");
+  if (!graphLayout || !listPanel) return;
+  const active = MEMORY_VIEW_TABS[tab] ? tab : "graph";
+  for (const [name, selector] of Object.entries(MEMORY_VIEW_TABS)) {
+    const button = document.querySelector(selector);
+    if (!button) continue;
+    button.classList.toggle("active", name === active);
+    button.setAttribute("aria-selected", String(name === active));
+  }
   // Inline display: CSS display rules on these containers override the hidden attribute.
-  graphLayout.style.display = showList ? "none" : "";
-  listPanel.style.display = showList ? "" : "none";
-  if (showList) loadMemoryList().catch(showError);
+  graphLayout.style.display = active === "graph" ? "" : "none";
+  listPanel.style.display = active === "list" ? "" : "none";
+  if (dupPanel) {
+    dupPanel.hidden = active !== "duplicates";
+    dupPanel.style.display = active === "duplicates" ? "" : "none";
+  }
+  if (active === "list") loadMemoryList().catch(showError);
+  else if (active === "duplicates") {
+    // A compaction report from an earlier visit is stale (data and language may have changed).
+    const report = document.querySelector("#memory-dup-compaction");
+    if (report) report.hidden = true;
+    loadMemoryDuplicates().catch(showError);
+  }
   else wakeGraphAnimation();
 }
 
@@ -861,11 +879,222 @@ async function importMemoryFiles() {
   scheduleGraphLoad();
 }
 
+/* Duplicates view: dedup gate flags, compaction and undo (see docs/MEMORY_DEDUP_RU.md). */
+function fillTemplate(text, values) {
+  return Object.entries(values).reduce((out, [key, value]) => out.replaceAll(`{${key}}`, String(value)), text);
+}
+
+// Server reasons are stable English phrases (memory_dedup.py); translate the known ones.
+const DUP_REASON_KEYS = {
+  "exact restatement": "dup.reason.exact",
+  "same content words": "dup.reason.sameWords",
+  "already covered by a fuller fact": "dup.reason.covered",
+  "same fact with added detail": "dup.reason.enrich",
+  "same statement with changed values": "dup.reason.changedValues",
+  "same statement with negation flipped": "dup.reason.negation",
+  "merged in review": "dup.reason.review",
+};
+
+function dupReasonLabel(reason) {
+  const text = String(reason || "");
+  const key = DUP_REASON_KEYS[text];
+  if (key) return t(key);
+  if (text.startsWith("llm judge:")) return `${t("dup.reason.llm")}:${text.slice("llm judge:".length)}`;
+  return text;
+}
+
+function dupActionLabel(action) {
+  const key = `dup.action.${action}`;
+  const label = t(key);
+  return label === key ? action : label;
+}
+
+function dupSideHtml(kicker, node) {
+  return `
+    <div class="memory-dup-side">
+      <div class="memory-dup-side-kicker">${escapeHtml(kicker)} · ${escapeHtml(node.type || "")}</div>
+      <strong class="memory-dup-open"${memoryItemOpenAttrs(node)}>${escapeHtml(node.label || "")}</strong>
+      <p>${escapeHtml(node.text || "")}</p>
+    </div>`;
+}
+
+function dupItemHtml(item) {
+  const isConflict = item.kind === "conflict";
+  const kindLabel = item.kind === "suggestion"
+    ? fillTemplate(t("dup.kind.suggestion"), { action: dupActionLabel(item.suggested_action || "") })
+    : t(`dup.kind.${item.kind}`);
+  const score = typeof item.score === "number" ? `${Math.round(item.score * 100)}%` : "";
+  const nearLabel = item.kind === "possible_duplicate" ? t(`dup.near.${item.near_kind === "semantic" ? "semantic" : "lexical"}`) : "";
+  const pair = `data-node="${escapeHtml(item.node.id)}" data-target="${escapeHtml(item.target.id)}"`;
+  const actions = isConflict
+    ? `<button type="button" class="candidate-action" data-dup-action="dismiss" ${pair}>${escapeHtml(t("dup.dismiss"))}</button>`
+    : `
+      <button type="button" class="candidate-action candidate-action-accept" data-dup-action="merge" data-keep="target" ${pair}>${escapeHtml(t("dup.mergeIntoExisting"))}</button>
+      <button type="button" class="candidate-action" data-dup-action="merge" data-keep="node" ${pair}>${escapeHtml(t("dup.keepNew"))}</button>
+      <button type="button" class="candidate-action candidate-action-reject" data-dup-action="distinct" ${pair}>${escapeHtml(t("dup.distinct"))}</button>`;
+  return `
+    <article class="memory-dup-card${isConflict ? " is-conflict" : ""}">
+      <div class="candidate-card-chips">
+        <span class="candidate-chip ${isConflict ? "memory-dup-chip-danger" : "warning"}">${escapeHtml(kindLabel)}</span>
+        ${nearLabel ? `<span class="candidate-chip subtle">${escapeHtml(nearLabel)}${score ? ` · ${escapeHtml(score)}` : ""}</span>` : ""}
+        ${item.reason ? `<span class="candidate-chip subtle">${escapeHtml(dupReasonLabel(item.reason))}</span>` : ""}
+      </div>
+      <div class="memory-dup-pair">
+        ${dupSideHtml(t("dup.node"), item.node)}
+        ${dupSideHtml(t("dup.target"), item.target)}
+      </div>
+      <div class="memory-dup-actions">${actions}</div>
+    </article>`;
+}
+
+function dupRecentHtml(entry) {
+  const when = String(entry.timestamp || "").replace("T", " ").slice(0, 16);
+  const target = entry.target_label ? ` ↔ ${escapeHtml(entry.target_label)}` : "";
+  return `
+    <div class="memory-dup-row${entry.undone ? " is-undone" : ""}">
+      <span class="candidate-chip subtle">${escapeHtml(dupActionLabel(entry.action))}</span>
+      <span class="memory-dup-row-text"><strong>${escapeHtml(entry.node.label || "")}</strong>${target}
+        ${entry.reason ? `<span class="muted"> · ${escapeHtml(dupReasonLabel(entry.reason))}</span>` : ""}</span>
+      <span class="muted">${escapeHtml(when)}</span>
+      ${entry.undone
+        ? `<span class="candidate-chip subtle">${escapeHtml(t("dup.undone"))}</span>`
+        : `<button type="button" class="candidate-action" data-dup-undo="${escapeHtml(entry.event_id)}">${escapeHtml(t("dup.undo"))}</button>`}
+    </div>`;
+}
+
+function syncDuplicatesBadge(count) {
+  const badge = document.querySelector("#memory-dup-badge");
+  if (!badge) return;
+  badge.textContent = String(count);
+  badge.hidden = !count;
+}
+
+async function loadMemoryDuplicates() {
+  const items = document.querySelector("#memory-dup-items");
+  const recent = document.querySelector("#memory-dup-recent");
+  if (!items || !recent) return;
+  const payload = await api(`/api/memory/duplicates?project_id=${projectParam()}&limit=100`);
+  const review = payload.items || [];
+  syncDuplicatesBadge(review.length);
+  const summary = document.querySelector("#memory-dup-summary");
+  if (summary) {
+    const parts = [fillTemplate(t("dup.summary"), { count: review.length })];
+    const last = payload.compaction_last || {};
+    if (last.at) {
+      parts.push(fillTemplate(t("dup.lastCompaction"), { date: String(last.at).slice(0, 10), merged: last.merged || 0 }));
+    }
+    if ((payload.settings || {}).mode === "suggest") parts.push(t("dup.suggestMode"));
+    summary.textContent = parts.join(" · ");
+  }
+  const compactButton = document.querySelector("#memory-dup-compact");
+  if (compactButton) compactButton.disabled = (payload.settings || {}).mode !== "auto";
+  rememberMemoryItems([...review.map(item => item.node), ...review.map(item => item.target)]);
+  items.innerHTML = review.length
+    ? review.map(dupItemHtml).join("")
+    : `<div class="memory-lifecycle-empty">${escapeHtml(t("dup.empty"))}</div>`;
+  const decisions = payload.recent || [];
+  recent.innerHTML = decisions.length
+    ? decisions.map(dupRecentHtml).join("")
+    : `<div class="memory-lifecycle-empty">${escapeHtml(t("dup.recentEmpty"))}</div>`;
+}
+
+function renderCompactionReport(report) {
+  const box = document.querySelector("#memory-dup-compaction");
+  if (!box) return;
+  const clusters = report.clusters || [];
+  const count = report.dry_run ? report.would_merge : report.merged;
+  box.hidden = false;
+  if (!clusters.length) {
+    box.innerHTML = `<div class="memory-lifecycle-empty">${escapeHtml(t("dup.previewNone"))}</div>`;
+    return;
+  }
+  const head = report.dry_run
+    ? fillTemplate(t("dup.previewResult"), { count, groups: clusters.length })
+    : fillTemplate(t("dup.compacted"), { count });
+  box.innerHTML = `<p class="muted">${escapeHtml(head)}</p>` + clusters.map(cluster => `
+    <div class="memory-dup-card">
+      <div class="memory-dup-side">
+        <div class="memory-dup-side-kicker">${escapeHtml(t("dup.keeper"))} · ${escapeHtml(cluster.keeper.type || "")}</div>
+        <strong>${escapeHtml(cluster.keeper.label || "")}</strong>
+        <p>${escapeHtml(cluster.keeper.text || "")}</p>
+      </div>
+      <div class="memory-dup-side-kicker">${escapeHtml(t("dup.covered"))}:</div>
+      ${(cluster.members || []).map(member => `
+        <div class="memory-dup-row"><span class="candidate-chip subtle">${escapeHtml(member.type || "")}</span>
+          <span class="memory-dup-row-text">${escapeHtml(member.label || "")} <span class="muted">· ${escapeHtml(dupReasonLabel(member.reason))}</span></span>
+        </div>`).join("")}
+    </div>`).join("");
+}
+
+async function previewMemoryCompaction() {
+  const report = await api("/api/memory/compact", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId || "architectos", dry_run: true }),
+  });
+  renderCompactionReport(report);
+}
+
+async function runMemoryCompaction() {
+  const ok = await showAppConfirm({
+    title: t("dup.confirmTitle"),
+    message: t("dup.confirmMessage"),
+    confirmLabel: t("dup.compact"),
+  });
+  if (!ok) return;
+  const report = await api("/api/memory/compact", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId || "architectos", dry_run: false }),
+  });
+  renderCompactionReport(report);
+  showSnackbar(fillTemplate(t("dup.compacted"), { count: report.merged || 0 }), "success");
+  await loadMemoryDuplicates();
+  scheduleGraphLoad();
+}
+
+async function handleDuplicatesClick(event) {
+  const undo = event.target.closest("[data-dup-undo]");
+  const action = event.target.closest("[data-dup-action]");
+  const button = undo || action;
+  if (!button) return;
+  button.disabled = true;
+  try {
+    if (undo) {
+      await api("/api/memory/dedup/undo", { method: "POST", body: JSON.stringify({ event_id: undo.dataset.dupUndo }) });
+      showSnackbar(t("dup.undoDone"), "success");
+    } else {
+      await api("/api/memory/duplicates/resolve", {
+        method: "POST",
+        body: JSON.stringify({
+          action: action.dataset.dupAction,
+          node_id: action.dataset.node,
+          target_id: action.dataset.target,
+          keep: action.dataset.keep || "target",
+        }),
+      });
+      showSnackbar(t("dup.resolved"), "success");
+    }
+    await loadMemoryDuplicates();
+    scheduleGraphLoad();
+  } catch (error) {
+    button.disabled = false;
+    showError(error);
+  }
+}
+
+function bindMemoryDuplicates() {
+  const panel = document.querySelector("#memory-duplicates-panel");
+  if (!panel || panel.dataset.bound) return;
+  panel.dataset.bound = "1";
+  panel.addEventListener("click", handleDuplicatesClick);
+  document.querySelector("#memory-dup-preview")?.addEventListener("click", () => previewMemoryCompaction().catch(showError));
+  document.querySelector("#memory-dup-compact")?.addEventListener("click", () => runMemoryCompaction().catch(showError));
+}
+
 if (typeof document !== "undefined") bindMemoryItemOpener();
 
 export {
-  batchUpdateCandidates, candidateBatchFilterFromUi, candidateSourceFromUi,
+  batchUpdateCandidates, bindMemoryDuplicates, candidateBatchFilterFromUi, candidateSourceFromUi,
   handleMemoryFileSelect, importMemoryFiles,
-  loadMemoryCandidates, loadMemoryLifecycle, loadMemoryLifecycleItems, loadMemoryList,
+  loadMemoryCandidates, loadMemoryDuplicates, loadMemoryLifecycle, loadMemoryLifecycleItems, loadMemoryList,
   renderMemoryFiles, shiftCandidatePage, switchMemoryTab, syncCandidateBatchActions,
 };

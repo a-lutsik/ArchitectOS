@@ -74,6 +74,12 @@ class StorageDedupMixin:
                     ON memory_dedup_stems(scope, project_key, stem);
                 CREATE INDEX IF NOT EXISTS idx_memory_dedup_stems_node
                     ON memory_dedup_stems(node_id);
+                CREATE TABLE IF NOT EXISTS dedup_rejected_pairs (
+                    left_id TEXT NOT NULL,
+                    right_id TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    PRIMARY KEY (left_id, right_id)
+                ) WITHOUT ROWID;
                 """
             )
             indexed = int(conn.execute("SELECT count(*) FROM memory_dedup_index").fetchone()[0])
@@ -205,3 +211,60 @@ class StorageDedupMixin:
                 ids,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def dedup_subject_groups(self, project_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+        """Subjects shared by 2+ indexed nodes (compaction candidates), largest first.
+
+        ``project_id`` narrows to that project's nodes; ``None`` covers every
+        project plus shared/global scopes. Artifacts are left to revisions.
+        """
+        sql = (
+            "SELECT scope, project_key, subject, count(*) AS size FROM memory_dedup_index "
+            "WHERE node_type NOT IN ({unstemmed})"
+        ).format(unstemmed=", ".join("?" for _ in UNSTEMMED_TYPES))
+        params: list[Any] = sorted(UNSTEMMED_TYPES)
+        if project_id is not None:
+            sql += " AND project_key = ?"
+            params.append(_project_key(project_id))
+        sql += " GROUP BY scope, project_key, subject HAVING count(*) >= 2 ORDER BY size DESC, subject LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._connect() as conn:  # type: ignore[attr-defined]
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    @staticmethod
+    def _pair_key(left: str, right: str) -> tuple[str, str]:
+        return (left, right) if left <= right else (right, left)
+
+    def add_dedup_rejected_pair(self, left_id: str, right_id: str) -> None:
+        """Remember that a person said these two nodes are different facts."""
+        from .models import utc_now
+
+        a, b = self._pair_key(str(left_id), str(right_id))
+        with self._connect() as conn:  # type: ignore[attr-defined]
+            conn.execute(
+                "INSERT OR REPLACE INTO dedup_rejected_pairs(left_id, right_id, at) VALUES (?, ?, ?)",
+                (a, b, utc_now()),
+            )
+
+    def dedup_rejected_pairs_for(self, node_ids: list[str]) -> set[tuple[str, str]]:
+        ids = [str(node_id) for node_id in dict.fromkeys(node_ids) if node_id][:MAX_QUERY_STEMS]
+        if not ids:
+            return set()
+        placeholders = ", ".join("?" for _ in ids)
+        with self._connect() as conn:  # type: ignore[attr-defined]
+            rows = conn.execute(
+                f"SELECT left_id, right_id FROM dedup_rejected_pairs "
+                f"WHERE left_id IN ({placeholders}) OR right_id IN ({placeholders})",
+                [*ids, *ids],
+            ).fetchall()
+        return {(str(row[0]), str(row[1])) for row in rows}
+
+    def list_recent_dedup_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Newest gate/compaction decisions (``dedup`` memory events) across all nodes."""
+        with self._connect() as conn:  # type: ignore[attr-defined]
+            rows = conn.execute(
+                "SELECT id, node_id, event_type, actor, timestamp, details FROM memory_node_events "
+                "WHERE event_type = 'dedup' ORDER BY timestamp DESC, rowid DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [self._memory_event_from_row(row) for row in rows]  # type: ignore[attr-defined]

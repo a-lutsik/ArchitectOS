@@ -877,7 +877,10 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
           dedup hit, any type upgrade and (enrich) the replaced text of the
           surviving node are rolled back;
         - update / conflict: the SUPERSEDES / CONTRADICTS edge is removed and the
-          old fact is valid again; the newer node stays.
+          old fact is valid again; the newer node stays;
+        - merge (compaction / review): the merged node is active again, edges the
+          merge copied onto the keeper are removed, and the pair is remembered as
+          different so compaction does not merge it again.
         """
         event_id = str(payload.get("event_id") or "").strip()
         event = self.repository.get_memory_event(event_id) if event_id else None
@@ -919,6 +922,9 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                     self.repository.upsert_node(target)
             for key in ("dedup_action", "supersedes", "conflicts_with", "needs_review"):
                 meta.pop(key, None)
+        elif action == "merge":
+            restored = self._undo_merge(node, details)
+            meta = {**dict(node.metadata or {}), "dedup_undone": undone}
         else:
             raise ValueError(f"dedup action cannot be undone: {action or 'unknown'}")
         meta["dedup_undone"] = [*undone, event_id]

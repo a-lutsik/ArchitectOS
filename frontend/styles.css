@@ -12763,6 +12763,150 @@ label {
   color: var(--ink);
 }
 
+/* Memory Duplicates view (dedup review, compaction, undo) */
+.memory-view-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: color-mix(in srgb, var(--warn, #d97706) 22%, transparent);
+  color: var(--warn, #d97706);
+}
+
+.memory-view-tab-badge[hidden] {
+  display: none;
+}
+
+/* Same footprint as the graph canvas: never shrink under the lifecycle block. */
+.memory-dup-panel {
+  flex: 0 0 auto;
+  max-height: min(640px, calc(100vh - 200px));
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.memory-dup-toolbar {
+  justify-content: flex-end;
+}
+
+.memory-dup-toolbar .memory-list-count {
+  margin-right: auto;
+}
+
+.memory-dup-heading {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.memory-dup-items,
+.memory-dup-recent,
+.memory-dup-compaction {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-dup-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-soft, rgba(0, 0, 0, 0.14));
+}
+
+.memory-dup-card.is-conflict {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+}
+
+.memory-dup-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.memory-dup-side {
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--panel-2, rgba(255, 255, 255, 0.04));
+}
+
+.memory-dup-side-kicker {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.memory-dup-side strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.memory-dup-open {
+  cursor: pointer;
+}
+
+.memory-dup-open:hover {
+  text-decoration: underline;
+}
+
+.memory-dup-side p {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.memory-dup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.memory-dup-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+
+.memory-dup-row-text {
+  flex: 1 1 240px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.memory-dup-row.is-undone {
+  opacity: 0.55;
+}
+
+.memory-dup-chip-danger {
+  background: color-mix(in srgb, var(--danger) 14%, var(--panel));
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+}
+
+@media (max-width: 720px) {
+  .memory-dup-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* Memory list view */
 .memory-list-panel {
   display: flex;

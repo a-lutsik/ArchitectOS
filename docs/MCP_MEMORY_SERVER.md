@@ -40,6 +40,7 @@ of other MCP servers; this feature makes ArchitectOS a *server* for other agents
 | `source_list` | List registered data sources | `project_id?` |
 | `memory_history` | Event history of a node (created/updated/superseded/accessed) | `id` (required) |
 | `memory_add_bulk` | Store a batch of nodes in one call; per-item errors don't abort the batch | `items` (required), `project_id?`, `scope?`, `source_id?`, `type?` |
+| `memory_compact` | Read-only preview of compaction: stored facts fully covered by a fuller fact with the same subject, grouped per keeper. Nothing is merged | `project_id?`, `max_clusters?` |
 
 Typical agent loop: initialize `instructions` already include a short stable-memory briefing.
 At the start of every user message call `memory_turn` with that message (pack + fact
