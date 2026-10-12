@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .chat_memory import _FACT_TYPE_RANK, _prefer_fact_type
 from .constants import (
     SYSTEM_PROJECT_ID,
 )
@@ -484,13 +486,16 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         """Scan existing facts for an exact restatement or a near-duplicate.
 
         Returns ``(exact_node, best_near_id, best_near_score)``. "Exact" means the
-        same fingerprint (top content tokens) within the same type/scope/project —
-        deterministic and dependency-free. Near-duplicate is the best token
-        similarity among same-type facts, surfaced for flagging only.
+        same normalized label + text within the same scope/project, and either
+        the same type or two fact types (Lesson/Decision/Requirement/Constraint)
+        — the same sentence saved once as a Lesson and once as a Decision is one
+        fact. Near-duplicate is the best token similarity among same-type facts,
+        surfaced for flagging only.
         """
         engine = self.ingestion_engine
         incoming_tokens = engine._tokens(f"{label} {text}")
         incoming_key = (self._normalize_fact_text(label), self._normalize_fact_text(text))
+        incoming_is_fact = node_type in _FACT_TYPE_RANK
         best_near_id, best_near_score = "", 0.0
         for node in self.repository.list_nodes():
             if node.status != "active":
@@ -500,7 +505,8 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 continue
             if node.scope != scope or node.project_id != project_id:
                 continue
-            if node.type != node_type:
+            same_type = node.type == node_type
+            if not same_type and not (incoming_is_fact and node.type in _FACT_TYPE_RANK):
                 continue
             # Exact = identical normalized label + text. Deliberately NOT the token
             # fingerprint: the fingerprint tokenizer drops digits, so facts that
@@ -508,15 +514,30 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             # "node 1") share a fingerprint and must never be auto-merged.
             if (self._normalize_fact_text(node.label), self._normalize_fact_text(node.text)) == incoming_key:
                 return node, node.id, 1.0
+            if not same_type:
+                continue
             node_tokens = set(meta.get("tokens") or []) or engine._tokens(f"{node.label} {node.text}")
             score = engine._similarity(incoming_tokens, node_tokens)
             if score > best_near_score:
                 best_near_id, best_near_score = node.id, score
         return None, best_near_id, best_near_score
 
+    # Stripped from both ends only: inner punctuation ("5.0" vs "50") is content.
+    # No dashes: a leading minus is a sign ("-5 °C" vs "5 °C").
+    _FACT_EDGE_PUNCTUATION = " .,;:!?…\"'`«»“”„()[]"
+
     @staticmethod
     def _normalize_fact_text(value: str) -> str:
-        return " ".join(str(value or "").split()).strip().lower()
+        """Comparison key for exact restatements.
+
+        Case, Unicode form (NFKC), ё/е, whitespace and sentence punctuation at
+        the edges do not change a fact, so "Data lives in SQLite" and
+        "data lives in SQLite." compare equal. Digits and inner punctuation are
+        kept.
+        """
+        text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
+        text = " ".join(text.split())
+        return text.strip(IngestionServiceMixin._FACT_EDGE_PUNCTUATION)
 
     def _register_duplicate_add(self, existing: Any, payload: dict[str, Any]) -> dict[str, Any]:
         """Fold a re-added identical fact into the node it duplicates.
@@ -528,12 +549,32 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         meta = dict(existing.metadata or {})
         meta["dedup_hits"] = int(meta.get("dedup_hits") or 0) + 1
         meta["last_dedup_at"] = utc_now()
+        # Cross-type restatement keeps the stronger fact type (Constraint >
+        # Requirement > Decision > Lesson); refresh_nodes below then re-evaluates
+        # the lifecycle tier for the new type.
+        incoming_type = str(payload.get("type") or "")
+        previous_type = str(existing.type or "")
+        if incoming_type in _FACT_TYPE_RANK and previous_type in _FACT_TYPE_RANK:
+            stronger = _prefer_fact_type(previous_type, incoming_type)
+            if stronger != previous_type:
+                existing.type = stronger
+                meta["dedup_type_from"] = previous_type
         existing.metadata = meta
         try:
             existing.confidence = max(float(existing.confidence or 0.0), float(payload.get("confidence") or 0.0))
         except (TypeError, ValueError):
             pass
         existing = self.repository.upsert_node(existing)
+        if existing.type != previous_type:
+            try:
+                self.repository.record_memory_event(
+                    existing.id,
+                    "updated",
+                    actor=str(payload.get("source") or "ui"),
+                    details={"reason": "dedup_type_upgrade", "type_from": previous_type, "type_to": existing.type},
+                )
+            except Exception as exc:  # history is best-effort, never blocks ingestion
+                _LOG.warning("dedup type event skipped: %s", exc)
         try:
             self.memory_lifecycle.refresh_nodes([existing.id], "dedup")
         except Exception as exc:  # lifecycle bump is best-effort

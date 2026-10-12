@@ -7,6 +7,7 @@ carries the fingerprint/similarity engine. ``graph_autolinker`` and
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
@@ -49,10 +50,29 @@ REVISIONABLE_SOURCE_TYPES = frozenset({
 
 # Bumped when the stored fingerprint format changes, so metadata written by an
 # older build can be recomputed instead of silently never matching. v2 is the
-# first deterministic format; v1 values depended on PYTHONHASHSEED.
-FINGERPRINT_VERSION = 2
+# first deterministic format; v1 values depended on PYTHONHASHSEED. v3 tokenizes
+# any script (v2 saw only ASCII, so Cyrillic facts fingerprinted as "") and adds
+# a digest of the full token set to long fingerprints.
+FINGERPRINT_VERSION = 3
 
-TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_\-/#.]{2,}", re.IGNORECASE)
+# Tokens shown in a fingerprint; longer sets also carry a digest of every token.
+FINGERPRINT_VISIBLE_TOKENS = 18
+
+# Letters/digits of any script. ASCII-only ``[a-z0-9]`` made Russian text
+# invisible to dedup: two unrelated Cyrillic facts shared the empty fingerprint.
+TOKEN_RE = re.compile(r"[^\W_][\w\-/#.]{2,}")
+
+# Russian function words, already in token form (lowercase, ё folded to е).
+RU_STOPWORDS = {
+    "для", "что", "как", "это", "эти", "этот", "эта", "этом", "этой", "этих",
+    "при", "или", "все", "так", "его", "она", "они", "оно", "был", "была",
+    "были", "было", "быть", "есть", "также", "тоже", "который", "которая",
+    "которое", "которые", "если", "чтобы", "только", "через", "после", "перед",
+    "между", "над", "под", "без", "про", "уже", "еще", "где", "когда", "чем",
+    "том", "тем", "вот", "нам", "нас", "вас", "вам", "них", "ним", "себя",
+    "свой", "своя", "свои", "можно", "нужно", "надо", "будет", "будут",
+    "более", "менее", "очень", "проект", "проекта", "проекте", "память", "памяти",
+}
 
 DUPLICATE_STOPWORDS = {
     "the", "and", "for", "with", "this", "that", "from", "into", "will", "shall",
@@ -60,7 +80,7 @@ DUPLICATE_STOPWORDS = {
     # Granola / meeting template boilerplate — shared across unrelated meetings.
     "granola", "meeting", "meetings", "attendees", "attendee", "creator", "note",
     "notes", "date", "gmt", "utc", "gmail.com", "summary", "action", "items",
-}
+} | RU_STOPWORDS
 
 CHAT_FACT_BOILERPLATE_PREFIXES = (
     "Durable fact extracted from a finished chat (not a full transcript).",
@@ -91,7 +111,10 @@ def _fingerprintable_text(label: str, body: str, metadata: dict[str, Any] | None
 def _token_set(text: str, stopwords: set[str], *, min_len: int = 1, strip_chars: str = "") -> set[str]:
     tokens: set[str] = set()
     for raw in TOKEN_RE.findall(text or ""):
-        token = raw.lower().strip(strip_chars) if strip_chars else raw.lower()
+        # Sentence punctuation is not part of the word: "SQLite." == "SQLite".
+        token = raw.lower().replace("ё", "е").rstrip(".")
+        if strip_chars:
+            token = token.strip(strip_chars)
         if len(token) < min_len or token in stopwords:
             continue
         tokens.add(token)
@@ -106,8 +129,18 @@ def fingerprint_from_tokens(tokens: set[str]) -> str:
     randomises per process via PYTHONHASHSEED. Identical text then fingerprinted
     differently after each restart, so stored fingerprints never matched freshly
     computed ones. Sorting makes the value stable across processes.
+
+    Only the alphabetically first tokens stay readable; when there are more, a
+    digest of the whole set is appended. Without it two long texts that agree on
+    their first 18 sorted tokens ("... uses postgres" / "... uses mysql") looked
+    like an exact duplicate.
     """
-    return "|".join(sorted(tokens)[:18])
+    ordered = sorted(tokens)
+    visible = "|".join(ordered[:FINGERPRINT_VISIBLE_TOKENS])
+    if len(ordered) <= FINGERPRINT_VISIBLE_TOKENS:
+        return visible
+    digest = hashlib.sha1("|".join(ordered).encode("utf-8")).hexdigest()[:12]
+    return f"{visible}#{digest}"
 
 
 def candidate_fingerprint(label: str, body: str, metadata: dict[str, Any] | None = None) -> str:
@@ -129,6 +162,13 @@ def candidate_fingerprint(label: str, body: str, metadata: dict[str, Any] | None
     if work_item_id:
         fingerprint = f"ado:{work_item_id}|{fingerprint}"
     return fingerprint
+
+
+def candidate_tokens(label: str, body: str, metadata: dict[str, Any] | None = None) -> list[str]:
+    """Token sample stored on a candidate next to its fingerprint (same input text)."""
+    return sorted(
+        _token_set(_fingerprintable_text(label, body, metadata), DUPLICATE_STOPWORDS)
+    )[:24]
 
 
 def _token_similarity(left: set[str], right: set[str], *, containment_weight: float) -> float:
@@ -186,7 +226,9 @@ class MemoryIngestionEngine:
                 if existing_pending and existing_pending.get("id"):
                     enriched["id"] = existing_pending["id"]
             fingerprint = str(enriched["metadata"]["fingerprint"])
-            if fingerprint in seen_fingerprints:
+            # An empty fingerprint means "no content tokens", not "same content":
+            # it must never make one fact a batch duplicate of another.
+            if fingerprint and fingerprint in seen_fingerprints:
                 if is_fact_atom:
                     skipped_reviewed += 1
                     continue
@@ -219,7 +261,8 @@ class MemoryIngestionEngine:
                 extra_key = str(enriched["metadata"].get("duplicate_of") or fingerprint)
                 enriched["id"] = stable_id("candidate-dup", extra_key, str(len(prepared)))
             prepared.append(enriched)
-            seen_fingerprints.add(fingerprint)
+            if fingerprint:
+                seen_fingerprints.add(fingerprint)
             if origin_key:
                 pending_by_origin.setdefault(origin_key, enriched)
             reference = self._reference_from_candidate(enriched)
@@ -828,17 +871,18 @@ class MemoryIngestionEngine:
     def _enrich_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(candidate)
         metadata = dict(enriched.get("metadata") or {})
-        fp_text = _fingerprintable_text(str(enriched.get("label") or ""), str(enriched.get("text") or ""), metadata)
-        tokens = sorted(self._tokens(fp_text))
+        label = str(enriched.get("label") or "")
+        text = str(enriched.get("text") or "")
         # Not setdefault: a fingerprint carried over from an older build is
         # stale rather than authoritative, so re-stamp anything below the
-        # current version instead of trusting it.
+        # current version instead of trusting it. Its token sample came from
+        # the same old tokenizer, so it is re-stamped with it.
         if not metadata.get("fingerprint") or int(metadata.get("fingerprint_version") or 0) < FINGERPRINT_VERSION:
-            metadata["fingerprint"] = candidate_fingerprint(
-                str(enriched.get("label") or ""), str(enriched.get("text") or ""), metadata
-            )
+            metadata["fingerprint"] = candidate_fingerprint(label, text, metadata)
             metadata["fingerprint_version"] = FINGERPRINT_VERSION
-        metadata.setdefault("tokens", tokens[:24])
+            metadata["tokens"] = candidate_tokens(label, text, metadata)
+        elif not metadata.get("tokens"):
+            metadata["tokens"] = candidate_tokens(label, text, metadata)
         metadata.setdefault("duplicate", False)
         enriched["metadata"] = metadata
         return enriched

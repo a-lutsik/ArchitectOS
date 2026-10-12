@@ -57,9 +57,25 @@ def _migration_005_candidate_fingerprint_v2(repository: Any, conn: sqlite3.Conne
     one, which killed the exact-match fast path and left duplicate detection to
     the slow similarity scan. Rewriting them in place repairs existing rows.
     """
+    _refresh_candidate_fingerprints(conn)
+
+
+def _migration_006_candidate_fingerprint_v3(repository: Any, conn: sqlite3.Connection) -> None:
+    """Re-stamp candidates written with the ASCII-only tokenizer.
+
+    v2 fingerprints and token samples ignored every non-ASCII word, so pending
+    Russian facts carried an empty or near-empty fingerprint and matched each
+    other (or nothing). Databases that already ran step 5 need this second pass;
+    on a fresh database step 5 already writes v3 and this is a no-op.
+    """
+    _refresh_candidate_fingerprints(conn)
+
+
+def _refresh_candidate_fingerprints(conn: sqlite3.Connection) -> None:
+    """Rewrite fingerprint + token sample of every candidate below the current version."""
     # Imported here, not at module scope: memory_ingestion imports storage,
     # which imports this module.
-    from .memory_ingestion import FINGERPRINT_VERSION, candidate_fingerprint
+    from .memory_ingestion import FINGERPRINT_VERSION, candidate_fingerprint, candidate_tokens
 
     updates: list[tuple[str, str]] = []
     for row in conn.execute("SELECT id, payload FROM memory_candidates").fetchall():
@@ -72,9 +88,10 @@ def _migration_005_candidate_fingerprint_v2(repository: Any, conn: sqlite3.Conne
             continue
         if int(metadata.get("fingerprint_version") or 0) >= FINGERPRINT_VERSION:
             continue
-        metadata["fingerprint"] = candidate_fingerprint(
-            str(payload.get("label") or ""), str(payload.get("text") or ""), metadata
-        )
+        label = str(payload.get("label") or "")
+        text = str(payload.get("text") or "")
+        metadata["fingerprint"] = candidate_fingerprint(label, text, metadata)
+        metadata["tokens"] = candidate_tokens(label, text, metadata)
         metadata["fingerprint_version"] = FINGERPRINT_VERSION
         updates.append((json.dumps(payload, sort_keys=True), str(row["id"])))
     if not updates:
@@ -94,6 +111,7 @@ MIGRATIONS: list[tuple[int, Callable[[Any, sqlite3.Connection], None]]] = [
     (3, _migration_003_mcp_server_defaults),
     (4, _migration_004_memory_node_source_id),
     (5, _migration_005_candidate_fingerprint_v2),
+    (6, _migration_006_candidate_fingerprint_v3),
 ]
 
 

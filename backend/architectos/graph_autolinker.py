@@ -10,14 +10,14 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from .memory_ingestion import _token_set, _token_similarity
+from .memory_ingestion import RU_STOPWORDS, _token_set, _token_similarity
 from .models import stable_id, utc_now
 from .storage import SQLiteMemoryRepository
 
 GRAPH_STOPWORDS = {
     "the", "and", "for", "with", "this", "that", "from", "into", "will", "shall",
     "should", "have", "has", "are", "was", "were", "been", "being",
-}
+} | RU_STOPWORDS
 
 SOURCE_HUB_CATALOG: dict[str, dict[str, str]] = {
     "docs": {"label": "Repo docs", "text": "Local repository documentation and markdown memory for this scope."},
