@@ -30,7 +30,7 @@ of other MCP servers; this feature makes ArchitectOS a *server* for other agents
 | `memory_search` | Return scored memory hits for a query | `query`, `project_id?`, `scope?`, `limit?`, `mode?` (`search`/`list`), `filters?` (exact, `!=X`, `a\|b`, lists) |
 | `memory_context` | Build a ready-to-inject briefing (memory + open tasks + providers) | `query` (required), `project_id?`, `scope?`, `limit?` |
 | `memory_turn` | Per-turn pack + fact capture (call at the start of every user message) | `user_text` (required), `assistant_text?`, `project_id?`, `scope?`, `limit?` |
-| `memory_add` | Persist a new memory; multi-fact dumps are split. Secrets auto-redacted | `label` (required), `text` (required), `type?`, `scope?`, `project_id?`, `confidence?` |
+| `memory_add` | Persist a new memory; multi-fact dumps are split. Secrets auto-redacted. A repeat of a stored fact is folded into it; a changed value supersedes it; a flipped statement is linked as a contradiction (`dedup` in the result) | `label` (required), `text` (required), `type?`, `scope?`, `project_id?`, `confidence?` |
 | `memory_get` | Fetch one memory node in full by id (untruncated text, metadata, evidence, neighbors) | `id` (required), `include_neighbors?` |
 | `memory_feedback` | Rate retrieved hits so ranking improves over time | `rating` (1 or -1, required), `hit_ids?`, `query?`, `note?`, `project_id?` |
 | `memory_list_projects` | List projects for scoping | – |

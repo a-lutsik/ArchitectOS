@@ -331,21 +331,50 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
                 "SELECT id, node_id, event_type, actor, timestamp, details FROM memory_node_events WHERE node_id = ? ORDER BY timestamp, rowid LIMIT ?",
                 (node_id, max(1, int(limit or 200))),
             ).fetchall()
-        events: list[dict[str, Any]] = []
-        for row in rows:
-            try:
-                details = json.loads(row["details"] or "{}")
-            except ValueError:
-                details = {}
-            events.append({
-                "id": row["id"],
-                "node_id": row["node_id"],
-                "event_type": row["event_type"],
-                "actor": row["actor"] or "",
-                "timestamp": row["timestamp"],
-                "details": details if isinstance(details, dict) else {},
-            })
-        return events
+        return [self._memory_event_from_row(row) for row in rows]
+
+    def get_memory_event(self, event_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, node_id, event_type, actor, timestamp, details FROM memory_node_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+        return self._memory_event_from_row(row) if row else None
+
+    @staticmethod
+    def _memory_event_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            details = json.loads(row["details"] or "{}")
+        except ValueError:
+            details = {}
+        return {
+            "id": row["id"],
+            "node_id": row["node_id"],
+            "event_type": row["event_type"],
+            "actor": row["actor"] or "",
+            "timestamp": row["timestamp"],
+            "details": details if isinstance(details, dict) else {},
+        }
+
+    @staticmethod
+    def memory_node_id(
+        node_type: str,
+        label: str,
+        scope: str,
+        project_id: str | None = None,
+        interface_id: str | None = None,
+        id_salt: str = "",
+    ) -> str:
+        """Id ``add_node`` gives a node: label-derived, so equal labels share it.
+
+        ``id_salt`` is appended only when set, which keeps every existing id
+        stable while letting a caller store a second fact under the same label.
+        """
+        clean_label, _ = sanitize_text(label)
+        parts = [node_type, scope, project_id or "", interface_id or "", clean_label]
+        if id_salt:
+            parts.append(id_salt)
+        return stable_id("node", *parts)
 
     def add_node(
         self,
@@ -358,6 +387,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
         confidence: float = 0.8,
         metadata: dict[str, Any] | None = None,
         source_id: str | None = None,
+        id_salt: str = "",
     ) -> MemoryNode:
         clean_text, redacted = sanitize_text(text)
         clean_label, label_redacted = sanitize_text(label)
@@ -365,7 +395,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
             raise ValueError("memory text must contain at least 4 non-secret characters")
         now = utc_now()
         node = MemoryNode(
-            id=stable_id("node", node_type, scope, project_id or "", interface_id or "", clean_label),
+            id=self.memory_node_id(node_type, label, scope, project_id, interface_id, id_salt),
             type=node_type if node_type else "Concept",
             label=clean_label[:180],
             scope=scope if scope else "project",

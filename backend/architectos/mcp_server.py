@@ -600,10 +600,23 @@ class MemoryMCPServer:
             "source": "mcp",
         })
         extras = [item for item in (node.get("also_created") or []) if item]
-        summary = f'Stored memory [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}).'
+        dedup = dict(node.get("dedup") or {})
+        action = str(dedup.get("action") or "")
+        target = f'"{dedup.get("target_label") or ""}" (id {dedup.get("target_id") or ""})'
+        if node.get("dedup_merged"):
+            summary = (
+                f'Already in memory as [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}); '
+                "recorded as a repeat, no new node."
+            )
+        else:
+            summary = f'Stored memory [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}).'
+            if action == "update":
+                summary += f" Supersedes {target}: same statement, changed values."
+            elif action == "conflict":
+                summary += f" Contradicts {target}; flagged for review."
         if extras:
             summary += f" Split into {1 + len(extras)} fact(s)."
-        return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id"), "source_id": node.get("source_id"), "also_created": extras})
+        return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id"), "source_id": node.get("source_id"), "also_created": extras, "dedup": dedup})
 
     def _tool_memory_add_bulk(self, args: dict[str, Any]) -> dict[str, Any]:
         raw_items: Any = args.get("items")
@@ -620,7 +633,8 @@ class MemoryMCPServer:
         stats = result.get("stats") or {}
         summary = (
             f'Bulk stored {stats.get("created", 0)} memor(y/ies)'
-            f' ({stats.get("deduplicated", 0)} deduplicated, {stats.get("errors", 0)} error(s)).'
+            f' ({stats.get("deduplicated", 0)} deduplicated, {stats.get("superseded", 0)} superseding older values,'
+            f' {stats.get("conflicts", 0)} conflicting, {stats.get("errors", 0)} error(s)).'
         )
         return _tool_result(summary, result)
 

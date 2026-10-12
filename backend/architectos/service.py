@@ -25,6 +25,7 @@ from .integrations_service import IntegrationsServiceMixin
 from .lifecycle_service import LifecycleServiceMixin, MemoryLifecycleEngine
 from .lsp import CodeIntelligenceManager
 from .mcp import MCPManager
+from .memory_dedup import MemoryDedupGate
 from .memory_ingestion import MemoryIngestionEngine
 from .memory_wipe_service import MemoryWipeMixin
 from .paths import is_frozen, resolve_frontend_root
@@ -73,6 +74,7 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         self.provider_router = ProviderRouter(project_root)
         self.security_policy = SecurityPolicy()
         self.ingestion_engine = MemoryIngestionEngine(self.repository)
+        self.memory_dedup = MemoryDedupGate(self.repository)
         self.memory_lifecycle = MemoryLifecycleEngine(self.repository)
         self._decay_stop = threading.Event()
         self._chat_session_stop = threading.Event()

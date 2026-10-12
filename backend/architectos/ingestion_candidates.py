@@ -11,6 +11,7 @@ import threading
 from typing import Any
 
 from .candidate_identity import candidate_origin_key
+from .memory_dedup import content_salt, incoming_features
 from .models import utc_now
 
 _LOG = logging.getLogger(__name__)
@@ -114,6 +115,43 @@ class IngestionCandidatesMixin:
             interface_id = f"rev:{content_hash}"
         elif interface_id is None and is_revision:
             interface_id = f"rev:{created_at}"
+        node_label = str(payload.get("label") or candidate.get("label") or "Memory candidate")
+        node_scope = str(payload.get("scope") or candidate.get("scope") or "project")
+        node_text = str(payload.get("text") or candidate.get("text") or "")
+        node_project = self._memory_project_id_for_scope(node_scope, str(candidate.get("project_id") or "architectos"))
+        confidence = float(payload.get("confidence") or candidate.get("confidence") or 0.72)
+        id_salt = ""
+        if interface_id is None:
+            # The node id derives from type+scope+label: a live node under the
+            # same label is either this very fact (fold into it) or another
+            # fact that must not be overwritten (store beside it).
+            holder = self.repository.get_node(
+                self.repository.memory_node_id(node_type, node_label, node_scope, node_project)
+            )
+            if holder is not None and holder.status == "active":
+                verdict = self.memory_dedup.compare(
+                    incoming_features(node_label, node_text), self.memory_dedup.node_features(holder)
+                )
+                if verdict.action == "duplicate":
+                    verdict.target_id, verdict.target_label = holder.id, str(holder.label or "")
+                    folded = self._register_duplicate_add(
+                        holder,
+                        {
+                            "label": node_label, "text": node_text, "type": node_type, "scope": node_scope,
+                            "project_id": node_project, "confidence": confidence,
+                            "source": "memory_candidate", "source_type": candidate.get("source_type") or "",
+                        },
+                        verdict,
+                    )
+                    candidate["status"] = "promoted"
+                    candidate["promoted_node_id"] = holder.id
+                    candidate["promoted_at"] = utc_now()
+                    candidate["metadata"] = {**dict(candidate.get("metadata") or {}), "dedup_merged": True}
+                    candidate = self.repository.update_memory_candidate(candidate)
+                    if refresh_duplicates:
+                        self._schedule_candidate_duplicate_refresh(candidate)
+                    return {"candidate": candidate, "memory": folded}
+                id_salt = content_salt(node_text)
         metadata = self.memory_lifecycle.seed_metadata(
             node_type=node_type,
             created_at=created_at,
@@ -123,16 +161,14 @@ class IngestionCandidatesMixin:
         )
         node = self.repository.add_node(
             node_type,
-            str(payload.get("label") or candidate.get("label") or "Memory candidate"),
-            str(payload.get("scope") or candidate.get("scope") or "project"),
-            str(payload.get("text") or candidate.get("text") or ""),
-            self._memory_project_id_for_scope(
-                str(payload.get("scope") or candidate.get("scope") or "project"),
-                str(candidate.get("project_id") or "architectos"),
-            ),
+            node_label,
+            node_scope,
+            node_text,
+            node_project,
             interface_id,
-            float(payload.get("confidence") or candidate.get("confidence") or 0.72),
+            confidence,
             metadata,
+            id_salt=id_salt,
         )
         # Lifecycle already seeded — initialize_node is a no-op write skip.
         node = self.memory_lifecycle.initialize_node(node, "promoted_candidate")

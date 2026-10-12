@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,7 @@ from .ingestion_candidates import IngestionCandidatesMixin
 from .ingestion_rescan import IngestionRescanMixin
 from .ingestion_timeouts import IngestionTimeoutsMixin
 from .mcp import MCPError
+from .memory_dedup import DedupDecision, MemoryDedupGate, content_salt
 from .memory_ingestion import (
     DUPLICATE_STOPWORDS,
     MemoryIngestionEngine,
@@ -34,6 +34,7 @@ from .memory_ingestion import (
 )
 from .models import utc_now
 from .source_service import SourceRegistryMixin
+from .storage import sanitize_text
 
 # Re-exported for ArchitectOSService / graph_autolinker / older imports.
 __all__ = [
@@ -365,9 +366,21 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             written.append(node)
         return written
 
-    NEAR_DUPLICATE_SIMILARITY = 0.72
+    NEAR_DUPLICATE_SIMILARITY = MemoryDedupGate.NEAR_DUPLICATE_SIMILARITY
 
-    def add_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def add_memory(
+        self,
+        payload: dict[str, Any],
+        *,
+        _dedup_nodes: list[Any] | None = None,
+        _force_new: bool = False,
+    ) -> dict[str, Any]:
+        """Store one fact through the dedup gate (see ``memory_dedup``).
+
+        ``_dedup_nodes`` lets batch callers share one node snapshot instead of
+        re-reading every node per item. ``_force_new`` skips the gate but still
+        avoids overwriting a node that holds the same label (used by undo).
+        """
         label = str(payload.get("label") or "").strip()
         text = str(payload.get("text") or "").strip()
         scope = str(payload.get("scope") or "project")
@@ -381,25 +394,37 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         if source_id and not self.repository.get_source(source_id):
             raise ValueError(f"source not found: {source_id}")
 
-        dedup_enabled = payload.get("dedup", True) is not False
-        exact, near_id, near_score = (
-            self._ingest_dedup_scan(label, text, node_type, scope, project_id)
+        dedup_enabled = payload.get("dedup", True) is not False and not _force_new
+        decision = (
+            self.memory_dedup.classify(label, text, node_type, scope, project_id, nodes=_dedup_nodes)
             if dedup_enabled
-            else (None, "", 0.0)
+            else DedupDecision()
         )
-        if exact is not None:
-            return self._register_duplicate_add(exact, payload)
+        if decision.action == "duplicate":
+            existing = self.repository.get_node(decision.target_id)
+            if existing is not None:
+                return self._register_duplicate_add(existing, payload, decision)
+            decision = DedupDecision()
 
+        interface_id = payload.get("interface_id")
+        # Node ids derive from type+scope+label, so a second, different fact
+        # under an existing label used to replace the first one in place.
+        id_salt = (
+            self._label_collision_salt(node_type, label, scope, project_id, interface_id, text)
+            if dedup_enabled or _force_new
+            else ""
+        )
         node = self.repository.add_node(
             node_type,
             label,
             scope,
             text,
             project_id,
-            payload.get("interface_id"),
+            interface_id,
             float(payload.get("confidence") or 0.8),
             {"source": str(payload.get("source") or "ui"), "source_type": str(payload.get("source_type") or payload.get("source") or "manual")},
             source_id=source_id,
+            id_salt=id_salt,
         )
         node = self.memory_lifecycle.initialize_node(node, "ui")
         try:
@@ -411,12 +436,16 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             )
         except Exception as exc:  # history is best-effort, never blocks ingestion
             _LOG.warning("memory created event skipped: %s", exc)
-        if near_id and near_score >= self.NEAR_DUPLICATE_SIMILARITY:
-            node.metadata["possible_duplicate_of"] = near_id
-            node.metadata["possible_duplicate_score"] = round(near_score, 3)
-            node = self.repository.upsert_node(node)
+        if _dedup_nodes is not None:
+            _dedup_nodes.append(node)
+        node, event_id = self._apply_dedup_relation(node, decision, payload)
         self.graph_auto_linker.link_node(node, payload.get("project_id") or "architectos")
-        return node.to_dict()
+        result = node.to_dict()
+        if dedup_enabled:
+            result["dedup"] = decision.to_dict()
+            if event_id:
+                result["dedup"]["event_id"] = event_id
+        return result
 
     def add_memory_from_agent(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Persist an explicit MCP memory_add, splitting multi-fact blobs into nodes."""
@@ -425,13 +454,14 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         facts = facts_from_memory_blob(str(payload.get("text") or ""))
         if len(facts) < 2:
             return self.add_memory(payload)
+        nodes = self.repository.list_nodes()
         created: list[dict[str, Any]] = []
         for index, fact in enumerate(facts):
             item = dict(payload)
             item["text"] = fact["text"]
             item["type"] = fact["type"]
             item["label"] = str(payload.get("label") or "").strip() if index == 0 else fact["text"][:72]
-            created.append(self.add_memory(item))
+            created.append(self.add_memory(item, _dedup_nodes=nodes))
         primary = dict(created[0])
         primary["also_created"] = [node.get("id") for node in created[1:] if node.get("id")]
         return primary
@@ -442,11 +472,12 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         """Store a batch of memory nodes in one call (News→Event-style pipelines).
 
         Each item goes through the regular ``add_memory`` path (redaction,
-        exact/near dedup, lifecycle init, auto-link, embedding queue). Items are
-        isolated: a failing item is reported in ``results`` and never aborts the
-        batch. Unlike ``add_memory_from_agent`` no multi-fact splitting happens —
-        one item is one node. Top-level project_id/scope/source_id/type/confidence
-        act as defaults that individual items may override.
+        dedup gate, lifecycle init, auto-link, embedding queue) against one
+        shared node snapshot. Items are isolated: a failing item is reported in
+        ``results`` and never aborts the batch. Unlike ``add_memory_from_agent``
+        no multi-fact splitting happens — one item is one node. Top-level
+        project_id/scope/source_id/type/confidence act as defaults that
+        individual items may override.
         """
         raw_items: Any = payload.get("items")
         if not isinstance(raw_items, list) or not raw_items:
@@ -458,97 +489,156 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             if payload.get(key) is not None
         }
         results: list[dict[str, Any]] = []
-        stats = {"created": 0, "deduplicated": 0, "errors": 0}
+        stats = {"created": 0, "deduplicated": 0, "superseded": 0, "conflicts": 0, "errors": 0}
         ids: list[str] = []
+        nodes = self.repository.list_nodes()
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 results.append({"index": index, "status": "error", "error": "item must be an object"})
                 stats["errors"] += 1
                 continue
             try:
-                node = self.add_memory({**defaults, **item})
+                node = self.add_memory({**defaults, **item}, _dedup_nodes=nodes)
             except Exception as exc:  # noqa: BLE001 - per-item isolation is the contract
                 results.append({"index": index, "status": "error", "error": str(exc)})
                 stats["errors"] += 1
                 continue
             status = "deduplicated" if node.get("dedup_merged") else "created"
             stats[status] += 1
+            action = str((node.get("dedup") or {}).get("action") or "")
+            if action == "update":
+                stats["superseded"] += 1
+            elif action == "conflict":
+                stats["conflicts"] += 1
             if status == "created" and node.get("id"):
                 ids.append(node["id"])
-            results.append({"index": index, "status": status, "id": node.get("id"), "label": node.get("label")})
+            entry = {"index": index, "status": status, "id": node.get("id"), "label": node.get("label")}
+            if action:
+                entry["dedup_action"] = action
+            results.append(entry)
         stats["received"] = len(raw_items)
         stats["processed"] = len(items)
         return {"ids": ids, "results": results, "stats": stats}
 
-    def _ingest_dedup_scan(
-        self, label: str, text: str, node_type: str, scope: str, project_id: str | None
-    ) -> tuple[Any | None, str, float]:
-        """Scan existing facts for an exact restatement or a near-duplicate.
+    def preview_memory_dedup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """What the dedup gate would do with this fact, without writing anything."""
+        label = str(payload.get("label") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        if not label and not text:
+            raise ValueError("label or text is required")
+        scope = str(payload.get("scope") or "project")
+        node_type = str(payload.get("type") or "Lesson")
+        project_id = self._memory_project_id_for_scope(scope, payload.get("project_id") or "architectos")
+        decision = self.memory_dedup.classify(label, text, node_type, scope, project_id)
+        return {"label": label, "type": node_type, "scope": scope, "project_id": project_id, "dedup": decision.to_dict()}
 
-        Returns ``(exact_node, best_near_id, best_near_score)``. "Exact" means the
-        same normalized label + text within the same scope/project, and either
-        the same type or two fact types (Lesson/Decision/Requirement/Constraint)
-        — the same sentence saved once as a Lesson and once as a Decision is one
-        fact. Near-duplicate is the best token similarity among same-type facts,
-        surfaced for flagging only.
+    def _label_collision_salt(
+        self,
+        node_type: str,
+        label: str,
+        scope: str,
+        project_id: str | None,
+        interface_id: Any,
+        text: str,
+    ) -> str:
+        """Salt the new node's id when a live node already holds its label-derived id.
+
+        Tombstoned (archived/merged/deleted) nodes keep the former overwrite
+        behaviour: re-adding under their label revives the id.
         """
-        engine = self.ingestion_engine
-        incoming_tokens = engine._tokens(f"{label} {text}")
-        incoming_key = (self._normalize_fact_text(label), self._normalize_fact_text(text))
-        incoming_is_fact = node_type in _FACT_TYPE_RANK
-        best_near_id, best_near_score = "", 0.0
-        for node in self.repository.list_nodes():
-            if node.status != "active":
-                continue
-            meta = dict(node.metadata or {})
-            if meta.get("structural") or meta.get("hub") or meta.get("scope_root"):
-                continue
-            if node.scope != scope or node.project_id != project_id:
-                continue
-            same_type = node.type == node_type
-            if not same_type and not (incoming_is_fact and node.type in _FACT_TYPE_RANK):
-                continue
-            # Exact = identical normalized label + text. Deliberately NOT the token
-            # fingerprint: the fingerprint tokenizer drops digits, so facts that
-            # differ only by a number ("cap 5000" vs "cap 9000", "node 0" vs
-            # "node 1") share a fingerprint and must never be auto-merged.
-            if (self._normalize_fact_text(node.label), self._normalize_fact_text(node.text)) == incoming_key:
-                return node, node.id, 1.0
-            if not same_type:
-                continue
-            node_tokens = set(meta.get("tokens") or []) or engine._tokens(f"{node.label} {node.text}")
-            score = engine._similarity(incoming_tokens, node_tokens)
-            if score > best_near_score:
-                best_near_id, best_near_score = node.id, score
-        return None, best_near_id, best_near_score
+        existing_id = self.repository.memory_node_id(node_type, label, scope, project_id, interface_id)
+        existing = self.repository.get_node(existing_id)
+        if existing is None or existing.status != "active":
+            return ""
+        return content_salt(text)
 
-    # Stripped from both ends only: inner punctuation ("5.0" vs "50") is content.
-    # No dashes: a leading minus is a sign ("-5 °C" vs "5 °C").
-    _FACT_EDGE_PUNCTUATION = " .,;:!?…\"'`«»“”„()[]"
+    def _apply_dedup_relation(
+        self, node: Any, decision: DedupDecision, payload: dict[str, Any]
+    ) -> tuple[Any, str]:
+        """Link a freshly created node to the fact it updates or contradicts."""
+        target_id = decision.target_id
+        if decision.action in {"update", "conflict"} and target_id and target_id != node.id:
+            edge_type = "SUPERSEDES" if decision.action == "update" else "CONTRADICTS"
+            edge_id = ""
+            try:
+                # SUPERSEDES stamps invalid_at on the old fact (non-destructive).
+                edge = self.create_graph_edge({
+                    "source": node.id,
+                    "target": target_id,
+                    "type": edge_type,
+                    "scope": node.scope,
+                    "confidence": 0.9 if decision.action == "update" else 0.8,
+                })
+                edge_id = str((edge.get("edge") or {}).get("id") or "")
+            except ValueError as exc:
+                _LOG.warning("dedup %s edge skipped: %s", edge_type, exc)
+            meta = dict(node.metadata or {})
+            meta["dedup_action"] = decision.action
+            if decision.action == "update":
+                meta["supersedes"] = target_id
+            else:
+                meta["conflicts_with"] = target_id
+                meta["needs_review"] = "conflict"
+            node.metadata = meta
+            node = self.repository.upsert_node(node)
+            event_id = self._record_dedup_event(
+                node.id,
+                payload,
+                {**decision.to_dict(), "edge_id": edge_id},
+            )
+            return node, event_id
+        if decision.near_id and decision.near_id != node.id and decision.near_score >= self.NEAR_DUPLICATE_SIMILARITY:
+            node.metadata["possible_duplicate_of"] = decision.near_id
+            node.metadata["possible_duplicate_score"] = round(decision.near_score, 3)
+            node = self.repository.upsert_node(node)
+        return node, ""
+
+    def _record_dedup_event(self, node_id: str, payload: dict[str, Any], details: dict[str, Any]) -> str:
+        try:
+            event = self.repository.record_memory_event(
+                node_id, "dedup", actor=str(payload.get("source") or "ui"), details=details,
+            )
+        except Exception as exc:  # history is best-effort, never blocks ingestion
+            _LOG.warning("dedup event skipped: %s", exc)
+            return ""
+        return str(event.get("id") or "")
 
     @staticmethod
-    def _normalize_fact_text(value: str) -> str:
-        """Comparison key for exact restatements.
+    def _dedup_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+        """Incoming fact as undo needs it. Redacted like a stored node: no secrets in the DB."""
+        snapshot = {
+            key: payload.get(key)
+            for key in ("type", "scope", "project_id", "interface_id", "source", "source_type", "source_id", "confidence")
+            if payload.get(key) not in (None, "")
+        }
+        snapshot["label"] = sanitize_text(str(payload.get("label") or ""))[0]
+        snapshot["text"] = sanitize_text(str(payload.get("text") or ""))[0]
+        return snapshot
 
-        Case, Unicode form (NFKC), ё/е, whitespace and sentence punctuation at
-        the edges do not change a fact, so "Data lives in SQLite" and
-        "data lives in SQLite." compare equal. Digits and inner punctuation are
-        kept.
-        """
-        text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
-        text = " ".join(text.split())
-        return text.strip(IngestionServiceMixin._FACT_EDGE_PUNCTUATION)
-
-    def _register_duplicate_add(self, existing: Any, payload: dict[str, Any]) -> dict[str, Any]:
-        """Fold a re-added identical fact into the node it duplicates.
+    def _register_duplicate_add(
+        self, existing: Any, payload: dict[str, Any], decision: DedupDecision | None = None
+    ) -> dict[str, Any]:
+        """Fold a re-added fact into the node it duplicates.
 
         Non-destructive update: bump confidence toward the incoming value, record
-        a dedup hit, refresh lifecycle access, and return the surviving node marked
-        ``dedup_merged`` so callers can tell no new node was created.
+        a dedup hit and its source, refresh lifecycle access, log a ``dedup``
+        event that ``undo_memory_dedup`` can reverse, and return the surviving
+        node marked ``dedup_merged`` so callers can tell no new node was created.
         """
+        decision = decision or DedupDecision(
+            "duplicate", target_id=existing.id, target_label=str(existing.label or ""), score=1.0,
+            reason="exact restatement",
+        )
         meta = dict(existing.metadata or {})
         meta["dedup_hits"] = int(meta.get("dedup_hits") or 0) + 1
         meta["last_dedup_at"] = utc_now()
+        sources = list(meta.get("dedup_sources") or [])
+        sources.append({
+            "source": str(payload.get("source") or "ui"),
+            "source_type": str(payload.get("source_type") or payload.get("source") or "manual"),
+            "at": meta["last_dedup_at"],
+        })
+        meta["dedup_sources"] = sources[-20:]
         # Cross-type restatement keeps the stronger fact type (Constraint >
         # Requirement > Decision > Lesson); refresh_nodes below then re-evaluates
         # the lifecycle tier for the new type.
@@ -565,23 +655,86 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         except (TypeError, ValueError):
             pass
         existing = self.repository.upsert_node(existing)
+        details = {**decision.to_dict(), "incoming": self._dedup_snapshot(payload)}
         if existing.type != previous_type:
-            try:
-                self.repository.record_memory_event(
-                    existing.id,
-                    "updated",
-                    actor=str(payload.get("source") or "ui"),
-                    details={"reason": "dedup_type_upgrade", "type_from": previous_type, "type_to": existing.type},
-                )
-            except Exception as exc:  # history is best-effort, never blocks ingestion
-                _LOG.warning("dedup type event skipped: %s", exc)
+            details.update({"type_from": previous_type, "type_to": existing.type})
+        event_id = self._record_dedup_event(existing.id, payload, details)
         try:
             self.memory_lifecycle.refresh_nodes([existing.id], "dedup")
         except Exception as exc:  # lifecycle bump is best-effort
             _LOG.warning("dedup refresh skipped: %s", exc)
-        result = existing.to_dict()
+        refreshed = self.repository.get_node(existing.id) or existing
+        result = refreshed.to_dict()
         result["dedup_merged"] = True
+        result["dedup"] = decision.to_dict()
+        if event_id:
+            result["dedup"]["event_id"] = event_id
         return result
+
+    def undo_memory_dedup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Reverse one gate decision recorded as a ``dedup`` memory event.
+
+        - duplicate: the swallowed fact is stored as its own node, the dedup hit
+          and any type upgrade on the surviving node are rolled back;
+        - update / conflict: the SUPERSEDES / CONTRADICTS edge is removed and the
+          old fact is valid again; the newer node stays.
+        """
+        event_id = str(payload.get("event_id") or "").strip()
+        event = self.repository.get_memory_event(event_id) if event_id else None
+        if not event or event.get("event_type") != "dedup":
+            raise ValueError("dedup event not found")
+        details = dict(event.get("details") or {})
+        action = str(details.get("action") or "")
+        node = self.repository.get_node(str(event.get("node_id") or ""))
+        if node is None:
+            raise ValueError("memory not found")
+        meta = dict(node.metadata or {})
+        undone = list(meta.get("dedup_undone") or [])
+        if event_id in undone:
+            raise ValueError("dedup event already undone")
+        restored: dict[str, Any] | None = None
+        if action == "duplicate":
+            meta["dedup_hits"] = max(0, int(meta.get("dedup_hits") or 0) - 1)
+            type_from = str(details.get("type_from") or "")
+            if type_from and node.type == details.get("type_to"):
+                node.type = type_from
+                meta.pop("dedup_type_from", None)
+        elif action in {"update", "conflict"}:
+            edge_id = str(details.get("edge_id") or "")
+            if edge_id:
+                self.repository.delete_edge(edge_id)
+            target = self.repository.get_node(str(details.get("target_id") or ""))
+            if action == "update" and target is not None:
+                target_meta = dict(target.metadata or {})
+                if target_meta.get("superseded_by") == node.id:
+                    target_meta.pop("invalid_at", None)
+                    target_meta.pop("superseded_by", None)
+                    target.metadata = target_meta
+                    self.repository.upsert_node(target)
+            for key in ("dedup_action", "supersedes", "conflicts_with", "needs_review"):
+                meta.pop(key, None)
+        else:
+            raise ValueError(f"dedup action cannot be undone: {action or 'unknown'}")
+        meta["dedup_undone"] = [*undone, event_id]
+        node.metadata = meta
+        node = self.repository.upsert_node(node)
+        if action == "duplicate":
+            incoming = dict(details.get("incoming") or {})
+            restored = self.add_memory(incoming, _force_new=True)
+            restored_node = self.repository.get_node(str(restored.get("id") or ""))
+            if restored_node is not None:
+                restored_node.metadata["dedup_restored_from"] = event_id
+                restored = self.repository.upsert_node(restored_node).to_dict()
+        try:
+            self.repository.record_memory_event(
+                node.id,
+                "dedup_undo",
+                actor=str(payload.get("actor") or "ui"),
+                details={"event_id": event_id, "action": action, "restored_id": (restored or {}).get("id", "")},
+            )
+        except Exception as exc:  # history is best-effort
+            _LOG.warning("dedup undo event skipped: %s", exc)
+        return {"event_id": event_id, "action": action, "memory": node.to_dict(), "restored": restored}
 
     def _memory_project_id_for_scope(self, scope: str, project_id: str | None) -> str | None:
         normalized = str(scope or "project")

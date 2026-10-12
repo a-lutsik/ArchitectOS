@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from backend.architectos.memory_dedup import normalize_fact_text
 from backend.architectos.memory_ingestion import (
     DUPLICATE_STOPWORDS,
     FINGERPRINT_VERSION,
@@ -111,7 +112,7 @@ class DedupIngestTests(unittest.TestCase):
         self.assertNotEqual(first["id"], second["id"])
 
     def test_leading_minus_is_not_stripped_as_punctuation(self) -> None:
-        normalize = self.service._normalize_fact_text
+        normalize = normalize_fact_text
         self.assertEqual(normalize("«Данные в SQLite.»"), normalize("данные в sqlite"))
         self.assertNotEqual(normalize("-5 градусов"), normalize("5 градусов"))
 
@@ -132,7 +133,7 @@ class DedupIngestTests(unittest.TestCase):
         self.assertEqual(stored.metadata.get("memory_tier"), "long_term")
         events = self.service.repository.list_memory_events(lesson["id"])
         self.assertTrue(any(
-            event["details"].get("reason") == "dedup_type_upgrade" and event["details"].get("type_to") == "Decision"
+            event["event_type"] == "dedup" and event["details"].get("type_to") == "Decision"
             for event in events
         ))
 

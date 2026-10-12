@@ -864,17 +864,22 @@ class ChatSessionServiceMixin:
         if meta.get("revision"):
             # Revisions must promote as a new node + SUPERSEDES, not be blocked as near-dups.
             return False
+        scope = str(candidate.get("scope") or "project")
         try:
-            _exact, near_id, near_score = self._ingest_dedup_scan(
+            decision = self.memory_dedup.classify(
                 str(candidate.get("label") or ""),
                 str(candidate.get("text") or ""),
                 str(candidate.get("type") or "Lesson"),
-                str(candidate.get("scope") or "project"),
-                candidate.get("project_id"),
+                scope,
+                self._memory_project_id_for_scope(scope, candidate.get("project_id")),
             )
         except Exception:  # noqa: BLE001 - never fail a chat/MCP turn on dedup
             return False
-        return bool(near_id) and float(near_score or 0.0) >= float(getattr(self, "NEAR_DUPLICATE_SIMILARITY", 0.72))
+        # Duplicates, value updates and contradictions stay in review: a person
+        # (not an auto-accepted chat turn) decides whether the old fact changed.
+        if decision.action != "new":
+            return True
+        return bool(decision.near_id) and decision.near_score >= self.memory_dedup.NEAR_DUPLICATE_SIMILARITY
 
     def _capture_favorite_message_candidate(self, project_id: str, chat_id: str, message_index: int, user_text: str, assistant_text: str) -> dict[str, Any] | None:
         # Explicit ★ save always creates a candidate (opt-in), but still prefer facts when possible.
