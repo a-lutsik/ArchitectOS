@@ -713,6 +713,9 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _patch_task(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().update_task(match.group("task_id"), payload))
 
+    def _delete_task(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().delete_task(match.group("task_id")))
+
     def _patch_provider(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().update_provider(match.group("provider_id"), payload))
 
@@ -864,6 +867,7 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("POST", re.compile(r"^/api/project/file/delete$"), ArchitectOSHandler._post_project_file_delete),
     # PATCH
     ("PATCH", re.compile(r"^/api/tasks/(?P<task_id>[^/]+)$"), ArchitectOSHandler._patch_task),
+    ("DELETE", re.compile(r"^/api/tasks/(?P<task_id>[^/]+)$"), ArchitectOSHandler._delete_task),
     ("PATCH", re.compile(r"^/api/providers/(?P<provider_id>[^/]+)$"), ArchitectOSHandler._patch_provider),
     ("PATCH", re.compile(r"^/api/memory/(?P<memory_id>[^/]+)/favorite$"), ArchitectOSHandler._patch_memory_favorite),
     ("PATCH", re.compile(r"^/api/settings$"), ArchitectOSHandler._patch_settings),

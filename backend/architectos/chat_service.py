@@ -40,6 +40,11 @@ class ChatServiceMixin:
             task["linked_memory_ids"] = list(payload["linked_memory_ids"] or [])
         return self.repository.upsert_task(task)
 
+    def delete_task(self, task_id: str) -> dict[str, Any]:
+        if not self.repository.delete_task(task_id):
+            raise ValueError("task not found")
+        return {"deleted": True, "id": task_id}
+
     def list_chats(self, project_id: str | None = None, limit: int = 80) -> dict[str, Any]:
         chats = []
         for chat in self.repository.list_chats(project_id)[: max(1, min(int(limit or 80), 500))]:

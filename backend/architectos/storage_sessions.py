@@ -50,6 +50,11 @@ class StorageSessionsMixin:
             rows = conn.execute(sql, params).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
+    def delete_task(self, task_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return cursor.rowcount > 0
+
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT payload FROM tasks WHERE id = ?", (task_id,)).fetchone()

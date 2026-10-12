@@ -7,6 +7,7 @@ base without importing one another. Everything here is re-exported from
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +143,23 @@ def is_local_memory_stub_text(text: str) -> bool:
     return value.startswith("This is Local Memory fallback") or value.startswith("Local Memory cannot run commands") or value.startswith("Local context is ready") or value.startswith("Local Memory (not a language model)")
 
 
+_MEMORY_HIT_LINE = re.compile(r"^- id=\S+ \[(?P<meta>[^\]]*)\] (?P<label>.+?):(?:\s|$)")
+
+
+def _memory_hit_labels(context: str, limit: int = 4) -> list[str]:
+    """Labels of memory hits in a packed context (``- id=… [type|scope|src] label: text``)."""
+    labels: list[str] = []
+    for line in (context or "").splitlines():
+        match = _MEMORY_HIT_LINE.match(line)
+        if match:
+            labels.append(match.group("label").strip())
+        elif line.startswith("- [") and ":" in line:
+            labels.append(line.split(":", 1)[0].replace("- ", "", 1))
+        if len(labels) >= limit:
+            break
+    return labels
+
+
 class LocalMemoryAdapter(ProviderAdapter):
     provider_id = "local-memory"
 
@@ -159,11 +177,7 @@ class LocalMemoryAdapter(ProviderAdapter):
     def run(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> dict[str, Any]:
         if looks_like_cli_install(request.message):
             return {"provider_id": self.provider_id, "status": "fallback", "text": LOCAL_MEMORY_CANNOT_INSTALL, "raw": None}
-        lines = [line for line in request.context.splitlines() if line.startswith("- [")]
-        labels = []
-        for line in lines[:4]:
-            head = line.split(":", 1)[0]
-            labels.append(head.replace("- ", ""))
+        labels = _memory_hit_labels(request.context)
         if labels:
             text = (
                 f"Local Memory (not a language model) found related notes for: {request.message}. "
