@@ -10,6 +10,18 @@ let mcpServers = [];
 let selectedServerId = null;
 let mcpEventsBound = false;
 
+/** Parse a JSON textarea; on failure flag the field and throw a readable error. */
+function parseJsonField(el, label) {
+  el.removeAttribute("aria-invalid");
+  try {
+    return JSON.parse(el.value);
+  } catch (error) {
+    el.setAttribute("aria-invalid", "true");
+    el.focus();
+    throw new Error(t("mcp.jsonInvalid").replace("{field}", label));
+  }
+}
+
 function isRemoteTransport(transport) {
   return REMOTE_TRANSPORTS.includes(String(transport || "").trim().toLowerCase());
 }
@@ -536,11 +548,11 @@ function initMcpMasterDetail() {
         };
 
         if (envEl && envEl.value.trim()) {
-          updates.env = JSON.parse(envEl.value);
+          updates.env = parseJsonField(envEl, "Env");
         }
 
         if (headersEl && headersEl.value.trim()) {
-          updates.headers = JSON.parse(headersEl.value);
+          updates.headers = parseJsonField(headersEl, "Headers");
         }
 
         await api("/api/mcp/servers", {
@@ -552,12 +564,12 @@ function initMcpMasterDetail() {
 
         const resultsEl = document.querySelector("#mcp-test-results");
         if (resultsEl) {
-          resultsEl.innerHTML = '<p class="success">Settings saved successfully!</p>';
+          resultsEl.innerHTML = `<p class="success">${escapeHtml(t("mcp.saved"))}</p>`;
         }
       } catch (error) {
         const resultsEl = document.querySelector("#mcp-test-results");
         if (resultsEl) {
-          resultsEl.innerHTML = `<p class="error">Failed to save: ${error.message}</p>`;
+          resultsEl.innerHTML = `<p class="error">${escapeHtml(t("mcp.saveFailed").replace("{error}", error.message))}</p>`;
         }
       }
     });

@@ -129,7 +129,7 @@
                     <line x1="12" y1="5" x2="12" y2="19"></line>
                     <line x1="5" y1="12" x2="19" y2="12"></line>
                   </svg>
-                  New Project
+                  <span data-i18n="files.newProject">New Project</span>
                 </button>
               </div>
 
@@ -238,7 +238,7 @@
                 <div class="workspace-editor-main" id="workspace-editor-surface">
                   <div class="editor-tabs" id="editor-tabs">
                     <div class="editor-tab-placeholder">
-                      <span id="editor-tab-empty-hint">No files open — click a file to start</span>
+                      <span id="editor-tab-empty-hint" data-i18n="files.editorEmptyHint">No files open — click a file to start</span>
                     </div>
                   </div>
 
@@ -255,7 +255,7 @@
                           <polyline points="17 21 17 13 7 13 7 21"></polyline>
                           <polyline points="7 3 7 8 15 8"></polyline>
                         </svg>
-                        Save
+                        <span data-i18n="files.save">Save</span>
                       </button>
                       <button id="editor-close" class="editor-btn" disabled title="Close">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -268,7 +268,7 @@
                   </div>
 
                   <textarea id="file-editor" class="file-editor-textarea"
-                    placeholder="Click a file in the tree to edit"></textarea>
+                    placeholder="Click a file in the tree to edit" data-i18n-placeholder="files.clickToEdit"></textarea>
                 </div>
 
                 <div class="workspace-ask-resizer" id="workspace-ask-resizer" title="Drag to resize Ask"></div>
@@ -1285,15 +1285,15 @@
             </div>
 
             <div class="add-memory-tabs">
-              <div class="tab-nav">
-                <button class="tab-button active" data-tab="autoscan">🤖 AutoScan</button>
-                <button class="tab-button" data-tab="manual">✍️ Manual</button>
-                <button class="tab-button" data-tab="files">📁 Files</button>
-                <button class="tab-button" data-tab="voice">🎙️ Voice</button>
+              <div class="tab-nav" role="tablist" aria-label="Add memory">
+                <button class="tab-button active" role="tab" id="add-memory-tab-autoscan" aria-selected="true" aria-controls="add-memory-panel-autoscan" data-tab="autoscan">🤖 AutoScan</button>
+                <button class="tab-button" role="tab" id="add-memory-tab-manual" aria-selected="false" aria-controls="add-memory-panel-manual" data-tab="manual">✍️ Manual</button>
+                <button class="tab-button" role="tab" id="add-memory-tab-files" aria-selected="false" aria-controls="add-memory-panel-files" data-tab="files">📁 Files</button>
+                <button class="tab-button" role="tab" id="add-memory-tab-voice" aria-selected="false" aria-controls="add-memory-panel-voice" data-tab="voice">🎙️ Voice</button>
               </div>
 
               <!-- AutoScan Tab -->
-              <div class="tab-content active" data-tab-content="autoscan">
+              <div class="tab-content active" role="tabpanel" id="add-memory-panel-autoscan" aria-labelledby="add-memory-tab-autoscan" data-tab-content="autoscan">
                 <div class="autoscan-help">
                   <p class="autoscan-help-text">🤖 <strong>AutoScan automatically finds important information</strong>
                     from your project sources and creates memory candidates for review. Select sources below and click Ingest to start.</p>
@@ -1497,7 +1497,7 @@
 
 
               <!-- Manual Tab -->
-              <div class="tab-content" data-tab-content="manual">
+              <div class="tab-content" role="tabpanel" id="add-memory-panel-manual" aria-labelledby="add-memory-tab-manual" data-tab-content="manual">
                 <form id="memory-form" class="stack-form">
                   <label>Label
                     <input id="memory-label" required>
@@ -1529,7 +1529,7 @@
               </div>
 
               <!-- Files Tab -->
-              <div class="tab-content" data-tab-content="files">
+              <div class="tab-content" role="tabpanel" id="add-memory-panel-files" aria-labelledby="add-memory-tab-files" data-tab-content="files">
                 <div class="stack-form">
                   <input id="memory-file-input" type="file" multiple hidden>
                   <div class="file-picker-section">
@@ -1560,7 +1560,7 @@
               </div>
 
               <!-- Voice Tab -->
-              <div class="tab-content" data-tab-content="voice">
+              <div class="tab-content" role="tabpanel" id="add-memory-panel-voice" aria-labelledby="add-memory-tab-voice" data-tab-content="voice">
                 <div class="voice-memory-container">
                   <div class="voice-help">
                     <p class="voice-help-text">🎙️ Speak a note, review the transcript, then save it into project or
@@ -1999,16 +1999,15 @@
               <div>
                 <p class="code-eyebrow" data-i18n="code.eyebrow">Setup</p>
                 <h3 id="code-status-title" data-i18n="code.status.title">Code context</h3>
-                <p id="code-status-message" class="code-status-message" data-i18n="code.status.noProject">Connect a
-                  project folder to analyze code and power AI suggestions.</p>
+                <p id="code-status-message" class="code-status-message" aria-live="polite">…</p>
               </div>
               <div id="code-status-badge" class="code-readiness-badge" data-tone="idle">—</div>
             </div>
             <div id="code-status-pills" class="code-status-pills"></div>
             <div class="code-status-actions">
-              <button id="code-connect-folder" type="button" class="btn-primary"
+              <button id="code-connect-folder" type="button" class="btn-primary" hidden
                 data-i18n="action.connectFolder">Connect folder</button>
-              <button id="code-analyze-project" type="button" class="btn-secondary"
+              <button id="code-analyze-project" type="button" class="btn-secondary" hidden
                 data-i18n="code.action.analyze">Analyze project</button>
             </div>
           </section>
@@ -2283,8 +2282,8 @@
                 <legend class="visually-hidden" data-i18n="settings.group.interface">Interface</legend>
                 <div class="settings-grid settings-grid-3">
                   <label class="settings-field">
-                    <span class="settings-field-label" data-i18n="settings.theme">Theme</span>
-                    <select id="theme-select">
+                    <span class="settings-field-label" id="theme-select-label" data-i18n="settings.theme">Theme</span>
+                    <select id="theme-select" aria-labelledby="theme-select-label">
                       <option value="system">system</option>
                       <option value="light">light</option>
                       <option value="dark">dark</option>
@@ -2293,8 +2292,8 @@
                       follows your OS preference.</small>
                   </label>
                   <label class="settings-field">
-                    <span class="settings-field-label" data-i18n="settings.density">Density</span>
-                    <select id="density-select">
+                    <span class="settings-field-label" id="density-select-label" data-i18n="settings.density">Density</span>
+                    <select id="density-select" aria-labelledby="density-select-label">
                       <option value="comfortable">comfortable</option>
                       <option value="compact">compact</option>
                     </select>
@@ -2302,8 +2301,8 @@
                       more on screen; comfortable is easier to click.</small>
                   </label>
                   <label class="settings-field">
-                    <span class="settings-field-label" data-i18n="settings.language">Language</span>
-                    <select id="settings-language-select">
+                    <span class="settings-field-label" id="settings-language-select-label" data-i18n="settings.language">Language</span>
+                    <select id="settings-language-select" aria-labelledby="settings-language-select-label">
                       <option value="en">English</option>
                       <option value="ru">Русский</option>
                       <option value="uk">Українська</option>

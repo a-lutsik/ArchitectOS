@@ -1,5 +1,6 @@
 /* Projects, onboarding, workspace files, search/context, tasks — extracted from app.js */
 import { api, ensureServerOnline } from "./api-client.js";
+import { showAppConfirm, showAppPrompt } from "./app-dialog.js";
 import { escapeHtml, setElementValue, setTextContent, showSnackbar } from "./dom-utils.js";
 import { fileEditor } from "./file-editor.js";
 import { fileFind } from "./file-find.js";
@@ -410,75 +411,145 @@ async function refreshWorkspace() {
   renderResults(document.querySelector("#workspace-favorites"), search.hits.filter(hit => hit.node.metadata && hit.node.metadata.favorite).slice(0, 5));
 }
 
+const TASK_STATUSES = ["todo", "doing", "blocked", "done"];
+
+function taskStatusLabel(status) {
+  return t(`tasks.status.${status}`);
+}
+
+function renderTaskCard(task) {
+  const el = document.createElement("article");
+  el.className = "task-card";
+  const priority = ["high", "medium", "low"].includes(task.priority) ? task.priority : "medium";
+  const detail = String(task.detail || "").trim();
+  const options = TASK_STATUSES.map(status => `<option value="${status}">${escapeHtml(taskStatusLabel(status))}</option>`).join("");
+  el.innerHTML = `
+    <div class="task-card-head">
+      <strong>${escapeHtml(task.title)}</strong>
+      <span class="badge task-priority task-priority-${priority}" title="${escapeHtml(t("tasks.priority"))}">${escapeHtml(t(`tasks.priority.${priority}`))}</span>
+    </div>
+    ${detail ? `<p>${escapeHtml(detail)}</p>` : ""}
+    <div class="task-card-actions">
+      <select data-task="${escapeHtml(task.id)}" aria-label="${escapeHtml(t("tasks.status"))}">${options}</select>
+      <button type="button" class="icon-btn-sm" data-task-edit="${escapeHtml(task.id)}" aria-label="${escapeHtml(t("tasks.edit"))}" title="${escapeHtml(t("tasks.edit"))}">✎</button>
+      <button type="button" class="icon-btn-sm" data-task-delete="${escapeHtml(task.id)}" aria-label="${escapeHtml(t("tasks.delete"))}" title="${escapeHtml(t("tasks.delete"))}">✕</button>
+    </div>`;
+  el.querySelector("select").value = task.status;
+  el.querySelector("[data-task-edit]").addEventListener("click", async () => {
+    try {
+      const title = await showAppPrompt({
+        title: t("tasks.editTitle"),
+        label: t("tasks.editLabel"),
+        value: task.title,
+        confirmLabel: t("tasks.edit"),
+      });
+      const next = String(title || "").trim();
+      if (!next || next === task.title) return;
+      await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: next }) });
+      await loadTasks();
+    } catch (error) {
+      showError(error);
+    }
+  });
+  el.querySelector("[data-task-delete]").addEventListener("click", async () => {
+    try {
+      const ok = await showAppConfirm({
+        title: t("tasks.deleteTitle"),
+        message: t("tasks.deleteConfirm").replace("{title}", task.title),
+        confirmLabel: t("tasks.delete"),
+        danger: true,
+      });
+      if (!ok) return;
+      await api(`/api/tasks/${task.id}`, { method: "DELETE" });
+      await loadTasks();
+      await refreshWorkspace();
+    } catch (error) {
+      showError(error);
+    }
+  });
+  return el;
+}
+
+function renderTaskComposer() {
+  const composer = document.createElement("form");
+  composer.className = "task-inline-composer";
+  composer.innerHTML = `
+    <input class="task-inline-title" type="text" placeholder="${escapeHtml(t("tasks.addPlaceholder"))}" aria-label="${escapeHtml(t("tasks.titleLabel"))}" required>
+    <div class="task-inline-extra" hidden>
+      <select class="task-inline-priority" aria-label="${escapeHtml(t("tasks.priority"))}">
+        <option value="high">${escapeHtml(t("tasks.priority.high"))}</option>
+        <option value="medium" selected>${escapeHtml(t("tasks.priority.medium"))}</option>
+        <option value="low">${escapeHtml(t("tasks.priority.low"))}</option>
+      </select>
+      <textarea class="task-inline-detail" rows="2" placeholder="${escapeHtml(t("tasks.detailPlaceholder"))}" aria-label="${escapeHtml(t("tasks.detailPlaceholder"))}"></textarea>
+      <div class="task-inline-actions">
+        <button type="submit" class="btn btn-primary btn-sm">${escapeHtml(t("tasks.add"))}</button>
+        <button type="button" class="btn btn-secondary btn-sm" data-cancel-task>${escapeHtml(t("tasks.cancel"))}</button>
+      </div>
+    </div>`;
+  const title = composer.querySelector(".task-inline-title");
+  const extra = composer.querySelector(".task-inline-extra");
+  title.addEventListener("focus", () => { extra.hidden = false; });
+  composer.querySelector("[data-cancel-task]").addEventListener("click", () => {
+    composer.reset();
+    extra.hidden = true;
+  });
+  composer.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const value = title.value.trim();
+    if (!value) return;
+    try {
+      await api("/api/tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: state.projectId,
+          title: value,
+          priority: composer.querySelector(".task-inline-priority").value || "medium",
+          status: "todo",
+          detail: composer.querySelector(".task-inline-detail").value || "",
+        }),
+      });
+      await loadTasks();
+      await refreshWorkspace();
+    } catch (error) {
+      showError(error);
+    }
+  });
+  return composer;
+}
+
 async function loadTasks() {
   const payload = await api(`/api/tasks?project_id=${projectParam()}`);
   const board = document.querySelector("#task-board");
   if (!board) return;
   board.innerHTML = "";
-  for (const status of ["todo", "doing", "blocked", "done"]) {
+  for (const status of TASK_STATUSES) {
     const column = document.createElement("section");
     column.className = "task-column";
-    column.innerHTML = `<h4>${status}</h4><div class="task-column-cards" data-status="${status}"></div>`;
+    column.innerHTML = `<h4>${escapeHtml(taskStatusLabel(status))}</h4><div class="task-column-cards" data-status="${status}"></div>`;
     const cards = column.querySelector(".task-column-cards");
     for (const task of payload.tasks.filter(item => item.status === status)) {
-      const el = document.createElement("article");
-      el.className = "task-card";
-      el.innerHTML = `<strong>${escapeHtml(task.title)}</strong><p>${escapeHtml(task.detail)}</p><select data-task="${escapeHtml(task.id)}"><option>todo</option><option>doing</option><option>blocked</option><option>done</option></select>`;
-      el.querySelector("select").value = task.status;
-      cards.appendChild(el);
+      cards.appendChild(renderTaskCard(task));
     }
     if (!cards.children.length) {
       const empty = document.createElement("div");
       empty.className = "task-column-empty";
-      empty.textContent = status === "done" ? "Nothing completed yet" : "No tasks";
+      empty.textContent = status === "done" ? t("tasks.nothingDone") : t("tasks.noTasks");
       cards.appendChild(empty);
     }
-    if (status === "todo") {
-      const composer = document.createElement("form");
-      composer.className = "task-inline-composer";
-      composer.innerHTML = `
-        <input class="task-inline-title" type="text" placeholder="+ Add a task" aria-label="New task title" required>
-        <div class="task-inline-extra" hidden>
-          <select class="task-inline-priority" aria-label="Priority">
-            <option value="high">high</option>
-            <option value="medium" selected>medium</option>
-            <option value="low">low</option>
-          </select>
-          <textarea class="task-inline-detail" rows="2" placeholder="Optional detail"></textarea>
-          <div class="task-inline-actions">
-            <button type="submit" class="btn btn-primary btn-sm">Add</button>
-            <button type="button" class="btn btn-secondary btn-sm" data-cancel-task>Cancel</button>
-          </div>
-        </div>`;
-      const title = composer.querySelector(".task-inline-title");
-      const extra = composer.querySelector(".task-inline-extra");
-      title.addEventListener("focus", () => { extra.hidden = false; });
-      composer.querySelector("[data-cancel-task]").addEventListener("click", () => {
-        composer.reset();
-        extra.hidden = true;
-      });
-      composer.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const value = title.value.trim();
-        if (!value) return;
-        await api("/api/tasks", {
-          method: "POST",
-          body: JSON.stringify({
-            project_id: state.projectId,
-            title: value,
-            priority: composer.querySelector(".task-inline-priority").value || "medium",
-            status: "todo",
-            detail: composer.querySelector(".task-inline-detail").value || "",
-          }),
-        });
-        await loadTasks();
-        await refreshWorkspace();
-      });
-      column.appendChild(composer);
-    }
+    if (status === "todo") column.appendChild(renderTaskComposer());
     board.appendChild(column);
   }
-  board.querySelectorAll("[data-task]").forEach(select => select.addEventListener("change", async () => { await api(`/api/tasks/${select.dataset.task}`, { method: "PATCH", body: JSON.stringify({ status: select.value }) }); await loadTasks(); await refreshWorkspace(); }));
+  board.querySelectorAll("[data-task]").forEach(select => select.addEventListener("change", async () => {
+    try {
+      await api(`/api/tasks/${select.dataset.task}`, { method: "PATCH", body: JSON.stringify({ status: select.value }) });
+      await loadTasks();
+      await refreshWorkspace();
+    } catch (error) {
+      showError(error);
+      await loadTasks().catch(() => {});
+    }
+  }));
 }
 
 export {

@@ -11,6 +11,9 @@ const ASK_PROMPT_STDERR_CAP = 8000;
 let releaseTerminalFocus = null;
 let historyCursor = -1;
 let historyDraft = "";
+// Finished runs stay in the output pane like a shell scrollback (capped).
+let transcript = "";
+const TRANSCRIPT_CAP = 20000;
 let lastRun = null;
 let runInFlight = false;
 let bound = false;
@@ -140,7 +143,8 @@ function renderTerminalRunning(command) {
     status.textContent = t("terminal.running");
   }
   if (output) {
-    output.textContent = [`$ ${command}`, "", t("terminal.waiting")].join("\n");
+    output.textContent = [transcript, `$ ${command}`, "", t("terminal.waiting")].filter(part => part !== "").join("\n");
+    output.scrollTop = output.scrollHeight;
   }
   syncAskAgentButton();
   syncTerminalTrigger();
@@ -160,7 +164,9 @@ function renderTerminalResult(payload) {
     stdout ? `\n${stdout}` : "",
     stderr ? `\n${stderr}` : "",
   ].filter(Boolean);
-  output.textContent = parts.join("\n");
+  transcript = (transcript ? `${transcript}\n\n` : "") + parts.join("\n");
+  if (transcript.length > TRANSCRIPT_CAP) transcript = transcript.slice(-TRANSCRIPT_CAP);
+  output.textContent = transcript;
   output.scrollTop = output.scrollHeight;
   status.hidden = false;
   status.className = `terminal-status${payload.status === "ok" || payload.status === "opened" ? " is-ok" : failed ? " is-error" : ""}`;
@@ -302,7 +308,7 @@ function requestDestructiveConfirmation(command, blocked) {
   });
 }
 
-async function executeTerminalCommand(commandOverride = "") {
+async function executeTerminalCommand(commandOverride = "", { clearInput = false } = {}) {
   const payload = terminalPayload(commandOverride);
   if (!payload.command.trim()) throw new Error(t("terminal.commandRequired"));
   const input = commandInput();
@@ -334,13 +340,18 @@ async function executeTerminalCommand(commandOverride = "") {
     runInFlight = false;
   }
   pushHistory({ command: payload.command, shell: result.shell || payload.shell, status: result.status });
+  if (clearInput) {
+    const field = commandInput();
+    if (field) field.value = "";
+    resetHistoryCursor();
+  }
   renderTerminalResult(result);
   renderTerminalHistory();
 }
 
 async function runTerminalCommand(event) {
   if (event) event.preventDefault();
-  await executeTerminalCommand();
+  await executeTerminalCommand("", { clearInput: true });
 }
 
 async function runInstallCommandInTerminal(command) {
@@ -397,6 +408,9 @@ function bindTerminalUi() {
   on("#terminal-open", "click", () => openExternalTerminal().catch(showError));
   on("#terminal-clear", "click", () => {
     state.terminalHistory = [];
+    transcript = "";
+    const out = document.querySelector("#terminal-output");
+    if (out) out.textContent = "";
     renderTerminalHistory();
   });
   on("#terminal-ask-agent", "click", () => askAgentFromTerminal().catch(showError));

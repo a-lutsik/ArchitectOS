@@ -495,7 +495,7 @@ async function saveRouterSettings() {
   };
   await api("/api/router/settings", { method: "PATCH", body: JSON.stringify(body) });
   await previewRouting(document.querySelector("#router-preview-query").value || "");
-  showSnackbar("Router settings saved.", "success");
+  showSnackbar(t("settings.routerSaved"), "success");
 }
 async function previewRouting(query) {
   const container = document.querySelector("#router-preview");

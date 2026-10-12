@@ -324,10 +324,14 @@ async function loadMemoryCandidates({ resetPage = false } = {}) {
       </div>`;
     return;
   }
+  // Rebuilding the list resets its scroll position; keep it so Accept/Reject on a
+  // card does not throw the reader to a different item.
+  const previousScrollTop = container.scrollTop;
   container.innerHTML = "";
   for (const candidate of candidates) {
     container.appendChild(renderCandidateCard(candidate));
   }
+  container.scrollTop = previousScrollTop;
   container.querySelectorAll("[data-promote-candidate]").forEach(button => button.addEventListener("click", async () => {
     button.disabled = true;
     try {
@@ -340,8 +344,13 @@ async function loadMemoryCandidates({ resetPage = false } = {}) {
   }));
   container.querySelectorAll("[data-reject-candidate]").forEach(button => button.addEventListener("click", async () => {
     button.disabled = true;
-    await api(`/api/memory/candidates/${button.dataset.rejectCandidate}/reject`, { method: "POST", body: JSON.stringify({ reason: "Rejected in Memory UI" }) });
-    await refreshMemorySurfaces();
+    try {
+      await api(`/api/memory/candidates/${button.dataset.rejectCandidate}/reject`, { method: "POST", body: JSON.stringify({ reason: "Rejected in Memory UI" }) });
+      await refreshMemorySurfaces();
+    } catch (error) {
+      button.disabled = false;
+      showError(error);
+    }
   }));
 }
 
@@ -439,9 +448,12 @@ function renderCandidateStatusStats(counts) {
   const revision = Number(counts?.revision || 0);
   const badge = document.querySelector("#nav-memory-review-badge");
   if (badge) {
-    badge.textContent = pending > 99 ? "99+" : String(pending);
-    badge.hidden = pending <= 0;
-    badge.title = `${pending} memory candidate(s) waiting for review`;
+    // Duplicates are a subset of pending and can be bulk-rejected; the nav badge
+    // only nags about candidates that need an actual decision.
+    const needsReview = Math.max(0, pending - duplicate);
+    badge.textContent = needsReview > 99 ? "99+" : String(needsReview);
+    badge.hidden = needsReview <= 0;
+    badge.title = `${needsReview} memory candidate(s) waiting for review` + (duplicate ? ` (+${duplicate} duplicate)` : "");
   }
   if (!root) return;
   const set = (id, value) => {

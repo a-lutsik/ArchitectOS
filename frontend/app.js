@@ -49,8 +49,10 @@ function bindEvents() {
   onAll(".nav-item", "click", item => switchView(item.currentTarget.dataset.view));
   on("#project-select", "change", event => { state.projectId = event.target.value; saveWorkspaceSettings({ current_project_id: state.projectId }).catch(showError); state.selectedFile = ""; state.memoryFiles = []; resetGraphFilters(); renderMemoryFiles(); syncProjectSwitcherLabel(); syncProjectTerminology(); syncProjectFields(); refreshWorkspace(); loadProjectFiles(); loadProjectSources().catch(showError); scheduleGraphLoad(); });
   on("#settings-language-select", "change", event => { applyLanguage(event.target.value); saveUiSettings({ language: state.language }).catch(showError); });
-  on("#theme-select", "change", event => applyTheme(event.target.value));
-  on("#density-select", "change", event => applyDensity(event.target.value));
+  // Persist right away like the language picker: a live-applied theme that only
+  // sticks after pressing Save (with no way to cancel) is confusing.
+  on("#theme-select", "change", event => { applyTheme(event.target.value); saveUiSettings({ theme: event.target.value }).catch(showError); });
+  on("#density-select", "change", event => { applyDensity(event.target.value); saveUiSettings({ density: event.target.value }).catch(showError); });
   on("#open-project-folder-modal", "click", openProjectFolderModal);
   on("#close-project-folder-modal", "click", closeProjectFolderModal);
   onAll("[data-close-project-folder]", "click", closeProjectFolderModal);
@@ -344,11 +346,12 @@ function initAddMemoryTabs() {
       const targetTab = button.dataset.tab;
 
       // Remove active class from all buttons and contents
-      tabButtons.forEach(btn => btn.classList.remove('active'));
+      tabButtons.forEach(btn => { btn.classList.remove('active'); btn.setAttribute('aria-selected', 'false'); });
       tabContents.forEach(content => content.classList.remove('active'));
 
       // Add active class to clicked button and corresponding content
       button.classList.add('active');
+      button.setAttribute('aria-selected', 'true');
       const targetContent = document.querySelector(`[data-tab-content="${targetTab}"]`);
       if (targetContent) {
         targetContent.classList.add('active');
