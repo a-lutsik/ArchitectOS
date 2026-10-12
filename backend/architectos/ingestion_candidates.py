@@ -132,9 +132,9 @@ class IngestionCandidatesMixin:
                 verdict = self.memory_dedup.compare(
                     incoming_features(node_label, node_text), self.memory_dedup.node_features(holder)
                 )
-                if verdict.action == "duplicate":
+                if verdict.action in {"duplicate", "enrich"} and self.memory_dedup_settings()["mode"] == "auto":
                     verdict.target_id, verdict.target_label = holder.id, str(holder.label or "")
-                    folded = self._register_duplicate_add(
+                    folded = self._fold_into_existing(
                         holder,
                         {
                             "label": node_label, "text": node_text, "type": node_type, "scope": node_scope,

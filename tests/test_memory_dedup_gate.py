@@ -47,13 +47,33 @@ class GateClassifierTests(unittest.TestCase):
         verdict = self._compare(("Сервис A", "Слушает порт 8080"), ("Сервис B", "Слушает порт 8081"))
         self.assertEqual(verdict.action, "new")
 
-    def test_added_detail_is_only_a_near_match(self) -> None:
+    def test_added_detail_under_same_subject_is_enrich(self) -> None:
         verdict = self._compare(
             ("Деплой", "Деплой через GitHub Actions"),
             ("Деплой", "Деплой через GitHub Actions на каждый push в main ветку"),
         )
-        self.assertEqual(verdict.action, "new")
+        self.assertEqual(verdict.action, "enrich")
         self.assertGreaterEqual(verdict.near_score, MemoryDedupGate.NEAR_DUPLICATE_SIMILARITY)
+
+    def test_shorter_restatement_is_covered_duplicate(self) -> None:
+        verdict = self._compare(
+            ("Деплой", "Деплой через GitHub Actions на каждый push в main ветку"),
+            ("Деплой", "Деплой через GitHub Actions"),
+        )
+        self.assertEqual((verdict.action, verdict.reason), ("duplicate", "already covered by a fuller fact"))
+
+    def test_added_detail_with_changed_value_is_not_enrich(self) -> None:
+        verdict = self._compare(
+            ("Лимит", "Лимит запросов 5000 в час"),
+            ("Лимит", "Лимит запросов 9000 в час и 10 в секунду"),
+        )
+        self.assertNotIn(verdict.action, {"enrich", "duplicate"})
+
+    def test_added_identifier_is_enrich_changed_identifier_is_not(self) -> None:
+        added = self._compare(("Config", "Config lives in settings.py"), ("Config", "Config lives in settings.py and settings.yaml"))
+        changed = self._compare(("Config", "Config lives in settings.py"), ("Config", "Config lives in settings.yaml"))
+        self.assertEqual(added.action, "enrich")
+        self.assertEqual(changed.action, "new")
 
 
 class GateWritePathTests(unittest.TestCase):

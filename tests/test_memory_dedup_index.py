@@ -46,7 +46,7 @@ class DedupIndexTests(unittest.TestCase):
     def _brute_force(self, label: str, text: str, node_type: str) -> Any:
         """The stage 1 scan: compare against every eligible node."""
         incoming = incoming_features(label, text)
-        rank = {"duplicate": 3, "update": 2, "conflict": 1}
+        rank = {"duplicate": 4, "enrich": 3, "update": 2, "conflict": 1}
         best_action, best_rank, best_score, best_target, best_near = "new", 0, 0.0, "", 0.0
         for node in sorted(self.repo.list_nodes(), key=lambda item: item.id):
             if not dedup_index_eligible(node) or node.scope != "project" or node.project_id != "architectos":

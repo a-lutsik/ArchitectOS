@@ -866,18 +866,21 @@ class ChatSessionServiceMixin:
             return False
         scope = str(candidate.get("scope") or "project")
         try:
-            decision = self.memory_dedup.classify(
+            decision = self._dedup_decide(
                 str(candidate.get("label") or ""),
                 str(candidate.get("text") or ""),
                 str(candidate.get("type") or "Lesson"),
                 scope,
                 self._memory_project_id_for_scope(scope, candidate.get("project_id")),
+                allow_llm=False,
             )
         except Exception:  # noqa: BLE001 - never fail a chat/MCP turn on dedup
             return False
-        # Duplicates, value updates and contradictions stay in review: a person
-        # (not an auto-accepted chat turn) decides whether the old fact changed.
-        if decision.action != "new":
+        # Duplicates, enrichments, value updates and contradictions stay in
+        # review: a person (not an auto-accepted chat turn) decides whether the
+        # stored fact changed. So do suggestions and close (lexical or semantic)
+        # neighbours.
+        if decision.action != "new" or decision.details.get("suggested_action"):
             return True
         return bool(decision.near_id) and decision.near_score >= self.memory_dedup.NEAR_DUPLICATE_SIMILARITY
 

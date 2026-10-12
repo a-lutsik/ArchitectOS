@@ -11,7 +11,9 @@ helpers stay on the service and are reached through ``self`` via the MRO.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
 from collections import Counter
 from pathlib import Path
@@ -25,7 +27,7 @@ from .ingestion_candidates import IngestionCandidatesMixin
 from .ingestion_rescan import IngestionRescanMixin
 from .ingestion_timeouts import IngestionTimeoutsMixin
 from .mcp import MCPError
-from .memory_dedup import DedupDecision, MemoryDedupGate, content_salt
+from .memory_dedup import DedupDecision, MemoryDedupGate, content_salt, dedup_settings, incoming_features
 from .memory_ingestion import (
     DUPLICATE_STOPWORDS,
     MemoryIngestionEngine,
@@ -389,14 +391,14 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
 
         dedup_enabled = payload.get("dedup", True) is not False and not _force_new
         decision = (
-            self.memory_dedup.classify(label, text, node_type, scope, project_id)
+            self._dedup_decide(label, text, node_type, scope, project_id)
             if dedup_enabled
             else DedupDecision()
         )
-        if decision.action == "duplicate":
+        if decision.action in {"duplicate", "enrich"}:
             existing = self.repository.get_node(decision.target_id)
             if existing is not None and existing.status == "active":
-                return self._register_duplicate_add(existing, payload, decision)
+                return self._fold_into_existing(existing, payload, decision)
             decision = DedupDecision()
 
         interface_id = payload.get("interface_id")
@@ -480,7 +482,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             if payload.get(key) is not None
         }
         results: list[dict[str, Any]] = []
-        stats = {"created": 0, "deduplicated": 0, "superseded": 0, "conflicts": 0, "errors": 0}
+        stats = {"created": 0, "deduplicated": 0, "enriched": 0, "superseded": 0, "conflicts": 0, "errors": 0}
         ids: list[str] = []
         for index, item in enumerate(items):
             if not isinstance(item, dict):
@@ -500,6 +502,8 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 stats["superseded"] += 1
             elif action == "conflict":
                 stats["conflicts"] += 1
+            elif action == "enrich":
+                stats["enriched"] += 1
             if status == "created" and node.get("id"):
                 ids.append(node["id"])
             entry = {"index": index, "status": status, "id": node.get("id"), "label": node.get("label")}
@@ -519,8 +523,188 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         scope = str(payload.get("scope") or "project")
         node_type = str(payload.get("type") or "Lesson")
         project_id = self._memory_project_id_for_scope(scope, payload.get("project_id") or "architectos")
-        decision = self.memory_dedup.classify(label, text, node_type, scope, project_id)
+        decision = self._dedup_decide(
+            label, text, node_type, scope, project_id, allow_llm=payload.get("use_llm", True) is not False,
+        )
         return {"label": label, "type": node_type, "scope": scope, "project_id": project_id, "dedup": decision.to_dict()}
+
+    def memory_dedup_settings(self) -> dict[str, Any]:
+        return dedup_settings(self.repository.get_setting("memory_dedup"))
+
+    def _dedup_decide(
+        self,
+        label: str,
+        text: str,
+        node_type: str,
+        scope: str,
+        project_id: str | None,
+        *,
+        allow_llm: bool = True,
+    ) -> DedupDecision:
+        """Full gate decision: deterministic rules, then the optional gray zone.
+
+        1. ``MemoryDedupGate.classify`` (index, stdlib, no network).
+        2. Still ``new``: neighbours from embeddings (real provider only) and the
+           lexical near match go through ``gray_candidates``; with
+           ``llm_judge`` on, the best ones are judged duplicate / enrich / new.
+           Otherwise a close semantic neighbour only sets the
+           possible-duplicate flag.
+        3. ``mode: suggest`` turns any non-new decision into a new node that
+           records what would have happened.
+        """
+        settings = self.memory_dedup_settings()
+        if settings["mode"] == "off":
+            return DedupDecision()
+        decision = self.memory_dedup.classify(label, text, node_type, scope, project_id)
+        if decision.action == "new":
+            decision = self._dedup_gray_zone(decision, label, text, node_type, scope, project_id, settings, allow_llm)
+        if settings["mode"] == "suggest" and decision.action != "new":
+            return DedupDecision(
+                near_id=decision.target_id,
+                near_score=max(decision.score, decision.near_score),
+                details={**decision.details, "suggested_action": decision.action, "suggested_reason": decision.reason},
+            )
+        return decision
+
+    def _dedup_gray_zone(
+        self,
+        decision: DedupDecision,
+        label: str,
+        text: str,
+        node_type: str,
+        scope: str,
+        project_id: str | None,
+        settings: dict[str, Any],
+        allow_llm: bool,
+    ) -> DedupDecision:
+        semantic = self._semantic_dedup_scores(label, text, scope, project_id, settings)
+        candidate_ids = set(semantic)
+        if decision.near_id:
+            candidate_ids.add(decision.near_id)
+        if not candidate_ids:
+            return decision
+        rows = [
+            row for row in self.repository.dedup_rows_by_ids(sorted(candidate_ids))
+            if row["scope"] == scope and row["project_key"] == (project_id or "")
+        ]
+        incoming = incoming_features(label, text)
+        if allow_llm and settings["llm_judge"] and settings["llm_max_candidates"]:
+            gray = self.memory_dedup.gray_candidates(
+                incoming, rows, node_type, semantic_scores=semantic, settings=settings,
+            )
+            for candidate in gray[: settings["llm_max_candidates"]]:
+                verdict = self._judge_dedup_pair(label, text, node_type, candidate, project_id, settings)
+                action = verdict.get("action")
+                if action in {"duplicate", "enrich"} and float(verdict.get("confidence") or 0.0) >= settings["llm_min_confidence"]:
+                    return DedupDecision(
+                        action,
+                        target_id=candidate["node_id"],
+                        target_label=candidate["label"],
+                        score=float(verdict.get("confidence") or 0.0),
+                        reason=f"llm judge: {verdict.get('reason') or action}",
+                        near_id=candidate["node_id"],
+                        near_score=candidate["rank"],
+                        details={
+                            "judge": "llm",
+                            "provider": verdict.get("provider", ""),
+                            "lexical": round(candidate["lexical"], 3),
+                            "cosine": round(candidate["cosine"], 3),
+                        },
+                    )
+        if decision.near_score < self.NEAR_DUPLICATE_SIMILARITY:
+            typed = [
+                row for row in rows
+                if self.memory_dedup.type_matches(str(row["node_type"]), node_type) and str(row["node_id"]) in semantic
+            ]
+            best = max(typed, key=lambda row: (semantic[str(row["node_id"])], str(row["node_id"])), default=None)
+            if best is not None and semantic[str(best["node_id"])] >= settings["semantic_flag_score"]:
+                decision.near_id = str(best["node_id"])
+                decision.near_score = semantic[decision.near_id]
+                decision.details = {**decision.details, "near_kind": "semantic"}
+        return decision
+
+    def _semantic_dedup_scores(
+        self, label: str, text: str, scope: str, project_id: str | None, settings: dict[str, Any]
+    ) -> dict[str, float]:
+        """Cosine of the closest stored nodes, or {} without a real embedding provider.
+
+        The offline hash embedder is lexical, not semantic, so it is skipped.
+        Bounded by ``memory_retrieval.vector_query_timeout_ms`` like Search.
+        """
+        if settings["semantic"] == "off":
+            return {}
+        engine = self.memory_embeddings
+        if not engine.enabled() or str(getattr(engine.provider, "provider_id", "") or "") in {"", "hash"}:
+            return {}
+        try:
+            timeout_s = max(0.05, min(int(engine.settings().get("vector_query_timeout_ms") or 2500), 5000) / 1000.0)
+        except (TypeError, ValueError):
+            timeout_s = 2.5
+        scores, _elapsed, _timed_out = self._vector_search_memory_timed(
+            sanitize_text(f"{label}\n{text}")[0], project_id=project_id, scope=scope, limit=8, timeout_s=timeout_s,
+        )
+        return scores
+
+    _DEDUP_JUDGE_ACTIONS = frozenset({"duplicate", "enrich", "new"})
+
+    def _judge_dedup_pair(
+        self,
+        label: str,
+        text: str,
+        node_type: str,
+        candidate: dict[str, Any],
+        project_id: str | None,
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Ask the routed LLM whether an incoming fact repeats or extends a stored one."""
+        from .adapters import ProviderRequest
+
+        stored = self.repository.get_node(str(candidate["node_id"]))
+        if stored is None:
+            return {"action": "new", "error": "stored node missing"}
+        prompt = (
+            "You deduplicate a project memory. Compare an INCOMING fact with a STORED fact and answer:\n"
+            '- "duplicate": both state the same fact and INCOMING adds nothing that STORED lacks.\n'
+            '- "enrich": the same fact, INCOMING keeps everything STORED says and adds details.\n'
+            '- "new": different facts or subjects, any changed value, name, negation or scope, or if unsure.\n'
+            "Answer with a single JSON object only:\n"
+            '{"action": "duplicate"|"enrich"|"new", "reason": "<short>", "confidence": 0.0-1.0}\n\n'
+            f"STORED [{stored.type}] {stored.label}:\n{(stored.text or '')[:1200]}\n\n"
+            f"INCOMING [{node_type}] {sanitize_text(label)[0]}:\n{sanitize_text(text)[0][:1200]}"
+        )
+        request = ProviderRequest(message=prompt, context="", project_id=project_id or "architectos", role="review")
+        try:
+            result = self.provider_router.route(
+                self.repository.list_providers(), request, settings["llm_provider_id"] or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - the judge is optional, never fail the write
+            _LOG.warning("dedup judge failed: %s", exc)
+            return {"action": "new", "error": str(exc)}
+        verdict = self._parse_dedup_verdict(str(result.get("text") or ""))
+        verdict["provider"] = str((result.get("selected_provider") or {}).get("id") or "")
+        return verdict
+
+    @classmethod
+    def _parse_dedup_verdict(cls, text: str) -> dict[str, Any]:
+        match = re.search(r"\{.*\}", text or "", re.DOTALL)
+        if not match:
+            return {"action": "new", "error": "no JSON in LLM response"}
+        try:
+            data = json.loads(match.group(0))
+        except ValueError:
+            return {"action": "new", "error": "invalid JSON in LLM response"}
+        if not isinstance(data, dict):
+            return {"action": "new", "error": "unexpected LLM response shape"}
+        action = str(data.get("action") or "new").strip().lower()
+        try:
+            confidence = max(0.0, min(float(data.get("confidence") or 0.0), 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return {
+            "action": action if action in cls._DEDUP_JUDGE_ACTIONS else "new",
+            "reason": str(data.get("reason") or "")[:300],
+            "confidence": confidence,
+        }
 
     def rebuild_memory_dedup_index(self) -> dict[str, Any]:
         """Recompute the dedup gate index from ``memory_nodes`` (repair / manual reindex)."""
@@ -581,9 +765,21 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 {**decision.to_dict(), "edge_id": edge_id},
             )
             return node, event_id
-        if decision.near_id and decision.near_id != node.id and decision.near_score >= self.NEAR_DUPLICATE_SIMILARITY:
+        suggested = str(decision.details.get("suggested_action") or "")
+        if decision.near_id and decision.near_id != node.id and (
+            suggested or decision.near_score >= self.NEAR_DUPLICATE_SIMILARITY
+        ):
             node.metadata["possible_duplicate_of"] = decision.near_id
             node.metadata["possible_duplicate_score"] = round(decision.near_score, 3)
+            if decision.details.get("near_kind"):
+                node.metadata["possible_duplicate_kind"] = decision.details["near_kind"]
+            if suggested:
+                # mode=suggest: the gate's verdict, for review instead of applied.
+                node.metadata["dedup_suggestion"] = {
+                    "action": suggested,
+                    "target_id": decision.near_id,
+                    "reason": str(decision.details.get("suggested_reason") or ""),
+                }
             node = self.repository.upsert_node(node)
         return node, ""
 
@@ -609,15 +805,17 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         snapshot["text"] = sanitize_text(str(payload.get("text") or ""))[0]
         return snapshot
 
-    def _register_duplicate_add(
+    def _fold_into_existing(
         self, existing: Any, payload: dict[str, Any], decision: DedupDecision | None = None
     ) -> dict[str, Any]:
-        """Fold a re-added fact into the node it duplicates.
+        """Fold a re-added (``duplicate``) or fuller (``enrich``) fact into a stored node.
 
-        Non-destructive update: bump confidence toward the incoming value, record
-        a dedup hit and its source, refresh lifecycle access, log a ``dedup``
-        event that ``undo_memory_dedup`` can reverse, and return the surviving
-        node marked ``dedup_merged`` so callers can tell no new node was created.
+        Bump confidence toward the incoming value, record a dedup hit and its
+        source, keep the stronger fact type, and for ``enrich`` replace the
+        stored text with the fuller incoming one (the old text goes into the
+        event). Logs a ``dedup`` event that ``undo_memory_dedup`` can reverse
+        and returns the surviving node marked ``dedup_merged`` so callers can
+        tell no new node was created.
         """
         decision = decision or DedupDecision(
             "duplicate", target_id=existing.id, target_label=str(existing.label or ""), score=1.0,
@@ -643,6 +841,11 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             if stronger != previous_type:
                 existing.type = stronger
                 meta["dedup_type_from"] = previous_type
+        previous_text = str(existing.text or "")
+        if decision.action == "enrich":
+            existing.text = sanitize_text(str(payload.get("text") or ""))[0] or previous_text
+            meta["dedup_enrichments"] = int(meta.get("dedup_enrichments") or 0) + 1
+            meta["last_enriched_at"] = meta["last_dedup_at"]
         existing.metadata = meta
         try:
             existing.confidence = max(float(existing.confidence or 0.0), float(payload.get("confidence") or 0.0))
@@ -652,6 +855,8 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         details = {**decision.to_dict(), "incoming": self._dedup_snapshot(payload)}
         if existing.type != previous_type:
             details.update({"type_from": previous_type, "type_to": existing.type})
+        if existing.text != previous_text:
+            details["previous_text"] = previous_text
         event_id = self._record_dedup_event(existing.id, payload, details)
         try:
             self.memory_lifecycle.refresh_nodes([existing.id], "dedup")
@@ -668,8 +873,9 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
     def undo_memory_dedup(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Reverse one gate decision recorded as a ``dedup`` memory event.
 
-        - duplicate: the swallowed fact is stored as its own node, the dedup hit
-          and any type upgrade on the surviving node are rolled back;
+        - duplicate / enrich: the swallowed fact is stored as its own node; the
+          dedup hit, any type upgrade and (enrich) the replaced text of the
+          surviving node are rolled back;
         - update / conflict: the SUPERSEDES / CONTRADICTS edge is removed and the
           old fact is valid again; the newer node stays.
         """
@@ -687,7 +893,13 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         if event_id in undone:
             raise ValueError("dedup event already undone")
         restored: dict[str, Any] | None = None
-        if action == "duplicate":
+        if action in {"duplicate", "enrich"}:
+            if "previous_text" in details:
+                incoming_text = str(dict(details.get("incoming") or {}).get("text") or "")
+                if node.text != incoming_text:
+                    raise ValueError("memory text changed since the merge; undo it manually")
+                node.text = str(details["previous_text"])
+                meta["dedup_enrichments"] = max(0, int(meta.get("dedup_enrichments") or 0) - 1)
             meta["dedup_hits"] = max(0, int(meta.get("dedup_hits") or 0) - 1)
             type_from = str(details.get("type_from") or "")
             if type_from and node.type == details.get("type_to"):
@@ -712,7 +924,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         meta["dedup_undone"] = [*undone, event_id]
         node.metadata = meta
         node = self.repository.upsert_node(node)
-        if action == "duplicate":
+        if action in {"duplicate", "enrich"}:
             incoming = dict(details.get("incoming") or {})
             restored = self.add_memory(incoming, _force_new=True)
             restored_node = self.repository.get_node(str(restored.get("id") or ""))

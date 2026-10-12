@@ -154,6 +154,7 @@ class SettingsRouterServiceMixin:
         settings = self.repository.all_settings()
         settings.setdefault("memory_lifecycle", self.memory_lifecycle.settings())
         settings.setdefault("memory_retrieval", self.memory_embeddings.settings())
+        settings["memory_dedup"] = self.memory_dedup_settings()
         settings["memory_embeddings"] = self.memory_embeddings_status()
         settings["vector_runtime"] = self.vector_runtime_status(discover=False)
         settings["integrations"] = self.integration_credentials()
@@ -257,7 +258,7 @@ class SettingsRouterServiceMixin:
         for key, value in payload.items():
             if not isinstance(value, dict):
                 raise ValueError("settings values must be objects")
-            if key in {"memory_lifecycle", "ui", "security", "workspace", "router", "memory_retrieval"}:
+            if key in {"memory_lifecycle", "ui", "security", "workspace", "router", "memory_retrieval", "memory_dedup"}:
                 current = dict(self.repository.get_setting(key) or {})
                 incoming = dict(value)
                 if key == "memory_retrieval":

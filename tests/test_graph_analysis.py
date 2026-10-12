@@ -241,6 +241,7 @@ class IngestDedupTests(unittest.TestCase):
             self.assertEqual(len(ids), 2)
 
     def test_near_duplicate_gets_flagged(self) -> None:
+        # Different subject (label), nearly the same text: kept apart, only flagged.
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
             base = service.add_memory({
@@ -248,11 +249,27 @@ class IngestDedupTests(unittest.TestCase):
                 "scope": "project", "text": "Alpha caching layer uses redis backing store sessions",
             })
             similar = service.add_memory({
-                "project_id": "architectos", "label": "Cache note", "type": "Decision",
+                "project_id": "architectos", "label": "Session store", "type": "Decision",
                 "scope": "project", "text": "Alpha caching layer uses redis backing store sessions cookies",
             })
             self.assertFalse(similar.get("dedup_merged"))
             self.assertEqual(similar["metadata"].get("possible_duplicate_of"), base["id"])
+
+    def test_added_detail_under_same_label_enriches_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            base = service.add_memory({
+                "project_id": "architectos", "label": "Cache note", "type": "Decision",
+                "scope": "project", "text": "Alpha caching layer uses redis backing store sessions",
+            })
+            fuller = service.add_memory({
+                "project_id": "architectos", "label": "Cache note", "type": "Decision",
+                "scope": "project", "text": "Alpha caching layer uses redis backing store sessions cookies",
+            })
+            self.assertTrue(fuller.get("dedup_merged"))
+            self.assertEqual(fuller["id"], base["id"])
+            self.assertEqual(fuller["dedup"]["action"], "enrich")
+            self.assertTrue(fuller["text"].endswith("cookies"))
 
     def test_dedup_can_be_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

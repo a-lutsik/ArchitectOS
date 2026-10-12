@@ -11,12 +11,18 @@ incoming fact is relative to what is already stored:
   "cap 9000"). New node that SUPERSEDES the old one.
 - ``conflict`` — the same statement with the negation flipped ("we use X" /
   "we do not use X"). New node plus a CONTRADICTS edge, flagged for review.
+- ``enrich`` — the same subject, and the incoming text keeps every content
+  word, number and identifier of the stored one while adding more. No new
+  node; the stored text is replaced by the fuller one (old text kept in the
+  dedup event, undoable). The reverse — a stored fact that already covers the
+  incoming one — is a ``duplicate``.
 - ``new`` — anything else; ``near_id``/``near_score`` still report the closest
   lexical match so callers can flag a possible duplicate.
 
 Numbers, negation and identifiers are protected: facts that differ in them are
-never folded together. Stdlib only, deterministic; semantic (embedding / LLM)
-judging of the gray zone is a later stage.
+never folded together. This module is stdlib-only and deterministic; the
+optional semantic neighbours (embeddings) and LLM judge for the gray zone are
+orchestrated by the ingestion service on top of ``gray_candidates``.
 """
 from __future__ import annotations
 
@@ -254,7 +260,70 @@ class DedupDecision:
         return payload
 
 
-_ACTION_RANK = {"duplicate": 3, "update": 2, "conflict": 1}
+_ACTION_RANK = {"duplicate": 4, "enrich": 3, "update": 2, "conflict": 1}
+
+DEFAULT_MEMORY_DEDUP: dict[str, Any] = {
+    # auto: apply decisions; suggest: store every fact as new and only record
+    # what the gate would have done (calibration); off: no gate at all.
+    "mode": "auto",
+    # auto: use embedding neighbours when a real (non-hash) provider is set.
+    "semantic": "auto",
+    # Cosine at which a semantic neighbour is flagged as a possible duplicate.
+    "semantic_flag_score": 0.86,
+    # Cosine / lexical score from which a compatible neighbour goes to the judge.
+    "judge_semantic_score": 0.8,
+    "judge_lexical_score": 0.55,
+    "llm_judge": False,
+    "llm_provider_id": "",
+    "llm_max_candidates": 2,
+    "llm_min_confidence": 0.75,
+}
+
+
+def dedup_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
+    settings = dict(DEFAULT_MEMORY_DEDUP)
+    settings.update({key: value for key, value in dict(raw or {}).items() if key in DEFAULT_MEMORY_DEDUP})
+    if settings["mode"] not in {"auto", "suggest", "off"}:
+        settings["mode"] = "auto"
+    if settings["semantic"] not in {"auto", "off"}:
+        settings["semantic"] = "auto"
+    for key in ("semantic_flag_score", "judge_semantic_score", "judge_lexical_score", "llm_min_confidence"):
+        try:
+            settings[key] = max(0.0, min(float(settings[key]), 1.0))
+        except (TypeError, ValueError):
+            settings[key] = DEFAULT_MEMORY_DEDUP[key]
+    try:
+        settings["llm_max_candidates"] = max(0, min(int(settings["llm_max_candidates"]), 5))
+    except (TypeError, ValueError):
+        settings["llm_max_candidates"] = DEFAULT_MEMORY_DEDUP["llm_max_candidates"]
+    settings["llm_judge"] = bool(settings["llm_judge"])
+    settings["llm_provider_id"] = str(settings["llm_provider_id"] or "")
+    return settings
+
+
+def _set_relation(incoming: frozenset[str], existing: frozenset[str]) -> str:
+    """equal | super (incoming ⊃ existing) | sub (incoming ⊂ existing) | disjoint."""
+    if incoming == existing:
+        return "equal"
+    if incoming >= existing:
+        return "super"
+    if incoming <= existing:
+        return "sub"
+    return "disjoint"
+
+
+def guards_compatible(incoming: FactFeatures, existing: FactFeatures) -> bool:
+    """Whether folding the two facts could lose or flip a protected detail.
+
+    Required before a semantic/LLM merge: same negation, and numbers and
+    identifiers nested (one side may add some, neither may change them).
+    """
+    if incoming.negated != existing.negated:
+        return False
+    return (
+        _set_relation(incoming.numbers, existing.numbers) != "disjoint"
+        and _set_relation(incoming.identifiers, existing.identifiers) != "disjoint"
+    )
 
 
 class MemoryDedupGate:
@@ -365,22 +434,37 @@ class MemoryDedupGate:
         jaccard = shared / len(left | right)
         near = self.near_score(incoming, existing)
         verdict = DedupDecision(near_score=near)
-        if incoming.identifiers and existing.identifiers and incoming.identifiers != existing.identifiers:
-            # Different files / ids / URLs are different objects, however alike the prose.
-            return verdict
         if incoming.label_core != existing.label_core:
             # Different subjects: at most a near match for the possible-duplicate flag.
             return verdict
-        if jaccard >= 1.0 and len(left) >= self.MIN_STEMS:
-            if incoming.numbers == existing.numbers and incoming.negated == existing.negated:
-                return DedupDecision("duplicate", score=1.0, reason="same content words", near_score=near)
-        if jaccard < self.RELATION_SIMILARITY or shared < 2:
+        ids = _set_relation(incoming.identifiers, existing.identifiers)
+        if ids == "disjoint":
+            # Different files / ids / URLs are different objects, however alike the prose.
             return verdict
+        numbers = _set_relation(incoming.numbers, existing.numbers)
         if incoming.negated != existing.negated:
-            return DedupDecision(
-                "conflict", score=jaccard, reason="same statement with negation flipped", near_score=near,
-            )
-        if incoming.numbers and existing.numbers and incoming.numbers != existing.numbers:
+            if ids == "equal" and jaccard >= self.RELATION_SIMILARITY and shared >= 2:
+                return DedupDecision(
+                    "conflict", score=jaccard, reason="same statement with negation flipped", near_score=near,
+                )
+            return verdict
+        if ids == "equal" and numbers == "equal" and jaccard >= 1.0 and len(left) >= self.MIN_STEMS:
+            return DedupDecision("duplicate", score=1.0, reason="same content words", near_score=near)
+        if min(len(left), len(right)) >= self.MIN_STEMS:
+            # Nested statements: one side keeps every content word, number and
+            # identifier of the other and adds more.
+            if right < left and ids in {"equal", "super"} and numbers in {"equal", "super"}:
+                return DedupDecision(
+                    "enrich", score=jaccard, reason="same fact with added detail", near_score=near,
+                    details={"added": sorted(left - right)[:20]},
+                )
+            if left < right and ids in {"equal", "sub"} and numbers in {"equal", "sub"}:
+                return DedupDecision(
+                    "duplicate", score=jaccard, reason="already covered by a fuller fact", near_score=near,
+                )
+        if ids != "equal" or jaccard < self.RELATION_SIMILARITY or shared < 2:
+            return verdict
+        if incoming.numbers and existing.numbers and numbers != "equal":
             return DedupDecision(
                 "update",
                 score=jaccard,
@@ -392,3 +476,41 @@ class MemoryDedupGate:
                 },
             )
         return verdict
+
+    def gray_candidates(
+        self,
+        incoming: FactFeatures,
+        rows: list[dict[str, Any]],
+        node_type: str,
+        *,
+        semantic_scores: dict[str, float],
+        settings: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Undecided neighbours worth an LLM look, best first.
+
+        A neighbour qualifies when it is of a compatible type, its protected
+        details are nested (``guards_compatible``), and it is close lexically
+        or semantically. Rows are dedup index rows (``node_id``, ``node_type``,
+        ``label``, ``features``).
+        """
+        picked: list[dict[str, Any]] = []
+        for row in rows:
+            node_id = str(row["node_id"])
+            if not self.type_matches(str(row["node_type"]), node_type):
+                continue
+            existing = features_from_json(str(row["features"]))
+            if not guards_compatible(incoming, existing):
+                continue
+            lexical = self.near_score(incoming, existing)
+            cosine = float(semantic_scores.get(node_id, 0.0))
+            if lexical < settings["judge_lexical_score"] and cosine < settings["judge_semantic_score"]:
+                continue
+            picked.append({
+                "node_id": node_id,
+                "label": str(row["label"] or ""),
+                "lexical": lexical,
+                "cosine": cosine,
+                "rank": max(lexical, cosine),
+            })
+        picked.sort(key=lambda item: (-item["rank"], item["node_id"]))
+        return picked

@@ -192,3 +192,16 @@ class StorageDedupMixin:
                 (scope, _project_key(project_id), *sample, max(1, int(min_shared)), max(1, int(limit))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def dedup_rows_by_ids(self, node_ids: list[str]) -> list[dict[str, Any]]:
+        """Index rows for these nodes; ids that are not indexed (ineligible) are absent."""
+        ids = [str(node_id) for node_id in dict.fromkeys(node_ids) if node_id][:MAX_QUERY_STEMS]
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        with self._connect() as conn:  # type: ignore[attr-defined]
+            rows = conn.execute(
+                f"SELECT node_id, node_type, label, scope, project_key, features FROM memory_dedup_index WHERE node_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return [dict(row) for row in rows]

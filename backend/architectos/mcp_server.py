@@ -603,17 +603,25 @@ class MemoryMCPServer:
         dedup = dict(node.get("dedup") or {})
         action = str(dedup.get("action") or "")
         target = f'"{dedup.get("target_label") or ""}" (id {dedup.get("target_id") or ""})'
-        if node.get("dedup_merged"):
+        if node.get("dedup_merged") and action == "enrich":
+            summary = (
+                f'Merged into existing [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}); '
+                "its text was replaced by your fuller version, no new node."
+            )
+        elif node.get("dedup_merged"):
             summary = (
                 f'Already in memory as [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}); '
                 "recorded as a repeat, no new node."
             )
         else:
             summary = f'Stored memory [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}).'
+            suggested = str((dedup.get("details") or {}).get("suggested_action") or "")
             if action == "update":
                 summary += f" Supersedes {target}: same statement, changed values."
             elif action == "conflict":
                 summary += f" Contradicts {target}; flagged for review."
+            elif suggested:
+                summary += f' Possible {suggested} of id {dedup.get("near_id") or ""}; left for review.'
         if extras:
             summary += f" Split into {1 + len(extras)} fact(s)."
         return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id"), "source_id": node.get("source_id"), "also_created": extras, "dedup": dedup})
@@ -633,7 +641,8 @@ class MemoryMCPServer:
         stats = result.get("stats") or {}
         summary = (
             f'Bulk stored {stats.get("created", 0)} memor(y/ies)'
-            f' ({stats.get("deduplicated", 0)} deduplicated, {stats.get("superseded", 0)} superseding older values,'
+            f' ({stats.get("deduplicated", 0)} deduplicated incl. {stats.get("enriched", 0)} enriched,'
+            f' {stats.get("superseded", 0)} superseding older values,'
             f' {stats.get("conflicts", 0)} conflicting, {stats.get("errors", 0)} error(s)).'
         )
         return _tool_result(summary, result)
