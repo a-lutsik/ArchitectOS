@@ -15250,3 +15250,68 @@ body:has(#chat-view.active) {
   color: #64748b;
   opacity: 1;
 }
+
+/* Phone: Ask composer and MCP master/detail (<= 600px) ---------------------- */
+@media (max-width: 600px) {
+  /* A grid track defaults to min-content, so the textarea's intrinsic width
+     pushed the composer 20px past the viewport. */
+  .composer {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .composer textarea,
+  .composer .composer-toolbar {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  .ask-composer-dock {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  /* Let the tool group shrink (its select has min-width: 0) so the send button
+     stays inside the toolbar instead of being pushed off-screen. */
+  .composer-toolbar .composer-left {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .composer-toolbar .composer-left .composer-select {
+    flex: 1 1 0;
+    min-width: 0;
+    width: auto;
+    max-width: 100%;
+  }
+
+  .composer-toolbar .composer-left select {
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* Server list: let the horizontal strip size to its items so labels are not
+     clipped, and keep the detail header controls on screen. */
+  .mcp-server-list {
+    height: auto;
+    max-height: none;
+  }
+
+  .mcp-server-items {
+    height: auto;
+    padding-bottom: 8px;
+  }
+
+  .mcp-detail-header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .mcp-detail-title,
+  .mcp-detail-actions {
+    flex: 1 1 auto;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+}
