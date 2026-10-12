@@ -368,18 +368,11 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
 
     NEAR_DUPLICATE_SIMILARITY = MemoryDedupGate.NEAR_DUPLICATE_SIMILARITY
 
-    def add_memory(
-        self,
-        payload: dict[str, Any],
-        *,
-        _dedup_nodes: list[Any] | None = None,
-        _force_new: bool = False,
-    ) -> dict[str, Any]:
+    def add_memory(self, payload: dict[str, Any], *, _force_new: bool = False) -> dict[str, Any]:
         """Store one fact through the dedup gate (see ``memory_dedup``).
 
-        ``_dedup_nodes`` lets batch callers share one node snapshot instead of
-        re-reading every node per item. ``_force_new`` skips the gate but still
-        avoids overwriting a node that holds the same label (used by undo).
+        ``_force_new`` skips the gate but still avoids overwriting a node that
+        holds the same label (used by undo).
         """
         label = str(payload.get("label") or "").strip()
         text = str(payload.get("text") or "").strip()
@@ -396,13 +389,13 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
 
         dedup_enabled = payload.get("dedup", True) is not False and not _force_new
         decision = (
-            self.memory_dedup.classify(label, text, node_type, scope, project_id, nodes=_dedup_nodes)
+            self.memory_dedup.classify(label, text, node_type, scope, project_id)
             if dedup_enabled
             else DedupDecision()
         )
         if decision.action == "duplicate":
             existing = self.repository.get_node(decision.target_id)
-            if existing is not None:
+            if existing is not None and existing.status == "active":
                 return self._register_duplicate_add(existing, payload, decision)
             decision = DedupDecision()
 
@@ -436,8 +429,6 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             )
         except Exception as exc:  # history is best-effort, never blocks ingestion
             _LOG.warning("memory created event skipped: %s", exc)
-        if _dedup_nodes is not None:
-            _dedup_nodes.append(node)
         node, event_id = self._apply_dedup_relation(node, decision, payload)
         self.graph_auto_linker.link_node(node, payload.get("project_id") or "architectos")
         result = node.to_dict()
@@ -454,14 +445,13 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         facts = facts_from_memory_blob(str(payload.get("text") or ""))
         if len(facts) < 2:
             return self.add_memory(payload)
-        nodes = self.repository.list_nodes()
         created: list[dict[str, Any]] = []
         for index, fact in enumerate(facts):
             item = dict(payload)
             item["text"] = fact["text"]
             item["type"] = fact["type"]
             item["label"] = str(payload.get("label") or "").strip() if index == 0 else fact["text"][:72]
-            created.append(self.add_memory(item, _dedup_nodes=nodes))
+            created.append(self.add_memory(item))
         primary = dict(created[0])
         primary["also_created"] = [node.get("id") for node in created[1:] if node.get("id")]
         return primary
@@ -472,9 +462,10 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         """Store a batch of memory nodes in one call (News→Event-style pipelines).
 
         Each item goes through the regular ``add_memory`` path (redaction,
-        dedup gate, lifecycle init, auto-link, embedding queue) against one
-        shared node snapshot. Items are isolated: a failing item is reported in
-        ``results`` and never aborts the batch. Unlike ``add_memory_from_agent``
+        dedup gate, lifecycle init, auto-link, embedding queue); the gate index
+        is written with each node, so later items see earlier ones. Items are
+        isolated: a failing item is reported in ``results`` and never aborts the
+        batch. Unlike ``add_memory_from_agent``
         no multi-fact splitting happens — one item is one node. Top-level
         project_id/scope/source_id/type/confidence act as defaults that
         individual items may override.
@@ -491,14 +482,13 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         results: list[dict[str, Any]] = []
         stats = {"created": 0, "deduplicated": 0, "superseded": 0, "conflicts": 0, "errors": 0}
         ids: list[str] = []
-        nodes = self.repository.list_nodes()
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 results.append({"index": index, "status": "error", "error": "item must be an object"})
                 stats["errors"] += 1
                 continue
             try:
-                node = self.add_memory({**defaults, **item}, _dedup_nodes=nodes)
+                node = self.add_memory({**defaults, **item})
             except Exception as exc:  # noqa: BLE001 - per-item isolation is the contract
                 results.append({"index": index, "status": "error", "error": str(exc)})
                 stats["errors"] += 1
@@ -531,6 +521,10 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         project_id = self._memory_project_id_for_scope(scope, payload.get("project_id") or "architectos")
         decision = self.memory_dedup.classify(label, text, node_type, scope, project_id)
         return {"label": label, "type": node_type, "scope": scope, "project_id": project_id, "dedup": decision.to_dict()}
+
+    def rebuild_memory_dedup_index(self) -> dict[str, Any]:
+        """Recompute the dedup gate index from ``memory_nodes`` (repair / manual reindex)."""
+        return self.repository.rebuild_dedup_index()
 
     def _label_collision_salt(
         self,

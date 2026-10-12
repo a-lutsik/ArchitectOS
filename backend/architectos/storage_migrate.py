@@ -200,6 +200,7 @@ class StorageMigrateMixin:
             if current_version < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._ensure_memory_fts()
+        self._ensure_dedup_index()
 
     def seed_if_empty(self) -> None:
         projects = self.list_projects()
@@ -323,6 +324,10 @@ class StorageMigrateMixin:
                 conn.execute(f"DELETE FROM memory_nodes_fts WHERE node_id IN ({placeholders})", seed_ids)
             except sqlite3.Error as exc:
                 _LOG.debug("seed cleanup skipped for memory_nodes_fts: %s", exc)
+            try:
+                self._delete_dedup_rows(conn, seed_ids)
+            except sqlite3.Error as exc:
+                _LOG.debug("seed cleanup skipped for memory_dedup_index: %s", exc)
             try:
                 conn.execute(f"DELETE FROM memory_embeddings WHERE node_id IN ({placeholders})", seed_ids)
             except sqlite3.Error as exc:

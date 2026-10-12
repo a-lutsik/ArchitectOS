@@ -501,6 +501,9 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _post_memory_dedup_undo(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().undo_memory_dedup(payload))
 
+    def _post_memory_dedup_reindex(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().rebuild_memory_dedup_index())
+
     def _post_security_preview(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().security_preview(payload), HTTPStatus.CREATED)
 
@@ -806,6 +809,7 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("POST", re.compile(r"^/api/memory$"), ArchitectOSHandler._post_memory),
     ("POST", re.compile(r"^/api/memory/dedup/preview$"), ArchitectOSHandler._post_memory_dedup_preview),
     ("POST", re.compile(r"^/api/memory/dedup/undo$"), ArchitectOSHandler._post_memory_dedup_undo),
+    ("POST", re.compile(r"^/api/memory/dedup/reindex$"), ArchitectOSHandler._post_memory_dedup_reindex),
     ("POST", re.compile(r"^/api/security/preview$"), ArchitectOSHandler._post_security_preview),
     ("POST", re.compile(r"^/api/ops/backup$"), ArchitectOSHandler._post_ops_backup),
     ("POST", re.compile(r"^/api/memory/decay/run$"), ArchitectOSHandler._post_memory_decay_run),

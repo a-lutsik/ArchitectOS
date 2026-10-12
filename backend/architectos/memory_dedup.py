@@ -21,6 +21,8 @@ judging of the gray zone is a later stage.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -180,6 +182,45 @@ def incoming_features(label: str, text: str) -> FactFeatures:
     return fact_features(sanitize_text(label)[0], sanitize_text(text)[0])
 
 
+# Bump when fact_features / the serialized format changes: the storage layer
+# rebuilds every index row written with an older version on startup.
+DEDUP_INDEX_VERSION = 1
+
+
+def source_hash(label: str, text: str) -> str:
+    """Identity of the text an index row was computed from."""
+    return hashlib.sha1(f"{label}\x1f{text}".encode()).hexdigest()
+
+
+def subject_key(features: FactFeatures) -> str:
+    """Index key of the label subject: every decisive action requires equal subjects."""
+    return hashlib.sha1("\x1f".join(sorted(features.label_core)).encode("utf-8")).hexdigest()[:20]
+
+
+def features_to_json(features: FactFeatures) -> str:
+    return json.dumps({
+        "key": list(features.key),
+        "label_core": sorted(features.label_core),
+        "stems": sorted(features.stems),
+        "numbers": sorted(features.numbers),
+        "negated": features.negated,
+        "identifiers": sorted(features.identifiers),
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def features_from_json(raw: str) -> FactFeatures:
+    data = json.loads(raw or "{}")
+    key = list(data.get("key") or ["", ""])
+    return FactFeatures(
+        key=(str(key[0]), str(key[1])),
+        label_core=frozenset(data.get("label_core") or ()),
+        stems=frozenset(data.get("stems") or ()),
+        numbers=frozenset(data.get("numbers") or ()),
+        negated=bool(data.get("negated")),
+        identifiers=frozenset(data.get("identifiers") or ()),
+    )
+
+
 def content_salt(text: str) -> str:
     """Deterministic id salt for a second fact stored under an existing label."""
     return hashlib.sha1(normalize_fact_text(text).encode("utf-8")).hexdigest()[:12]
@@ -227,31 +268,27 @@ class MemoryDedupGate:
 
     def __init__(self, repository: Any) -> None:
         self.repository = repository
-        self._cache: dict[str, tuple[str, FactFeatures]] = {}
-
-    def node_features(self, node: Any) -> FactFeatures:
-        stamp = f"{getattr(node, 'updated_at', '')}|{getattr(node, 'label', '')}|{len(str(getattr(node, 'text', '') or ''))}"
-        cached = self._cache.get(node.id)
-        if cached and cached[0] == stamp:
-            return cached[1]
-        if len(self._cache) > 100_000:
-            self._cache.clear()
-        features = fact_features(str(node.label or ""), str(node.text or ""))
-        self._cache[node.id] = (stamp, features)
-        return features
 
     @staticmethod
-    def comparable(node: Any, scope: str, project_id: str | None, node_type: str) -> bool:
-        if node.status != "active":
-            return False
-        meta = dict(node.metadata or {})
-        if meta.get("structural") or meta.get("hub") or meta.get("scope_root") or meta.get("invalid_at"):
-            return False
-        if node.scope != scope or node.project_id != project_id:
-            return False
+    def node_features(node: Any) -> FactFeatures:
+        return fact_features(str(node.label or ""), str(node.text or ""))
+
+    @staticmethod
+    def type_matches(stored_type: str, node_type: str) -> bool:
         # The same sentence saved once as a Lesson and once as a Decision is one
         # fact; other types (Artifact, Project, ...) only match their own type.
-        return node.type == node_type or (node.type in _FACT_TYPE_RANK and node_type in _FACT_TYPE_RANK)
+        return stored_type == node_type or (stored_type in _FACT_TYPE_RANK and node_type in _FACT_TYPE_RANK)
+
+    def near_min_shared(self, stem_count: int) -> int:
+        """Fewest shared stems a node needs to reach the possible-duplicate flag.
+
+        ``near = max(J, 0.85 * containment)``. J >= t needs ``shared >= t * |incoming|``;
+        the containment branch needs ``shared >= 0.847 * smaller`` with
+        ``smaller >= MIN_STEMS``, i.e. at least ``MIN_STEMS`` shared stems. The
+        smaller of the two bounds is therefore safe: no qualifying node is missed.
+        """
+        by_jaccard = math.ceil(self.NEAR_DUPLICATE_SIMILARITY * stem_count)
+        return max(1, min(by_jaccard, self.MIN_STEMS))
 
     def classify(
         self,
@@ -261,34 +298,61 @@ class MemoryDedupGate:
         scope: str,
         project_id: str | None,
         *,
-        nodes: Iterable[Any] | None = None,
         exclude_ids: Iterable[str] = (),
     ) -> DedupDecision:
+        """Relation of an incoming fact to the indexed nodes of its scope/project.
+
+        Two indexed reads instead of a scan: duplicate/update/conflict all need
+        the same label subject (one lookup by subject key), and the
+        possible-duplicate flag reads stem neighbours (``near_min_shared``).
+        Only active, non-structural, non-superseded nodes are indexed.
+        """
         incoming = incoming_features(label, text)
         excluded = set(exclude_ids)
         best = DedupDecision()
         best_rank = 0
-        for node in self.repository.list_nodes() if nodes is None else nodes:
-            if node.id in excluded or not self.comparable(node, scope, project_id, node_type):
+        subject_rows = self.repository.dedup_subject_rows(scope, project_id, subject_key(incoming))
+        for row in sorted(subject_rows, key=lambda item: str(item["node_id"])):
+            node_id = str(row["node_id"])
+            if node_id in excluded or not self.type_matches(str(row["node_type"]), node_type):
                 continue
-            verdict = self.compare(incoming, self.node_features(node))
+            verdict = self.compare(incoming, features_from_json(str(row["features"])))
             if verdict.near_score > best.near_score:
-                best.near_id, best.near_score = node.id, verdict.near_score
+                best.near_id, best.near_score = node_id, verdict.near_score
             rank = _ACTION_RANK.get(verdict.action, 0)
             if not rank:
                 continue
-            if verdict.action == "duplicate" and verdict.score >= 1.0 and verdict.reason == "exact restatement":
-                verdict.target_id, verdict.target_label = node.id, str(node.label or "")
-                verdict.near_id, verdict.near_score = node.id, 1.0
+            if verdict.action == "duplicate" and verdict.reason == "exact restatement":
+                verdict.target_id, verdict.target_label = node_id, str(row["label"] or "")
+                verdict.near_id, verdict.near_score = node_id, 1.0
                 return verdict
-            better = rank > best_rank or (rank == best_rank and verdict.score > best.score)
-            if better:
+            if rank > best_rank or (rank == best_rank and verdict.score > best.score):
                 best.action, best.score, best.reason, best.details = (
                     verdict.action, verdict.score, verdict.reason, verdict.details,
                 )
-                best.target_id, best.target_label = node.id, str(node.label or "")
+                best.target_id, best.target_label = node_id, str(row["label"] or "")
                 best_rank = rank
+        if incoming.stems:
+            neighbours = self.repository.dedup_stem_neighbours(
+                scope, project_id, sorted(incoming.stems), self.near_min_shared(len(incoming.stems)),
+            )
+            for row in sorted(neighbours, key=lambda item: str(item["node_id"])):
+                node_id = str(row["node_id"])
+                if node_id in excluded or not self.type_matches(str(row["node_type"]), node_type):
+                    continue
+                near = self.near_score(incoming, features_from_json(str(row["features"])))
+                if near > best.near_score:
+                    best.near_id, best.near_score = node_id, near
         return best
+
+    def near_score(self, incoming: FactFeatures, existing: FactFeatures) -> float:
+        left, right = incoming.stems, existing.stems
+        if not left or not right:
+            return 0.0
+        shared = len(left & right)
+        smaller = min(len(left), len(right))
+        containment = shared / smaller if smaller >= self.MIN_STEMS else 0.0
+        return max(shared / len(left | right), containment * 0.85)
 
     def compare(self, incoming: FactFeatures, existing: FactFeatures) -> DedupDecision:
         """Relation of one incoming fact to one stored fact (no repository access)."""
@@ -299,9 +363,7 @@ class MemoryDedupGate:
             return DedupDecision()
         shared = len(left & right)
         jaccard = shared / len(left | right)
-        smaller = min(len(left), len(right))
-        containment = shared / smaller if smaller >= self.MIN_STEMS else 0.0
-        near = max(jaccard, containment * 0.85)
+        near = self.near_score(incoming, existing)
         verdict = DedupDecision(near_score=near)
         if incoming.identifiers and existing.identifiers and incoming.identifiers != existing.identifiers:
             # Different files / ids / URLs are different objects, however alike the prose.

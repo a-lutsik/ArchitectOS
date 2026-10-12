@@ -243,6 +243,11 @@ class MemoryWipeMixin:
                 except sqlite3.Error as exc:
                     _LOG.debug("wipe skipped memory_embeddings: %s", exc)
                 try:
+                    for table in ("memory_dedup_stems", "memory_dedup_index"):
+                        self._delete_in_chunks(conn, f"DELETE FROM {table} WHERE node_id IN ({{ph}})", node_ids)
+                except sqlite3.Error as exc:
+                    _LOG.debug("wipe skipped memory_dedup_index: %s", exc)
+                try:
                     events_deleted = self._delete_in_chunks(
                         conn, "DELETE FROM memory_node_events WHERE node_id IN ({ph})", node_ids
                     )

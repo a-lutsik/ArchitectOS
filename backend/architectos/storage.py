@@ -17,6 +17,7 @@ from .constants import SECRET_MASK
 from .models import MemoryEdge, MemoryNode, Project, Source, stable_id, utc_now
 from .security import SecurityPolicy
 from .storage_candidates import StorageCandidatesMixin
+from .storage_dedup import StorageDedupMixin
 from .storage_migrate import SCHEMA_VERSION, StorageMigrateMixin
 from .storage_search import StorageSearchMixin
 from .storage_sessions import StorageSessionsMixin
@@ -99,7 +100,7 @@ def strip_sensitive_settings(value: Any) -> Any:
     return value
 
 
-class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, StorageSessionsMixin, StorageMigrateMixin):
+class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandidatesMixin, StorageSessionsMixin, StorageMigrateMixin):
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         self.data_dir = project_root / "data"
@@ -423,6 +424,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageCandidatesMixin, Storage
                 (node.id, node.type, node.label, node.scope, node.project_id, node.interface_id, node.source_id, node.status, node.confidence, node.created_at, node.updated_at, json.dumps(node.to_dict(), sort_keys=True)),
             )
             self._sync_memory_fts_row(conn, node)
+            self._sync_dedup_index_row(conn, node)
         if notify:
             for listener in self._node_upsert_listeners:
                 try:
