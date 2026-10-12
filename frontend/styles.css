@@ -11219,7 +11219,8 @@ label {
 /* Search Palette */
 .search-palette-input input {
   font-size: 14px !important;
-  padding: 10px 14px !important;
+  /* keep room for the leading search icon and the trailing shortcut hint */
+  padding: 10px 80px 10px 42px !important;
   min-height: 44px !important;
 }
 
@@ -14304,9 +14305,30 @@ html.theme-dark #settings-view .setting-toggle-warn {
 }
 
 @media (max-width: 820px) {
+  /* Narrow screens: stack the file tree above the editor instead of hiding it,
+     otherwise files cannot be opened at all. Inline width from the resizer is
+     overridden here on purpose. */
+  .workspace-main-area {
+    flex-direction: column;
+  }
 
-  .workspace-sidebar,
   .workspace-resizer {
+    display: none;
+  }
+
+  .workspace-sidebar {
+    width: 100% !important;
+    max-width: none;
+    min-width: 0 !important;
+    height: 40vh;
+    max-height: 320px;
+    flex: 0 0 auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  /* The project switcher in the topbar already covers this block. */
+  .workspace-sidebar .project-info {
     display: none;
   }
 }
@@ -15068,4 +15090,163 @@ body:has(#chat-view.active) {
   font-size: 13.5px !important;
   font-weight: 500;
   border-radius: var(--radius-xs);
+}
+/* Phone layout (<= 600px) ----------------------------------------------------
+   The sidebar becomes a compact top bar with a horizontally scrolling nav, and
+   the topbar controls wrap instead of overflowing the viewport. Placed last so
+   it wins over the legacy 760px nav grid rule. */
+@media (max-width: 600px) {
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: static;
+    height: auto;
+    padding: 8px 12px 6px;
+    border-right: 0;
+    border-bottom: 1px solid var(--side-border);
+    overflow: visible;
+  }
+
+  .sidebar .brand {
+    margin-bottom: 6px;
+    padding: 0;
+  }
+
+  .sidebar .brand p {
+    display: none;
+  }
+
+  .sidebar .brand-mark,
+  .sidebar .brand-mark img {
+    width: 28px;
+    height: 28px;
+  }
+
+  .sidebar-nav {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-width: thin;
+  }
+
+  .sidebar-nav .nav-group {
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .sidebar-nav .nav-group-label {
+    display: none;
+  }
+
+  .sidebar-nav .nav-item,
+  .sidebar-nav .nav-setup-toggle {
+    flex: 0 0 auto;
+    width: auto;
+    white-space: nowrap;
+    min-height: 40px;
+  }
+
+  .sidebar-nav .nav-setup-items:not([hidden]) {
+    display: flex;
+    flex-direction: row;
+    gap: 4px;
+  }
+
+  /* The topbar height is fixed (--topbar-h) and the stage heights are derived
+     from it, so keep a single row: the active nav item already names the view. */
+  .topbar #view-title {
+    display: none;
+  }
+
+  .topbar-controls {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    gap: 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .topbar-controls .project-select {
+    flex: 1 0 140px;
+    max-width: none;
+  }
+
+  /* The legacy 760px rule makes every control full width; keep icons compact. */
+  .topbar-controls button,
+  .topbar-controls .search-trigger-btn {
+    width: auto;
+  }
+
+  .icon-btn {
+    min-width: 40px;
+    min-height: 40px;
+  }
+}
+
+/* Task cards: priority badge + edit/delete actions ------------------------- */
+.task-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.task-card-head strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-priority-high {
+  color: var(--danger, #c0392b);
+}
+
+.task-priority-low {
+  color: var(--muted);
+}
+
+.task-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.task-card-actions select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.task-card-actions .icon-btn-sm {
+  flex: 0 0 auto;
+  min-width: 28px;
+  height: 28px;
+}
+
+/* Terminal is always a dark surface, so its controls must not follow the app's
+   light theme (light buttons on #0c1018, and a disabled "Ask agent" that looks
+   like a ghost). */
+.terminal-dialog .terminal-chrome-actions .btn-secondary {
+  background: #1e293b;
+  border-color: #334155;
+  color: #e2e8f0;
+}
+
+.terminal-dialog .terminal-chrome-actions .btn-secondary:hover {
+  background: #273449;
+}
+
+.terminal-dialog .terminal-chrome-actions .btn-primary:disabled {
+  background: #1e293b;
+  border-color: #334155;
+  color: #64748b;
+  opacity: 1;
 }
