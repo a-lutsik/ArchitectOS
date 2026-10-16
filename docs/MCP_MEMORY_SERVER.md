@@ -33,20 +33,68 @@ of other MCP servers; this feature makes ArchitectOS a *server* for other agents
 | `memory_add` | Persist a new memory; multi-fact dumps are split. Secrets auto-redacted | `label` (required), `text` (required), `type?`, `scope?`, `project_id?`, `confidence?` |
 | `memory_get` | Fetch one memory node in full by id (untruncated text, metadata, evidence, neighbors) | `id` (required), `include_neighbors?` |
 | `memory_feedback` | Rate retrieved hits so ranking improves over time | `rating` (1 or -1, required), `hit_ids?`, `query?`, `note?`, `project_id?` |
-| `memory_list_projects` | List projects for scoping | – |
-| `project_create` | Create a project; without `root_path` a knowledge-only project (no local folder) | `name?`, `root_path?`, `description?` (name or root_path required) |
+| `memory_list_projects` | List projects for scoping (`id`, `name`, `root_path`, `bound`) plus `create_new: true` | – |
+| `memory_use_project` | Bind this folder to a project (writes `.architectos.json`) | `project_id` **or** unique `name`, `cwd?` |
+| `project_create` | Create a project; from an unbound folder also binds it | `name?`, `root_path?`, `description?` (name or root_path required) |
 | `memory_link` | Create a typed edge between two memory nodes (`SUPERSEDES` is bi-temporal) | `source`, `target`, `type` (required), `scope?`, `confidence?` |
-| `source_create` | Register an external data source for a project (idempotent by name) | `project_id`, `name` (required), `kind?`, `config?` |
+| `source_create` | Register an external data source for a project (idempotent by name) | `name` (required), `project_id?` (required when the server is not bound), `kind?`, `config?` |
 | `source_list` | List registered data sources | `project_id?` |
 | `memory_history` | Event history of a node (created/updated/superseded/accessed) | `id` (required) |
 | `memory_add_bulk` | Store a batch of nodes in one call; per-item errors don't abort the batch | `items` (required), `project_id?`, `scope?`, `source_id?`, `type?` |
 
-Typical agent loop: initialize `instructions` already include a short stable-memory briefing.
-At the start of every user message call `memory_turn` with that message (pack + fact
-capture). Still use `memory_search` / `memory_get` to narrow; `memory_add` for an
-explicit lesson; `memory_feedback` to rate hits. Low-risk Lessons from `memory_turn`
-auto-write to short-term memory; Decisions/Constraints stay in the review queue (7-day TTL)
-with source **MCP** (not Ask). The same durable fact from an Ask dialog is not queued twice.
+One MCP server can serve every git folder. Bind order for a process:
+
+1. `--project-id` / `ARCHITECTOS_PROJECT_ID` (explicit pin)
+2. `.architectos.json` walked up from cwd (like `.git`)
+3. `project_id_for_path(cwd)` (longest ArchitectOS `root_path` that contains cwd)
+4. unbound
+
+Unbound memory tools that need a project do **not** write to project `architectos`.
+They return a tool error listing projects (`id` + `name`) and tell the agent to call
+`memory_list_projects`, then `memory_use_project` (by name or id) or `project_create`
+(create a new project, which auto-binds the folder).
+
+```mermaid
+---
+config:
+ layout: elk
+ flowchart:
+  curve: linear
+  nodeSpacing: 40
+  rankSpacing: 50
+---
+flowchart TB
+  start["MCP tool needs a project"] --> pin{"`--project-id` / `ARCHITECTOS_PROJECT_ID`?"}
+  pin -->|yes| bound["Use that project"]
+  pin -->|no| file{"`.architectos.json` walked up from cwd?"}
+  file -->|yes| bound
+  file -->|no| path{"`project_id_for_path(cwd)`?"}
+  path -->|yes| bound
+  path -->|no| unbound["Tool error: list projects, then `memory_use_project` or `project_create`"]
+```
+
+The first session in a new folder should list projects, ask the user **by name**
+(always offer to create a new project), then bind. After that the git/workspace
+folder keeps `.architectos.json`:
+
+```json
+{"project_id":"project_…","name":"Shop"}
+```
+
+That file lives in the workspace folder (the process cwd, or the `cwd` argument), not
+inside the ArchitectOS data root unless that folder *is* the workspace. A new
+Cursor / Codex / Claude folder without that file is unbound again and asks. An
+explicit `project_id` argument on a tool still overrides the bind. Env /
+`--project-id` still beats the file.
+
+Typical agent loop: if initialize `instructions` name a bound project id, call
+`memory_turn` at the start of every user message (pack + fact capture). If the folder
+is unbound, pick a project first — do not call `memory_turn` / `memory_search` /
+`memory_add` until then. Still use `memory_search` / `memory_get` to narrow;
+`memory_add` for an explicit lesson; `memory_feedback` to rate hits. Low-risk Lessons
+from `memory_turn` auto-write to short-term memory; Decisions/Constraints stay in the
+review queue (7-day TTL) with source **MCP** (not Ask). The same durable fact from an
+Ask dialog is not queued twice.
 
 ### Exposed resources (management views)
 
@@ -62,12 +110,20 @@ with source **MCP** (not Ask). The same durable fact from an Ask dialog is not q
 - Python 3 available on PATH (the same interpreter used to run ArchitectOS).
 - The absolute path to this repository — **or** an installed package (see below).
 
-Optional environment variable:
+Optional environment variables:
 
 - `ARCHITECTOS_ROOT` — override the root whose `data/architectos.db` is used.
   Defaults to the ArchitectOS repository root (or the current working directory
   when running from an installed package), so the MCP server and the desktop app
   share one memory store by default.
+- `ARCHITECTOS_PROJECT_ID` — optional explicit pin for this MCP process. It beats
+  `.architectos.json` and path matching. Tools that omit `project_id` then read
+  and write that project. The same pin is `--project-id` on the command line, and
+  an explicit `project_id` argument still overrides it. You can share one MCP
+  command across folders and let `.architectos.json` (or a first-session picker)
+  choose the project; use the env pin only when you want the config itself to
+  force an id. The id comes from `memory_list_projects` (field `id`, and
+  `bound: true` on the bound row).
 
 ### Install as a package (optional)
 
@@ -100,15 +156,26 @@ Use absolute paths.
   "mcpServers": {
     "architectos-memory": {
       "command": "python3",
-      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"]
+      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"],
+      "env": {
+        "ARCHITECTOS_ROOT": "/ABSOLUTE/PATH/TO/ArchitectOS"
+      }
     }
   }
 }
 ```
 
+Reuse one MCP command for every folder: do **not** set `ARCHITECTOS_PROJECT_ID`
+per workspace as the only bind. The first session in a new folder lists projects,
+the user picks a name (or creates one), and `.architectos.json` remembers the id.
+Set `ARCHITECTOS_PROJECT_ID` (or pass `--project-id` in `args`) only when this
+connection must stay pinned regardless of that file. Claude Code (`.mcp.json`)
+and Codex (`[mcp_servers.architectos-memory.env]`) use the same optional pin.
+
 Reload Cursor. In Settings → MCP you should see `architectos-memory` with its
-tools. In chat the agent should call `memory_turn` at the start of each user
-message; `memory_add` still persists an explicit lesson or decision.
+tools. In chat, if the folder is bound, the agent should call `memory_turn` at
+the start of each user message; if it is unbound, list/bind a project first.
+`memory_add` still persists an explicit lesson or decision.
 
 ## Register in Claude Code
 
@@ -119,7 +186,8 @@ Add to `.mcp.json` in the project (or `~/.claude.json` for user scope):
   "mcpServers": {
     "architectos-memory": {
       "command": "python3",
-      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"]
+      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"],
+      "env": { "ARCHITECTOS_ROOT": "/ABSOLUTE/PATH/TO/ArchitectOS" }
     }
   }
 }
@@ -127,6 +195,7 @@ Add to `.mcp.json` in the project (or `~/.claude.json` for user scope):
 
 Or with the installed package: `"command": "architectos-mcp"`, plus
 `"env": {"ARCHITECTOS_ROOT": "/ABSOLUTE/PATH/TO/ArchitectOS"}`.
+`ARCHITECTOS_PROJECT_ID` is optional; omit it unless you want this connection pinned.
 
 ## Register in Junie / JetBrains AI Assistant (IntelliJ)
 
@@ -154,14 +223,16 @@ Create `.vscode/mcp.json` in your workspace:
     "architectos-memory": {
       "type": "stdio",
       "command": "python3",
-      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"]
+      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"],
+      "env": { "ARCHITECTOS_ROOT": "/ABSOLUTE/PATH/TO/ArchitectOS" }
     }
   }
 }
 ```
 
 Open the Copilot Chat **Agent** view, confirm the server is running, and the
-`memory_*` tools become available to the model.
+`memory_*` tools become available to the model. `ARCHITECTOS_PROJECT_ID` is
+optional; a new folder without `.architectos.json` asks which project to bind.
 
 ## Register in Claude Desktop
 
@@ -175,13 +246,15 @@ Edit the Claude Desktop config file:
   "mcpServers": {
     "architectos-memory": {
       "command": "python3",
-      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"]
+      "args": ["/ABSOLUTE/PATH/TO/ArchitectOS/mcp_memory_server.py"],
+      "env": { "ARCHITECTOS_ROOT": "/ABSOLUTE/PATH/TO/ArchitectOS" }
     }
   }
 }
 ```
 
 Restart Claude Desktop; the tools appear under the MCP tools menu.
+`ARCHITECTOS_PROJECT_ID` is optional; omit it unless you want this connection pinned.
 
 ## Notes and safety
 

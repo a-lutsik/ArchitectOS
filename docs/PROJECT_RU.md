@@ -616,7 +616,9 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp_memory_serve
 | `memory_add` | Записать новый факт/решение (секреты вырезаются; пачка фактов режется) | `label`, `text`, `type?`, `scope?`, `project_id?`, `confidence?` |
 | `memory_get` | Полный узел по id (без обрезки, с метаданными и соседями) | `id`, `include_neighbors?` |
 | `memory_feedback` | Оценка выдачи (±1) — улучшает ранжирование | `rating`, `hit_ids?`, `query?`, `note?` |
-| `memory_list_projects` | Список проектов для скоупинга | — |
+| `memory_list_projects` | Список проектов (`id`, `name`, `root_path`, `bound`) плюс `create_new: true` | — |
+| `memory_use_project` | Привязать текущую папку к проекту (пишет `.architectos.json`) | `project_id` **или** уникальное `name`, `cwd?` |
+| `project_create` | Создать проект; из непривязанной папки сразу биндит её | `name?`, `root_path?`, `description?` |
 | `memory_themes` | Тематические кластеры графа | — |
 | `memory_explain_path` | Кратчайший путь между двумя узлами | — |
 | `code_neighbors` | Кто вызывает символ и кого вызывает он | — |
@@ -624,7 +626,21 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp_memory_serve
 
 Ресурсы: `memory://briefing`, `memory://projects`, `memory://review`, шаблон `memory://nodes/{id}`.
 
-Типичный цикл агента: briefing уже в `instructions` при старте MCP; на каждое сообщение пользователя — `memory_turn`; дальше `memory_search` / `memory_get` при необходимости → ответ → `memory_feedback` → `memory_add` для явной записи.
+Привязка папки (порядок): `--project-id` / `ARCHITECTOS_PROJECT_ID` **>**
+`.architectos.json` вверх от cwd **>** `project_id_for_path(cwd)` **>** без
+привязки. Непривязанные memory-инструменты **не** пишут в проект `architectos`:
+возвращают ошибку со списком проектов (`id` + `name`) и просят вызвать
+`memory_list_projects`, затем `memory_use_project` (по имени или id) или
+`project_create` (новый проект сразу биндит папку). Файл `.architectos.json` —
+`{"project_id","name"}` в git/workspace-папке; новая папка Cursor/Codex/Claude
+без этого файла спрашивает снова. Явный аргумент `project_id` у инструмента
+перекрывает bind. `ARCHITECTOS_PROJECT_ID` в конфиге клиента не обязателен.
+
+Типичный цикл агента: если `instructions` уже называют bound project id — на
+каждое сообщение пользователя `memory_turn`; если папка unbound — сначала
+выбрать проект, не вызывать `memory_turn` / `memory_search` / `memory_add` до
+этого. Дальше `memory_search` / `memory_get` при необходимости → ответ →
+`memory_feedback` → `memory_add` для явной записи.
 
 Факты из `memory_turn` попадают в очередь с источником **MCP**, не Ask. Если
 тот же факт уже есть как MCP, Ask-сессия его не дублирует. Хуки агентов идут
@@ -663,6 +679,10 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp_memory_serve
   }
 }
 ```
+
+`ARCHITECTOS_PROJECT_ID` в `env` не обязателен: одна команда на все папки, bind
+через `.architectos.json` или первый выбор проекта. Ставьте pin только если
+этот коннект должен игнорировать файл.
 
 После правки перезагрузите MCP в Cursor: в Settings → MCP должен появиться
 `architectos-memory` со списком инструментов.

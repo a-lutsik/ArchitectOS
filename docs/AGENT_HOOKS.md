@@ -88,6 +88,10 @@ The project is resolved from the hook's working directory: the registered projec
 whose `root_path` contains that directory wins, and the most deeply nested root
 wins for monorepos. No match falls back to the `architectos` project.
 
+MCP tools do **not** use that fallback. An unbound MCP folder errors, lists
+projects, and asks the agent to call `memory_list_projects` then
+`memory_use_project` or `project_create` (see [MCP_MEMORY_SERVER.md](MCP_MEMORY_SERVER.md)).
+
 ## Transport
 
 The hook prefers the running app: it reads `data/architectos.runtime.json` for the

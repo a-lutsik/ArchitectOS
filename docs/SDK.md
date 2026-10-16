@@ -23,6 +23,11 @@ architectos mcp                     # MCP stdio (also: architectos-mcp)
 python3 -m architectos hook doctor
 ```
 
+`architectos mcp` uses the same folder bind as the memory server: `--project-id` /
+`ARCHITECTOS_PROJECT_ID`, then `.architectos.json`, then `project_id_for_path(cwd)`.
+Unbound memory tools do not write to project `architectos`. Details:
+[MCP_MEMORY_SERVER.md](MCP_MEMORY_SERVER.md).
+
 Optional extras (all auto-detected, stdlib fallback otherwise):
 
 ```bash

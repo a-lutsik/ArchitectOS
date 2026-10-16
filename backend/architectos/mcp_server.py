@@ -47,6 +47,76 @@ def _resolve_root() -> Path:
     return resolve_project_root()
 
 
+def resolve_mcp_project_id(argv: list[str] | None = None, env: dict[str, str] | None = None) -> str:
+    """Project pin for this MCP process.
+
+    ``--project-id`` wins over ``ARCHITECTOS_PROJECT_ID``. Each Cursor, Claude, or
+    Codex folder sets its own value so that one connection talks to one ArchitectOS
+    project.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    environ = os.environ if env is None else env
+    project_id = str(environ.get("ARCHITECTOS_PROJECT_ID") or "").strip()
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--project-id" and index + 1 < len(args):
+            project_id = str(args[index + 1] or "").strip()
+            index += 2
+            continue
+        if token.startswith("--project-id="):
+            project_id = token.split("=", 1)[1].strip()
+            index += 1
+            continue
+        index += 1
+    return project_id
+
+
+MCP_BIND_FILENAME = ".architectos.json"
+
+
+def find_mcp_bind_file(start: Path) -> Path | None:
+    """Walk *start* and its parents for ``.architectos.json``, like git walks for ``.git``."""
+    try:
+        current = Path(start).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if current.is_file():
+        current = current.parent
+    while True:
+        candidate = current / MCP_BIND_FILENAME
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            return None
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def read_mcp_bind_project_id(start: Path) -> str:
+    path = find_mcp_bind_file(start)
+    if path is None:
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("project_id") or "").strip()
+
+
+def write_mcp_bind_file(folder: Path, project_id: str, name: str) -> Path:
+    folder = Path(folder).expanduser().resolve()
+    path = folder / MCP_BIND_FILENAME
+    payload = {"project_id": str(project_id).strip(), "name": str(name).strip()}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def _log(message: str) -> None:
     sys.stderr.write(f"[architectos-mcp] {message}\n")
     sys.stderr.flush()
@@ -65,7 +135,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Natural-language search query. May be empty when mode='list'."},
-                "project_id": {"type": "string", "description": "Optional project id to scope the search."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
                 "scope": {"type": "string", "description": "Optional scope filter (e.g. project, interface, shared, global)."},
                 "limit": {"type": "integer", "description": "Max number of hits (default 8).", "minimum": 1, "maximum": 50},
                 "mode": {"type": "string", "enum": ["search", "list"], "description": "'search' (default) ranks by relevance; 'list' returns nodes matching filters without scoring."},
@@ -98,7 +168,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "What the assistant is about to work on."},
-                "project_id": {"type": "string", "description": "Optional project id to scope the context."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
                 "scope": {"type": "string", "description": "Optional scope filter."},
                 "limit": {"type": "integer", "description": "Max memory hits to include (default 8).", "minimum": 1, "maximum": 50},
             },
@@ -118,7 +188,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "user_text": {"type": "string", "description": "The latest user message (required)."},
                 "assistant_text": {"type": "string", "description": "Your reply so far, if capturing after answering."},
-                "project_id": {"type": "string", "description": "Optional project id to scope the turn."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
                 "scope": {"type": "string", "description": "Optional scope filter."},
                 "limit": {"type": "integer", "description": "Max memory hits in the pack (default 8).", "minimum": 1, "maximum": 50},
             },
@@ -139,7 +209,7 @@ TOOLS: list[dict[str, Any]] = [
                 "text": {"type": "string", "description": "Full memory content (>= 4 non-secret characters)."},
                 "type": {"type": "string", "description": "Memory type: Lesson, Decision, Concept, Artifact, etc. (default Lesson)."},
                 "scope": {"type": "string", "description": "Scope: project, interface, shared, global (default project)."},
-                "project_id": {"type": "string", "description": "Project id (default 'architectos')."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
                 "confidence": {"type": "number", "description": "Confidence 0..1 (default 0.8).", "minimum": 0, "maximum": 1},
                 "source_id": {"type": "string", "description": "Optional id of a registered Source (see source_create) this memory originates from."},
             },
@@ -175,15 +245,36 @@ TOOLS: list[dict[str, Any]] = [
                 "hit_ids": {"type": "array", "items": {"type": "string"}, "description": "Memory node ids the rating applies to."},
                 "query": {"type": "string", "description": "The query or task the memory was retrieved for."},
                 "note": {"type": "string", "description": "Optional free-form note (e.g. what was stale or wrong)."},
-                "project_id": {"type": "string", "description": "Project id (default 'architectos')."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
             },
             "required": ["rating"],
         },
     },
     {
         "name": "memory_list_projects",
-        "description": "List ArchitectOS projects (id, name, root path) available for scoping memory.",
+        "description": (
+            "List ArchitectOS projects (id, name, root path, bound) and always include "
+            "create_new so the user can pick an existing project by name or create one. "
+            "Call this first when the folder is unbound."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "memory_use_project",
+        "description": (
+            "Bind this workspace folder to an ArchitectOS project. Accepts project_id or a "
+            "unique project name, plus optional cwd. Writes .architectos.json in that folder, "
+            "sets the process bind, and fills an empty project root_path with the folder. "
+            "Call after the user picks a name from memory_list_projects."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ArchitectOS project id to bind."},
+                "name": {"type": "string", "description": "Unique project name to bind when project_id is omitted."},
+                "cwd": {"type": "string", "description": "Workspace folder to bind (default: process working directory)."},
+            },
+        },
     },
     {
         "name": "project_create",
@@ -232,12 +323,12 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project_id": {"type": "string", "description": "Project the source belongs to (required)."},
+                "project_id": {"type": "string", "description": "Project the source belongs to. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
                 "name": {"type": "string", "description": "Source name (required)."},
                 "kind": {"type": "string", "description": "Source kind: rss, api, pipeline, manual, ... (default 'generic')."},
                 "config": {"type": "object", "description": "Optional kind-specific config (url, schedule, credentials reference, ...).", "additionalProperties": True},
             },
-            "required": ["project_id", "name"],
+            "required": ["name"],
         },
     },
     {
@@ -246,7 +337,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project_id": {"type": "string", "description": "Optional project id to scope the list."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
             },
         },
     },
@@ -282,7 +373,7 @@ TOOLS: list[dict[str, Any]] = [
                     "items": {"type": "object"},
                     "description": "Memory items: {label, text, type?, scope?, confidence?, source_id?} (max 200).",
                 },
-                "project_id": {"type": "string", "description": "Default project id for items without one."},
+                "project_id": {"type": "string", "description": "Default ArchitectOS project id for items without one. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
                 "scope": {"type": "string", "description": "Default scope for items without one."},
                 "source_id": {"type": "string", "description": "Default Source id for items without one."},
                 "type": {"type": "string", "description": "Default memory type for items without one."},
@@ -302,7 +393,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Optional query to rank themes by relevance."},
-                "project_id": {"type": "string", "description": "Optional project id to scope the themes."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
                 "limit": {"type": "integer", "description": "Max themes to return (default 6).", "minimum": 1, "maximum": 20},
             },
         },
@@ -335,7 +426,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "symbol": {"type": "string", "description": "Symbol id, 'path::qualname', qualname, or name."},
-                "project_id": {"type": "string", "description": "Optional project id to scope resolution."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
             },
             "required": ["symbol"],
         },
@@ -352,7 +443,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "symbol": {"type": "string", "description": "Symbol id, 'path::qualname', qualname, or name."},
                 "depth": {"type": "integer", "description": "Reverse-call depth (default 3).", "minimum": 1, "maximum": 6},
-                "project_id": {"type": "string", "description": "Optional project id to scope resolution."},
+                "project_id": {"type": "string", "description": "ArchitectOS project id. Omit to use this server's bound project. If the folder is unbound, call memory_list_projects then memory_use_project or project_create."},
             },
             "required": ["symbol"],
         },
@@ -361,8 +452,13 @@ TOOLS: list[dict[str, Any]] = [
 
 
 class MemoryMCPServer:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, project_id: str | None = None, cwd: str | Path | None = None) -> None:
         self.root = root
+        self.cwd = self._resolve_cwd(cwd)
+        self._pinned = bool(str(project_id or "").strip())
+        self.project_id = str(project_id or "").strip()
+        if not self.project_id:
+            self.project_id = read_mcp_bind_project_id(self.cwd)
         self._service: Any | None = None
         self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "memory_search": self._tool_search,
@@ -372,6 +468,7 @@ class MemoryMCPServer:
             "memory_get": self._tool_get,
             "memory_feedback": self._tool_feedback,
             "memory_list_projects": self._tool_list_projects,
+            "memory_use_project": self._tool_use_project,
             "project_create": self._tool_project_create,
             "memory_link": self._tool_memory_link,
             "source_create": self._tool_source_create,
@@ -384,6 +481,14 @@ class MemoryMCPServer:
             "code_impact": self._tool_code_impact,
         }
 
+    @staticmethod
+    def _resolve_cwd(cwd: str | Path | None) -> Path:
+        raw = Path.cwd() if cwd is None else Path(cwd)
+        try:
+            return raw.expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return raw
+
     # -- Service (lazy) ----------------------------------------------------
     @property
     def service(self) -> Any:
@@ -395,10 +500,108 @@ class MemoryMCPServer:
         return self._service
 
     # -- Run loop ----------------------------------------------------------
+    def _ensure_bind(self) -> None:
+        """Fill self.project_id from cwd root_path match when still unbound."""
+        if self.project_id or self._pinned:
+            return
+        try:
+            found = self.service.project_id_for_path(str(self.cwd))
+        except Exception as exc:  # noqa: BLE001 - bind is best-effort
+            _log(f"path bind skipped: {exc}")
+            return
+        if found:
+            self.project_id = str(found).strip()
+
+    def _arg_project_id(self, args: dict[str, Any]) -> str | None:
+        """Explicit tool argument wins; otherwise the process bind, if any."""
+        explicit = str(args.get("project_id") or "").strip()
+        if explicit:
+            return explicit
+        self._ensure_bind()
+        return self.project_id or None
+
+    def _require_project_id(self, args: dict[str, Any]) -> str:
+        project_id = self._arg_project_id(args)
+        if project_id:
+            return project_id
+        raise ValueError(self._unbound_error_message())
+
+    def _write_project_id(self, args: dict[str, Any]) -> str:
+        return self._require_project_id(args)
+
+    def _unbound_error_message(self) -> str:
+        try:
+            projects = self.service.projects()
+        except Exception:  # noqa: BLE001 - still tell the agent how to bind
+            projects = []
+        rows = [{"id": project.get("id"), "name": project.get("name")} for project in projects]
+        listed = "\n".join(f'- {row["id"]}: {row["name"]}' for row in rows) if rows else "(no projects yet)"
+        return (
+            "This folder is not bound to an ArchitectOS project. "
+            "Call memory_list_projects, ask the user to pick a project by name "
+            "(or create a new one), then call memory_use_project or project_create.\n"
+            f"Projects:\n{listed}"
+        )
+
+    def _workspace_folder(self, args: dict[str, Any]) -> Path:
+        raw = str(args.get("cwd") or "").strip()
+        folder = Path(raw).expanduser() if raw else self.cwd
+        try:
+            folder = folder.resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"cwd is invalid: {raw or folder}") from exc
+        if not folder.is_dir():
+            raise ValueError(f"cwd is not a directory: {folder}")
+        return folder
+
+    def _resolve_project_ref(self, project_id: str, name: str) -> dict[str, Any]:
+        projects = self.service.projects()
+        wanted_id = str(project_id or "").strip()
+        wanted_name = str(name or "").strip()
+        if wanted_id:
+            for project in projects:
+                if str(project.get("id") or "") == wanted_id:
+                    return project
+            raise ValueError(f"Unknown project_id {wanted_id}. Call memory_list_projects.")
+        if not wanted_name:
+            raise ValueError("project_id or name is required")
+        needle = wanted_name.lower()
+        matches = [project for project in projects if str(project.get("name") or "").strip().lower() == needle]
+        if not matches:
+            raise ValueError(f'No project named "{wanted_name}". Call memory_list_projects or project_create.')
+        if len(matches) > 1:
+            listed = "\n".join(f'- {project.get("id")}: {project.get("name")}' for project in matches)
+            raise ValueError(f'Ambiguous project name "{wanted_name}". Matches:\n{listed}')
+        return matches[0]
+
+    def _bind_to_project(self, project: dict[str, Any], folder: Path) -> dict[str, Any]:
+        project_id = str(project.get("id") or "").strip()
+        name = str(project.get("name") or "").strip()
+        if not project_id:
+            raise ValueError("project id is missing")
+        folder = Path(folder).expanduser().resolve()
+        if not folder.is_dir():
+            raise ValueError(f"cwd is not a directory: {folder}")
+        write_mcp_bind_file(folder, project_id, name)
+        self.project_id = project_id
+        stored = self.service.repository.get_project(project_id)
+        if stored is not None and not str(stored.root_path or "").strip():
+            stored.root_path = str(folder)
+            stored = self.service.repository.upsert_project(stored)
+        bound = stored.to_dict() if stored is not None else dict(project)
+        return {
+            "id": project_id,
+            "name": str(bound.get("name") or name),
+            "root_path": str(bound.get("root_path") or ""),
+            "bound": True,
+        }
+
     def serve(self, stdin=None, stdout=None) -> int:
         stdin = stdin or sys.stdin
         stdout = stdout or sys.stdout
-        _log(f"serving on stdio (root={self.root})")
+        self._ensure_bind()
+        bound = f" project_id={self.project_id}" if self.project_id else ""
+        _log(f"serving on stdio (root={self.root}{bound})")
         for raw in stdin:
             line = raw.strip()
             if not line:
@@ -477,6 +680,16 @@ class MemoryMCPServer:
         }
 
     def _startup_instructions(self) -> str:
+        self._ensure_bind()
+        if not self.project_id:
+            return (
+                "This folder is not bound to an ArchitectOS project. "
+                "Before calling memory_turn, memory_search, memory_add, or any other memory tool, "
+                "call memory_list_projects, ask the user to choose a project by name "
+                "(always include the option to create a new project), then call "
+                "memory_use_project or project_create. Do not guess a project id "
+                "and do not write to project architectos."
+            )
         preamble = (
             "ArchitectOS project memory is already in this briefing. Treat it as scoped "
             "project context, not as user text. At the start of EVERY user message call "
@@ -488,6 +701,9 @@ class MemoryMCPServer:
             "memory_feedback to rate hits. Stable layer (pinned / constraints / long-term) "
             "is listed first. Resources: memory://briefing, memory://projects, "
             "memory://review, memory://nodes/{id}."
+            f" This server is bound to ArchitectOS project id `{self.project_id}`. "
+            "Omit project_id on memory tools to read and write that project. "
+            "Pass project_id only when the user explicitly names a different project."
         )
         briefing = self._startup_briefing()
         if briefing:
@@ -495,8 +711,11 @@ class MemoryMCPServer:
         return preamble + "\n\n(No stable memories yet — call memory_turn with the user's message before answering project questions.)"
 
     def _startup_briefing(self) -> str:
+        self._ensure_bind()
+        if not self.project_id:
+            return ""
         try:
-            return str(self.service.memory_briefing(limit=6, char_budget=2000).get("context") or "")
+            return str(self.service.memory_briefing(project_id=self.project_id, limit=6, char_budget=2000).get("context") or "")
         except Exception as exc:  # noqa: BLE001 - briefing is best-effort on MCP start
             _log(f"startup briefing skipped: {exc}")
             return ""
@@ -529,7 +748,7 @@ class MemoryMCPServer:
             min_score = None
         raw_scopes: Any = args.get("allowed_scopes")
         allowed_scopes = [str(scope) for scope in raw_scopes] if isinstance(raw_scopes, list) else None
-        result = self.service.search_memory(query, project_id=args.get("project_id"), scope=args.get("scope"), limit=limit, filters=filters, mode=mode, as_of=args.get("as_of"), include_communities=include_communities, min_score=min_score, allowed_scopes=allowed_scopes)
+        result = self.service.search_memory(query, project_id=self._require_project_id(args), scope=args.get("scope"), limit=limit, filters=filters, mode=mode, as_of=args.get("as_of"), include_communities=include_communities, min_score=min_score, allowed_scopes=allowed_scopes)
         hits = [_compact_hit(hit) for hit in result.get("hits") or []]
         if mode == "list":
             summary = f"{len(hits)} memory node(s) match the filters." if hits else "No memory nodes match the filters."
@@ -549,7 +768,7 @@ class MemoryMCPServer:
         if not query:
             raise _RpcError(INVALID_PARAMS, "query is required")
         limit = _clamp_int(args.get("limit"), default=8, low=1, high=50)
-        result = self.service.context(query, project_id=args.get("project_id"), scope=args.get("scope"), limit=limit)
+        result = self.service.context(query, project_id=self._require_project_id(args), scope=args.get("scope"), limit=limit)
         return _tool_result(str(result.get("context") or ""), {"query": query, "context": result.get("context") or "", "hits": [_compact_hit(hit) for hit in result.get("hits") or []]})
 
     def _tool_turn(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -560,7 +779,7 @@ class MemoryMCPServer:
         result = self.service.capture_memory_turn(
             user_text,
             str(args.get("assistant_text") or ""),
-            project_id=args.get("project_id"),
+            project_id=self._require_project_id(args),
             scope=args.get("scope"),
             limit=limit,
         )
@@ -594,7 +813,7 @@ class MemoryMCPServer:
             "text": args.get("text"),
             "type": args.get("type") or "Lesson",
             "scope": args.get("scope") or "project",
-            "project_id": args.get("project_id") or "architectos",
+            "project_id": self._write_project_id(args),
             "confidence": args.get("confidence"),
             "source_id": args.get("source_id"),
             "source": "mcp",
@@ -611,7 +830,7 @@ class MemoryMCPServer:
             raise _RpcError(INVALID_PARAMS, "items must be a non-empty list")
         result = self.service.add_memory_bulk({
             "items": raw_items,
-            "project_id": args.get("project_id") or "architectos",
+            "project_id": self._write_project_id(args),
             "scope": args.get("scope"),
             "source_id": args.get("source_id"),
             "type": args.get("type"),
@@ -625,10 +844,10 @@ class MemoryMCPServer:
         return _tool_result(summary, result)
 
     def _tool_source_create(self, args: dict[str, Any]) -> dict[str, Any]:
-        project_id = str(args.get("project_id") or "").strip()
         name = str(args.get("name") or "").strip()
-        if not project_id or not name:
-            raise _RpcError(INVALID_PARAMS, "project_id and name are required")
+        if not name:
+            raise _RpcError(INVALID_PARAMS, "name is required")
+        project_id = self._require_project_id(args)
         config = args.get("config") if isinstance(args.get("config"), dict) else {}
         result = self.service.create_source({
             "project_id": project_id,
@@ -641,7 +860,7 @@ class MemoryMCPServer:
         return _tool_result(summary, result)
 
     def _tool_source_list(self, args: dict[str, Any]) -> dict[str, Any]:
-        sources = self.service.list_sources(args.get("project_id") or None)
+        sources = self.service.list_sources(self._arg_project_id(args))
         rows = [
             {"id": s.get("id"), "project_id": s.get("project_id"), "name": s.get("name"), "kind": s.get("kind"), "config": s.get("config") or {}}
             for s in sources
@@ -664,7 +883,7 @@ class MemoryMCPServer:
 
     def _tool_themes(self, args: dict[str, Any]) -> dict[str, Any]:
         limit = _clamp_int(args.get("limit"), default=6, low=1, high=20)
-        result = self.service.community_summaries(project_id=args.get("project_id"), query=args.get("query"), limit=limit)
+        result = self.service.community_summaries(project_id=self._require_project_id(args), query=args.get("query"), limit=limit)
         themes = result.get("communities") or []
         if themes:
             lines = [
@@ -689,7 +908,7 @@ class MemoryMCPServer:
         symbol = str(args.get("symbol") or "").strip()
         if not symbol:
             raise _RpcError(INVALID_PARAMS, "symbol is required")
-        result = self.service.code_neighbors(symbol, project_id=args.get("project_id"))
+        result = self.service.code_neighbors(symbol, project_id=self._require_project_id(args))
         if not result.get("found"):
             return _tool_result(f"No code symbol found for '{symbol}'.", result)
         sym = result.get("symbol") or {}
@@ -711,7 +930,7 @@ class MemoryMCPServer:
         if not symbol:
             raise _RpcError(INVALID_PARAMS, "symbol is required")
         depth = _clamp_int(args.get("depth"), default=3, low=1, high=6)
-        result = self.service.code_impact(symbol, depth=depth, project_id=args.get("project_id"))
+        result = self.service.code_impact(symbol, depth=depth, project_id=self._require_project_id(args))
         if not result.get("found"):
             return _tool_result(f"No code symbol found for '{symbol}'.", result)
         impacted = result.get("impacted") or []
@@ -727,12 +946,25 @@ class MemoryMCPServer:
         return _tool_result(summary, result)
 
     def _tool_list_projects(self, _args: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_bind()
         projects = self.service.projects()
-        rows = [{"id": p.get("id"), "name": p.get("name"), "root_path": p.get("root_path")} for p in projects]
+        rows = [
+            {"id": p.get("id"), "name": p.get("name"), "root_path": p.get("root_path"), "bound": bool(self.project_id) and p.get("id") == self.project_id}
+            for p in projects
+        ]
         summary = "Projects:\n" + "\n".join(f'- {r["id"]}: {r["name"]}' for r in rows) if rows else "No projects yet."
-        return _tool_result(summary, {"projects": rows})
+        summary += "\nCreate a new project: call project_create (create_new is true)."
+        return _tool_result(summary, {"projects": rows, "create_new": True})
+
+    def _tool_use_project(self, args: dict[str, Any]) -> dict[str, Any]:
+        folder = self._workspace_folder(args)
+        project = self._resolve_project_ref(str(args.get("project_id") or ""), str(args.get("name") or ""))
+        bound = self._bind_to_project(project, folder)
+        summary = f'Bound this folder to project "{bound["name"]}" (id {bound["id"]}).'
+        return _tool_result(summary, bound)
 
     def _tool_project_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_bind()
         name = str(args.get("name") or "").strip()
         root_path = str(args.get("root_path") or "").strip()
         if not name and not root_path:
@@ -743,15 +975,22 @@ class MemoryMCPServer:
             "description": str(args.get("description") or ""),
         })
         project = result.get("project") or {}
+        bound_payload: dict[str, Any] | None = None
+        if not self._pinned and not self.project_id:
+            bound_payload = self._bind_to_project(project, self._workspace_folder(args))
+            project = {**project, **bound_payload}
         kind = "knowledge" if not project.get("root_path") else "workspace"
         action = "Created" if result.get("created") else "Found existing"
         summary = f'{action} {kind} project "{project.get("name")}" (id {project.get("id")}).'
+        if bound_payload:
+            summary += " Bound this folder to that project."
         return _tool_result(summary, {
             "id": project.get("id"),
             "name": project.get("name"),
             "root_path": project.get("root_path") or "",
             "description": project.get("description") or "",
             "created": bool(result.get("created")),
+            "bound": bool(bound_payload) or (bool(self.project_id) and project.get("id") == self.project_id),
         })
 
     def _tool_memory_link(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -803,7 +1042,7 @@ class MemoryMCPServer:
         if rating not in {1, -1}:
             raise _RpcError(INVALID_PARAMS, "rating must be 1 (useful) or -1 (not useful)")
         result = self.service.record_retrieval_feedback({
-            "project_id": args.get("project_id") or "architectos",
+            "project_id": self._write_project_id(args),
             "rating": rating,
             "hit_ids": args.get("hit_ids") or [],
             "query": args.get("query") or "",
@@ -853,7 +1092,7 @@ class MemoryMCPServer:
             rows = [{"id": p.get("id"), "name": p.get("name"), "root_path": p.get("root_path")} for p in self.service.projects()]
             return _resource_contents(uri, {"projects": rows})
         if uri == "memory://review":
-            result = self.service.list_memory_candidates(status="candidate", limit=100)
+            result = self.service.list_memory_candidates(self.project_id or None, status="candidate", limit=100)
             candidates = [
                 {
                     "id": c.get("id"),
@@ -938,12 +1177,13 @@ def main(argv: list[str] | None = None) -> int:
 
         return hook_main(raw[1:])
     root = _resolve_root()
+    project_id = resolve_mcp_project_id(raw)
     if getattr(sys, "frozen", False) and not os.environ.get("ARCHITECTOS_ROOT"):
         _log(
             f"ARCHITECTOS_ROOT unset; using {root} "
             "(set ARCHITECTOS_ROOT to the full-app data root to share architectos.db)"
         )
-    return MemoryMCPServer(root).serve()
+    return MemoryMCPServer(root, project_id=project_id).serve()
 
 
 if __name__ == "__main__":

@@ -227,9 +227,21 @@ Decision и Constraint ждут review, карточки в очереди с ч
 | `memory_add` | Записать урок/решение (секреты редактируются; несколько фактов режутся на узлы) |
 | `memory_get` | Полный узел по id |
 | `memory_feedback` | Оценка хитов (±1) для ранжирования |
-| `memory_list_projects` | Список проектов для scope |
+| `memory_list_projects` | Список проектов (`id`, `name`, `bound`) плюс `create_new: true` |
+| `memory_use_project` | Привязать папку к проекту (пишет `.architectos.json`) |
+| `project_create` | Создать проект; из unbound-папки сразу биндит её |
 
-Типичный цикл агента: briefing в `instructions` при старте, затем `memory_turn` на каждое сообщение пользователя → при необходимости search/get → ответ → feedback → add явных уроков.
+Один MCP-сервер обслуживает все git-папки. Порядок bind: `--project-id` /
+`ARCHITECTOS_PROJECT_ID` **>** `.architectos.json` вверх от cwd **>**
+`project_id_for_path(cwd)` **>** без привязки. Непривязанные memory-инструменты
+**не** пишут в проект `architectos`: ошибка со списком `id` + `name`, затем
+`memory_list_projects` → `memory_use_project` или `project_create`.
+`ARCHITECTOS_PROJECT_ID` в `mcp.json` не обязателен. Новая папка Cursor/Codex/Claude
+без `.architectos.json` спрашивает снова.
+
+Типичный цикл агента: если папка уже bound — briefing в `instructions` и
+`memory_turn` на каждое сообщение; если unbound — сначала выбрать проект. Дальше
+при необходимости search/get → ответ → feedback → add явных уроков.
 
 Один факт — одна карточка: `memory_turn` и хуки пишут **MCP**; диалоги в приложении
 пишут **Ask**. Одно и то же сообщение не появляется в обоих каналах.
