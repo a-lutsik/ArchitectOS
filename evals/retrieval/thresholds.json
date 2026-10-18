@@ -1,0 +1,12 @@
+{
+  "_comment": "RATCHET for tests/test_retrieval_eval.py (hash embeddings, deterministic). Floors sit ~0.03 below the measured baseline; raise them when retrieval improves, never lower them to make a change pass. Baseline 2026-10-18: hybrid recall@10 0.559 / nDCG@10 0.599 / MRR 0.624; hybrid_graph recall@10 0.726 / nDCG@10 0.684; context recall 0.93.",
+  "provider": "hash",
+  "floors": {
+    "hybrid": {"overall": {"recall@10": 0.53, "ndcg@10": 0.57, "mrr": 0.59, "answer@1": 0.55}},
+    "hybrid_graph": {
+      "overall": {"recall@10": 0.70, "ndcg@10": 0.65, "mrr": 0.60},
+      "by_category": {"exact": {"recall@10": 0.95}, "multi_hop": {"recall@10": 0.95}, "shared": {"recall@10": 1.0}}
+    },
+    "context": {"context_recall": 0.90}
+  }
+}
