@@ -40,6 +40,32 @@ def _as_str_list(value: Any) -> list[str]:
     return [str(item).strip() for item in items if str(item).strip()]
 
 
+_WORK_ITEM_REF_RE = re.compile(r"(?<![A-Za-z0-9])(?:AB)?#(\d+)\b", re.I)
+
+
+def normalize_commit_search_text(text: str) -> str:
+    """Turn identifiers into the words Azure DevOps commit search tokenises.
+
+    The index matches message words, so ``METER_LOAD_PROFILE_PROCESSOR`` finds nothing while
+    ``meter load profile processor`` does, and ``AB#30152`` only matches as bare ``30152``.
+    """
+    cleaned = _WORK_ITEM_REF_RE.sub(r"\1", str(text or ""))
+    cleaned = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", cleaned).replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def commit_search_is_empty(result: Any) -> bool:
+    """True when a commit search answered successfully but matched nothing."""
+    payload = result.get("result") if isinstance(result, dict) and "result" in result else result
+    texts: list[str] = []
+    if isinstance(payload, dict) and isinstance(payload.get("content"), list):
+        texts = [str(item.get("text") or "") for item in payload["content"] if isinstance(item, dict)]
+    else:
+        texts = [str(payload or "")]
+    joined = "\n".join(texts)
+    return bool(re.search(r'"count"\s*:\s*0\b', joined)) and '"results":[]' in joined.replace(" ", "")
+
+
 _PR_STATUS_NAMES = {1: "Active", 2: "Abandoned", 3: "Completed"}
 
 

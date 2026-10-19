@@ -32,7 +32,7 @@ Memory-first:
 3) Work-item comments and long description parts live as linked child memory nodes — memory_get or graph neighbors after the main card.
 4) If memory has Azure Boards work item IDs or thin summaries, call boards_get_item / boards_list_comments for those IDs to refresh live details.
 5) If memory has nothing useful for the question, call memory_search with a sharper query, then boards_search (or boards_query_wiql for structured filters), then boards_get_item as needed. Boards lookups cover every work item in the project by default — never narrow them to the current user unless the user explicitly asked for their own items ("my tasks", "мои задачи", "assigned to me"); only then call boards_my_work.
-6) Prefer fs_* tools when the question needs files under the project folder. For git history — a commit hash, "which change broke this", "what did that fix touch" — use repo_* tools: repo_pull_requests_for_commit or repo_search_commits to locate the change, repo_get_pull_request for its changed files and linked work items, repo_read_file_at to see a file as of that commit, then compare with fs_read on the working copy.
+6) Prefer fs_* tools when the question needs files under the project folder. For git history — a commit hash, "which change broke this", "what did that fix touch" — use repo_* tools: repo_pull_requests_for_commit or repo_search_commits to locate the change (it matches message words: turn SNAKE_CASE names into words, search work items by bare number, and on 0 hits retry with 2-3 other phrasings or the numbers of linked work items before saying nothing was found), repo_get_pull_request for its changed files and linked work items, repo_read_file_at to see a file as of that commit, then compare with fs_read on the working copy.
 7) For meetings / “what did X say” / call notes: if memory Meeting hits are missing or thin, call granola_list_meetings, then granola_get_meetings (and granola_get_transcript when notes are incomplete). Do not answer about meeting tools when the user asked about something else (a work item, a file, or a cited memory node).
 8) Do not call tools when memory already answers the question fully. When memory is truncated, thin, off-topic, or the question is about source code behaviour, fetch/search now instead of guessing.
 9) For code questions (bugs, root cause, how X works) follow the call chain end-to-end: locate files, read them, then read their dependencies. Do not stop at search hits or file names.
@@ -79,6 +79,8 @@ from .tool_ado import (  # noqa: F401
     BOARDS_EXPAND_LEVELS,
     ado_call_plan,
     call_ado_tool,
+    commit_search_is_empty,
+    normalize_commit_search_text,
     is_empty_mcp_payload,
     mcp_tool_error_text,
 )
@@ -233,8 +235,10 @@ REPO_TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="repo_search_commits",
         description=(
-            "Search Azure Repos commits by message text, author, branch, or date range. "
-            "Use it to locate the commit behind a change before reading its pull request."
+            "Search Azure Repos commits by message words, author, branch, or date range. "
+            "Matches words in the commit message, not code identifiers: write METER_LOAD_PROFILE_PROCESSOR as "
+            "'meter load profile processor' and a work item as the bare number (30152, not AB#30152). "
+            "An empty result does not prove the commit is missing; retry with other wording or related work item ids."
         ),
         server_id="azure-devops",
         mcp_tool="repo_search_commits",
@@ -697,6 +701,7 @@ class ToolGateway:
 
     def _execute_repo(self, spec: ToolSpec, args: dict[str, Any]) -> Any:
         ado_project = self._boards_project_for(args)
+        result: Any = None
         op_args: dict[str, Any] = {"project": ado_project}
         repository = args.get("repositoryId") or args.get("repository") or args.get("repo")
         if spec.name == "repo_list_repositories":
@@ -708,7 +713,6 @@ class ToolGateway:
             if not search_text:
                 raise ValueError("repo_search_commits requires searchText")
             op_args.update({
-                "searchText": search_text,
                 "repository": repository,
                 "branch": args.get("branch"),
                 "author": args.get("author"),
@@ -716,6 +720,12 @@ class ToolGateway:
                 "commitEndDate": args.get("commitEndDate"),
                 "top": args.get("top"),
             })
+            # The index matches message words: try the identifier as words first, then as typed.
+            variants = [normalize_commit_search_text(search_text), search_text]
+            for variant in dict.fromkeys(item for item in variants if item):
+                result = call_ado_tool(self.mcp_manager, op, {**op_args, "searchText": variant})
+                if not commit_search_is_empty(result):
+                    break
         elif spec.name == "repo_pull_requests_for_commit":
             op = "pull_requests_for_commit"
             op_args.update({
@@ -749,7 +759,8 @@ class ToolGateway:
             })
         else:
             raise ValueError(f"Unsupported repo tool: {spec.name}")
-        result = call_ado_tool(self.mcp_manager, op, op_args)
+        if result is None:
+            result = call_ado_tool(self.mcp_manager, op, op_args)
         if is_empty_mcp_payload(result):
             raise MCPError(
                 f"Azure Repos returned no data for {op} in project '{ado_project}'. "
