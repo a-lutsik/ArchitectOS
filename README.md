@@ -292,6 +292,7 @@ All documentation lives in [`docs/`](docs):
 | [RELEASE_QA.md](docs/RELEASE_QA.md) | Release packaging and QA checklist. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [CODE_GRAPH.md](docs/CODE_GRAPH.md) | Architecture and code-map. |
 | [SEARCH_MEMORY_GUIDE.md](docs/SEARCH_MEMORY_GUIDE.md) | Searching and managing memory. |
+| [EVALS.md](docs/EVALS.md) | Retrieval quality & safety evals (metrics, CI gate, how to extend). |
 | [GUIDE_RU.md](docs/GUIDE_RU.md) · [PROJECT_RU.md](docs/PROJECT_RU.md) | Russian user guide & project documentation. |
 
 ---
@@ -313,6 +314,15 @@ python3 -m mypy
 MEMORY_EMBEDDING_PROVIDER=hash python3 -m coverage run -m unittest discover -s tests -p 'test_*.py'
 python3 -m coverage report --fail-under=72
 ```
+
+Retrieval quality is measured separately on a public fixture corpus
+(`tests/test_retrieval_eval.py` gates it in CI). Human-readable report:
+
+```bash
+python3 -m evals.retrieval_eval --show-misses
+```
+
+See [docs/EVALS.md](docs/EVALS.md).
 
 ---
 

@@ -685,6 +685,8 @@ class RetrievalServiceMixin:
             include_shared=bool(project_id),
             node_types=sorted(RULE_LAYER_TYPES),
         )
+        # Superseded rules (SUPERSEDES → invalid_at) are history, not governing rules.
+        nodes = [node for node in nodes if self._memory_node_visible_at(node, None)]
         vector_scores = self._vector_scores_for_query(
             query,
             project_id=project_id,
@@ -709,6 +711,8 @@ class RetrievalServiceMixin:
             include_shared=bool(project_id),
             node_types=sorted(STABLE_PACK_TYPES),
         )
+        # The always-on layer must not resurrect facts a SUPERSEDES edge retired.
+        nodes = [node for node in nodes if self._memory_node_visible_at(node, None)]
         vector_scores = self._vector_scores_for_query(
             query,
             project_id=project_id,

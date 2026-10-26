@@ -1,0 +1,47 @@
+{
+  "_comment": "Graded relevance judgments (qrels) for corpus.json. relevant: {key: grade} with 2 = the answer, 1 = useful supporting context. forbidden: keys that must never be returned for this query (superseded facts, other projects). All queries run against project_id = main_project unless 'project' is set.",
+  "queries": [
+    {"id": "ex-01", "category": "exact", "query": "TimescaleDB hypertables meter readings", "relevant": {"d_hypertable": 2, "d_compression": 1, "d_caggs": 1}},
+    {"id": "ex-02", "category": "exact", "query": "Liquibase changeset checksum", "relevant": {"l_liquibase_checksum": 2, "d_liquibase": 1}},
+    {"id": "ex-03", "category": "exact", "query": "Azure Key Vault secrets", "relevant": {"d_keyvault": 2, "l_keyvault_rotate": 1}},
+    {"id": "ex-04", "category": "exact", "query": "RabbitMQ work queue recalculation", "relevant": {"d_rabbit_new": 2, "l_heartbeat": 1, "d_idempotent": 1}, "forbidden": ["d_scheduler_old"]},
+    {"id": "ex-05", "category": "exact", "query": "Keycloak identity provider", "relevant": {"d_keycloak": 2, "c_field_auth": 1}},
+    {"id": "ex-06", "category": "exact", "query": "continuous aggregates hourly consumption", "relevant": {"d_caggs": 2}},
+    {"id": "ex-07", "category": "exact", "query": "day-ahead forecast 10:00", "relevant": {"r_forecast": 2, "l_forecast_mismatch": 1}},
+    {"id": "ex-08", "category": "exact", "query": "ELK correlation id logging", "relevant": {"d_elk": 2}},
+
+    {"id": "pa-01", "category": "paraphrase", "query": "how do we store raw interval data from smart meters", "relevant": {"d_hypertable": 2, "c_retention": 1}},
+    {"id": "pa-02", "category": "paraphrase", "query": "how long must we keep measurement history", "relevant": {"c_retention": 2}},
+    {"id": "pa-03", "category": "paraphrase", "query": "why did backlog writes for old periods fail", "relevant": {"l_compression_locks": 2, "d_compression": 1}},
+    {"id": "pa-04", "category": "paraphrase", "query": "where do passwords and connection strings come from", "relevant": {"d_keyvault": 2, "l_keyvault_rotate": 1}},
+    {"id": "pa-05", "category": "paraphrase", "query": "can we send customer consumption data to a hosted LLM API", "relevant": {"c_no_cloud_llm": 2, "d_spring_ai": 1}},
+    {"id": "pa-06", "category": "paraphrase", "query": "same message processed twice by two workers", "relevant": {"l_heartbeat": 2, "d_idempotent": 2}},
+    {"id": "pa-07", "category": "paraphrase", "query": "hiding a column in the UI is not enough for permissions", "relevant": {"c_field_auth": 2}},
+    {"id": "pa-08", "category": "paraphrase", "query": "who handles user login", "relevant": {"d_keycloak": 2}},
+
+    {"id": "ru-01", "category": "cross_lingual", "query": "как храним показания счётчиков", "relevant": {"d_hypertable": 2}},
+    {"id": "ru-02", "category": "cross_lingual", "query": "сколько лет хранить сырые данные для аудита", "relevant": {"c_retention": 2}},
+    {"id": "ru-03", "category": "cross_lingual", "query": "почему сломался деплой после правки миграции", "relevant": {"l_liquibase_checksum": 2, "d_liquibase": 1}},
+    {"id": "ru-04", "category": "cross_lingual", "query": "откуда приложение берёт секреты", "relevant": {"d_keyvault": 2}},
+    {"id": "ru-05", "category": "cross_lingual", "query": "можно ли отправлять данные клиентов во внешние LLM", "relevant": {"c_no_cloud_llm": 2}},
+    {"id": "ru-06", "category": "cross_lingual", "query": "почему новый прогноз расходился со старым", "relevant": {"l_forecast_mismatch": 2}},
+
+    {"id": "mh-01", "category": "multi_hop", "query": "RabbitMQ prefetch workers", "relevant": {"d_rabbit_new": 2, "l_heartbeat": 2, "d_idempotent": 1}, "note": "lesson is linked only through the graph, no shared words"},
+    {"id": "mh-02", "category": "multi_hop", "query": "Ollama vLLM provider routing", "relevant": {"d_spring_ai": 2, "c_no_cloud_llm": 2}, "note": "the constraint that limits this decision shares no words with the query"},
+    {"id": "mh-03", "category": "multi_hop", "query": "Key Vault configuration fallback", "relevant": {"d_keyvault": 2, "l_keyvault_rotate": 2}},
+    {"id": "mh-04", "category": "multi_hop", "query": "segmentby meter_id compression policy", "relevant": {"d_compression": 2, "l_compression_locks": 2}},
+
+    {"id": "tm-01", "category": "temporal", "query": "how are recalculation jobs scheduled", "relevant": {"d_rabbit_new": 2}, "forbidden": ["d_scheduler_old"]},
+    {"id": "tm-02", "category": "temporal", "query": "single scheduler instance Quartz", "relevant": {"d_rabbit_new": 2}, "forbidden": ["d_scheduler_old"], "note": "query wording matches only the superseded decision"},
+
+    {"id": "is-01", "category": "isolation", "query": "invoice rounding half-even", "relevant": {}, "forbidden": ["b_rounding"]},
+    {"id": "is-02", "category": "isolation", "query": "Kafka billing events retention", "relevant": {}, "forbidden": ["b_kafka"]},
+    {"id": "is-03", "category": "isolation", "query": "meter readings nightly export", "relevant": {"d_hypertable": 1}, "forbidden": ["b_meter_export"]},
+
+    {"id": "sh-01", "category": "shared", "query": "Java 21 Spring Boot baseline", "relevant": {"sh_java": 2}},
+    {"id": "sh-02", "category": "shared", "query": "blameless postmortem after incidents", "relevant": {"sh_postmortem": 2}},
+
+    {"id": "no-01", "category": "noise", "query": "best neapolitan pizza dough recipe", "relevant": {}},
+    {"id": "no-02", "category": "noise", "query": "квартальный маркетинговый бюджет", "relevant": {}}
+  ]
+}
