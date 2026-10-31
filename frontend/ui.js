@@ -70,7 +70,6 @@ function applyLanguage(language) {
   labelPrefix("#archive-after", "settings.archive");
   labelPrefix("#delete-after", "settings.delete");
   labelPrefix("#promote-after-hits", "settings.promote");
-  labelPrefix("#chat-memory-mode", "settings.chatMemoryMode");
   labelPrefix("#chat-candidate-ttl", "settings.chatCandidateTtl");
   labelPrefix("#chat-session-idle", "settings.chatSessionIdle");
   labelPrefix("#embedding-provider", "settings.embeddingProvider");

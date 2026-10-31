@@ -3885,6 +3885,57 @@ body>div:has(> svg .error-icon) {
   animation: snackbarIn .18s ease-out;
 }
 
+.snackbar:has(.snackbar-action) {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.snackbar-action {
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.snackbar-action:hover {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* Memory capture policy (Settings → Memory capture) */
+#settings-view .capture-mode-options {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+#settings-view .capture-mode-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+#settings-view .capture-mode-option:has(input:checked) {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+#settings-view .capture-mode-option input {
+  margin-top: 3px;
+}
+
+#settings-view .capture-stats {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+
 .snackbar.success {
   border-left-color: var(--ok);
 }

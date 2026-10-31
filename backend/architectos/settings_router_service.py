@@ -16,6 +16,7 @@ import threading
 from typing import Any
 
 from .embeddings import MemoryEmbeddingEngine, build_embedding_provider, probe_embedding_provider
+from .memory_capture import capture_from_legacy, legacy_mirror, normalize_capture_settings
 from .models import utc_now
 from .routing import RouterPolicy, classify_role
 
@@ -155,6 +156,7 @@ class SettingsRouterServiceMixin:
         settings.setdefault("memory_lifecycle", self.memory_lifecycle.settings())
         settings.setdefault("memory_retrieval", self.memory_embeddings.settings())
         settings["memory_dedup"] = self.memory_dedup_settings()
+        settings["memory_capture"] = {**self.memory_capture_settings(), "stats_7d": self.memory_capture_stats(days=7)}
         settings["memory_embeddings"] = self.memory_embeddings_status()
         settings["vector_runtime"] = self.vector_runtime_status(discover=False)
         settings["integrations"] = self.integration_credentials()
@@ -258,7 +260,7 @@ class SettingsRouterServiceMixin:
         for key, value in payload.items():
             if not isinstance(value, dict):
                 raise ValueError("settings values must be objects")
-            if key in {"memory_lifecycle", "ui", "security", "workspace", "router", "memory_retrieval", "memory_dedup"}:
+            if key in {"memory_lifecycle", "ui", "security", "workspace", "router", "memory_retrieval", "memory_dedup", "memory_capture"}:
                 current = dict(self.repository.get_setting(key) or {})
                 incoming = dict(value)
                 if key == "memory_retrieval":
@@ -269,6 +271,7 @@ class SettingsRouterServiceMixin:
                 self.repository.set_setting(key, current)
             else:
                 self.repository.set_setting(key, value)
+        self._sync_memory_capture_mirror(payload)
         if "memory_retrieval" in payload:
             # Rebuild only when the embedding identity changes — timeout/pool/min_score are live.
             identity_keys = ("embeddings_enabled", "embedding_provider", "embedding_model", "embedding_dimensions", "embedding_base_url", "embedding_account_id")
@@ -280,6 +283,35 @@ class SettingsRouterServiceMixin:
             self._reload_embedding_engine(rebuild=needs_rebuild)
         self._sync_router_settings()
         return self.settings()
+
+    def memory_capture_settings(self) -> dict[str, Any]:
+        """Capture policy (``memory_capture``), derived from legacy keys when unset."""
+        raw = self.repository.get_setting("memory_capture")
+        if not raw:
+            return capture_from_legacy(self.repository.get_setting("memory_lifecycle"))
+        return normalize_capture_settings(raw)
+
+    def _sync_memory_capture_mirror(self, payload: dict[str, Any]) -> None:
+        """Keep ``memory_capture`` and the legacy lifecycle keys saying the same thing.
+
+        The policy is the source of truth. A patch to the legacy keys alone
+        (older UI, scripts, tests) re-derives the policy from them; a patch to
+        the policy rewrites the legacy keys so every reader agrees.
+        """
+        legacy_patch = dict(payload.get("memory_lifecycle") or {})
+        touched_legacy = any(key in legacy_patch for key in ("chat_memory_mode", "chat_auto_accept"))
+        if "memory_capture" in payload:
+            policy = normalize_capture_settings(self.repository.get_setting("memory_capture"))
+        elif touched_legacy:
+            policy = capture_from_legacy(self.repository.get_setting("memory_lifecycle"))
+        else:
+            return
+        self.repository.set_setting("memory_capture", {k: policy[k] for k in ("mode", "aggressiveness", "min_confidence")})
+        life = dict(self.repository.get_setting("memory_lifecycle") or {})
+        mirror = legacy_mirror(policy)
+        if any(life.get(key) != value for key, value in mirror.items()):
+            life.update(mirror)
+            self.repository.set_setting("memory_lifecycle", life)
 
     def _reload_embedding_engine(self, *, rebuild: bool = False) -> None:
         retrieval_settings = dict(self.repository.get_setting("memory_retrieval") or {})

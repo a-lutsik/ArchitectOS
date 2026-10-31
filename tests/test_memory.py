@@ -77,6 +77,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
     def test_chat_turn_does_not_create_candidate_until_session_ends(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_capture": {"mode": "review"}})
             result = service.post_chat_message({
                 "project_id": "architectos",
                 "message": "Architecture decision: useful chat turns should become reviewable memory candidates.",
@@ -101,6 +102,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
     def test_session_finalize_enqueues_one_candidate_per_fact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_capture": {"mode": "review"}})
             result = service.post_chat_message({
                 "project_id": "architectos",
                 "message": "Architecture decision: never commit directly to main.\nConstraint: always use pytest for tests.",
@@ -233,6 +235,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
     def test_stale_chat_candidates_expire_by_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_capture": {"mode": "review"}})
             service.update_settings({"memory_lifecycle": {"chat_candidate_ttl_days": 1}})
             result = service.post_chat_message({
                 "project_id": "architectos",
@@ -253,6 +256,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
     def test_idle_finalize_creates_session_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_capture": {"mode": "review"}})
             service.update_settings({"memory_lifecycle": {"chat_session_idle_minutes": 1}})
             created = service.post_chat_message({
                 "project_id": "architectos",
@@ -377,6 +381,7 @@ class ArchitectOSMemoryTests(unittest.TestCase):
     def test_council_turn_persists_chat_without_per_turn_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_capture": {"mode": "review"}})
 
             def fake_run_ai(payload):
                 return {

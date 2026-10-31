@@ -113,7 +113,32 @@ async function finalizeChatSession(chatId, trigger = "manual") {
   });
   await loadChats({ openDefault: false });
   await loadMemoryCandidates();
+  notifyCaptureOutcome(result);
   return result;
+}
+
+/* "Saved N facts" after End session, with Undo for what the auto policy wrote. */
+function notifyCaptureOutcome(result) {
+  const atoms = Array.isArray(result?.atoms) ? result.atoms : [];
+  const saved = atoms.filter(item => item?.status === "promoted" && item?.metadata?.auto_accepted);
+  const queued = atoms.filter(item => item?.status === "candidate");
+  if (!saved.length && !queued.length) return;
+  const parts = [];
+  if (saved.length) parts.push(t("capture.saved").replace("{count}", String(saved.length)));
+  if (queued.length) parts.push(t("capture.queued").replace("{count}", String(queued.length)));
+  const action = saved.length
+    ? {
+      label: t("capture.undo"),
+      onClick: async () => {
+        for (const item of saved) {
+          await api("/api/memory/capture/undo", { method: "POST", body: JSON.stringify({ candidate_id: item.id }) }).catch(showError);
+        }
+        showSnackbar(t("capture.undone").replace("{count}", String(saved.length)), "info");
+        await loadMemoryCandidates().catch(() => {});
+      },
+    }
+    : null;
+  showSnackbar(parts.join(" · "), "success", action ? { action } : {});
 }
 const CHAT_SUGGESTIONS = [
   "Explain adapter routing",

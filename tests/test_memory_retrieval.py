@@ -1066,6 +1066,7 @@ class MemoryAsyncIndexingTests(unittest.TestCase):
     def test_autoscan_skips_chat_dump_when_session_summary_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_capture": {"mode": "review"}})
             result = service.post_chat_message({
                 "project_id": "architectos",
                 "message": "Architecture decision: useful chat turns should become reviewable memory candidates.",
@@ -1127,6 +1128,7 @@ class MemoryAsyncIndexingTests(unittest.TestCase):
     def test_finalize_retires_autoscan_chat_dump(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
+            service.update_settings({"memory_capture": {"mode": "review"}})
             posted = service.post_chat_message({
                 "project_id": "architectos",
                 "message": "Architecture decision: useful chat turns should become reviewable memory candidates.",
@@ -1414,14 +1416,17 @@ class MemoryChatAutoAcceptTests(unittest.TestCase):
         payload.update(overrides)
         return service.repository.upsert_memory_candidate(payload)
 
-    def test_auto_accept_skips_decisions_even_when_enabled(self) -> None:
+    def test_auto_accept_writes_decisions_in_auto_mode_and_holds_them_in_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
             candidate = self._candidate(service, type="Decision")
-            result = service._maybe_auto_accept_chat_candidate(candidate, service.memory_lifecycle.settings())  # noqa: SLF001
-            self.assertIsNone(result)
-            stored = service.repository.get_memory_candidate("cand_auto_1")
-            self.assertEqual(stored.get("status"), "candidate")
+            result = service._maybe_auto_accept_chat_candidate(candidate)  # noqa: SLF001
+            self.assertIsNotNone(result)
+            self.assertEqual(service.repository.get_memory_candidate("cand_auto_1").get("status"), "promoted")
+            service.update_settings({"memory_capture": {"mode": "review"}})
+            held = self._candidate(service, id="cand_auto_2", type="Decision")
+            self.assertIsNone(service._maybe_auto_accept_chat_candidate(held))  # noqa: SLF001
+            self.assertEqual(service.repository.get_memory_candidate("cand_auto_2").get("status"), "candidate")
 
     def test_auto_accept_promotes_low_risk_lesson_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

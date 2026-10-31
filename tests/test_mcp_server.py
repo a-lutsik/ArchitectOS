@@ -314,9 +314,10 @@ class MemoryMCPServerTests(unittest.TestCase):
         self.assertIn("Never commit to main", briefing)
         self.assertIn("Stable memory", briefing)
 
-    def test_memory_turn_packs_and_queues_constraint(self) -> None:
+    def test_memory_turn_queues_decision_in_review_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server = self._server(Path(tmp))
+            server.service.update_settings({"memory_capture": {"mode": "review"}})
             responses = _run(server, [
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_turn", "arguments": {
                     "user_text": "Architecture decision: never commit directly to main.",
@@ -328,8 +329,28 @@ class MemoryMCPServerTests(unittest.TestCase):
         text = result["content"][0]["text"]
         payload = json.loads(text.split("```json", 1)[1].rsplit("```", 1)[0])
         self.assertTrue(payload.get("kept"))
+        self.assertEqual(payload.get("capture_mode"), "review")
         self.assertGreaterEqual(len(payload.get("queued") or []), 1)
         self.assertEqual(payload["queued"][0]["type"], "Decision")
+        self.assertEqual(payload.get("auto_accepted"), [])
+
+    def test_memory_turn_writes_decision_at_once_in_auto_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            responses = _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_turn", "arguments": {
+                    "user_text": "Architecture decision: never commit directly to main.",
+                    "project_id": "architectos",
+                }}},
+            ])
+        result = responses[0]["result"]
+        self.assertFalse(result.get("isError"))
+        payload = json.loads(result["content"][0]["text"].split("```json", 1)[1].rsplit("```", 1)[0])
+        self.assertEqual(payload.get("capture_mode"), "auto")
+        self.assertEqual(payload.get("queued"), [])
+        self.assertGreaterEqual(len(payload.get("auto_accepted") or []), 1)
+        self.assertEqual(payload["auto_accepted"][0]["type"], "Decision")
+        self.assertTrue(payload["auto_accepted"][0]["metadata"].get("auto_accepted"))
 
     def test_memory_turn_auto_writes_low_risk_lesson(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

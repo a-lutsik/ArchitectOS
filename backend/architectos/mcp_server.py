@@ -585,12 +585,15 @@ class MemoryMCPServer:
         queued = result.get("queued") or []
         accepted = result.get("auto_accepted") or []
         notes = []
+        capture_mode = str(result.get("capture_mode") or "")
         if accepted:
-            notes.append(f"Auto-wrote {len(accepted)} low-risk lesson(s) to short-term memory.")
+            notes.append(f"Saved {len(accepted)} fact(s) to memory (capture mode auto; undoable in Memory).")
         if queued:
             notes.append(f"Queued {len(queued)} fact(s) for review (7-day TTL).")
         if not accepted and not queued and result.get("kept"):
             notes.append("Turn was durable but produced no new atoms (duplicate or filtered).")
+        if capture_mode == "off" and not result.get("kept"):
+            notes.append("Memory capture is off: only explicit memory_add is stored.")
         summary = pack if pack else "No memory pack for this turn."
         if notes:
             summary = f"{summary}\n\n" + " ".join(notes)
@@ -599,9 +602,13 @@ class MemoryMCPServer:
             "context": pack,
             "hits": [_compact_hit(hit) for hit in result.get("hits") or []],
             "queued": [{"id": item.get("id"), "label": item.get("label"), "type": item.get("type")} for item in queued],
-            "auto_accepted": [{"id": item.get("id"), "label": item.get("label"), "promoted_node_id": item.get("promoted_node_id")} for item in accepted],
+            "auto_accepted": [
+                {"id": item.get("id"), "label": item.get("label"), "type": item.get("type"), "promoted_node_id": item.get("promoted_node_id"), "metadata": {"auto_accepted": True}}
+                for item in accepted
+            ],
             "kept": result.get("kept"),
             "reason": result.get("reason"),
+            "capture_mode": capture_mode,
         }
         return _tool_result(summary, data)
 

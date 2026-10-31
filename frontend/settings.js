@@ -28,7 +28,9 @@ async function loadSettings() {
   const sourceSchedulerEnabled = document.querySelector("#source-scheduler-enabled");
   const sourceSchedulerTick = document.querySelector("#source-scheduler-tick");
   const sourceDefaultInterval = document.querySelector("#source-default-interval");
-  const chatMemoryMode = document.querySelector("#chat-memory-mode");
+  const capture = settings.memory_capture || {};
+  const captureAggressiveness = document.querySelector("#capture-aggressiveness");
+  const captureMinConfidence = document.querySelector("#capture-min-confidence");
   const chatCandidateTtl = document.querySelector("#chat-candidate-ttl");
   const chatSessionIdle = document.querySelector("#chat-session-idle");
   const chatStoreFactsOnly = document.querySelector("#chat-store-facts-only");
@@ -53,7 +55,11 @@ async function loadSettings() {
   if (sourceSchedulerEnabled) sourceSchedulerEnabled.checked = lifecycle.source_scheduler_enabled !== false;
   if (sourceSchedulerTick) sourceSchedulerTick.value = lifecycle.source_scheduler_tick_minutes ?? 5;
   if (sourceDefaultInterval) sourceDefaultInterval.value = lifecycle.source_default_interval_minutes ?? 60;
-  if (chatMemoryMode) chatMemoryMode.value = lifecycle.chat_memory_mode || "strict";
+  const captureMode = document.querySelector(`input[name="capture-mode"][value="${capture.mode || "auto"}"]`);
+  if (captureMode) captureMode.checked = true;
+  if (captureAggressiveness) captureAggressiveness.value = capture.aggressiveness || "normal";
+  if (captureMinConfidence) captureMinConfidence.value = capture.min_confidence ?? 0.7;
+  renderCaptureStats(capture.stats_7d);
   if (chatCandidateTtl) chatCandidateTtl.value = lifecycle.chat_candidate_ttl_days ?? 7;
   if (chatSessionIdle) chatSessionIdle.value = lifecycle.chat_session_idle_minutes ?? 30;
   if (chatStoreFactsOnly) chatStoreFactsOnly.checked = lifecycle.chat_store_facts_only !== false;
@@ -64,6 +70,20 @@ async function loadSettings() {
   state.onboardingComplete = ui.onboarding_complete === true;
   fillEmbeddingsSettings(settings);
   fillIntegrationCredentials(settings.integrations || {});
+}
+
+function renderCaptureStats(stats) {
+  const el = document.querySelector("#capture-stats");
+  if (!el) return;
+  if (!stats) {
+    el.textContent = "";
+    return;
+  }
+  el.textContent = t("settings.captureStats")
+    .replace("{days}", String(stats.days ?? 7))
+    .replace("{saved}", String(stats.auto_saved ?? 0))
+    .replace("{queued}", String(stats.queued ?? 0))
+    .replace("{undone}", String(stats.undone ?? 0));
 }
 
 function fillEmbeddingsSettings(settings) {

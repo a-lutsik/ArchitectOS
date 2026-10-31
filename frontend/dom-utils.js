@@ -29,7 +29,7 @@ function on(selector, eventName, handler, options) {
 function onAll(selector, eventName, handler, options) {
   document.querySelectorAll(selector).forEach(el => el.addEventListener(eventName, handler, options));
 }
-function showSnackbar(message, tone = "info") {
+function showSnackbar(message, tone = "info", options = {}) {
   let stack = document.querySelector("#snackbar-stack");
   if (!stack) {
     stack = document.createElement("div");
@@ -40,14 +40,25 @@ function showSnackbar(message, tone = "info") {
   const item = document.createElement("div");
   item.className = `snackbar ${tone}`.trim();
   item.setAttribute("role", tone === "error" ? "alert" : "status");
-  item.innerHTML = `<span>${escapeHtml(message)}</span><button type="button" aria-label="Dismiss">&times;</button>`;
+  const action = options.action && options.action.label
+    ? `<button type="button" class="snackbar-action">${escapeHtml(options.action.label)}</button>`
+    : "";
+  item.innerHTML = `<span>${escapeHtml(message)}</span>${action}<button type="button" class="snackbar-close" aria-label="Dismiss">&times;</button>`;
   stack.appendChild(item);
   const close = () => {
     item.classList.add("leaving");
     window.setTimeout(() => item.remove(), 180);
   };
-  on(item.querySelector("button"), "click", close);
-  window.setTimeout(close, tone === "error" ? 7000 : 4200);
+  on(item.querySelector(".snackbar-close"), "click", close);
+  const actionButton = item.querySelector(".snackbar-action");
+  if (actionButton) {
+    on(actionButton, "click", () => {
+      actionButton.disabled = true;
+      Promise.resolve(options.action.onClick?.()).finally(close);
+    });
+  }
+  const duration = Number(options.duration) || (action ? 9000 : tone === "error" ? 7000 : 4200);
+  window.setTimeout(close, duration);
 }
 function labelPrefix(inputSelector, key) {
   const input = document.querySelector(inputSelector);

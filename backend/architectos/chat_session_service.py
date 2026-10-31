@@ -12,7 +12,7 @@ the MRO on :class:`ArchitectOSService`.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +23,8 @@ from .chat_memory import (
     evaluate_chat_turn,
     facts_from_markdown_summary,
     infer_fact_subject,
-    normalize_chat_memory_mode,
 )
+from .memory_capture import filter_facts_for_policy
 from .models import stable_id, utc_now
 
 _LOG = logging.getLogger("architectos.service")
@@ -48,9 +48,10 @@ class ChatSessionServiceMixin:
         chat = dict(chat)
         actual_project_id = str(chat.get("project_id") or project_id or "architectos")
         life = self.memory_lifecycle.settings()
-        mode = normalize_chat_memory_mode(life.get("chat_memory_mode"))
+        policy = self.memory_capture_settings()
+        mode = policy["chat_memory_mode"]
         if mode == "off" and not force and trigger != "manual":
-            return {"chat": chat, "candidate": None, "skipped": True, "reason": "chat_memory_mode=off"}
+            return {"chat": chat, "candidate": None, "skipped": True, "reason": "memory_capture=off"}
 
         all_messages = list(chat.get("messages") or [])
         start_index = max(0, min(int(chat.get("session_start_message_index") or 0), len(all_messages)))
@@ -121,7 +122,9 @@ class ChatSessionServiceMixin:
             skip_ask_card = self._facts_already_captured_as_mcp(actual_project_id, facts)
             saved = None
             atoms: list[dict[str, Any]] = []
-            if not skip_ask_card:
+            # mode=off: the session still closes with a context-only summary,
+            # but nothing enters memory or the Review Queue without an explicit save.
+            if not skip_ask_card and policy["mode"] != "off":
                 atoms = self._enqueue_session_fact_atoms(
                     actual_project_id,
                     chat_id,
@@ -169,7 +172,7 @@ class ChatSessionServiceMixin:
                     {"trigger": trigger, "revision": revision},
                 )
             elif saved:
-                promoted = self._maybe_auto_accept_chat_candidate(saved, life)
+                promoted = self._maybe_auto_accept_chat_candidate(saved, policy)
                 if promoted and promoted.get("memory"):
                     self._record_keeper_event(
                         actual_project_id,
@@ -277,8 +280,15 @@ class ChatSessionServiceMixin:
         template: str = "chat_session_atom",
         id_kind: str = "chat_session_atom",
     ) -> list[dict[str, Any]]:
-        """One review-queue candidate per durable fact, not one blob for the whole chat."""
-        facts = collapse_similar_facts(list(facts or []), limit=12)
+        """One candidate per durable fact, not one blob for the whole chat.
+
+        The capture policy decides whether each atom is written at once
+        (``mode=auto``) or waits in the Review Queue (``mode=review``).
+        """
+        policy = self.memory_capture_settings()
+        if policy["mode"] == "off":
+            return []
+        facts = collapse_similar_facts(filter_facts_for_policy(list(facts or []), policy), limit=12)
         saved_atoms: list[dict[str, Any]] = []
         origin = "mcp" if source_type == "mcp" else "session_keeper"
         from_mcp = source_type == "mcp"
@@ -323,7 +333,7 @@ class ChatSessionServiceMixin:
             saved = self.repository.upsert_memory_candidate(prepared[0])
             if not saved:
                 continue
-            promoted = self._maybe_auto_accept_chat_candidate(saved, self.memory_lifecycle.settings())
+            promoted = self._maybe_auto_accept_chat_candidate(saved, policy)
             if promoted and promoted.get("memory"):
                 saved = self.repository.get_memory_candidate(str(saved.get("id") or "")) or saved
                 self._record_keeper_event(
@@ -392,7 +402,7 @@ class ChatSessionServiceMixin:
         idle_minutes = int(life.get("chat_session_idle_minutes") or 0)
         if idle_minutes <= 0:
             return {"finalized": 0, "idle_minutes": idle_minutes, "disabled": True}
-        if normalize_chat_memory_mode(life.get("chat_memory_mode")) == "off":
+        if self.memory_capture_settings()["chat_memory_mode"] == "off":
             return {"finalized": 0, "idle_minutes": idle_minutes, "disabled": True}
         now = datetime.now(timezone.utc)
         finalized = 0
@@ -617,7 +627,8 @@ class ChatSessionServiceMixin:
         user_text = str(user_text or "").strip()
         assistant_text = str(assistant_text or "").strip()
         life = self.memory_lifecycle.settings()
-        mode = normalize_chat_memory_mode(life.get("chat_memory_mode"))
+        policy = self.memory_capture_settings()
+        mode = policy["chat_memory_mode"]
         verdict = evaluate_chat_turn(user_text, assistant_text, mode=mode)
         if not verdict.keep:
             self._record_keeper_event(
@@ -631,7 +642,7 @@ class ChatSessionServiceMixin:
             return None
 
         facts_only = bool(life.get("chat_store_facts_only", True))
-        facts = list(verdict.facts or [])
+        facts = filter_facts_for_policy(list(verdict.facts or []), policy)
         if facts_only and facts:
             saved_last = None
             for index, fact in enumerate(facts[:3]):
@@ -674,7 +685,7 @@ class ChatSessionServiceMixin:
                 if not prepared:
                     continue
                 saved_last = self.repository.upsert_memory_candidate(prepared[0])
-                promoted = self._maybe_auto_accept_chat_candidate(saved_last, life)
+                promoted = self._maybe_auto_accept_chat_candidate(saved_last, policy)
                 if promoted and promoted.get("memory"):
                     self._record_keeper_event(
                         project_id,
@@ -733,10 +744,56 @@ class ChatSessionServiceMixin:
         self._record_keeper_event(project_id, chat_id, source, "candidate_created", f"Created memory candidate: {saved.get('label')}", {"candidate_id": saved.get("id"), **dict(metadata or {})})
         return saved
 
-    # Low-risk only. Decisions / constraints / requirements stay in review.
-    CHAT_AUTO_ACCEPT_TYPES = {"Lesson"}
+    # Fact types the extractor produces. Rules-keeper cards ("Rule", template
+    # rules_keeper) and raw turn dumps are not fact atoms and always go to review.
+    CHAT_AUTO_ACCEPT_TYPES = {"Lesson", "Decision", "Constraint", "Requirement"}
     CHAT_AUTO_ACCEPT_TEMPLATES = {"chat_session_atom", "chat_fact_keeper", "mcp_turn_atom"}
-    CHAT_AUTO_ACCEPT_MIN_CONFIDENCE = 0.70
+
+    def undo_auto_capture(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Take back a fact the ``auto`` policy wrote: archive the node, reject the candidate."""
+        candidate_id = str(payload.get("candidate_id") or "").strip()
+        candidate = self.repository.get_memory_candidate(candidate_id) if candidate_id else None
+        if not candidate:
+            raise ValueError("memory candidate not found")
+        meta = dict(candidate.get("metadata") or {})
+        if not meta.get("auto_accepted") or candidate.get("status") != "promoted":
+            raise ValueError("candidate was not auto-captured")
+        node = self.repository.get_node(str(candidate.get("promoted_node_id") or ""))
+        if node is not None and node.status == "active":
+            node.status = "archived"
+            node.metadata["archived_at"] = utc_now()
+            node.metadata["archived_reason"] = "auto_capture_undo"
+            node = self.repository.upsert_node(node)
+            try:
+                self.repository.record_memory_event(node.id, "archived", actor="ui", details={"reason": "auto_capture_undo", "candidate_id": candidate_id})
+            except Exception as exc:  # history is best-effort
+                _LOG.warning("undo event skipped: %s", exc)
+        candidate["status"] = "rejected"
+        candidate["rejected_at"] = utc_now()
+        candidate["reject_reason"] = "auto capture undone"
+        candidate["metadata"] = {**meta, "auto_capture_undone": True}
+        candidate = self.repository.update_memory_candidate(candidate)
+        self._record_keeper_event(
+            str(candidate.get("project_id") or "architectos"),
+            str(candidate.get("source_ref") or ""),
+            "session_keeper",
+            "undone",
+            f"Undid auto-captured fact: {candidate.get('label')}",
+            {"candidate_id": candidate_id, "node_id": getattr(node, "id", "")},
+        )
+        return {"candidate": candidate, "memory": node.to_dict() if node else None}
+
+    def memory_capture_stats(self, days: int = 7, project_id: str | None = None) -> dict[str, Any]:
+        """Counters behind the capture setting: what the policy did lately."""
+        since = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%dT%H:%M:%SZ")
+        counts = self.repository.count_keeper_events_since(since, project_id)
+        return {
+            "days": int(days),
+            "auto_saved": int(counts.get("auto_accepted", 0)),
+            "queued": int(counts.get("candidate_created", 0)),
+            "undone": int(counts.get("undone", 0)),
+            "skipped": int(counts.get("skipped", 0)),
+        }
 
     def project_id_for_path(self, path: str | None) -> str | None:
         """Map a working directory to the project that owns it (longest root wins).
@@ -791,8 +848,8 @@ class ChatSessionServiceMixin:
         user = str(user_text or "").strip()
         assistant = str(assistant_text or "").strip()
         packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
-        life = self.memory_lifecycle.settings()
-        mode = normalize_chat_memory_mode(life.get("chat_memory_mode"))
+        policy = self.memory_capture_settings()
+        mode = policy["chat_memory_mode"]
         verdict = evaluate_chat_turn(user, assistant, mode=mode)
         source_ref = stable_id("mcp_turn", actual_project_id, user[:240], assistant[:240])
         trigger = f"hook_turn:{client}" if client else "mcp_turn"
@@ -817,23 +874,27 @@ class ChatSessionServiceMixin:
             "hits": packed.get("hits") or [],
             "kept": bool(verdict.keep),
             "reason": verdict.reason,
+            "capture_mode": policy["mode"],
             "atoms": atoms,
             "queued": queued,
             "auto_accepted": accepted,
         }
 
-    def _maybe_auto_accept_chat_candidate(self, candidate: dict[str, Any] | None, settings: dict[str, Any]) -> dict[str, Any] | None:
-        """Promote low-risk Lesson atoms; decisions and constraints stay in review.
+    def _maybe_auto_accept_chat_candidate(self, candidate: dict[str, Any] | None, settings: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Write an extracted fact at once when the capture policy is ``auto``.
 
-        Default on. Requires a fact template, source_ref, confidence ≥ 0.70, and
-        no near-duplicate of an existing node. The promoted node has
-        metadata.auto_accepted=True.
+        Requires a fact template, source_ref and confidence ≥
+        ``memory_capture.min_confidence``. Duplicates, revisions (value
+        updates) and near-duplicates/conflicts found by the dedup gate stay in
+        review whatever the mode. The promoted node has
+        metadata.auto_accepted=True so ``undo_auto_capture`` can reverse it.
         """
-        if not settings.get("chat_auto_accept"):
+        policy = settings if settings and "mode" in settings else self.memory_capture_settings()
+        if policy.get("mode") != "auto":
             return None
         if not candidate or str(candidate.get("status") or "candidate") != "candidate":
             return None
-        if float(candidate.get("confidence") or 0.0) < self.CHAT_AUTO_ACCEPT_MIN_CONFIDENCE:
+        if float(candidate.get("confidence") or 0.0) < float(policy.get("min_confidence") or 0.0):
             return None
         if not str(candidate.get("source_ref") or "").strip():
             return None
@@ -923,7 +984,7 @@ class ChatSessionServiceMixin:
 
     def _after_chat_turn(self, project_id: str, chat_id: str, user_text: str, assistant_text: str, *, source: str) -> None:
         self._update_chat_summaries(project_id, chat_id, user_text, assistant_text)
-        mode = normalize_chat_memory_mode(self.memory_lifecycle.settings().get("chat_memory_mode"))
+        mode = self.memory_capture_settings()["chat_memory_mode"]
         if mode == "off":
             return
         # Rules keeper only when the turn already looks durable (avoid chitchat → rule spam).
@@ -935,7 +996,7 @@ class ChatSessionServiceMixin:
             self._record_keeper_event(project_id, chat_id, "rules_keeper", "candidate_created", f"Created rule candidate: {rule_candidate.get('label')}", {"candidate_id": rule_candidate.get("id")})
 
     def _chat_turn_worth_memory(self, user_text: str, assistant_text: str) -> bool:
-        mode = normalize_chat_memory_mode(self.memory_lifecycle.settings().get("chat_memory_mode"))
+        mode = self.memory_capture_settings()["chat_memory_mode"]
         return evaluate_chat_turn(user_text, assistant_text, mode=mode).keep
 
     def _chat_turn_memory_title(self, user_text: str) -> str:

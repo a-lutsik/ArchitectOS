@@ -5,6 +5,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 from .models import MemoryEdge, MemoryNode, Project, stable_id, utc_now
 from .storage_defaults import _default_provider_command
@@ -121,7 +122,7 @@ class StorageSessionsMixin:
         event, redacted = _sanitize_payload(dict(event))
         if redacted:
             event["security_redacted"] = True
-        event.setdefault("id", stable_id("keeper-event", event.get("project_id", "architectos"), event.get("chat_id", ""), event.get("kind", ""), utc_now()))
+        event.setdefault("id", stable_id("keeper-event", event.get("project_id", "architectos"), event.get("chat_id", ""), event.get("kind", ""), utc_now(), uuid4().hex))
         event.setdefault("project_id", "architectos")
         event.setdefault("chat_id", "")
         event.setdefault("status", "info")
@@ -133,6 +134,18 @@ class StorageSessionsMixin:
                 (event["id"], event["project_id"], event["chat_id"], event["status"], event["updated_at"], json.dumps(event, sort_keys=True)),
             )
         return event
+
+    def count_keeper_events_since(self, since: str, project_id: str | None = None) -> dict[str, int]:
+        """Keeper events per status since ``since`` (ISO) — the capture counters."""
+        sql = "SELECT status, count(*) AS n FROM keeper_events WHERE updated_at >= ?"
+        params: list[Any] = [since]
+        if project_id:
+            sql += " AND project_id = ?"
+            params.append(project_id)
+        sql += " GROUP BY status"
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return {str(row["status"]): int(row["n"]) for row in rows}
 
     def list_keeper_events(self, project_id: str | None = None, chat_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         sql = "SELECT payload FROM keeper_events"

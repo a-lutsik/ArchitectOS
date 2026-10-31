@@ -45,9 +45,11 @@ of other MCP servers; this feature makes ArchitectOS a *server* for other agents
 Typical agent loop: initialize `instructions` already include a short stable-memory briefing.
 At the start of every user message call `memory_turn` with that message (pack + fact
 capture). Still use `memory_search` / `memory_get` to narrow; `memory_add` for an
-explicit lesson; `memory_feedback` to rate hits. Low-risk Lessons from `memory_turn`
-auto-write to short-term memory; Decisions/Constraints stay in the review queue (7-day TTL)
-with source **MCP** (not Ask). The same durable fact from an Ask dialog is not queued twice.
+explicit lesson; `memory_feedback` to rate hits. Facts from `memory_turn` follow the
+memory capture policy (`memory_capture.mode`: `auto` writes them at once, `review`
+queues them for 7 days, `off` keeps only explicit `memory_add`); the result reports
+`capture_mode`, `auto_accepted` and `queued`. Cards carry source **MCP** (not Ask).
+The same durable fact from an Ask dialog is not queued twice.
 
 ### Exposed resources (management views)
 

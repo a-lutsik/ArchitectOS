@@ -51,7 +51,7 @@ MCP `memory_turn` and agent hooks use the same capture path (`capture_memory_tur
 
 The same durable fact is one card. The first channel wins; Ask does not recast an MCP fact (and the reverse). Completed Ask threads are not dumped again by AutoScan.
 
-Chat-memory mode (`off` / `strict` / `aggressive`) lives under **Settings → Chat memory**. Agent-hook install is **Setup → Agent hooks**; see `docs/AGENT_HOOKS.md` and `docs/MCP_MEMORY_SERVER.md`.
+The memory capture policy (`memory_capture`: `mode` `auto` / `review` / `off`, `aggressiveness` `conservative` / `normal` / `eager`, `min_confidence`) lives under **Settings → Memory capture**; the former `memory_lifecycle.chat_memory_mode` / `chat_auto_accept` keys are kept as mirrors of it. Agent-hook install is **Setup → Agent hooks**; see `docs/AGENT_HOOKS.md` and `docs/MCP_MEMORY_SERVER.md`.
 
 ## No Secrets
 

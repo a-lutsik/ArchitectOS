@@ -2442,24 +2442,63 @@
 
               <section class="panel settings-card settings-page" data-settings-page="chat-memory" hidden>
               <div class="panel-header">
-                <h3 data-i18n="settings.group.chatMemory">Chat memory</h3>
+                <h3 data-i18n="settings.group.chatMemory">Memory capture</h3>
               </div>
               <fieldset class="settings-section">
-                <legend class="visually-hidden" data-i18n="settings.group.chatMemory">Chat memory</legend>
-                <p class="settings-section-desc" data-i18n="settings.group.chatMemory.desc">How Ask conversations become
-                  memory candidates. Stricter modes store less noise; aggressive stores more and needs more review.</p>
+                <legend class="visually-hidden" data-i18n="settings.group.chatMemory">Memory capture</legend>
+                <p class="settings-section-desc" data-i18n="settings.group.chatMemory.desc">What happens to the durable
+                  facts ArchitectOS extracts from Ask, MCP agents and IDE hooks. The extractor is the same in every
+                  mode; the mode only decides whether a fact is written at once or waits for you.</p>
+                <div class="capture-mode-options" role="radiogroup" aria-labelledby="capture-mode-label">
+                  <span id="capture-mode-label" class="settings-field-label" data-i18n="settings.captureMode">How to save
+                    what matters</span>
+                  <label class="capture-mode-option">
+                    <input type="radio" name="capture-mode" value="auto" checked>
+                    <span class="setting-toggle-copy">
+                      <span class="setting-toggle-title" data-i18n="settings.captureMode.auto">Automatically — like
+                        Claude</span>
+                      <span class="setting-toggle-desc" data-i18n="settings.captureMode.auto.desc">Facts are written to
+                        memory right away and can be undone. Conflicts, changed values and low-confidence facts still
+                        wait in the Review Queue.</span>
+                    </span>
+                  </label>
+                  <label class="capture-mode-option">
+                    <input type="radio" name="capture-mode" value="review">
+                    <span class="setting-toggle-copy">
+                      <span class="setting-toggle-title" data-i18n="settings.captureMode.review">Through review</span>
+                      <span class="setting-toggle-desc" data-i18n="settings.captureMode.review.desc">Same selection, but
+                        every fact becomes a candidate you accept or reject.</span>
+                    </span>
+                  </label>
+                  <label class="capture-mode-option">
+                    <input type="radio" name="capture-mode" value="off">
+                    <span class="setting-toggle-copy">
+                      <span class="setting-toggle-title" data-i18n="settings.captureMode.off">Off</span>
+                      <span class="setting-toggle-desc" data-i18n="settings.captureMode.off.desc">Only explicit saves:
+                        "Remember …", ★ on a reply, MCP memory_add.</span>
+                    </span>
+                  </label>
+                  <p id="capture-stats" class="capture-stats muted"></p>
+                </div>
                 <div class="settings-grid settings-grid-3">
                   <label class="settings-field">
-                    <span class="settings-field-label" data-i18n="settings.chatMemoryMode">Chat memory mode</span>
-                    <select id="chat-memory-mode">
-                      <option value="off" data-i18n="settings.chatMemoryMode.off">Off (★ / Remember only)</option>
-                      <option value="strict" selected data-i18n="settings.chatMemoryMode.strict">Strict (session
-                        summary)</option>
-                      <option value="aggressive" data-i18n="settings.chatMemoryMode.aggressive">Aggressive</option>
+                    <span class="settings-field-label" data-i18n="settings.captureAggressiveness">How much to pick
+                      up</span>
+                    <select id="capture-aggressiveness">
+                      <option value="conservative" data-i18n="settings.captureAggressiveness.conservative">Conservative
+                        (only what you said)</option>
+                      <option value="normal" selected data-i18n="settings.captureAggressiveness.normal">Normal</option>
+                      <option value="eager" data-i18n="settings.captureAggressiveness.eager">Eager (more turns)</option>
                     </select>
-                    <small class="field-hint" data-i18n="settings.chatMemoryMode.desc">Off: only explicit Remember/★.
-                      Strict: durable facts from session summaries. Aggressive: more turns → more candidates in Review
-                      Queue.</small>
+                    <small class="field-hint" data-i18n="settings.captureAggressiveness.desc">Conservative ignores facts
+                      mined from assistant replies. Eager keeps longer turns too and needs more review.</small>
+                  </label>
+                  <label class="settings-field">
+                    <span class="settings-field-label" data-i18n="settings.captureMinConfidence">Auto-save
+                      confidence</span>
+                    <input id="capture-min-confidence" type="number" min="0" max="1" step="0.05" value="0.7">
+                    <small class="field-hint" data-i18n="settings.captureMinConfidence.desc">In automatic mode, facts
+                      below this confidence go to the Review Queue instead of memory.</small>
                   </label>
                   <label class="settings-field">
                     <span class="settings-field-label" data-i18n="settings.chatCandidateTtl">Chat candidate TTL</span>

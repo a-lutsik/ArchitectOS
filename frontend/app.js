@@ -220,6 +220,11 @@ function bindEvents() {
           language: document.querySelector("#settings-language-select")?.value || state.language,
           onboarding_complete: state.onboardingComplete,
         },
+        memory_capture: {
+          mode: document.querySelector('input[name="capture-mode"]:checked')?.value || "auto",
+          aggressiveness: document.querySelector("#capture-aggressiveness")?.value || "normal",
+          min_confidence: Number(document.querySelector("#capture-min-confidence")?.value ?? 0.7),
+        },
         memory_lifecycle: {
           enabled: document.querySelector("#lifecycle-enabled")?.checked ?? true,
           refresh_on_access: document.querySelector("#refresh-on-access")?.checked ?? true,
@@ -227,7 +232,6 @@ function bindEvents() {
           source_scheduler_enabled: document.querySelector("#source-scheduler-enabled")?.checked ?? true,
           source_scheduler_tick_minutes: Number(document.querySelector("#source-scheduler-tick")?.value || 5),
           source_default_interval_minutes: Number(document.querySelector("#source-default-interval")?.value || 60),
-          chat_memory_mode: document.querySelector("#chat-memory-mode")?.value || "strict",
           chat_candidate_ttl_days: Number(document.querySelector("#chat-candidate-ttl")?.value || 7),
           chat_session_idle_minutes: Number(document.querySelector("#chat-session-idle")?.value || 30),
           chat_store_facts_only: document.querySelector("#chat-store-facts-only")?.checked ?? true,

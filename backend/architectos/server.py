@@ -504,6 +504,14 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _post_memory_dedup_reindex(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().rebuild_memory_dedup_index())
 
+    def _post_memory_capture_undo(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().undo_auto_capture(payload))
+
+    def _get_memory_capture_stats(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().memory_capture_stats(
+            int(self._first(query, "days") or "7"), self._first(query, "project_id") or None,
+        ))
+
     def _post_memory_compact(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().compact_memory(payload))
 
@@ -771,6 +779,7 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("GET", re.compile(r"^/api/memory/ingest$"), ArchitectOSHandler._get_memory_ingest),
     ("GET", re.compile(r"^/api/memory/items$"), ArchitectOSHandler._get_memory_items),
     ("GET", re.compile(r"^/api/memory/duplicates$"), ArchitectOSHandler._get_memory_duplicates),
+    ("GET", re.compile(r"^/api/memory/capture/stats$"), ArchitectOSHandler._get_memory_capture_stats),
     ("GET", re.compile(r"^/api/memory/briefing$"), ArchitectOSHandler._get_memory_briefing),
     ("GET", re.compile(r"^/api/memory/search$"), ArchitectOSHandler._get_memory_search),
     ("GET", re.compile(r"^/api/memory/feedback$"), ArchitectOSHandler._get_memory_feedback),
@@ -823,6 +832,7 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("POST", re.compile(r"^/api/memory/dedup/undo$"), ArchitectOSHandler._post_memory_dedup_undo),
     ("POST", re.compile(r"^/api/memory/dedup/reindex$"), ArchitectOSHandler._post_memory_dedup_reindex),
     ("POST", re.compile(r"^/api/memory/compact$"), ArchitectOSHandler._post_memory_compact),
+    ("POST", re.compile(r"^/api/memory/capture/undo$"), ArchitectOSHandler._post_memory_capture_undo),
     ("POST", re.compile(r"^/api/memory/duplicates/resolve$"), ArchitectOSHandler._post_memory_duplicates_resolve),
     ("POST", re.compile(r"^/api/security/preview$"), ArchitectOSHandler._post_security_preview),
     ("POST", re.compile(r"^/api/ops/backup$"), ArchitectOSHandler._post_ops_backup),
