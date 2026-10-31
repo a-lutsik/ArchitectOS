@@ -289,7 +289,8 @@ All documentation lives in [`docs/`](docs):
 | [RELEASE_QA.md](docs/RELEASE_QA.md) | Release packaging and QA checklist. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [CODE_GRAPH.md](docs/CODE_GRAPH.md) | Architecture and code-map. |
 | [SEARCH_MEMORY_GUIDE.md](docs/SEARCH_MEMORY_GUIDE.md) | Searching and managing memory. |
-| [MEMORY_DEDUP_RU.md](docs/MEMORY_DEDUP_RU.md) | Memory dedup & compaction design (proposal, RU). |
+| [MEMORY_DEDUP_RU.md](docs/MEMORY_DEDUP_RU.md) | Memory dedup & compaction design (RU). |
+| [MEMORY_CAPTURE_RU.md](docs/MEMORY_CAPTURE_RU.md) | Auto-capture of important facts: Claude vs ArchitectOS analysis and proposal (RU). |
 | [GUIDE_RU.md](docs/GUIDE_RU.md) · [PROJECT_RU.md](docs/PROJECT_RU.md) | Russian user guide & project documentation. |
 
 ---
