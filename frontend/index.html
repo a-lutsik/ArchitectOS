@@ -2501,6 +2501,14 @@
                       below this confidence go to the Review Queue instead of memory.</small>
                   </label>
                   <label class="settings-field">
+                    <span class="settings-field-label" data-i18n="settings.captureProjectConfidence">Project decisions
+                      auto-save at</span>
+                    <input id="capture-project-min-confidence" type="number" min="0" max="1" step="0.05" value="0.85">
+                    <small class="field-hint" data-i18n="settings.captureProjectConfidence.desc">Shared project facts
+                      (decisions, constraints) need this much confidence to skip review; corrections, preferences and
+                      references use the threshold on the left.</small>
+                  </label>
+                  <label class="settings-field">
                     <span class="settings-field-label" data-i18n="settings.chatCandidateTtl">Chat candidate TTL</span>
                     <span class="settings-input-with-unit">
                       <input id="chat-candidate-ttl" type="number" min="0" value="7">

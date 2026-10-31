@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .fact_signals import has_capture_signal
+
 CHAT_MEMORY_MODES = ("off", "strict", "aggressive")
 DEFAULT_CHAT_MEMORY_MODE = "strict"
 DEFAULT_CHAT_CANDIDATE_TTL_DAYS = 7
@@ -20,6 +22,7 @@ _CHITCHAT_EXACT = {
     "как дела", "как ты", "що робиш", "что делаешь",
     "good morning", "good evening", "доброе утро", "добрый вечер",
     "bye", "пока", "до свидания",
+    "no thanks", "no, thanks", "нет, спасибо", "нет спасибо", "не надо, спасибо",
 }
 
 _CHITCHAT_PREFIXES = (
@@ -126,7 +129,11 @@ def is_chitchat_user_message(user_text: str) -> bool:
 
 def has_durable_signal(text: str) -> bool:
     haystack = str(text or "")
-    return any(pattern.search(haystack) for pattern in _DURABLE_RE)
+    if any(pattern.search(haystack) for pattern in _DURABLE_RE):
+        return True
+    # Corrections, confirmations, first-person preferences and references carry
+    # no project keyword yet are the most useful things to remember.
+    return has_capture_signal(haystack)
 
 
 def chat_turn_score(user_text: str, assistant_text: str) -> float:
@@ -282,7 +289,7 @@ def facts_from_markdown_summary(text: str, *, limit: int = 12) -> list[dict[str,
     return facts
 
 
-_FACT_TYPE_RANK = {"Constraint": 3, "Requirement": 2, "Decision": 1, "Lesson": 0}
+_FACT_TYPE_RANK = {"Constraint": 3, "Requirement": 2, "Decision": 1, "Lesson": 0, "Preference": 0}
 
 
 def _prefer_fact_type(left: str, right: str) -> str:

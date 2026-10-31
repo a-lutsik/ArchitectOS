@@ -25,7 +25,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .chat_memory import normalize_chat_memory_mode
+from .chat_memory import classify_fact_type, normalize_chat_memory_mode
+from .fact_signals import FACT_KINDS, describe_fact
 
 CAPTURE_MODES = ("auto", "review", "off")
 AGGRESSIVENESS_LEVELS = ("conservative", "normal", "eager")
@@ -34,7 +35,14 @@ DEFAULT_MEMORY_CAPTURE: dict[str, Any] = {
     "mode": "auto",
     "aggressiveness": "normal",
     "min_confidence": 0.7,
+    # project facts (decisions, constraints shared by a team) cost more when
+    # wrong than a personal preference or a correction, so auto needs more.
+    "auto_project_min_confidence": 0.85,
 }
+
+# Kind → scope and node type. ``user`` facts describe the person, not the
+# project, so they live in the global scope and keep the Preference type.
+KIND_SCOPE = {"user": "global", "feedback": "project", "project": "project", "reference": "project"}
 
 # Fact sources (``chat_memory.extract_durable_facts``) that come from the user's
 # own words. ``conservative`` keeps only these.
@@ -48,10 +56,11 @@ def normalize_capture_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     settings["mode"] = mode if mode in CAPTURE_MODES else DEFAULT_MEMORY_CAPTURE["mode"]
     level = str(settings["aggressiveness"] or "").strip().lower()
     settings["aggressiveness"] = level if level in AGGRESSIVENESS_LEVELS else DEFAULT_MEMORY_CAPTURE["aggressiveness"]
-    try:
-        settings["min_confidence"] = max(0.0, min(float(settings["min_confidence"]), 1.0))
-    except (TypeError, ValueError):
-        settings["min_confidence"] = DEFAULT_MEMORY_CAPTURE["min_confidence"]
+    for key in ("min_confidence", "auto_project_min_confidence"):
+        try:
+            settings[key] = max(0.0, min(float(settings[key]), 1.0))
+        except (TypeError, ValueError):
+            settings[key] = DEFAULT_MEMORY_CAPTURE[key]
     settings["chat_memory_mode"] = legacy_chat_memory_mode(settings)
     return settings
 
@@ -85,6 +94,41 @@ def legacy_mirror(settings: dict[str, Any]) -> dict[str, Any]:
         "chat_memory_mode": legacy_chat_memory_mode(settings),
         "chat_auto_accept": settings.get("mode") == "auto",
     }
+
+
+def auto_threshold(settings: dict[str, Any], kind: str, signals: list[str] | tuple[str, ...] = ()) -> float:
+    """Confidence an extracted fact needs before ``auto`` writes it at once.
+
+    Shared project facts need ``auto_project_min_confidence`` unless the person
+    asked for the save outright ("Remember: …").
+    """
+    base = float(settings.get("min_confidence") or 0.0)
+    if str(kind or "project") == "project" and "explicit_save" not in set(signals or ()):
+        return max(base, float(settings.get("auto_project_min_confidence") or 0.0))
+    return base
+
+
+def annotate_fact(fact: dict[str, Any]) -> dict[str, Any]:
+    """Return the fact with kind, confidence, scope, type and signals filled in.
+
+    ``kind`` follows ``fact_signals.classify_fact_kind``; a ``user`` fact becomes
+    a global-scope ``Preference``. Values already set by the caller (an explicit
+    kind from a future LLM extractor) are kept.
+    """
+    annotated = dict(fact or {})
+    text = str(annotated.get("text") or "")
+    described = describe_fact(text, str(annotated.get("source") or ""))
+    kind = str(annotated.get("kind") or described["kind"])
+    annotated["kind"] = kind if kind in FACT_KINDS else "project"
+    annotated.setdefault("confidence", described["confidence"])
+    annotated["signals"] = described["signals"]
+    annotated["scope"] = KIND_SCOPE.get(annotated["kind"], "project")
+    if annotated["kind"] == "user":
+        annotated["type"] = "Preference"
+    elif not annotated.get("type"):
+        annotated["type"] = classify_fact_type(text)
+    annotated.setdefault("evidence", text[:240])
+    return annotated
 
 
 def filter_facts_for_policy(facts: list[dict[str, Any]], settings: dict[str, Any]) -> list[dict[str, Any]]:

@@ -81,6 +81,12 @@ Capture routes through `capture_memory_turn`, which is the same path MCP's
   **review queue** with a 7-day TTL; `off` captures nothing but explicit saves.
   Conflicts, changed values and duplicates found by the dedup gate wait for a
   person in every mode. See `docs/MEMORY_CAPTURE_RU.md`.
+- Each fact carries a kind — `user` (preferences about the person, stored as a
+  global `Preference`), `feedback` (corrections and confirmed approaches),
+  `project` (decisions the code does not state) or `reference` (where to look
+  outside the repo) — and a confidence from `fact_signals`. In `auto`, project
+  facts need `auto_project_min_confidence` (0.85) unless the person said
+  "remember"; the other kinds need `min_confidence` (0.7).
 - Secrets are redacted before anything is written.
 - Chit-chat is filtered out by `evaluate_chat_turn` before any candidate is made.
 - Cards land in the review queue with source **MCP** (`source_type=mcp`, label

@@ -306,7 +306,10 @@ class SettingsRouterServiceMixin:
             policy = capture_from_legacy(self.repository.get_setting("memory_lifecycle"))
         else:
             return
-        self.repository.set_setting("memory_capture", {k: policy[k] for k in ("mode", "aggressiveness", "min_confidence")})
+        self.repository.set_setting(
+            "memory_capture",
+            {k: policy[k] for k in ("mode", "aggressiveness", "min_confidence", "auto_project_min_confidence")},
+        )
         life = dict(self.repository.get_setting("memory_lifecycle") or {})
         mirror = legacy_mirror(policy)
         if any(life.get(key) != value for key, value in mirror.items()):

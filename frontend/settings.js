@@ -31,6 +31,7 @@ async function loadSettings() {
   const capture = settings.memory_capture || {};
   const captureAggressiveness = document.querySelector("#capture-aggressiveness");
   const captureMinConfidence = document.querySelector("#capture-min-confidence");
+  const captureProjectConfidence = document.querySelector("#capture-project-min-confidence");
   const chatCandidateTtl = document.querySelector("#chat-candidate-ttl");
   const chatSessionIdle = document.querySelector("#chat-session-idle");
   const chatStoreFactsOnly = document.querySelector("#chat-store-facts-only");
@@ -59,6 +60,7 @@ async function loadSettings() {
   if (captureMode) captureMode.checked = true;
   if (captureAggressiveness) captureAggressiveness.value = capture.aggressiveness || "normal";
   if (captureMinConfidence) captureMinConfidence.value = capture.min_confidence ?? 0.7;
+  if (captureProjectConfidence) captureProjectConfidence.value = capture.auto_project_min_confidence ?? 0.85;
   renderCaptureStats(capture.stats_7d);
   if (chatCandidateTtl) chatCandidateTtl.value = lifecycle.chat_candidate_ttl_days ?? 7;
   if (chatSessionIdle) chatSessionIdle.value = lifecycle.chat_session_idle_minutes ?? 30;

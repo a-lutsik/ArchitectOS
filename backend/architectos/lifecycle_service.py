@@ -372,6 +372,9 @@ class MemoryLifecycleEngine:
         node_type = str(getattr(node, "type", "") or "")
         if node_type in set(settings["long_term_types"]) or node_type in {"Project", "Provider"}:
             return True
+        if node_type == "Preference" or metadata.get("kind") == "user":
+            # Facts about the person (role, preferences) stay valid across projects and time.
+            return True
         if node_type == "Artifact":
             # Code/doc artifacts are volatile snapshots — never keyword-promote them.
             return False

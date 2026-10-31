@@ -224,6 +224,7 @@ function bindEvents() {
           mode: document.querySelector('input[name="capture-mode"]:checked')?.value || "auto",
           aggressiveness: document.querySelector("#capture-aggressiveness")?.value || "normal",
           min_confidence: Number(document.querySelector("#capture-min-confidence")?.value ?? 0.7),
+          auto_project_min_confidence: Number(document.querySelector("#capture-project-min-confidence")?.value ?? 0.85),
         },
         memory_lifecycle: {
           enabled: document.querySelector("#lifecycle-enabled")?.checked ?? true,

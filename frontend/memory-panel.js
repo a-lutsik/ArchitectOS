@@ -152,8 +152,19 @@ function renderMemoryLifecycleItem(item) {
 const MEMORY_TYPE_ICONS = {
   Decision: "🎯", Lesson: "💡", Constraint: "⚠️", Feature: "✨", Doc: "📚",
   Artifact: "📦", Task: "✅", Concept: "💭", Project: "🏗️", Provider: "🔌",
-  Requirement: "📋", Meeting: "🤝",
+  Requirement: "📋", Meeting: "🤝", Preference: "🧭",
 };
+
+const FACT_KIND_CHIPS = { user: "accent", feedback: "accent", project: "subtle", reference: "subtle" };
+
+function candidateKindChips(candidate) {
+  const meta = candidate.metadata || {};
+  const kind = String(meta.kind || "");
+  if (!kind || !FACT_KIND_CHIPS[kind]) return "";
+  const confidence = Number(candidate.confidence);
+  const pct = Number.isFinite(confidence) ? ` · ${Math.round(confidence * 100)}%` : "";
+  return `<span class="candidate-chip ${FACT_KIND_CHIPS[kind]}" title="${escapeHtml(t("candidate.kind.hint"))}">${escapeHtml(t(`candidate.kind.${kind}`))}${escapeHtml(pct)}</span>`;
+}
 function memoryTypeIcon(type) {
   return MEMORY_TYPE_ICONS[type] || "📝";
 }
@@ -557,6 +568,11 @@ function candidateWhy(candidate) {
       ? `Already in memory. Similar to “${label}”.`
       : "Already in memory.";
   }
+  if (meta.kind && (meta.capture_signals || []).length) {
+    const signals = (meta.capture_signals || []).map(name => t(`candidate.signal.${name}`)).join(", ");
+    return `${t(`candidate.kind.why.${meta.kind}`)} ${t("candidate.signals").replace("{signals}", signals)}`;
+  }
+  if (meta.kind) return t(`candidate.kind.why.${meta.kind}`);
   const reasons = {
     code: "Found in project source files.",
     docs: "Found in local repository docs.",
@@ -627,6 +643,7 @@ function renderCandidateCard(candidate) {
             <div class="candidate-card-chips">
               <span class="candidate-chip">${escapeHtml(candidateSourceLabel(sourceType))}</span>
               ${candidate.type ? `<span class="candidate-chip subtle">${escapeHtml(candidate.type)}</span>` : ""}
+              ${candidateKindChips(candidate)}
               ${status !== "candidate" ? `<span class="candidate-chip subtle">${escapeHtml(status === "promoted" ? "accepted" : status)}</span>` : ""}
               ${revisionChip}
               ${duplicateChip}

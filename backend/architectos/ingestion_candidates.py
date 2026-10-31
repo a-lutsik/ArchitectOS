@@ -308,6 +308,9 @@ class IngestionCandidatesMixin:
             "change_summary",
             "fact_key",
             "fact_subject",
+            "kind",
+            "evidence",
+            "capture_signals",
         ):
             if meta.get(key) not in (None, "", [], {}):
                 payload[key] = meta[key]

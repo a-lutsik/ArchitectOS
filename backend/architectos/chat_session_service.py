@@ -24,7 +24,7 @@ from .chat_memory import (
     facts_from_markdown_summary,
     infer_fact_subject,
 )
-from .memory_capture import filter_facts_for_policy
+from .memory_capture import annotate_fact, auto_threshold, filter_facts_for_policy
 from .models import stable_id, utc_now
 
 _LOG = logging.getLogger("architectos.service")
@@ -298,7 +298,8 @@ class ChatSessionServiceMixin:
             if from_mcp
             else "Durable fact extracted from Ask (not a full transcript)."
         )
-        for fact in facts[:12]:
+        for raw_fact in facts[:12]:
+            fact = annotate_fact(raw_fact)
             fact_text = str(fact.get("text") or "").strip()
             if len(fact_text) < 18:
                 continue
@@ -311,9 +312,9 @@ class ChatSessionServiceMixin:
                 "source_ref": chat_id,
                 "label": f"{label_prefix}: {label_seed}",
                 "type": str(fact.get("type") or "Lesson"),
-                "scope": "project",
+                "scope": str(fact.get("scope") or "project"),
                 "text": f"{body_prefix}\n\n{fact_text}".strip(),
-                "confidence": 0.74,
+                "confidence": float(fact.get("confidence") or 0.74),
                 "metadata": {
                     "chat_id": chat_id,
                     "template": template,
@@ -321,6 +322,9 @@ class ChatSessionServiceMixin:
                     "source_type": source_type,
                     "fact_key": fact_text[:240],
                     "fact_source": fact.get("source") or "session",
+                    "kind": fact.get("kind") or "project",
+                    "evidence": fact.get("evidence") or fact_text[:240],
+                    "capture_signals": list(fact.get("signals") or []),
                     "trigger": trigger,
                     "session_revision": revision,
                     "chat_memory_mode": mode,
@@ -444,7 +448,12 @@ class ChatSessionServiceMixin:
                 text = str(fact.get("text") or "").strip()
                 if not text:
                     continue
-                facts.append({"text": text, "type": str(fact.get("type") or "Lesson")})
+                # Keep who said it: the capture policy scores a person's own
+                # line higher than text mined from a reply.
+                entry = {"text": text, "type": str(fact.get("type") or "Lesson"), "source": str(fact.get("source") or "session")}
+                if fact.get("subject"):
+                    entry["subject"] = str(fact.get("subject") or "")
+                facts.append(entry)
             decision = self._decision_log_line(user_text, assistant_text)
             if decision:
                 decisions.append(decision.lstrip("- ").strip())
@@ -645,7 +654,8 @@ class ChatSessionServiceMixin:
         facts = filter_facts_for_policy(list(verdict.facts or []), policy)
         if facts_only and facts:
             saved_last = None
-            for index, fact in enumerate(facts[:3]):
+            for index, raw_fact in enumerate(facts[:3]):
+                fact = annotate_fact(raw_fact)
                 fact_text = str(fact.get("text") or "").strip()
                 if not fact_text:
                     continue
@@ -657,19 +667,22 @@ class ChatSessionServiceMixin:
                     "source_ref": chat_id,
                     "label": f"Chat fact: {label_seed}",
                     "type": str(fact.get("type") or self._chat_turn_memory_type(user_text, assistant_text)),
-                    "scope": "project",
+                    "scope": str(fact.get("scope") or "project"),
                     "text": (
                         "Durable fact extracted from chat (not a full transcript).\n\n"
                         f"{fact_text}\n\n"
                         f"Context user prompt: {user_text[:400]}"
                     ).strip(),
-                    "confidence": max(0.55, min(0.85, 0.55 + verdict.score * 0.3)),
+                    "confidence": float(fact.get("confidence") or 0.6),
                     "metadata": {
                         "chat_id": chat_id,
                         "template": "chat_fact_keeper",
                         "source": source,
                         "source_type": "chat",
                         "fact_source": fact.get("source"),
+                        "kind": fact.get("kind") or "project",
+                        "evidence": fact.get("evidence") or fact_text[:240],
+                        "capture_signals": list(fact.get("signals") or []),
                         "salience": verdict.score,
                         "chat_memory_mode": mode,
                         **dict(metadata or {}),
@@ -746,7 +759,7 @@ class ChatSessionServiceMixin:
 
     # Fact types the extractor produces. Rules-keeper cards ("Rule", template
     # rules_keeper) and raw turn dumps are not fact atoms and always go to review.
-    CHAT_AUTO_ACCEPT_TYPES = {"Lesson", "Decision", "Constraint", "Requirement"}
+    CHAT_AUTO_ACCEPT_TYPES = {"Lesson", "Decision", "Constraint", "Requirement", "Preference"}
     CHAT_AUTO_ACCEPT_TEMPLATES = {"chat_session_atom", "chat_fact_keeper", "mcp_turn_atom"}
 
     def undo_auto_capture(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -894,7 +907,9 @@ class ChatSessionServiceMixin:
             return None
         if not candidate or str(candidate.get("status") or "candidate") != "candidate":
             return None
-        if float(candidate.get("confidence") or 0.0) < float(policy.get("min_confidence") or 0.0):
+        meta_in = dict(candidate.get("metadata") or {})
+        kind = str(meta_in.get("kind") or "project")
+        if float(candidate.get("confidence") or 0.0) < auto_threshold(policy, kind, list(meta_in.get("capture_signals") or [])):
             return None
         if not str(candidate.get("source_ref") or "").strip():
             return None
