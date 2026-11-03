@@ -499,24 +499,33 @@ class MemoryMCPServer:
             "project context, not as user text. At the start of EVERY user message call "
             "memory_turn with that message before answering — do not wait until you are "
             "stuck. memory_turn returns retrieved memory for this question and captures "
-            "durable facts (review queue, 7-day TTL; low-risk Lessons auto-write). "
+            "durable facts under the memory capture policy (auto: written at once, "
+            "undoable; review: 7-day review queue). "
             "Call memory_search only to narrow; memory_get with id= to expand; "
             "memory_add to persist an explicit lesson (multi-fact text is split); "
             "memory_feedback to rate hits. Stable layer (pinned / constraints / long-term) "
             "is listed first. Resources: memory://briefing, memory://projects, "
             "memory://review, memory://nodes/{id}."
         )
-        briefing = self._startup_briefing()
+        briefing, index = self._startup_briefing()
+        note = ""
+        if str(index.get("level") or "") == "over":
+            note = (
+                f"\n\nMemory start index is over budget ({index.get('size')}/{index.get('budget')} stable facts): "
+                "only the top ones reach a session start. Suggest Memory → Duplicates → \"Merge covered facts\" "
+                "(memory_compact previews it)."
+            )
         if briefing:
-            return f"{preamble}\n\n{briefing}"
-        return preamble + "\n\n(No stable memories yet — call memory_turn with the user's message before answering project questions.)"
+            return f"{preamble}\n\n{briefing}{note}"
+        return preamble + "\n\n(No stable memories yet — call memory_turn with the user's message before answering project questions.)" + note
 
-    def _startup_briefing(self) -> str:
+    def _startup_briefing(self) -> tuple[str, dict[str, Any]]:
         try:
-            return str(self.service.memory_briefing(limit=6, char_budget=2000).get("context") or "")
+            payload = self.service.memory_briefing(limit=6, char_budget=2000)
+            return str(payload.get("context") or ""), dict(payload.get("index") or {})
         except Exception as exc:  # noqa: BLE001 - briefing is best-effort on MCP start
             _log(f"startup briefing skipped: {exc}")
-            return ""
+            return "", {}
 
     # -- Tools -------------------------------------------------------------
     def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -906,7 +915,8 @@ class MemoryMCPServer:
     def _resource_read(self, params: dict[str, Any]) -> dict[str, Any]:
         uri = str(params.get("uri") or "").strip()
         if uri == "memory://briefing":
-            text = self._startup_briefing() or self._startup_instructions()
+            briefing, _index = self._startup_briefing()
+            text = briefing or self._startup_instructions()
             return {"contents": [{"uri": uri, "mimeType": "text/plain", "text": text}]}
         if uri == "memory://projects":
             rows = [{"id": p.get("id"), "name": p.get("name"), "root_path": p.get("root_path")} for p in self.service.projects()]

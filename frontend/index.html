@@ -2514,6 +2514,16 @@
                       agent turn or Ask session. Rules keep working offline and as a fallback.</small>
                   </label>
                   <label class="settings-field">
+                    <span class="settings-field-label" data-i18n="settings.captureIndexBudget">Start index budget</span>
+                    <span class="settings-input-with-unit">
+                      <input id="capture-index-budget" type="number" min="20" max="5000" step="10" value="200">
+                      <span class="field-unit" data-i18n="settings.unit.facts">facts</span>
+                    </span>
+                    <small class="field-hint" data-i18n="settings.captureIndexBudget.desc">How many stable facts (pinned,
+                      constraints, requirements, decisions) the start layer may hold before Memory warns and suggests
+                      compaction. A session start shows only the best 6–12 of them.</small>
+                  </label>
+                  <label class="settings-field">
                     <span class="settings-field-label" data-i18n="settings.captureProjectConfidence">Project decisions
                       auto-save at</span>
                     <input id="capture-project-min-confidence" type="number" min="0" max="1" step="0.05" value="0.85">

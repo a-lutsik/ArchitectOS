@@ -226,6 +226,7 @@ function bindEvents() {
           min_confidence: Number(document.querySelector("#capture-min-confidence")?.value ?? 0.7),
           auto_project_min_confidence: Number(document.querySelector("#capture-project-min-confidence")?.value ?? 0.85),
           extractor: document.querySelector("#capture-extractor")?.value || "auto",
+          budget_index_lines: Number(document.querySelector("#capture-index-budget")?.value || 200),
         },
         memory_lifecycle: {
           enabled: document.querySelector("#lifecycle-enabled")?.checked ?? true,

@@ -789,7 +789,9 @@ class RetrievalServiceMixin:
                 node_text_chars=160,
                 tools_available=True,
             )
-        return {"project_id": actual, "context": context, "stable": stable}
+        index_status = getattr(self, "memory_index_status", None)
+        index = index_status(actual) if callable(index_status) else {}
+        return {"project_id": actual, "context": context, "stable": stable, "index": index}
 
     def context(self, query: str, project_id: str | None = None, scope: str | None = None, limit: int = 8, tools_available: bool = True) -> dict[str, Any]:
         search = self.search_memory(query, project_id=project_id, scope=scope, limit=max(limit, 10), expand_graph=True)

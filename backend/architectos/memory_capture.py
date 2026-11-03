@@ -42,6 +42,10 @@ DEFAULT_MEMORY_CAPTURE: dict[str, Any] = {
     "extractor": "auto",
     "llm_provider_id": "",
     "llm_max_facts": 8,
+    # Size of the always-on start layer (pinned / constraints / requirements /
+    # decisions) before the Memory page warns that it has outgrown a session
+    # start — the analogue of Claude Code's 200-line MEMORY.md limit.
+    "budget_index_lines": 200,
 }
 
 EXTRACTORS = ("auto", "heuristic", "llm")
@@ -69,6 +73,10 @@ def normalize_capture_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         settings["llm_max_facts"] = max(1, min(int(settings["llm_max_facts"]), 20))
     except (TypeError, ValueError):
         settings["llm_max_facts"] = DEFAULT_MEMORY_CAPTURE["llm_max_facts"]
+    try:
+        settings["budget_index_lines"] = max(20, min(int(settings["budget_index_lines"]), 5000))
+    except (TypeError, ValueError):
+        settings["budget_index_lines"] = DEFAULT_MEMORY_CAPTURE["budget_index_lines"]
     for key in ("min_confidence", "auto_project_min_confidence"):
         try:
             settings[key] = max(0.0, min(float(settings[key]), 1.0))

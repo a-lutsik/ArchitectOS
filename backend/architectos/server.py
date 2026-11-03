@@ -507,6 +507,11 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _post_memory_capture_undo(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().undo_auto_capture(payload))
 
+    def _get_memory_index_status(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
+        self._json(self.get_service().memory_index_status(
+            self._first(query, "project_id") or None, preview=self._first(query, "preview") in {"1", "true"},
+        ))
+
     def _get_memory_capture_stats(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().memory_capture_stats(
             int(self._first(query, "days") or "7"), self._first(query, "project_id") or None,
@@ -780,6 +785,7 @@ ROUTES: list[tuple[str, re.Pattern[str], RouteHandler]] = [
     ("GET", re.compile(r"^/api/memory/items$"), ArchitectOSHandler._get_memory_items),
     ("GET", re.compile(r"^/api/memory/duplicates$"), ArchitectOSHandler._get_memory_duplicates),
     ("GET", re.compile(r"^/api/memory/capture/stats$"), ArchitectOSHandler._get_memory_capture_stats),
+    ("GET", re.compile(r"^/api/memory/index-status$"), ArchitectOSHandler._get_memory_index_status),
     ("GET", re.compile(r"^/api/memory/briefing$"), ArchitectOSHandler._get_memory_briefing),
     ("GET", re.compile(r"^/api/memory/search$"), ArchitectOSHandler._get_memory_search),
     ("GET", re.compile(r"^/api/memory/feedback$"), ArchitectOSHandler._get_memory_feedback),

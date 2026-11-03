@@ -21,6 +21,7 @@ from typing import Any
 from .chat_memory import _FACT_TYPE_RANK, _prefer_fact_type
 from .memory_dedup import features_from_json
 from .models import utc_now
+from .search import is_stable_pack_node
 
 _LOG = logging.getLogger(__name__)
 
@@ -229,6 +230,50 @@ class DedupReviewServiceMixin:
         summary = {key: report[key] for key in ("at", "dry_run", "mode", "groups_examined", "merged", "would_merge")}
         self.repository.set_setting("memory_dedup_compaction_last", summary)  # type: ignore[attr-defined]
         return report
+
+    # -- start-of-session index budget -------------------------------------------
+    BRIEFING_MAX_ITEMS = 12
+
+    def memory_index_status(self, project_id: str | None = None, *, preview: bool = False) -> dict[str, Any]:
+        """How big the always-on start layer is against ``memory_capture.budget_index_lines``.
+
+        The start layer is every active pinned / Constraint / Requirement /
+        Decision node the project (plus shared/global) holds; a session start
+        shows the best ``BRIEFING_MAX_ITEMS`` of them, so once the layer is over
+        budget the rest never reaches an agent until memory is compacted. With
+        ``preview`` the compaction dry run says how much could be merged.
+        """
+        project = str(project_id or "architectos")
+        budget = int(self.memory_capture_settings()["budget_index_lines"])  # type: ignore[attr-defined]
+        by_type: dict[str, int] = {}
+        pinned = 0
+        size = 0
+        for node in self.repository.list_nodes(project_id=project, status="active", include_shared=True):  # type: ignore[attr-defined]
+            payload = node.to_dict() if hasattr(node, "to_dict") else dict(node)
+            if not is_stable_pack_node(payload):
+                continue
+            size += 1
+            by_type[str(payload.get("type") or "")] = by_type.get(str(payload.get("type") or ""), 0) + 1
+            meta = dict(payload.get("metadata") or {})
+            if meta.get("pinned") or meta.get("favorite"):
+                pinned += 1
+        ratio = size / budget if budget else 0.0
+        level = "over" if size > budget else ("near" if ratio >= 0.8 else "ok")
+        status: dict[str, Any] = {
+            "project_id": project,
+            "size": size,
+            "budget": budget,
+            "over_by": max(0, size - budget),
+            "ratio": round(ratio, 3),
+            "level": level,
+            "by_type": dict(sorted(by_type.items())),
+            "pinned": pinned,
+            "briefing_items": min(size, self.BRIEFING_MAX_ITEMS),
+        }
+        if preview:
+            report = self.compact_memory({"project_id": project, "dry_run": True})  # type: ignore[attr-defined]
+            status["compactable"] = int(report.get("would_merge") or 0)
+        return status
 
     # -- review queue ----------------------------------------------------------
     def list_memory_duplicates(self, project_id: str | None = None, limit: int = 100) -> dict[str, Any]:

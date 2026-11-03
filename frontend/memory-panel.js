@@ -15,7 +15,10 @@ async function loadMemoryLifecycle() {
   if (!container) return;
 
   try {
-    const payload = await api(`/api/analytics?project_id=${projectParam()}`);
+    const [payload, index] = await Promise.all([
+      api(`/api/analytics?project_id=${projectParam()}`),
+      api(`/api/memory/index-status?project_id=${projectParam()}`).catch(() => null),
+    ]);
     const life = payload.memory_lifecycle || {};
     const tier = life.by_tier || {};
     const stateCounts = life.by_state || {};
@@ -32,6 +35,7 @@ async function loadMemoryLifecycle() {
     const shortTermPct = total > 0 ? Math.round((tier.short_term || 0) / total * 100) : 0;
 
     container.innerHTML = `
+      ${memoryIndexBudgetHtml(index)}
       <div style="margin-bottom: 16px;">
         <strong style="color: var(--ink); font-size: 14px;">Status Breakdown</strong>
         <div style="display: flex; gap: 10px; margin-top: 8px; flex-wrap: wrap;">
@@ -62,6 +66,37 @@ async function loadMemoryLifecycle() {
   } catch (error) {
     container.innerHTML = '<div style="color: var(--muted);">Failed to load lifecycle data</div>';
   }
+}
+
+/* Start-of-session index against its budget (the MEMORY.md-style limit). */
+function memoryIndexBudgetHtml(index) {
+  if (!index || typeof index.size !== "number") return "";
+  const level = String(index.level || "ok");
+  const badge = level === "over" ? "badge danger" : level === "near" ? "badge warning" : "badge";
+  const hint = t(level === "over" ? "memory.index.over" : level === "near" ? "memory.index.near" : "memory.index.ok")
+    .replace("{items}", String(index.briefing_items ?? 0))
+    .replace("{over}", String(index.over_by ?? 0));
+  const action = level === "ok"
+    ? ""
+    : `<button type="button" class="candidate-action" data-memory-index-compact>${escapeHtml(t("dup.preview"))}</button>`;
+  return `
+    <div class="memory-index-budget" data-level="${escapeHtml(level)}" style="margin-bottom: 16px;">
+      <strong style="color: var(--ink); font-size: 14px;">${escapeHtml(t("memory.index.title"))}</strong>
+      <div style="display: flex; gap: 10px; margin-top: 8px; flex-wrap: wrap; align-items: center;">
+        <span class="${badge}">${escapeHtml(String(index.size))} / ${escapeHtml(String(index.budget))}</span>
+        <span class="muted" style="font-size: 12.5px;">${escapeHtml(hint)}</span>
+        ${action}
+      </div>
+    </div>`;
+}
+
+function bindMemoryIndexBudget() {
+  document.addEventListener("click", event => {
+    const button = event.target.closest?.("[data-memory-index-compact]");
+    if (!button) return;
+    switchMemoryTab("duplicates");
+    previewMemoryCompaction().catch(showError);
+  });
 }
 
 async function loadMemoryLifecycleItems() {
@@ -1107,7 +1142,10 @@ function bindMemoryDuplicates() {
   document.querySelector("#memory-dup-compact")?.addEventListener("click", () => runMemoryCompaction().catch(showError));
 }
 
-if (typeof document !== "undefined") bindMemoryItemOpener();
+if (typeof document !== "undefined") {
+  bindMemoryItemOpener();
+  bindMemoryIndexBudget();
+}
 
 export {
   batchUpdateCandidates, bindMemoryDuplicates, candidateBatchFilterFromUi, candidateSourceFromUi,

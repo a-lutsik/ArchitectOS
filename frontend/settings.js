@@ -33,6 +33,7 @@ async function loadSettings() {
   const captureMinConfidence = document.querySelector("#capture-min-confidence");
   const captureProjectConfidence = document.querySelector("#capture-project-min-confidence");
   const captureExtractor = document.querySelector("#capture-extractor");
+  const captureIndexBudget = document.querySelector("#capture-index-budget");
   const chatCandidateTtl = document.querySelector("#chat-candidate-ttl");
   const chatSessionIdle = document.querySelector("#chat-session-idle");
   const chatStoreFactsOnly = document.querySelector("#chat-store-facts-only");
@@ -63,6 +64,7 @@ async function loadSettings() {
   if (captureMinConfidence) captureMinConfidence.value = capture.min_confidence ?? 0.7;
   if (captureProjectConfidence) captureProjectConfidence.value = capture.auto_project_min_confidence ?? 0.85;
   if (captureExtractor) captureExtractor.value = capture.extractor || "auto";
+  if (captureIndexBudget) captureIndexBudget.value = capture.budget_index_lines ?? 200;
   renderCaptureStats(capture.stats_7d);
   if (chatCandidateTtl) chatCandidateTtl.value = lifecycle.chat_candidate_ttl_days ?? 7;
   if (chatSessionIdle) chatSessionIdle.value = lifecycle.chat_session_idle_minutes ?? 30;
