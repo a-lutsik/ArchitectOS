@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -426,6 +427,76 @@ class HookEndpointTests(unittest.TestCase):
                 server.shutdown()
                 thread.join(timeout=2)
                 server.server_close()
+
+
+class HookTimingLogTests(unittest.TestCase):
+    LINE = re.compile(
+        r"^\S+ event=prompt client=codex transport=(?P<transport>http|offline) ms=\d+\.\d "
+        r"tokens=(?P<tokens>\d+) hits=(?P<hits>\d+) project=architectos queued=\d+ auto=\d+$"
+    )
+    PROMPT = "Remember: UniqueBirchFormatter is the required Python formatter in this repo."
+
+    def _capture(self, root: Path, prompt: str) -> str:
+        return agent_hooks.handle_capture(
+            json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": prompt, "cwd": str(root)}),
+            client="codex",
+            event="prompt",
+            root=root,
+        )
+
+    def _log_lines(self, root: Path) -> list[str]:
+        return (root / "data" / "hooks.log").read_text(encoding="utf-8").splitlines()
+
+    def test_debug_log_records_one_offline_timing_line_without_prompt_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": "1"}):
+            root = Path(tmp)
+            ArchitectOSService(root)
+            self._capture(root, self.PROMPT)
+            out = self._capture(root, "Which formatter should I use, UniqueBirchFormatter or something else?")
+            lines = self._log_lines(root)
+        self.assertEqual(len(lines), 2)
+        first, second = (self.LINE.match(line) for line in lines)
+        assert first is not None and second is not None, lines
+        self.assertEqual((first["transport"], first["tokens"]), ("offline", "0"))
+        injected = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(int(second["tokens"]), max(1, round(len(injected) / 4)))
+        self.assertGreaterEqual(int(second["hits"]), 1)
+        self.assertNotIn("UniqueBirchFormatter", "\n".join(lines))
+
+    def test_debug_log_names_the_http_transport_when_the_app_is_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": "1"}):
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+
+            class TestHandler(ArchitectOSHandler):
+                pass
+
+            TestHandler.service = service
+            server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                (root / "data" / "architectos.runtime.json").write_text(
+                    json.dumps({"url": f"http://127.0.0.1:{server.server_port}", "auth_token": service.auth_token}),
+                    encoding="utf-8",
+                )
+                self._capture(root, self.PROMPT)
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+                server.server_close()
+            lines = self._log_lines(root)
+        self.assertEqual(len(lines), 1)
+        match = self.LINE.match(lines[0])
+        assert match is not None, lines
+        self.assertEqual(match["transport"], "http")
+
+    def test_debug_log_stays_off_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": ""}):
+            root = Path(tmp)
+            ArchitectOSService(root)
+            self._capture(root, self.PROMPT)
+            self.assertFalse((root / "data" / "hooks.log").exists())
 
 
 if __name__ == "__main__":

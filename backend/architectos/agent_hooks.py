@@ -21,14 +21,17 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from .paths import is_frozen, resolve_project_root
+from .usage import estimate_tokens_from_text
 
 CLIENTS: tuple[str, ...] = ("cursor", "claude", "codex")
 
@@ -118,14 +121,18 @@ class HookTurn:
         return (self.client, self.event) in _INJECTS
 
 
-def _debug(message: str) -> None:
-    if os.environ.get("ARCHITECTOS_HOOK_DEBUG", "").strip() not in {"1", "true", "yes", "on"}:
+def _debug_enabled() -> bool:
+    return os.environ.get("ARCHITECTOS_HOOK_DEBUG", "").strip() in {"1", "true", "yes", "on"}
+
+
+def _debug(message: str, root: Path | None = None) -> None:
+    if not _debug_enabled():
         return
     try:
-        path = resolve_project_root() / "data" / "hooks.log"
+        path = (root or resolve_project_root()) / "data" / "hooks.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{message}\n")
+            handle.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {message}\n")
     except OSError:
         pass
 
@@ -233,6 +240,17 @@ def _direct_service(root: Path | None = None):
 
 def run_turn(turn: HookTurn, *, root: Path | None = None, timeout: float | None = None, limit: int = 8) -> dict[str, Any] | None:
     """Send the turn to ArchitectOS and return its memory pack, or None on failure."""
+    return _send_turn(turn, root=root, timeout=timeout, limit=limit)[0]
+
+
+def _send_turn(
+    turn: HookTurn,
+    *,
+    root: Path | None = None,
+    timeout: float | None = None,
+    limit: int = 8,
+) -> tuple[dict[str, Any] | None, str]:
+    """Memory pack plus the transport that produced it: http, offline or none."""
     wait = float(timeout if timeout is not None else os.environ.get("ARCHITECTOS_HOOK_TIMEOUT", _DEFAULT_TIMEOUT))
     endpoint = runtime_endpoint(root)
     if turn.event == EVENT_SESSION:
@@ -241,14 +259,14 @@ def run_turn(turn: HookTurn, *, root: Path | None = None, timeout: float | None 
             query = urllib.parse.urlencode({"cwd": turn.cwd}) if turn.cwd else ""
             result = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait)
             if result is not None:
-                return result
+                return result, "http"
         if not _offline_allowed():
-            return None
+            return None, "none"
         try:
-            return _direct_service(root).memory_briefing(cwd=turn.cwd or None)
+            return _direct_service(root).memory_briefing(cwd=turn.cwd or None), "offline"
         except Exception as exc:  # noqa: BLE001 - hooks must stay silent
-            _debug(f"briefing failed: {exc}")
-            return None
+            _debug(f"briefing failed: {exc}", root)
+            return None, "none"
 
     payload = {
         "user_text": turn.user_text,
@@ -261,9 +279,9 @@ def run_turn(turn: HookTurn, *, root: Path | None = None, timeout: float | None 
         url, token = endpoint
         result = _request_json(f"{url}/api/memory/turn", token, payload=payload, timeout=wait)
         if result is not None:
-            return result
+            return result, "http"
     if not _offline_allowed():
-        return None
+        return None, "none"
     try:
         return _direct_service(root).capture_memory_turn(
             turn.user_text,
@@ -271,10 +289,10 @@ def run_turn(turn: HookTurn, *, root: Path | None = None, timeout: float | None 
             cwd=turn.cwd or None,
             client=turn.client,
             limit=limit,
-        )
+        ), "offline"
     except Exception as exc:  # noqa: BLE001 - hooks must stay silent
-        _debug(f"capture failed: {exc}")
-        return None
+        _debug(f"capture failed: {exc}", root)
+        return None, "none"
 
 
 # -- Rendering ---------------------------------------------------------------
@@ -328,12 +346,28 @@ def handle_capture(
         return _silent(turn.client, turn.event)
     if turn.event == EVENT_RESPONSE and not turn.assistant_text:
         return _silent(turn.client, turn.event)
-    result = run_turn(turn, root=root)
-    _debug(
-        f"client={turn.client} event={turn.event} project={(result or {}).get('project_id')} "
-        f"queued={len((result or {}).get('queued') or [])} auto={len((result or {}).get('auto_accepted') or [])}"
+    started = time.perf_counter()
+    result, transport = _send_turn(turn, root=root)
+    out = render_stdout(turn, result)
+    if _debug_enabled():
+        _debug(_timing_line(turn, transport, (time.perf_counter() - started) * 1000.0, out, result), root)
+    return out
+
+
+def _timing_line(turn: HookTurn, transport: str, elapsed_ms: float, out: str, result: dict[str, Any] | None) -> str:
+    """One hooks.log line per event: counts and timings only, never prompt text.
+
+    ``tokens`` estimates what was actually injected (0 when the hook stayed silent).
+    """
+    data = result or {}
+    injected = ""
+    if out and out != "{}":
+        injected = str(json.loads(out).get("hookSpecificOutput", {}).get("additionalContext") or "")
+    return (
+        f"event={turn.event} client={turn.client} transport={transport} ms={elapsed_ms:.1f} "
+        f"tokens={estimate_tokens_from_text(injected)} hits={len(data.get('hits') or data.get('stable') or [])} "
+        f"project={data.get('project_id')} queued={len(data.get('queued') or [])} auto={len(data.get('auto_accepted') or [])}"
     )
-    return render_stdout(turn, result)
 
 
 # -- Installation ------------------------------------------------------------

@@ -126,7 +126,18 @@ prints `{}`.
 | `ARCHITECTOS_HOOK_DISABLED=1` | Turn all hooks into no-ops without editing configs |
 | `ARCHITECTOS_HOOK_TIMEOUT` | HTTP timeout in seconds (default `5`) |
 | `ARCHITECTOS_HOOK_OFFLINE=0` | Do not fall back to opening the store directly |
-| `ARCHITECTOS_HOOK_DEBUG=1` | Append one line per event to `data/hooks.log` |
+| `ARCHITECTOS_HOOK_DEBUG=1` | Append one line per event to `data/hooks.log` (see below) |
+
+With `ARCHITECTOS_HOOK_DEBUG=1` each handled event adds one line with counts and
+timings only, never prompt or answer text:
+
+```text
+2026-11-04T10:00:00+00:00 event=prompt client=claude transport=http ms=312.4 tokens=1003 hits=10 project=architectos queued=0 auto=1
+```
+
+`transport` is `http` (app running), `offline` (store opened by the hook) or
+`none`; `ms` covers the event inside the hook process, not the interpreter start;
+`tokens` estimates the injected context (0 when the hook stayed silent).
 
 ## Manual check
 
