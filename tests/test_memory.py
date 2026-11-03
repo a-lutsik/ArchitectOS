@@ -54,6 +54,17 @@ class ArchitectOSMemoryTests(unittest.TestCase):
             self.assertIn("[REDACTED]", node["text"])
             self.assertTrue(node["metadata"].get("redacted"))
 
+    def test_delete_and_edit_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            task = service.create_task({"project_id": "architectos", "title": "Temp task"})
+            edited = service.update_task(task["id"], {"title": "Renamed", "detail": "More", "priority": "low"})
+            self.assertEqual((edited["title"], edited["priority"]), ("Renamed", "low"))
+            self.assertEqual(service.delete_task(task["id"]), {"deleted": True, "id": task["id"]})
+            self.assertEqual([t for t in service.list_tasks("architectos")["tasks"] if t["id"] == task["id"]], [])
+            with self.assertRaises(ValueError):
+                service.delete_task(task["id"])
+
     def test_tasks_workflows_and_local_chat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))

@@ -30,6 +30,32 @@ The MCP direction is bidirectional: ArchitectOS is an MCP *client* (connects out
 Filesystem/GitHub/Jira/... servers) and, via `architectos.mcp_server`, an MCP *server*
 that exposes the memory engine so IDE agents can read and write ArchitectOS memory.
 
+MCP project binding is per process, not a default write to project `architectos`.
+Order: `--project-id` / `ARCHITECTOS_PROJECT_ID` **>** `.architectos.json` walked
+up from cwd **>** `project_id_for_path(cwd)` **>** unbound. Unbound memory tools
+return a tool error (project `id` + `name`) and tell the agent to call
+`memory_list_projects`, then `memory_use_project` or `project_create`.
+`.architectos.json` is `{"project_id","name"}` in the git/workspace folder; a new
+Cursor / Codex / Claude folder without that file asks again. An explicit tool
+`project_id` still overrides the bind. See `docs/MCP_MEMORY_SERVER.md`.
+
+```mermaid
+---
+config:
+ layout: elk
+ flowchart:
+  curve: linear
+  nodeSpacing: 40
+  rankSpacing: 50
+---
+flowchart TB
+  subgraph bind ["MCP project bind"]
+    pin["`--project-id` / `ARCHITECTOS_PROJECT_ID`"] --> file["`.architectos.json` from cwd"]
+    file --> path["`project_id_for_path(cwd)`"]
+    path --> unbound["Unbound: error, do not write `architectos`"]
+  end
+```
+
 The backend is a stdlib-only Python 3.12 package under `backend/architectos`.
 `ArchitectOSService` (`service.py`, ~213 lines) is a thin facade composed from 13
 `*ServiceMixin` modules, one per concern: `ai_runtime_service`,
@@ -166,7 +192,7 @@ stored version and stamps `SCHEMA_VERSION` (currently 3).
 - MCP Hub: real MCP stdio JSON-RPC client, server registry (Filesystem, GitHub, Azure DevOps, Jira, Slack, Confluence, Granola), test/list-tools/call with approval gating.
 - Agent tools: OpenAI/Azure providers receive the tool catalog as native function schemas (`ProviderRequest.tools`) and their calls are replayed through the same `tool_calls` loop other providers reach via the text protocol. Azure DevOps ops go through `call_ado_tool`, which targets the current `@azure-devops/mcp` action-based tools (`wit_work_item`, `wit_query`, `repo_repository`, `repo_pull_request`, `wiki`) and retries the pre-consolidation names on older servers; empty payloads and `isError` results surface as tool failures instead of silent nulls.
 - Azure Repos in chat: `repo_search_commits`, `repo_pull_requests_for_commit`, `repo_get_pull_request`, `repo_list_pull_request_comments`, `repo_read_file_at`, and `repo_list_repositories` let the agent trace a commit hash to its pull request, changed files, linked work items, and the file content at that revision, then diff it against the working copy via `fs_read`. They ship with the Azure DevOps MCP server and are read-only.
-- MCP Memory Server: exposes the memory engine over MCP stdio so Cursor, Copilot, and Claude Desktop can search/read and add memory (`mcp_memory_server.py`; see `docs/MCP_MEMORY_SERVER.md`).
+- MCP Memory Server: exposes the memory engine over MCP stdio so Cursor, Copilot, and Claude Desktop can search/read and add memory (`mcp_memory_server.py`; see `docs/MCP_MEMORY_SERVER.md`). Folders bind with `--project-id` / `ARCHITECTOS_PROJECT_ID`, then `.architectos.json`, then `project_id_for_path(cwd)`; unbound tools error instead of writing project `architectos`. `memory_list_projects` includes `create_new: true`.
 - Agent hooks: client lifecycle hooks that capture a turn even when the agent calls no tool, normalized in `agent_hooks.py`. Capture reuses `capture_memory_turn`, so review, TTL, and redaction rules are the same as MCP's. Registration is the same installer whether you use Setup → Agent hooks, `architectos hook`, `architectos_hook.py`, or the frozen `architectos-server hook` / `architectos-mcp hook` subcommand (see `docs/AGENT_HOOKS.md`). The memory engine is also a pip-installable SDK (`from architectos import ArchitectOS`, `docs/SDK.md`).
 - Code Intelligence: real LSP stdio JSON-RPC client for Python, TypeScript, Go, Rust, and Java with document symbols and hover; no custom parsers.
 - Persistent code graph: `scan_project` runs `CodeGraphIngestor` (`code_graph.py`) to extract `Symbol` nodes (functions/methods/classes with signature + docstring) and code edges — `DEFINES`/`CONTAINS`/`IMPORTS` (EXTRACTED) and best-effort `CALLS` (INFERRED) — into the same `memory_nodes`/`memory_edges` graph, giving communities/PageRank/retrieval a real code substrate. Offline (Python `ast` + regex for JS/TS), idempotent, and pruned on re-scan. Agents query it via the `code_neighbors` and `code_impact` MCP tools; symbol embeddings are optional (`embed_symbols` policy). See `docs/CODE_GRAPH.md`.

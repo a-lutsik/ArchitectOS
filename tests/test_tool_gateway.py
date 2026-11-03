@@ -196,6 +196,21 @@ class ToolGatewayUnitTests(unittest.TestCase):
         gateway.execute("repo_list_pull_request_comments", {"pullRequestId": 15372, "repositoryId": "E-AI", "threadId": 7})
         self.assertEqual(mcp.calls[-1][2]["action"], "list_comments")
 
+    def test_commit_search_normalizes_identifiers(self) -> None:
+        from backend.architectos.tool_ado import commit_search_is_empty, normalize_commit_search_text
+
+        self.assertEqual(normalize_commit_search_text("METER_LOAD_PROFILE_PROCESSOR"), "METER LOAD PROFILE PROCESSOR")
+        self.assertEqual(normalize_commit_search_text("MeterLoadProfileProcessor"), "Meter Load Profile Processor")
+        self.assertEqual(normalize_commit_search_text("AB#30152"), "30152")
+        self.assertEqual(normalize_commit_search_text("#30152"), "30152")
+        self.assertTrue(commit_search_is_empty({"content": [{"type": "text", "text": '{"count":0,"results":[],"infoCode":0}'}]}))
+        self.assertFalse(commit_search_is_empty({"content": [{"type": "text", "text": '{"count":1,"results":[{"commitId":"a"}]}'}]}))
+
+        mcp = _FakeMCP({"azure-devops"})
+        gateway = ToolGateway(mcp, boards_project=lambda: "E-AI")
+        gateway.execute("repo_search_commits", {"searchText": "AB#30152"})
+        self.assertEqual(mcp.calls[0][2]["searchText"], "30152")
+
     def test_repo_tools_report_missing_repository(self) -> None:
         gateway = ToolGateway(_FakeMCP({"azure-devops"}), boards_project=lambda: "E-AI")
         result = gateway.execute("repo_pull_requests_for_commit", {"commits": "a1b2c3d"})

@@ -33,7 +33,9 @@ def _call(name: str, arguments: dict, call_id: int = 1) -> dict:
 class ProjectCreateToolTests(unittest.TestCase):
     def test_create_knowledge_project_without_root_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            server = MemoryMCPServer(Path(tmp), cwd=workspace)
             responses = _run(server, [
                 _call("project_create", {"name": "Crypto Intel", "description": "News pipeline"}, 1),
                 _call("project_create", {"name": "Crypto Intel"}, 2),  # idempotent by name
@@ -42,17 +44,20 @@ class ProjectCreateToolTests(unittest.TestCase):
             ])
         created = _payload(responses[0]["result"])
         self.assertTrue(created["created"])
-        self.assertEqual(created["root_path"], "")
+        self.assertEqual(Path(created["root_path"]).resolve(), workspace.resolve())
         again = _payload(responses[1]["result"])
         self.assertFalse(again["created"])
         self.assertEqual(again["id"], created["id"])
         self.assertEqual(responses[2]["error"]["code"], -32602)
         projects = _payload(responses[3]["result"])["projects"]
         self.assertIn(created["id"], {p["id"] for p in projects})
+        self.assertTrue(_payload(responses[3]["result"]).get("create_new"))
 
     def test_create_project_with_root_path_still_validates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            server = MemoryMCPServer(Path(tmp), cwd=workspace)
             responses = _run(server, [
                 _call("project_create", {"name": "Bad", "root_path": "/no/such/dir-xyz"}, 1),
                 _call("project_create", {"name": "Ws", "root_path": tmp}, 2),
@@ -64,12 +69,14 @@ class ProjectCreateToolTests(unittest.TestCase):
 
     def test_knowledge_project_survives_service_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            first = MemoryMCPServer(Path(tmp))
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            first = MemoryMCPServer(Path(tmp), cwd=workspace)
             project_id = _payload(_run(first, [
                 _call("project_create", {"name": "Pipeline Knowledge"}, 1),
             ])[0]["result"])["id"]
             # A fresh service instance runs seed_if_empty (startup cleanup).
-            second = MemoryMCPServer(Path(tmp))
+            second = MemoryMCPServer(Path(tmp), cwd=workspace)
             projects = _payload(_run(second, [_call("memory_list_projects", {}, 1)])[0]["result"])["projects"]
         self.assertIn(project_id, {p["id"] for p in projects})
 
@@ -122,7 +129,7 @@ class MemoryLinkToolTests(unittest.TestCase):
 class SourceToolTests(unittest.TestCase):
     def test_source_create_list_and_memory_add_with_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=Path(tmp))
             project_id = _payload(_run(server, [
                 _call("project_create", {"name": "Sources Proj"}, 1),
             ])[0]["result"])["id"]
@@ -172,7 +179,7 @@ class SourceToolTests(unittest.TestCase):
             svc.add_memory({"project_id": "architectos", "label": "Marker beta", "type": "Lesson",
                             "scope": "project", "text": "Shared marker text beta.", "source_id": src_b})
             responses = _run(server, [
-                _call("memory_search", {"mode": "list", "query": "", "filters": {"source_id": src_a}}, 1),
+                _call("memory_search", {"mode": "list", "query": "", "filters": {"source_id": src_a}, "project_id": "architectos"}, 1),
             ])
         hits = _payload(responses[0]["result"])["hits"]
         labels = {h["label"] for h in hits}

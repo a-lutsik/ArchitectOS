@@ -42,7 +42,7 @@ An Ask session ends when:
 
 On finalize, ArchitectOS extracts durable facts into the review queue (`template=chat_session_atom`, label `Chat fact:`). A session summary is stored in `chat_context_summaries` for chat packing and the next session's LLM prompt; a `chat_session_summary` review card is written only when no queueable atoms were extracted (digest fallback). If those facts are already queued as MCP, Ask finalize skips the queue entirely. Continuing the same dialog reopens the session and bumps `session_revision`. Explicit **Remember answer** and ★ favorite still bypass the session gate.
 
-MCP `memory_turn` and agent hooks use the same capture path (`capture_memory_turn`) but a different channel:
+MCP `memory_turn` and agent hooks use the same capture path (`capture_memory_turn`) but a different channel. MCP tools resolve the project by `--project-id` / `ARCHITECTOS_PROJECT_ID`, then `.architectos.json`, then `project_id_for_path(cwd)`; they do not default writes to project `architectos` (see `docs/MCP_MEMORY_SERVER.md`). Agent hooks still fall back to `architectos` when no folder matches (see `docs/AGENT_HOOKS.md`).
 
 | Channel | Source in the UI | `source_type` | Queue label |
 | --- | --- | --- | --- |

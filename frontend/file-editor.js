@@ -1,12 +1,16 @@
 // File editor module. ES module.
 import { api } from "./api-client.js";
 import { showAppConfirm, showAppPrompt } from "./app-dialog.js";
-import { on } from "./dom-utils.js";
+import { escapeHtml, on } from "./dom-utils.js";
 import { getFileExtension } from "./file-tree.js";
 import { loadProjectFiles } from "./projects.js";
 import { projectParam, state, t } from "./state.js";
 import { showError } from "./ui.js";
 import { workspaceChat } from "./workspace-chat.js";
+
+// Paths come from the project tree and may contain quotes or brackets, which
+// would make a raw attribute selector throw.
+const cssEscape = (value) => (window.CSS && CSS.escape ? CSS.escape(String(value)) : String(value).replace(/["\\]/g, '\\$&'));
 
 const fileEditor = {
   currentFile: null,
@@ -15,6 +19,8 @@ const fileEditor = {
   openFiles: new Map(), // path -> { content, modified, element }
 
   init() {
+    const pathEl = document.getElementById('editor-file-path');
+    if (pathEl && !this.currentFile) pathEl.textContent = t('files.selectToEdit');
     this.bindEvents();
     this.setupContextMenu();
     this.setupKeyboardShortcuts();
@@ -161,7 +167,7 @@ const fileEditor = {
       this.isModified = false;
 
       if (statusEl) {
-        statusEl.textContent = 'Saved';
+        statusEl.textContent = t('files.saved');
         statusEl.className = 'editor-status saved';
         setTimeout(() => {
           statusEl.textContent = '';
@@ -208,7 +214,7 @@ const fileEditor = {
       delete editor.dataset.language;
     }
 
-    if (pathEl) pathEl.textContent = 'Select or create a file';
+    if (pathEl) pathEl.textContent = t('files.selectOrCreate');
     if (statusEl) {
       statusEl.textContent = '';
       statusEl.className = 'editor-status';
@@ -233,7 +239,7 @@ const fileEditor = {
 
     if (statusEl) {
       if (this.isModified) {
-        statusEl.textContent = 'Modified';
+        statusEl.textContent = t('files.modified');
         statusEl.className = 'editor-status modified';
       } else {
         statusEl.textContent = '';
@@ -340,8 +346,15 @@ const fileEditor = {
     if (!newPath || newPath === oldPath) return;
 
     try {
-      // Read current content
-      const payload = await api(`/api/project/file?project_id=${projectParam()}&path=${encodeURIComponent(oldPath)}`);
+      // Unsaved edits live only in the textarea; reading from disk would drop them.
+      const isOpen = this.currentFile === oldPath;
+      let text;
+      if (isOpen && this.isModified) {
+        text = document.getElementById('file-editor').value;
+      } else {
+        const payload = await api(`/api/project/file?project_id=${projectParam()}&path=${encodeURIComponent(oldPath)}`);
+        text = payload.text;
+      }
 
       // Create new file with same content
       await api('/api/project/file/save', {
@@ -349,7 +362,7 @@ const fileEditor = {
         body: JSON.stringify({
           project_id: state.projectId,
           path: newPath,
-          text: payload.text
+          text
         })
       });
 
@@ -362,9 +375,11 @@ const fileEditor = {
         })
       });
 
-      if (this.currentFile === oldPath) {
-        this.closeFile();
+      if (isOpen) {
+        await this.closeFile({ force: true });
         await this.openFile(newPath);
+      } else {
+        this.removeTab(oldPath);
       }
 
       await loadProjectFiles();
@@ -437,7 +452,7 @@ const fileEditor = {
     if (placeholder) placeholder.remove();
 
     // Check if tab already exists
-    if (tabsContainer.querySelector(`[data-tab-path="${path}"]`)) return;
+    if (tabsContainer.querySelector(`[data-tab-path="${cssEscape(path)}"]`)) return;
 
     const tab = document.createElement('div');
     tab.className = 'editor-tab active';
@@ -448,8 +463,8 @@ const fileEditor = {
 
     tab.innerHTML = `
       <span class="editor-tab-icon">${icon}</span>
-      <span class="editor-tab-name">${path.split('/').pop()}</span>
-      <button class="editor-tab-close" aria-label="Close">
+      <span class="editor-tab-name">${escapeHtml(path.split('/').pop())}</span>
+      <button class="editor-tab-close" aria-label="${escapeHtml(t('files.close'))}">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="18" y1="6" x2="6" y2="18"></line>
           <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -478,12 +493,12 @@ const fileEditor = {
   },
 
   removeTab(path) {
-    const tab = document.querySelector(`[data-tab-path="${path}"]`);
+    const tab = document.querySelector(`[data-tab-path="${cssEscape(path)}"]`);
     if (tab) tab.remove();
 
     const tabsContainer = document.getElementById('editor-tabs');
     if (tabsContainer && tabsContainer.children.length === 0) {
-      tabsContainer.innerHTML = '<div class="editor-tab-placeholder"><span>No files open</span></div>';
+      tabsContainer.innerHTML = `<div class="editor-tab-placeholder"><span>${escapeHtml(t('files.noFilesOpen'))}</span></div>`;
     }
   },
 

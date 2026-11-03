@@ -4,7 +4,7 @@ import json
 import os
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +109,58 @@ def _provider_urlopen(provider: dict[str, Any], req: urllib.request.Request, *, 
         return urlopen(req, timeout=timeout)
 
 
+def _probe_credentials(provider: dict[str, Any], build: Callable[[], tuple[str, dict[str, str]]]) -> tuple[str, str]:
+    """Cheap authenticated GET to see whether the key is accepted.
+
+    Returns ``("invalid", detail)`` only for 401/403. Network trouble or other
+    HTTP errors are ``("unverified", reason)`` so an offline machine does not
+    turn a possibly valid key into a hard failure.
+    """
+    timeout = min(8, int(provider.get("timeout_seconds") or 8))
+    try:
+        url, headers = build()  # endpoint validation resolves DNS, so it can fail offline
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with _provider_urlopen(provider, req, timeout=timeout) as response:
+            response.read(1)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            return "invalid", f"HTTP {exc.code}"
+        return "unverified", f"HTTP {exc.code}"
+    except (OSError, ValueError) as exc:
+        return "unverified", str(exc) or exc.__class__.__name__
+    return "verified", ""
+
+
+def _credential_verdict_result(
+    provider_id: str, verdict: str, detail: str, api_key_env: str, model: str, details: dict[str, Any], *, ok_hint: str
+) -> dict[str, Any]:
+    if verdict == "invalid":
+        return {
+            "provider_id": provider_id,
+            "ready": False,
+            "status": "invalid_credentials",
+            "message": f"{api_key_env} was rejected by the provider ({detail}).",
+            "hint": f"Paste a valid {api_key_env} in Setup → Providers, then Test.",
+            "actions": [f"Replace {api_key_env} in Providers", "Run provider test again"],
+            "details": details,
+        }
+    if verdict == "verified":
+        message = f"{api_key_env} was accepted for model {model}."
+        hint = ok_hint
+    else:
+        message = f"{api_key_env} is set for model {model}, but it could not be verified ({detail})."
+        hint = "The key was not confirmed (offline or provider unreachable). Send a short chat prompt to verify."
+    return {
+        "provider_id": provider_id,
+        "ready": True,
+        "status": "configured",
+        "message": message,
+        "hint": hint,
+        "actions": ["Send a short chat prompt", "Check model name if execution fails"],
+        "details": {**details, "verified": verdict == "verified"},
+    }
+
+
 class OpenAIResponsesAdapter(ProviderAdapter):
     provider_id = "openai"
     service_name = "OpenAI"
@@ -154,15 +206,17 @@ class OpenAIResponsesAdapter(ProviderAdapter):
                 "actions": [f"Set {api_key_env} in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model},
             }
-        return {
-            "provider_id": self.provider_id,
-            "ready": True,
-            "status": "configured",
-            "message": f"{api_key_env} is available for model {model}.",
-            "hint": "Credentials are present. Use chat or /api/ai/run to verify model-level access.",
-            "actions": ["Send a short chat prompt", "Check model name if execution fails"],
-            "details": {"api_key_env": api_key_env, "model": model, "base_url": self._responses_endpoint(provider)},
-        }
+        def build() -> tuple[str, dict[str, str]]:
+            endpoint = self._responses_endpoint(provider)
+            base = endpoint[: -len("/responses")] if endpoint.endswith("/responses") else endpoint.rstrip("/")
+            return f"{base}/models", self._request_headers(os.environ.get(api_key_env) or "")
+
+        verdict, detail = _probe_credentials(provider, build)
+        return _credential_verdict_result(
+            self.provider_id, verdict, detail, api_key_env, model,
+            {"api_key_env": api_key_env, "model": model, "base_url": str(provider.get("base_url") or self.default_endpoint)},
+            ok_hint="Key accepted. Send a short chat prompt to verify model-level access.",
+        )
 
     def run(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> dict[str, Any]:
         api_key_env = self._api_key_env(provider)
@@ -455,15 +509,23 @@ class AnthropicMessagesAdapter(ProviderAdapter):
                 "actions": [f"Set {api_key_env} in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model},
             }
-        return {
-            "provider_id": self.provider_id,
-            "ready": True,
-            "status": "configured",
-            "message": f"{api_key_env} is available for model {model}.",
-            "hint": "Credentials are present. Send a short chat prompt to verify model access.",
-            "actions": ["Send a short chat prompt", "Check model name if execution fails"],
-            "details": {"api_key_env": api_key_env, "model": model, "base_url": str(provider.get("base_url") or "https://api.anthropic.com")},
-        }
+        base_url = str(provider.get("base_url") or "https://api.anthropic.com")
+
+        def build() -> tuple[str, dict[str, str]]:
+            endpoint = _anthropic_messages_endpoint(provider)
+            base = endpoint[: -len("/messages")] if endpoint.endswith("/messages") else endpoint.rstrip("/")
+            headers = {
+                "x-api-key": os.environ.get(api_key_env) or "",
+                "anthropic-version": str(provider.get("anthropic_version") or "2023-06-01"),
+            }
+            return f"{base}/models", headers
+
+        verdict, detail = _probe_credentials(provider, build)
+        return _credential_verdict_result(
+            self.provider_id, verdict, detail, api_key_env, model,
+            {"api_key_env": api_key_env, "model": model, "base_url": base_url},
+            ok_hint="Key accepted. Send a short chat prompt to verify model access.",
+        )
 
     def run(self, provider: dict[str, Any], request: ProviderRequest, project_root: Path) -> dict[str, Any]:
         api_key_env = str(provider.get("api_key_env") or "ANTHROPIC_API_KEY")
@@ -603,15 +665,18 @@ class OpenRouterAdapter(ProviderAdapter):
                 "actions": [f"Set {api_key_env} in Providers", "Run provider test again"],
                 "details": {"api_key_env": api_key_env, "model": model},
             }
-        return {
-            "provider_id": self.provider_id,
-            "ready": True,
-            "status": "configured",
-            "message": f"{api_key_env} is available for model {model}.",
-            "hint": "Credentials are present. Refresh models or send a short chat prompt.",
-            "actions": ["Refresh models", "Send a short chat prompt", "Check model slug if execution fails"],
-            "details": {"api_key_env": api_key_env, "model": model, "base_url": _openrouter_base_url(provider)},
-        }
+        base_url = str(provider.get("base_url") or "https://openrouter.ai/api/v1").rstrip("/")
+
+        def build() -> tuple[str, dict[str, str]]:
+            # /models is public on OpenRouter, so it cannot reject a bad key; /auth/key can.
+            return f"{_openrouter_base_url(provider)}/auth/key", {"Authorization": f"Bearer {os.environ.get(api_key_env) or ''}"}
+
+        verdict, detail = _probe_credentials(provider, build)
+        return _credential_verdict_result(
+            self.provider_id, verdict, detail, api_key_env, model,
+            {"api_key_env": api_key_env, "model": model, "base_url": base_url},
+            ok_hint="Key accepted. Refresh models or send a short chat prompt.",
+        )
 
     def list_models(self, provider: dict[str, Any], project_root: Path) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}

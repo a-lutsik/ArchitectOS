@@ -191,7 +191,7 @@ const searchPalette = {
             <circle class="palette-searching-sweep" cx="20" cy="20" r="15.5"/>
           </svg>
         </div>
-        <p class="palette-searching-copy">Searching memory for “${q}”…</p>
+        <p class="palette-searching-copy">${escapeHtml(t("palette.searching")).replace("{q}", q)}</p>
       </div>
       <div class="palette-searching-skeleton" aria-hidden="true">
         ${[0, 1, 2].map((i) => `

@@ -41,6 +41,63 @@ class LocalMemoryAskTests(unittest.TestCase):
         self.assertIn("npx -y mcp-confluence", result["text"])
 
 
+class CredentialProbeTests(unittest.TestCase):
+    def _check(self, adapter_cls, env: str, side_effect):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {env: "sk-test"}), mock.patch(
+            "backend.architectos.adapters.urlopen", side_effect=side_effect
+        ), mock.patch("backend.architectos.adapters.validate_outbound_url", side_effect=lambda url, **_: url), mock.patch(
+            "backend.architectos.adapters_extract.validate_outbound_url", side_effect=lambda url, **_: url
+        ):
+            return adapter_cls().check({}, Path("."))
+
+    def test_rejected_key_is_not_ready(self) -> None:
+        import io
+        import urllib.error
+
+        from backend.architectos.adapters import AnthropicMessagesAdapter, OpenAIResponsesAdapter, OpenRouterAdapter
+
+        for cls, env in (
+            (AnthropicMessagesAdapter, "ANTHROPIC_API_KEY"),
+            (OpenAIResponsesAdapter, "OPENAI_API_KEY"),
+            (OpenRouterAdapter, "OPENROUTER_API_KEY"),
+        ):
+            err = urllib.error.HTTPError("http://x", 401, "no", {}, io.BytesIO(b"{}"))
+            result = self._check(cls, env, err)
+            self.assertFalse(result["ready"], cls.__name__)
+            self.assertEqual(result["status"], "invalid_credentials")
+
+    def test_offline_endpoint_resolution_does_not_raise(self) -> None:
+        from unittest import mock
+
+        from backend.architectos.adapters import AnthropicMessagesAdapter
+
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}), mock.patch(
+            "backend.architectos.adapters_extract.validate_outbound_url", side_effect=ValueError("could not be resolved")
+        ):
+            result = AnthropicMessagesAdapter().check({}, Path("."))
+        self.assertTrue(result["ready"])
+        self.assertIs(result["details"]["verified"], False)
+
+    def test_unreachable_provider_stays_ready_but_unverified(self) -> None:
+        from backend.architectos.adapters import AnthropicMessagesAdapter
+
+        result = self._check(AnthropicMessagesAdapter, "ANTHROPIC_API_KEY", OSError("offline"))
+        self.assertTrue(result["ready"])
+        self.assertIs(result["details"]["verified"], False)
+        self.assertIn("could not be verified", result["message"])
+
+    def test_accepted_key_is_verified(self) -> None:
+        import io
+
+        from backend.architectos.adapters import OpenAIResponsesAdapter
+
+        result = self._check(OpenAIResponsesAdapter, "OPENAI_API_KEY", lambda req, timeout=None: io.BytesIO(b"{}"))
+        self.assertTrue(result["ready"])
+        self.assertIs(result["details"]["verified"], True)
+
+
 class ProviderReadyRuleTests(unittest.TestCase):
     def test_enabled_missing_credentials_is_not_ready(self) -> None:
         openai = {

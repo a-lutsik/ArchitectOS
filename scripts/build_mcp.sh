@@ -129,9 +129,16 @@ Register in Claude Code (.mcp.json or ~/.claude.json)
   }
 }
 
+ARCHITECTOS_PROJECT_ID is optional. One command can serve every folder: bind
+order is --project-id / ARCHITECTOS_PROJECT_ID, then .architectos.json walked
+up from cwd, then project_id_for_path(cwd). Unbound memory tools do not write
+to project architectos; the agent should call memory_list_projects, then
+memory_use_project or project_create. A new Cursor/Codex/Claude folder without
+.architectos.json asks again.
+
 Reload the client after editing config. Tools: memory_search, memory_context,
-memory_add, memory_get, memory_feedback, memory_list_projects, and related
-code/memory helpers.
+memory_add, memory_get, memory_feedback, memory_list_projects,
+memory_use_project, project_create, and related code/memory helpers.
 EOF
 
 cp "$OUT_DIR/$BIN_NAME" "$STAGE_DIR/"

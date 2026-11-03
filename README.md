@@ -28,7 +28,10 @@ AI provider you configured.
   role; multi-agent **Council** can fan one request across roles.
 - **MCP hub + memory server** — a real stdio MCP client and an
   `architectos-mcp` memory server so Cursor, Claude, and Copilot can read and
-  add the same memory.
+  add the same memory. A folder binds via `--project-id` /
+  `ARCHITECTOS_PROJECT_ID`, then `.architectos.json`, then
+  `project_id_for_path(cwd)`; unbound memory tools do not write to project
+  `architectos` (see [docs/MCP_MEMORY_SERVER.md](docs/MCP_MEMORY_SERVER.md)).
 - **Agent hooks** — capture turns from Cursor / Claude Code / Codex and inject
   per-question memory even when the agent never calls a memory tool.
 - **Structured workflows** (Intro / Access / Rules / Help / Review), task board,

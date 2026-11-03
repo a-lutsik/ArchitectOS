@@ -75,7 +75,8 @@ class IndexBudgetTests(unittest.TestCase):
 
     def test_mcp_instructions_warn_only_when_over_budget(self) -> None:
         def instructions(root: Path) -> str:
-            server = MemoryMCPServer(root)
+            # Bound explicitly: an unbound server only tells the agent to pick a project.
+            server = MemoryMCPServer(root, project_id="architectos")
             stdin = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n")
             stdout = io.StringIO()
             server.serve(stdin=stdin, stdout=stdout)

@@ -163,7 +163,10 @@ Produces under `dist/mcp/`:
 - `architectos-mcp_<ver>_<platform>.zip`
 
 Point MCP clients at the binary and set `ARCHITECTOS_ROOT` to the shared data
-root (see above). Full protocol docs: [MCP_MEMORY_SERVER.md](MCP_MEMORY_SERVER.md).
+root (see above). `ARCHITECTOS_PROJECT_ID` is optional; folders bind with
+`.architectos.json` (or `project_id_for_path(cwd)`). Unbound memory tools do
+not write to project `architectos`. Full protocol docs:
+[MCP_MEMORY_SERVER.md](MCP_MEMORY_SERVER.md).
 
 ### Out of scope (v1)
 
