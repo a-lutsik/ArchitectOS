@@ -467,6 +467,24 @@ class ChatSessionServiceMixin:
                 continue
             seen_facts.add(key)
             unique_facts.append(fact)
+        extraction: dict[str, Any] = {"extractor": "heuristic"}
+        policy = self.memory_capture_settings()
+        if policy.get("mode") != "off" and messages and self.llm_extractor_active(policy):
+            # One call for the whole session: the transcript as the dialog, the
+            # retrieval pack for the first question as "already known".
+            user_part = "\n".join(str(m.get("text") or "").strip() for m in messages if m.get("role") == "user")
+            assistant_part = "\n".join(str(m.get("text") or "").strip() for m in messages if m.get("role") != "user")
+            first_user = next((str(m.get("text") or "") for m in messages if m.get("role") == "user"), "")
+            try:
+                known = self.context(first_user or user_part[:400], project_id=str(chat.get("project_id") or "architectos"), limit=8).get("hits") or []
+            except Exception:  # noqa: BLE001 - the known block is advisory
+                known = []
+            llm_facts, extraction = self.extract_capture_facts(
+                user_part, assistant_part, project_id=str(chat.get("project_id") or "architectos"), heuristic_facts=unique_facts,
+                known_hits=known, chat_id=str(chat.get("id") or ""), trigger="session_summary", policy=policy,
+            )
+            if extraction.get("extractor") == "llm":
+                unique_facts = llm_facts
         facts = collapse_similar_facts(unique_facts, limit=12)
         decisions = list(dict.fromkeys(decisions))[:8]
 
@@ -580,6 +598,7 @@ class ChatSessionServiceMixin:
             "text": summary_text,
             "has_facts": has_facts,
             "facts": facts,
+            "extractor": extraction.get("extractor"),
             "type": memory_type,
             "confidence": 0.78 if facts or decisions else 0.62,
         }
@@ -806,6 +825,8 @@ class ChatSessionServiceMixin:
             "queued": int(counts.get("candidate_created", 0)),
             "undone": int(counts.get("undone", 0)),
             "skipped": int(counts.get("skipped", 0)),
+            "llm_calls": int(counts.get("llm_ok", 0)),
+            "llm_fallbacks": int(counts.get("llm_fallback", 0)),
         }
 
     def project_id_for_path(self, path: str | None) -> str | None:
@@ -866,13 +887,19 @@ class ChatSessionServiceMixin:
         verdict = evaluate_chat_turn(user, assistant, mode=mode)
         source_ref = stable_id("mcp_turn", actual_project_id, user[:240], assistant[:240])
         trigger = f"hook_turn:{client}" if client else "mcp_turn"
+        facts, extraction = self._capture_facts_for_turn(
+            user, assistant, verdict, project_id=actual_project_id, known_hits=packed.get("hits") or [],
+            chat_id=source_ref, trigger=trigger, policy=policy,
+        )
+        kept = bool(facts) if extraction.get("extractor") == "llm" else bool(verdict.keep)
+        reason = verdict.reason if extraction.get("extractor") != "llm" else ("llm_keep" if facts else "llm_nothing_durable")
         atoms: list[dict[str, Any]] = []
-        if verdict.keep:
+        if kept:
             atoms = self._enqueue_session_fact_atoms(
                 actual_project_id,
                 source_ref,
                 1,
-                list(verdict.facts or []),
+                facts,
                 mode=mode,
                 trigger=trigger,
                 source_type="mcp",
@@ -885,13 +912,42 @@ class ChatSessionServiceMixin:
             "project_id": actual_project_id,
             "context": packed.get("context") or "",
             "hits": packed.get("hits") or [],
-            "kept": bool(verdict.keep),
-            "reason": verdict.reason,
+            "kept": kept,
+            "reason": reason,
+            "extractor": extraction.get("extractor"),
             "capture_mode": policy["mode"],
             "atoms": atoms,
             "queued": queued,
             "auto_accepted": accepted,
         }
+
+    def _capture_facts_for_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        verdict: Any,
+        *,
+        project_id: str,
+        known_hits: list[dict[str, Any]],
+        chat_id: str,
+        trigger: str,
+        policy: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Tier 1 decides whether a turn is worth a model call; tier 2 extracts.
+
+        Chit-chat, empty turns and ``mode=off`` never reach the model. Short
+        turns the heuristics already rejected are also skipped unless there is
+        enough text for the model to find what keywords missed.
+        """
+        heuristic = list(getattr(verdict, "facts", None) or [])
+        if policy.get("mode") == "off" or str(getattr(verdict, "reason", "")) in {"chitchat", "empty_turn", "chat_memory_mode=off"}:
+            return heuristic, {"extractor": "heuristic"}
+        if not getattr(verdict, "keep", False) and len(str(user_text or "")) + len(str(assistant_text or "")) < 120:
+            return heuristic, {"extractor": "heuristic"}
+        return self.extract_capture_facts(
+            user_text, assistant_text, project_id=project_id, heuristic_facts=heuristic,
+            known_hits=known_hits, chat_id=chat_id, trigger=trigger, policy=policy,
+        )
 
     def _maybe_auto_accept_chat_candidate(self, candidate: dict[str, Any] | None, settings: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Write an extracted fact at once when the capture policy is ``auto``.

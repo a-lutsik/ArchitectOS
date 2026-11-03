@@ -32,6 +32,7 @@ async function loadSettings() {
   const captureAggressiveness = document.querySelector("#capture-aggressiveness");
   const captureMinConfidence = document.querySelector("#capture-min-confidence");
   const captureProjectConfidence = document.querySelector("#capture-project-min-confidence");
+  const captureExtractor = document.querySelector("#capture-extractor");
   const chatCandidateTtl = document.querySelector("#chat-candidate-ttl");
   const chatSessionIdle = document.querySelector("#chat-session-idle");
   const chatStoreFactsOnly = document.querySelector("#chat-store-facts-only");
@@ -61,6 +62,7 @@ async function loadSettings() {
   if (captureAggressiveness) captureAggressiveness.value = capture.aggressiveness || "normal";
   if (captureMinConfidence) captureMinConfidence.value = capture.min_confidence ?? 0.7;
   if (captureProjectConfidence) captureProjectConfidence.value = capture.auto_project_min_confidence ?? 0.85;
+  if (captureExtractor) captureExtractor.value = capture.extractor || "auto";
   renderCaptureStats(capture.stats_7d);
   if (chatCandidateTtl) chatCandidateTtl.value = lifecycle.chat_candidate_ttl_days ?? 7;
   if (chatSessionIdle) chatSessionIdle.value = lifecycle.chat_session_idle_minutes ?? 30;
@@ -81,11 +83,17 @@ function renderCaptureStats(stats) {
     el.textContent = "";
     return;
   }
-  el.textContent = t("settings.captureStats")
+  let text = t("settings.captureStats")
     .replace("{days}", String(stats.days ?? 7))
     .replace("{saved}", String(stats.auto_saved ?? 0))
     .replace("{queued}", String(stats.queued ?? 0))
     .replace("{undone}", String(stats.undone ?? 0));
+  if (stats.llm_calls || stats.llm_fallbacks) {
+    text += " " + t("settings.captureStatsLlm")
+      .replace("{calls}", String(stats.llm_calls ?? 0))
+      .replace("{fallbacks}", String(stats.llm_fallbacks ?? 0));
+  }
+  el.textContent = text;
 }
 
 function fillEmbeddingsSettings(settings) {

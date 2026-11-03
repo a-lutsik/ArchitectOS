@@ -25,6 +25,7 @@ from .integrations_service import IntegrationsServiceMixin
 from .lifecycle_service import LifecycleServiceMixin, MemoryLifecycleEngine
 from .lsp import CodeIntelligenceManager
 from .mcp import MCPManager
+from .capture_extractor_service import CaptureExtractorMixin
 from .dedup_review_service import DedupReviewServiceMixin
 from .memory_dedup import MemoryDedupGate
 from .memory_ingestion import MemoryIngestionEngine
@@ -46,7 +47,7 @@ from .tool_gateway import (
 _LOG = logging.getLogger("architectos.service")
 
 
-class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, ProvidersCouncilServiceMixin, IntegrationsServiceMixin, ToolExecServiceMixin, ProjectScanServiceMixin, AzureSyncServiceMixin, IngestionServiceMixin, ChatSessionServiceMixin, ChatServiceMixin, RetrievalServiceMixin, GraphServiceMixin, LifecycleServiceMixin, MemoryWipeMixin, DedupReviewServiceMixin):
+class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, ProvidersCouncilServiceMixin, IntegrationsServiceMixin, ToolExecServiceMixin, ProjectScanServiceMixin, AzureSyncServiceMixin, IngestionServiceMixin, ChatSessionServiceMixin, ChatServiceMixin, RetrievalServiceMixin, GraphServiceMixin, LifecycleServiceMixin, MemoryWipeMixin, DedupReviewServiceMixin, CaptureExtractorMixin):
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         # Per-instance API token: the HTTP layer requires it for every /api/*

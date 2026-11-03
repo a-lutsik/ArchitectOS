@@ -16,7 +16,7 @@ import threading
 from typing import Any
 
 from .embeddings import MemoryEmbeddingEngine, build_embedding_provider, probe_embedding_provider
-from .memory_capture import capture_from_legacy, legacy_mirror, normalize_capture_settings
+from .memory_capture import DEFAULT_MEMORY_CAPTURE, capture_from_legacy, legacy_mirror, normalize_capture_settings
 from .models import utc_now
 from .routing import RouterPolicy, classify_role
 
@@ -306,10 +306,7 @@ class SettingsRouterServiceMixin:
             policy = capture_from_legacy(self.repository.get_setting("memory_lifecycle"))
         else:
             return
-        self.repository.set_setting(
-            "memory_capture",
-            {k: policy[k] for k in ("mode", "aggressiveness", "min_confidence", "auto_project_min_confidence")},
-        )
+        self.repository.set_setting("memory_capture", {k: policy[k] for k in DEFAULT_MEMORY_CAPTURE})
         life = dict(self.repository.get_setting("memory_lifecycle") or {})
         mirror = legacy_mirror(policy)
         if any(life.get(key) != value for key, value in mirror.items()):

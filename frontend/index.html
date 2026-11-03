@@ -2501,6 +2501,19 @@
                       below this confidence go to the Review Queue instead of memory.</small>
                   </label>
                   <label class="settings-field">
+                    <span class="settings-field-label" data-i18n="settings.captureExtractor">Extractor</span>
+                    <select id="capture-extractor">
+                      <option value="auto" selected data-i18n="settings.captureExtractor.auto">Auto (model when a provider
+                        is connected)</option>
+                      <option value="heuristic" data-i18n="settings.captureExtractor.heuristic">Rules only (offline)
+                      </option>
+                      <option value="llm" data-i18n="settings.captureExtractor.llm">Model always</option>
+                    </select>
+                    <small class="field-hint" data-i18n="settings.captureExtractor.desc">The model reads the turn with the
+                      same brief Claude uses for its own memory and sees what is already stored; one cheap call per
+                      agent turn or Ask session. Rules keep working offline and as a fallback.</small>
+                  </label>
+                  <label class="settings-field">
                     <span class="settings-field-label" data-i18n="settings.captureProjectConfidence">Project decisions
                       auto-save at</span>
                     <input id="capture-project-min-confidence" type="number" min="0" max="1" step="0.05" value="0.85">

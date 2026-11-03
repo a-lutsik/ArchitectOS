@@ -38,7 +38,13 @@ DEFAULT_MEMORY_CAPTURE: dict[str, Any] = {
     # project facts (decisions, constraints shared by a team) cost more when
     # wrong than a personal preference or a correction, so auto needs more.
     "auto_project_min_confidence": 0.85,
+    # auto: ask the model when a non-local provider is enabled; heuristic: never; llm: always try.
+    "extractor": "auto",
+    "llm_provider_id": "",
+    "llm_max_facts": 8,
 }
+
+EXTRACTORS = ("auto", "heuristic", "llm")
 
 # Kind → scope and node type. ``user`` facts describe the person, not the
 # project, so they live in the global scope and keep the Preference type.
@@ -46,7 +52,7 @@ KIND_SCOPE = {"user": "global", "feedback": "project", "project": "project", "re
 
 # Fact sources (``chat_memory.extract_durable_facts``) that come from the user's
 # own words. ``conservative`` keeps only these.
-USER_FACT_SOURCES = frozenset({"user_line", "user_statement", "user_explicit", "memory_add_split"})
+USER_FACT_SOURCES = frozenset({"user_line", "user_statement", "user_explicit", "memory_add_split", "llm_user"})
 
 
 def normalize_capture_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -56,6 +62,13 @@ def normalize_capture_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     settings["mode"] = mode if mode in CAPTURE_MODES else DEFAULT_MEMORY_CAPTURE["mode"]
     level = str(settings["aggressiveness"] or "").strip().lower()
     settings["aggressiveness"] = level if level in AGGRESSIVENESS_LEVELS else DEFAULT_MEMORY_CAPTURE["aggressiveness"]
+    extractor = str(settings["extractor"] or "").strip().lower()
+    settings["extractor"] = extractor if extractor in EXTRACTORS else DEFAULT_MEMORY_CAPTURE["extractor"]
+    settings["llm_provider_id"] = str(settings["llm_provider_id"] or "").strip()
+    try:
+        settings["llm_max_facts"] = max(1, min(int(settings["llm_max_facts"]), 20))
+    except (TypeError, ValueError):
+        settings["llm_max_facts"] = DEFAULT_MEMORY_CAPTURE["llm_max_facts"]
     for key in ("min_confidence", "auto_project_min_confidence"):
         try:
             settings[key] = max(0.0, min(float(settings[key]), 1.0))

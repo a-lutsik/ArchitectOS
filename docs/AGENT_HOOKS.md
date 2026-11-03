@@ -87,6 +87,9 @@ Capture routes through `capture_memory_turn`, which is the same path MCP's
   outside the repo) — and a confidence from `fact_signals`. In `auto`, project
   facts need `auto_project_min_confidence` (0.85) unless the person said
   "remember"; the other kinds need `min_confidence` (0.7).
+- With a real provider enabled (`memory_capture.extractor`: `auto`), the facts
+  come from one model call per turn that sees what memory already holds; the
+  rule-based extractor is the offline path and the fallback on any failure.
 - Secrets are redacted before anything is written.
 - Chit-chat is filtered out by `evaluate_chat_turn` before any candidate is made.
 - Cards land in the review queue with source **MCP** (`source_type=mcp`, label
