@@ -96,9 +96,11 @@ Capture routes through `capture_memory_turn`, which is the same path MCP's
   `MCP fact:`), not Ask. If the same fact is later finalized from an Ask dialog,
   ArchitectOS keeps the MCP card and does not add an Ask duplicate.
 
-The project is resolved from the hook's working directory: the registered project
-whose `root_path` contains that directory wins, and the most deeply nested root
-wins for monorepos. No match falls back to the `architectos` project.
+The project is resolved from the hook's working directory by the same rule as the
+MCP server: a `.architectos.json` bind found walking up from that directory wins;
+otherwise the registered project whose `root_path` contains it wins, and the most
+deeply nested root wins for monorepos. No match falls back to the `architectos`
+project.
 
 MCP tools do **not** use that fallback. An unbound MCP folder errors, lists
 projects, and asks the agent to call `memory_list_projects` then
