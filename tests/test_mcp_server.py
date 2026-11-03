@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from backend.architectos.mcp_server import TOOLS, MemoryMCPServer
+from backend.architectos.usage import estimate_tokens_from_text
 
 
 def _run(server: MemoryMCPServer, messages: list[dict]) -> list[dict]:
@@ -760,6 +761,31 @@ class ResolveRootTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             with mock.patch.object(sys, "frozen", True, create=True):
                 self.assertEqual(_resolve_root(), (Path.home() / "ArchitectOS").resolve())
+
+
+class CatalogSizeTests(unittest.TestCase):
+    """Every MCP session pays for the tool catalog and the startup instructions.
+
+    Tokens use the project estimate (``usage.estimate_tokens_from_text``, 4 chars
+    per token) over what the client receives: the JSON of ``tools/list`` and the
+    instructions of a bound project with no stable memory yet (the briefing on
+    top of them has its own 2 000-char budget). The limits sit just above today's
+    size (3 838 + 257 tokens) so growth fails here; stage 4 of
+    docs/AGENT_INTEGRATION_PLAN_RU.md lowers the target to <= 2 000 in total (§8).
+    """
+
+    TOOLS_TOKEN_LIMIT = 3900
+    INSTRUCTIONS_TOKEN_LIMIT = 300
+
+    def test_tool_catalog_stays_under_its_token_limit(self) -> None:
+        tokens = estimate_tokens_from_text(json.dumps(TOOLS))
+        self.assertLessEqual(tokens, self.TOOLS_TOKEN_LIMIT, f"tools/list grew to ~{tokens} tokens")
+
+    def test_startup_instructions_stay_under_their_token_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            instructions = MemoryMCPServer(Path(tmp), project_id="architectos")._startup_instructions()
+        tokens = estimate_tokens_from_text(instructions)
+        self.assertLessEqual(tokens, self.INSTRUCTIONS_TOKEN_LIMIT, f"startup instructions grew to ~{tokens} tokens")
 
 
 if __name__ == "__main__":
