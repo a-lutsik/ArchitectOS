@@ -152,6 +152,22 @@ class StorageSessionsMixin:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return {str(row["status"]): int(row["n"]) for row in rows}
 
+    def list_agent_turn_metrics_since(self, since: str, project_id: str | None = None) -> list[tuple[float, int, int]]:
+        """``(total_ms, pack_tokens, hits)`` of ``agent_turn`` keeper events since ``since`` (ISO)."""
+        sql = (
+            "SELECT json_extract(payload, '$.metadata.timing.total_ms') AS total_ms,"
+            " json_extract(payload, '$.metadata.pack_tokens') AS pack_tokens,"
+            " json_extract(payload, '$.metadata.hits') AS hits"
+            " FROM keeper_events WHERE status = 'agent_turn' AND updated_at >= ?"
+        )
+        params: list[Any] = [since]
+        if project_id:
+            sql += " AND project_id = ?"
+            params.append(project_id)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [(float(row["total_ms"] or 0.0), int(row["pack_tokens"] or 0), int(row["hits"] or 0)) for row in rows]
+
     def list_keeper_events(self, project_id: str | None = None, chat_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         sql = "SELECT payload FROM keeper_events"
         params: list[Any] = []

@@ -12,6 +12,7 @@ the MRO on :class:`ArchitectOSService`.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,16 @@ from .chat_memory import (
 )
 from .memory_capture import annotate_fact, auto_threshold, filter_facts_for_policy
 from .models import stable_id, utc_now
+from .usage import estimate_tokens_from_text
 
 _LOG = logging.getLogger("architectos.service")
+
+
+def _percentile(ordered: list[float], q: float) -> float:
+    """Nearest-rank percentile of an already sorted list (0.0 when empty)."""
+    if not ordered:
+        return 0.0
+    return round(ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))], 1)
 
 
 class ChatSessionServiceMixin:
@@ -819,6 +828,8 @@ class ChatSessionServiceMixin:
         """Counters behind the capture setting: what the policy did lately."""
         since = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%dT%H:%M:%SZ")
         counts = self.repository.count_keeper_events_since(since, project_id)
+        turns = self.repository.list_agent_turn_metrics_since(since, project_id)
+        latencies = sorted(total_ms for total_ms, _, _ in turns)
         return {
             "days": int(days),
             "auto_saved": int(counts.get("auto_accepted", 0)),
@@ -827,6 +838,13 @@ class ChatSessionServiceMixin:
             "skipped": int(counts.get("skipped", 0)),
             "llm_calls": int(counts.get("llm_ok", 0)),
             "llm_fallbacks": int(counts.get("llm_fallback", 0)),
+            # A pack with no hits is the one hooks do not inject.
+            "agent_turns": {
+                "count": len(turns),
+                "latency_ms": {"p50": _percentile(latencies, 0.5), "p95": _percentile(latencies, 0.95)},
+                "pack_tokens_avg": round(sum(tokens for _, tokens, _ in turns) / len(turns), 1) if turns else 0.0,
+                "empty_pack_share": round(sum(1 for _, _, hits in turns if not hits) / len(turns), 3) if turns else 0.0,
+            },
         }
 
     def project_id_for_path(self, path: str | None) -> str | None:
@@ -877,11 +895,15 @@ class ChatSessionServiceMixin:
         which auto-promote to short-term memory. Raw dialogue is not stored.
         ``cwd`` resolves the project when the caller is a hook that only knows a
         working directory; ``client`` is recorded on candidates for auditing.
+        ``timing`` and ``pack_tokens`` are also kept on an ``agent_turn`` keeper
+        event, which ``memory_capture_stats`` aggregates.
         """
+        started = time.perf_counter()
         actual_project_id = str(project_id or self.project_id_for_path(cwd) or "architectos")
         user = str(user_text or "").strip()
         assistant = str(assistant_text or "").strip()
         packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
+        extract_started = time.perf_counter()
         policy = self.memory_capture_settings()
         mode = policy["chat_memory_mode"]
         verdict = evaluate_chat_turn(user, assistant, mode=mode)
@@ -893,6 +915,7 @@ class ChatSessionServiceMixin:
         )
         kept = bool(facts) if extraction.get("extractor") == "llm" else bool(verdict.keep)
         reason = verdict.reason if extraction.get("extractor") != "llm" else ("llm_keep" if facts else "llm_nothing_durable")
+        capture_started = time.perf_counter()
         atoms: list[dict[str, Any]] = []
         if kept:
             atoms = self._enqueue_session_fact_atoms(
@@ -908,10 +931,45 @@ class ChatSessionServiceMixin:
             )
         queued = [item for item in atoms if str(item.get("status") or "") == "candidate"]
         accepted = [item for item in atoms if str(item.get("status") or "") == "promoted"]
+        finished = time.perf_counter()
+        context_timing = packed.get("timing") or {}
+        timing = {
+            "search_ms": float(context_timing.get("search_ms") or 0.0),
+            "stable_ms": float(context_timing.get("stable_ms") or 0.0),
+            "pack_ms": float(context_timing.get("pack_ms") or 0.0),
+            "extractor_ms": round((capture_started - extract_started) * 1000.0, 1),
+            "capture_ms": round((finished - capture_started) * 1000.0, 1),
+            "total_ms": round((finished - started) * 1000.0, 1),
+        }
+        context = str(packed.get("context") or "")
+        hits = packed.get("hits") or []
+        pack_tokens = estimate_tokens_from_text(context)
+        try:
+            self._record_keeper_event(
+                actual_project_id,
+                source_ref,
+                "agent_turn",
+                "agent_turn",
+                f"Agent turn: {len(hits)} hit(s), {pack_tokens} pack tokens, {timing['total_ms']} ms",
+                {
+                    "trigger": trigger,
+                    "timing": timing,
+                    "pack_tokens": pack_tokens,
+                    "hits": len(hits),
+                    "atoms": len(atoms),
+                    "extractor": extraction.get("extractor"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - counters must never break the turn
+            _LOG.warning("agent turn event skipped for project %s: %s", actual_project_id, exc)
+        _LOG.debug(
+            "memory turn project=%s trigger=%s hits=%s atoms=%s pack_tokens=%s timing=%s",
+            actual_project_id, trigger, len(hits), len(atoms), pack_tokens, timing,
+        )
         return {
             "project_id": actual_project_id,
-            "context": packed.get("context") or "",
-            "hits": packed.get("hits") or [],
+            "context": context,
+            "hits": hits,
             "kept": kept,
             "reason": reason,
             "extractor": extraction.get("extractor"),
@@ -919,6 +977,8 @@ class ChatSessionServiceMixin:
             "atoms": atoms,
             "queued": queued,
             "auto_accepted": accepted,
+            "timing": timing,
+            "pack_tokens": pack_tokens,
         }
 
     def _capture_facts_for_turn(

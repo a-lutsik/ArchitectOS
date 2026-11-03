@@ -1,6 +1,7 @@
 """Memory capture policy (stage A): one extractor, the mode decides a fact's fate."""
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,6 +183,44 @@ class CapturePolicyServiceTests(unittest.TestCase):
         self.assertGreaterEqual(stats["undone"], 1)
         self.assertGreaterEqual(stats["queued"], 1)
         self.assertEqual(stats["days"], 7)
+
+    def test_turn_reports_timing_and_pack_tokens(self) -> None:
+        turn = self.service.capture_memory_turn(DECISION, project_id="architectos")
+        timing = turn["timing"]
+        self.assertEqual(set(timing), {"search_ms", "stable_ms", "pack_ms", "extractor_ms", "capture_ms", "total_ms"})
+        self.assertTrue(all(value >= 0 for value in timing.values()))
+        self.assertGreater(timing["capture_ms"], 0, "the decision is written, so capture took time")
+        parts = timing["search_ms"] + timing["stable_ms"] + timing["pack_ms"] + timing["extractor_ms"] + timing["capture_ms"]
+        self.assertLessEqual(parts, timing["total_ms"] + 0.5)
+        self.assertEqual(turn["pack_tokens"], max(1, round(len(turn["context"]) / 4)))
+
+    def test_turn_event_keeps_counters_without_dialogue_text(self) -> None:
+        turn = self.service.capture_memory_turn(DECISION, project_id="architectos", client="codex")
+        events = [item for item in self.service.repository.list_keeper_events("architectos") if item.get("kind") == "agent_turn"]
+        self.assertEqual(len(events), 1)
+        meta = events[0]["metadata"]
+        self.assertEqual(meta["timing"], turn["timing"])
+        self.assertEqual(meta["pack_tokens"], turn["pack_tokens"])
+        self.assertEqual(meta["trigger"], "hook_turn:codex")
+        self.assertNotIn("never commit", json.dumps(events[0]).lower())
+
+    def test_stats_aggregate_agent_turn_latency_and_pack_size(self) -> None:
+        empty = self.service.memory_capture_stats(days=7)["agent_turns"]
+        self.assertEqual(empty, {"count": 0, "latency_ms": {"p50": 0.0, "p95": 0.0}, "pack_tokens_avg": 0.0, "empty_pack_share": 0.0})
+        turns = [
+            self.service.capture_memory_turn(DECISION, project_id="architectos"),
+            self.service.capture_memory_turn("Should I commit directly to main?", project_id="architectos"),
+            self.service.capture_memory_turn("Which branch do we commit to: main?", project_id="architectos"),
+        ]
+        stats = self.service.memory_capture_stats(days=7)
+        agent = stats["agent_turns"]
+        latencies = sorted(turn["timing"]["total_ms"] for turn in turns)
+        self.assertEqual(agent["count"], 3)
+        self.assertEqual(agent["latency_ms"], {"p50": latencies[1], "p95": latencies[2]})
+        self.assertEqual(agent["pack_tokens_avg"], round(sum(turn["pack_tokens"] for turn in turns) / 3, 1))
+        self.assertEqual(agent["empty_pack_share"], round(sum(1 for turn in turns if not turn["hits"]) / 3, 3))
+        self.assertEqual(stats["skipped"], 0, "turn events must not leak into the existing counters")
+        self.assertEqual(self.service.memory_capture_stats(days=7, project_id="other")["agent_turns"]["count"], 0)
 
 
 if __name__ == "__main__":

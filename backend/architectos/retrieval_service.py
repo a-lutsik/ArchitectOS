@@ -794,12 +794,16 @@ class RetrievalServiceMixin:
         return {"project_id": actual, "context": context, "stable": stable, "index": index}
 
     def context(self, query: str, project_id: str | None = None, scope: str | None = None, limit: int = 8, tools_available: bool = True) -> dict[str, Any]:
+        started = time.perf_counter()
         search = self.search_memory(query, project_id=project_id, scope=scope, limit=max(limit, 10), expand_graph=True)
+        searched = time.perf_counter()
         tasks = [task for task in self.repository.list_tasks(project_id) if task["status"] != "done"][:5]
         providers = [provider for provider in self.repository.list_providers() if provider["enabled"]][:5]
         boards_ids = self._boards_ids_from_memory_hits(search["hits"])
+        stable_started = time.perf_counter()
         stable_hits = self.list_stable_memory(project_id=project_id, limit=6, query=query, scope=scope)
         rule_layer_hits = self.list_rule_layer_memory(project_id=project_id, limit=8, query=query, scope=scope)
+        stable_done = time.perf_counter()
         pack_stable = list({
             str((hit.get("node") or {}).get("id") or ""): hit
             for hit in [*stable_hits, *rule_layer_hits]
@@ -815,6 +819,10 @@ class RetrievalServiceMixin:
             tools_available=tools_available,
             stable_hits=pack_stable,
         )
+        token_economy = self._token_economy_for_pack(packed, project_id=project_id)
+        search_ms = (searched - started) * 1000.0
+        stable_ms = (stable_done - stable_started) * 1000.0
+        total_ms = (time.perf_counter() - started) * 1000.0
         return {
             "query": query,
             "context": packed,
@@ -822,7 +830,13 @@ class RetrievalServiceMixin:
             "stable_hits": stable_hits,
             "rule_layer_hits": rule_layer_hits,
             "retrieval": search.get("retrieval") or {},
-            "token_economy": self._token_economy_for_pack(packed, project_id=project_id),
+            "token_economy": token_economy,
+            # pack_ms is the rest of the call: tasks, providers, packing and token economy.
+            "timing": {
+                "search_ms": round(search_ms, 1),
+                "stable_ms": round(stable_ms, 1),
+                "pack_ms": round(total_ms - search_ms - stable_ms, 1),
+            },
         }
 
     def _memory_corpus_stats(self, project_id: str | None = None) -> dict[str, int]:
