@@ -571,6 +571,9 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
     def _post_memory_turn(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         raw_limit = str(payload.get("limit") or "").strip()
         limit = max(1, min(int(raw_limit), 50)) if raw_limit.isdigit() else 8
+        raw_exclude = payload.get("exclude_ids")
+        exclude_ids = [str(item) for item in raw_exclude[:2000]] if isinstance(raw_exclude, list) else []
+        raw_vector_ms = str(payload.get("vector_timeout_ms") or "").strip()
         self._json(
             self.get_service().capture_memory_turn(
                 str(payload.get("user_text") or ""),
@@ -580,6 +583,11 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
                 limit=limit,
                 cwd=payload.get("cwd") or None,
                 client=payload.get("client") or None,
+                hook=payload.get("hook") is True,
+                capture=payload.get("capture") is not False,
+                include_stable=payload.get("include_stable") is not False,
+                exclude_ids=exclude_ids,
+                vector_timeout_ms=int(raw_vector_ms) if raw_vector_ms.isdigit() else None,
             ),
             HTTPStatus.CREATED,
         )

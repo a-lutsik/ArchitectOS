@@ -96,8 +96,10 @@ class RetrievalServiceMixin:
         min_score: float | None = None,
         relevance_floor: float | None = None,
         allowed_scopes: list[str] | set[str] | None = None,
+        vector_timeout_ms: int | None = None,
     ) -> dict[str, Any]:
-        # FTS + vector in parallel; vector is best-effort with a hard timeout.
+        # FTS + vector in parallel; vector is best-effort with a hard timeout
+        # (memory_retrieval.vector_query_timeout_ms unless vector_timeout_ms overrides it).
         # Lifecycle access bump runs inline (cheap: notify=False, no re-embedding);
         # refresh=True additionally reloads fresh lifecycle metadata into hits.
         # as_of (ISO date/datetime) = temporal point-in-time query: only nodes
@@ -127,7 +129,8 @@ class RetrievalServiceMixin:
         retrieval_settings = self.memory_embeddings.settings()
         vector_pool = max(8, min(int(retrieval_settings.get("vector_pool") or 64), 200))
         try:
-            timeout_s = max(0.05, min(int(retrieval_settings.get("vector_query_timeout_ms") or 2500), 5000) / 1000.0)
+            timeout_ms = vector_timeout_ms if vector_timeout_ms is not None else retrieval_settings.get("vector_query_timeout_ms")
+            timeout_s = max(0.05, min(int(timeout_ms or 2500), 5000) / 1000.0)
         except (TypeError, ValueError):
             timeout_s = 2.5
         try:

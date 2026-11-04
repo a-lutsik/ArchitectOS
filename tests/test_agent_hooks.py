@@ -68,6 +68,156 @@ class HookNormalizationTests(unittest.TestCase):
         self.assertIsNone(agent_hooks.normalize_payload({"hook_event_name": "PreCompact"}, client="codex"))
 
 
+_FILLER = (
+    "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa "
+    "quebec romeo sierra tango uniform victor whiskey xray yankee zulu amber basalt cobalt dune ember fjord"
+).split()
+
+
+def _seed(service: ArchitectOSService, project_id: str, count: int, word: str = "ledger") -> list[str]:
+    """``count`` long, mutually distinct Lesson nodes that all match ``word``; returns their ids."""
+    ids: list[str] = []
+    for index in range(count):
+        filler = " ".join(_FILLER[(index * 7 + step) % len(_FILLER)] + str(index) for step in range(40))
+        node = service.repository.add_node(
+            "Lesson",
+            f"{word} rule {index}",
+            "project",
+            f"The {word} service must batch writes before replicating them. {filler}",
+            project_id,
+            None,
+            0.8,
+            {"source": "test"},
+        )
+        ids.append(node.id)
+    return ids
+
+
+class HookTimeoutTests(unittest.TestCase):
+    def _timeouts(self, env: dict[str, str]) -> dict[str, float]:
+        seen: dict[str, float] = {}
+
+        def fake_request(url: str, token: str, *, payload: object, timeout: float, root: object = None) -> dict[str, object]:
+            seen["session" if "briefing" in url else ("response" if payload and payload.get("assistant_text") else "prompt")] = timeout  # type: ignore[union-attr]
+            return {"context": "", "hits": []}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env), \
+                mock.patch.object(agent_hooks, "_request_json", side_effect=fake_request):
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            for raw_event, event, field in (
+                ("SessionStart", "session", ""),
+                ("UserPromptSubmit", "prompt", "prompt"),
+                ("Stop", "response", "last_assistant_message"),
+            ):
+                payload = {"hook_event_name": raw_event, "cwd": str(root)}
+                if field:
+                    payload[field] = "How do we batch ledger writes?"
+                agent_hooks.handle_capture(json.dumps(payload), client="claude", event=event, root=root)
+        return seen
+
+    def test_injecting_events_wait_two_seconds_and_capture_five(self) -> None:
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("ARCHITECTOS_HOOK_TIMEOUT", None)
+            os.environ.pop("ARCHITECTOS_HOOK_INJECT_TIMEOUT", None)
+            seen = self._timeouts({})
+        self.assertEqual(seen, {"session": 2.0, "prompt": 2.0, "response": 5.0})
+
+    def test_timeouts_are_overridable_per_kind(self) -> None:
+        seen = self._timeouts({"ARCHITECTOS_HOOK_TIMEOUT": "7", "ARCHITECTOS_HOOK_INJECT_TIMEOUT": "0.5"})
+        self.assertEqual(seen, {"session": 0.5, "prompt": 0.5, "response": 7.0})
+
+    def test_hook_pack_cuts_vector_search_at_800_ms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            _seed(service, "architectos", 3)
+            with mock.patch.object(service, "_vector_search_memory_timed", return_value=({}, 0.0, False)) as vector:
+                service.capture_memory_turn("How do we batch ledger writes?", hook=True, capture=False)
+                hook_timeout = vector.call_args.kwargs["timeout_s"]
+                service.capture_memory_turn("How do we batch ledger writes?")
+                default_timeout = vector.call_args.kwargs["timeout_s"]
+        self.assertEqual(hook_timeout, 0.8)
+        self.assertEqual(default_timeout, 2.5)
+
+    def test_vector_timeout_is_a_request_parameter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            _seed(service, "architectos", 2)
+            with mock.patch.object(service, "_vector_search_memory_timed", return_value=({}, 0.0, False)) as vector:
+                service.search_memory("ledger", project_id="architectos", vector_timeout_ms=300)
+        self.assertEqual(vector.call_args.kwargs["timeout_s"], 0.3)
+
+
+class HookBudgetTests(unittest.TestCase):
+    QUESTION = "How do we batch ledger writes before replicating?"
+
+    def test_hook_pack_fits_the_hook_budget_and_excerpt_length(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            _seed(service, "architectos", 12)
+            full = service.context(self.QUESTION, project_id="architectos")
+            hook = service.capture_memory_turn(self.QUESTION, hook=True, capture=False)
+        self.assertGreater(len(full["context"]), 1600)
+        self.assertLessEqual(len(hook["context"]), 1600)
+        self.assertGreaterEqual(len(hook["hits"]), 1)
+        lines = [line for line in hook["context"].splitlines() if line.startswith("- id=")]
+        self.assertGreaterEqual(len(lines), 2)
+        for line in lines[:-1]:  # the last line may be cut by the budget
+            excerpt = line.split(": ", 1)[1].rsplit(" (evidence:", 1)[0]
+            self.assertLessEqual(len(excerpt), 220)
+        self.assertEqual(hook["atoms"], [])
+        self.assertEqual(hook["reason"], "inject_only")
+
+    def test_hook_char_budget_setting_is_read_and_clamped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            _seed(service, "architectos", 12)
+            service.repository.set_setting("agent", {"hook_char_budget": 2600})
+            wide = service.capture_memory_turn(self.QUESTION, hook=True, capture=False)["context"]
+            service.repository.set_setting("agent", {"hook_char_budget": 300})
+            settings = service.agent_hook_settings()
+        self.assertGreater(len(wide), 1600)
+        self.assertLessEqual(len(wide), 2600)
+        self.assertEqual(settings["hook_char_budget"], 1200)
+
+    def test_pack_without_hits_above_the_relevance_floor_is_not_injected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 4)
+            service.repository.set_setting("agent", {"hook_min_score": 999})
+            floored = service.capture_memory_turn(self.QUESTION, hook=True, capture=False)
+            out = agent_hooks.render_stdout(
+                agent_hooks.HookTurn(client="claude", event="prompt", raw_event="UserPromptSubmit"), floored
+            )
+            service.repository.set_setting("agent", {"hook_min_score": 0})
+            open_floor = service.capture_memory_turn(self.QUESTION, hook=True, capture=False)
+        self.assertEqual((floored["hits"], floored["context"], out), ([], "", ""))
+        self.assertGreaterEqual(len(open_floor["hits"]), 1)
+
+    def test_hook_prompt_asks_the_server_for_the_hook_pack(self) -> None:
+        sent: list[dict[str, object]] = []
+
+        def fake_request(url: str, token: str, *, payload: dict[str, object], timeout: float, root: object = None) -> dict[str, object]:
+            sent.append(payload)
+            return {"context": "", "hits": []}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agent_hooks, "_request_json", side_effect=fake_request):
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            agent_hooks.handle_capture(
+                json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": self.QUESTION, "cwd": str(root)}),
+                client="claude", event="prompt", root=root,
+            )
+        self.assertIs(sent[0]["hook"], True)
+
+
 class HookRenderTests(unittest.TestCase):
     def test_injecting_client_returns_additional_context(self) -> None:
         turn = agent_hooks.HookTurn(client="codex", event=agent_hooks.EVENT_PROMPT, raw_event="UserPromptSubmit")

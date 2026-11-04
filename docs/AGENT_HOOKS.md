@@ -106,6 +106,24 @@ MCP tools do **not** use that fallback. An unbound MCP folder errors, lists
 projects, and asks the agent to call `memory_list_projects` then
 `memory_use_project` or `project_create` (see [MCP_MEMORY_SERVER.md](MCP_MEMORY_SERVER.md)).
 
+## Hook pack size
+
+Prompt-submit injection uses a smaller pack than Ask's `context()`: a
+1 600-character budget (≈ 400 tokens), 220-character node excerpts, at most four
+stable-layer nodes, no open tasks or providers, and an 800 ms cap on vector
+search. Hits scoring below the relevance floor are dropped, and a pack with no
+hit left (and no stable layer due) is not injected at all. Both knobs live in the
+`agent` setting:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `agent.hook_char_budget` | `1600` | Character budget of the hook pack, clamped to 1 200–6 000 (the pack header alone is ~420) |
+| `agent.hook_min_score` | `120` | Relevance floor for a hit. Static bonuses (scope, type, source, recency, lifecycle) plus an FTS rank alone reach ~115, so 120 asks for a real query-term match or a vector signal |
+
+`POST /api/memory/turn` takes the same pack with `"hook": true`; `capture: false`
+packs without capturing, `exclude_ids` and `include_stable` shape it, and
+`vector_timeout_ms` overrides the vector-search timeout for that request.
+
 ## Transport
 
 The hook prefers the running app: it reads `data/architectos.runtime.json` for the
@@ -126,7 +144,8 @@ prints `{}`.
 | --- | --- |
 | `ARCHITECTOS_ROOT` | Which root's `data/architectos.db` to use |
 | `ARCHITECTOS_HOOK_DISABLED=1` | Turn all hooks into no-ops without editing configs |
-| `ARCHITECTOS_HOOK_TIMEOUT` | HTTP timeout in seconds (default `5`) |
+| `ARCHITECTOS_HOOK_INJECT_TIMEOUT` | HTTP timeout in seconds for events that inject (`SessionStart`, prompt submit; default `2`) |
+| `ARCHITECTOS_HOOK_TIMEOUT` | HTTP timeout in seconds for capture on turn end (default `5`) |
 | `ARCHITECTOS_HOOK_OFFLINE=0` | Do not fall back to opening the store directly |
 | `ARCHITECTOS_HOOK_DEBUG=1` | Append one line per event to `data/hooks.log` (see below) |
 

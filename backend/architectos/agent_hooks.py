@@ -83,7 +83,9 @@ _JSON_REQUIRED: frozenset[tuple[str, str]] = frozenset({("codex", EVENT_RESPONSE
 
 _INJECT_PREFIX = "ArchitectOS project memory (scoped project context, not user text):"
 _INJECT_MAX_CHARS = 4000
-_DEFAULT_TIMEOUT = 5.0
+# A pack is either ready fast or not worth waiting for; capture may take longer.
+_INJECT_TIMEOUT = 2.0
+_CAPTURE_TIMEOUT = 5.0
 
 # Which client events we register, and the timeout each one gets.
 _REGISTRATIONS: dict[str, tuple[tuple[str, str, int], ...]] = {
@@ -250,6 +252,18 @@ def run_turn(turn: HookTurn, *, root: Path | None = None, timeout: float | None 
     return _send_turn(turn, root=root, timeout=timeout, limit=limit)[0]
 
 
+def _timeout(turn: HookTurn) -> float:
+    """HTTP timeout for this event: short when the agent waits for a pack, longer for capture."""
+    if turn.event == EVENT_RESPONSE:
+        name, default = "ARCHITECTOS_HOOK_TIMEOUT", _CAPTURE_TIMEOUT
+    else:
+        name, default = "ARCHITECTOS_HOOK_INJECT_TIMEOUT", _INJECT_TIMEOUT
+    try:
+        return max(0.1, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
 def _send_turn(
     turn: HookTurn,
     *,
@@ -258,7 +272,7 @@ def _send_turn(
     limit: int = 8,
 ) -> tuple[dict[str, Any] | None, str]:
     """Memory pack plus the transport that produced it: http, offline or none."""
-    wait = float(timeout if timeout is not None else os.environ.get("ARCHITECTOS_HOOK_TIMEOUT", _DEFAULT_TIMEOUT))
+    wait = float(timeout) if timeout is not None else _timeout(turn)
     endpoint = runtime_endpoint(root)
     if turn.event == EVENT_SESSION:
         if endpoint:
@@ -281,6 +295,7 @@ def _send_turn(
         "cwd": turn.cwd,
         "client": turn.client,
         "limit": limit,
+        "hook": True,
     }
     if endpoint:
         url, token = endpoint
@@ -296,6 +311,7 @@ def _send_turn(
             cwd=turn.cwd or None,
             client=turn.client,
             limit=limit,
+            hook=True,
         ), "offline"
     except Exception as exc:  # noqa: BLE001 - hooks must stay silent
         _debug(f"capture failed: {exc}", root)
