@@ -209,7 +209,14 @@ def runtime_endpoint(root: Path | None = None) -> tuple[str, str] | None:
     return url.rstrip("/"), token
 
 
-def _request_json(url: str, token: str, *, payload: dict[str, Any] | None, timeout: float) -> dict[str, Any] | None:
+def _request_json(
+    url: str,
+    token: str,
+    *,
+    payload: dict[str, Any] | None,
+    timeout: float,
+    root: Path | None = None,
+) -> dict[str, Any] | None:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     request.add_header("X-ArchitectOS-Token", token)
@@ -219,7 +226,7 @@ def _request_json(url: str, token: str, *, payload: dict[str, Any] | None, timeo
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
             body = response.read().decode("utf-8")
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        _debug(f"http failed: {exc}")
+        _debug(f"http failed: {exc}", root)
         return None
     try:
         parsed = json.loads(body)
@@ -257,7 +264,7 @@ def _send_turn(
         if endpoint:
             url, token = endpoint
             query = urllib.parse.urlencode({"cwd": turn.cwd}) if turn.cwd else ""
-            result = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait)
+            result = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait, root=root)
             if result is not None:
                 return result, "http"
         if not _offline_allowed():
@@ -277,7 +284,7 @@ def _send_turn(
     }
     if endpoint:
         url, token = endpoint
-        result = _request_json(f"{url}/api/memory/turn", token, payload=payload, timeout=wait)
+        result = _request_json(f"{url}/api/memory/turn", token, payload=payload, timeout=wait, root=root)
         if result is not None:
             return result, "http"
     if not _offline_allowed():
@@ -340,7 +347,7 @@ def handle_capture(
     payload = parsed if isinstance(parsed, dict) else {}
     turn = normalize_payload(payload, client=client, event=event)
     if turn is None:
-        _debug(f"ignored event client={client} event={event}")
+        _debug(f"ignored event client={client} event={event}", root)
         return _silent(client, event)
     if turn.event == EVENT_PROMPT and not turn.user_text:
         return _silent(turn.client, turn.event)

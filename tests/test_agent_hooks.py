@@ -523,6 +523,44 @@ class HookTimingLogTests(unittest.TestCase):
             self._capture(root, self.PROMPT)
             self.assertFalse((root / "data" / "hooks.log").exists())
 
+    def test_silent_events_log_zero_injected_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": "1"}):
+            root = Path(tmp)
+            ArchitectOSService(root)
+            self._capture(root, self.PROMPT)
+            stop = agent_hooks.handle_capture(
+                json.dumps({"hook_event_name": "Stop", "last_assistant_message": self.PROMPT, "cwd": str(root)}),
+                client="codex",
+                event="response",
+                root=root,
+            )
+            cursor = agent_hooks.handle_capture(
+                json.dumps({"hook_event_name": "beforeSubmitPrompt", "prompt": "Which Python formatter do we use?", "cwd": str(root)}),
+                client="cursor",
+                event="prompt",
+                root=root,
+            )
+            lines = self._log_lines(root)[1:]
+        self.assertEqual((stop, cursor), ("{}", ""))
+        self.assertEqual(len(lines), 2)
+        self.assertRegex(lines[0], r" event=response client=codex transport=offline ms=\d+\.\d tokens=0 hits=\d+ ")
+        self.assertRegex(lines[1], r" event=prompt client=cursor transport=offline ms=\d+\.\d tokens=0 hits=[1-9]\d* ")
+
+    def test_failure_lines_land_under_the_given_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": "1"}):
+            root = Path(tmp)
+            ArchitectOSService(root)
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:1", "auth_token": "token"}),
+                encoding="utf-8",
+            )
+            agent_hooks.handle_capture('{"hook_event_name": "PreCompact"}', client="codex", root=root)
+            self._capture(root, self.PROMPT)
+            log = "\n".join(self._log_lines(root))
+        self.assertIn("ignored event client=codex", log)
+        self.assertIn("http failed:", log)
+        self.assertIn("transport=offline", log)
+
 
 if __name__ == "__main__":
     unittest.main()
