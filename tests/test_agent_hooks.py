@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -98,12 +99,13 @@ class HookTimeoutTests(unittest.TestCase):
     def _timeouts(self, env: dict[str, str]) -> dict[str, float]:
         seen: dict[str, float] = {}
 
-        def fake_request(url: str, token: str, *, payload: object, timeout: float, root: object = None) -> tuple[dict[str, object], str]:
-            seen["session" if "briefing" in url else ("response" if payload and payload.get("assistant_text") else "prompt")] = timeout  # type: ignore[union-attr]
-            return {"context": "", "hits": []}, ""
+        def fake_urlopen(request: urllib.request.Request, timeout: float) -> object:
+            body = json.loads(request.data or b"{}")
+            seen["session" if "briefing" in request.full_url else ("response" if body.get("assistant_text") else "prompt")] = timeout
+            raise urllib.error.URLError(ConnectionRefusedError("app closed"))
 
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env), \
-                mock.patch.object(agent_hooks, "_request_json", side_effect=fake_request):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {**env, "ARCHITECTOS_HOOK_OFFLINE": "0"}), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
             root = Path(tmp)
             (root / "data").mkdir()
             (root / "data" / "architectos.runtime.json").write_text(
@@ -206,11 +208,12 @@ class HookBudgetTests(unittest.TestCase):
     def test_hook_prompt_asks_the_server_for_the_hook_pack(self) -> None:
         sent: list[dict[str, object]] = []
 
-        def fake_request(url: str, token: str, *, payload: dict[str, object], timeout: float, root: object = None) -> tuple[dict[str, object], str]:
-            sent.append(payload)
-            return {"context": "", "hits": []}, ""
+        def fake_urlopen(request: urllib.request.Request, timeout: float) -> object:
+            sent.append(json.loads(request.data or b"{}"))
+            raise urllib.error.URLError(ConnectionRefusedError("app closed"))
 
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agent_hooks, "_request_json", side_effect=fake_request):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_OFFLINE": "0"}), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
             root = Path(tmp)
             (root / "data").mkdir()
             (root / "data" / "architectos.runtime.json").write_text(
