@@ -181,6 +181,38 @@ class MultiHopExpansionTests(unittest.TestCase):
             scoped = service.context("zephyr alpha anchor unique", project_id="project_a", scope="global", limit=8)
             self.assertEqual({hit["node"]["id"] for hit in scoped["hits"]}, {shared})
 
+    def test_other_project_neighbors_do_not_crowd_out_own(self) -> None:
+        # Project B's many 1-hop neighbors of a shared node must not take the
+        # PageRank slots (or node budget) that A's own 2-hop neighbor needs.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            shared = service.add_memory({
+                "label": "Alpha anchor", "type": "Lesson", "scope": "global",
+                "text": "Zephyr alpha anchor unique marker keyword",
+            })["id"]
+            one_hop = service.add_memory({
+                "project_id": "project_a", "label": "Bravo node", "type": "Decision",
+                "scope": "project", "text": "Bravo caching subsystem session cookie eviction",
+            })["id"]
+            two_hop = service.add_memory({
+                "project_id": "project_a", "label": "Delta node", "type": "Decision",
+                "scope": "project", "text": "Delta localization glossary translation locale",
+            })["id"]
+            service.repository.add_edge(shared, one_hop, "RELATED_TO", "project")
+            service.repository.add_edge(one_hop, two_hop, "RELATED_TO", "project")
+            for word in ("kiwi", "mango", "papaya", "guava", "lychee", "durian",
+                         "quince", "feijoa", "rambutan", "longan", "salak", "jabuticaba"):
+                foreign = service.add_memory({
+                    "project_id": "project_b", "label": f"{word} constraint", "type": "Constraint",
+                    "scope": "project", "text": f"{word} deployment {word} rollout pipeline {word}",
+                })["id"]
+                service.repository.add_edge(shared, foreign, "RELATED_TO", "project")
+
+            result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertEqual(surfaced, {shared, one_hop, two_hop})
+
 
 class TemporalSupersedeTests(unittest.TestCase):
     OLD_TS = "2026-01-01T00:00:00+00:00"

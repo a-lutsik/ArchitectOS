@@ -236,24 +236,11 @@ class RetrievalServiceMixin:
             graph_edges, neighbor_order = self._pagerank_graph_expansion(
                 seeds=[node.id for node in nodes],
                 limit=limit,
+                project_id=project_id,
+                scope=scope,
             )
             if neighbor_order:
                 neighbors = self.repository.list_nodes_by_ids(list(neighbor_order))
-                # Edges cross project boundaries (a shared node links into many
-                # projects), so neighbors get the same project visibility as the
-                # FTS/vector prefilter that produced the seeds.
-                walked = len(neighbors)
-                neighbors = [
-                    node for node in neighbors
-                    if MemoryEmbeddingEngine._passes_scope_filter(
-                        node.scope or "", node.project_id or "", project_id=project_id, scope=scope
-                    )
-                ]
-                if len(neighbors) < walked:
-                    _LOG.debug(
-                        "graph expansion dropped %d of %d neighbors outside project=%s scope=%s",
-                        walked - len(neighbors), walked, project_id, scope,
-                    )
                 if normalized_filters:
                     neighbors = [node for node in neighbors if self._memory_node_matches_filters(node, normalized_filters)]
                 neighbors = [node for node in neighbors if self._memory_node_visible_at(node, as_of)]
@@ -358,7 +345,14 @@ class RetrievalServiceMixin:
     # other. Traverse only semantic content edges so hop distance stays meaningful.
     _STRUCTURAL_EDGE_TYPES = frozenset({"HAS_MEMORY", "DOCUMENTED_IN"})
 
-    def _pagerank_graph_expansion(self, *, seeds: list[str], limit: int) -> tuple[list[Any], list[str]]:
+    def _pagerank_graph_expansion(
+        self,
+        *,
+        seeds: list[str],
+        limit: int,
+        project_id: str | None = None,
+        scope: str | None = None,
+    ) -> tuple[list[Any], list[str]]:
         """Walk the memory graph up to N hops from the query matches and return the
         highest personalized-PageRank neighbors, ordered by graph proximity.
 
@@ -368,6 +362,10 @@ class RetrievalServiceMixin:
         graph proximity instead of pulling in every direct neighbor. Bounded by a
         hop count and a node budget to keep context builds fast. Returns the
         subgraph edges plus the neighbor ids in descending PageRank order.
+
+        Only nodes visible to ``project_id``/``scope`` (the FTS/vector prefilter
+        rule) are walked: a shared node links into many projects, and other
+        projects' nodes must neither surface nor spend the budget and PageRank mass.
         """
         seed_set = {sid for sid in seeds if sid}
         if not seed_set:
@@ -375,6 +373,7 @@ class RetrievalServiceMixin:
 
         collected: dict[str, Any] = {}
         visited = set(seed_set)
+        hidden: set[str] = set()
         frontier = list(seed_set)
         for _hop in range(self.GRAPH_EXPANSION_HOPS):
             if not frontier or len(visited) >= self.GRAPH_EXPANSION_MAX_NODES:
@@ -385,14 +384,26 @@ class RetrievalServiceMixin:
                     continue
                 collected[edge.id] = edge
                 for endpoint in (edge.source, edge.target):
-                    if endpoint not in visited:
+                    if endpoint not in visited and endpoint not in hidden:
                         next_frontier.add(endpoint)
+            visible = {
+                node_id
+                for node_id, (node_scope, node_project) in self.repository.node_scopes_by_ids(next_frontier).items()
+                if MemoryEmbeddingEngine._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope)
+            }
+            hidden |= next_frontier - visible
+            next_frontier = visible
             # Respect the node budget deterministically (smaller ids first).
             for endpoint in sorted(next_frontier):
                 if len(visited) >= self.GRAPH_EXPANSION_MAX_NODES:
                     break
                 visited.add(endpoint)
             frontier = [nid for nid in sorted(next_frontier) if nid in visited]
+        if hidden:
+            _LOG.debug(
+                "graph expansion skipped %d invisible or missing nodes for project=%s scope=%s (walked %d)",
+                len(hidden), project_id, scope, len(visited),
+            )
 
         graph_edges = list(collected.values())
         if not graph_edges:
