@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from backend.architectos.mcp_server import TOOLS, MemoryMCPServer
+from backend.architectos.storage import SQLiteMemoryRepository
 from backend.architectos.usage import estimate_tokens_from_text
 
 
@@ -548,6 +549,193 @@ class MemoryMCPServerTests(unittest.TestCase):
 
 def _tool_payload(result: dict) -> dict:
     return json.loads(result["content"][0]["text"].split("```json", 1)[1].rsplit("```", 1)[0])
+
+
+def _seed_two_projects(repository: SQLiteMemoryRepository) -> dict[str, str]:
+    """Nodes of project_a, project_b and cross-project ones, keyed by role."""
+    rows = {
+        "own": ("Decision", "Cache eviction rule", "project", "Session cache entries expire after ten minutes.", "project_a"),
+        "own2": ("Lesson", "Cache warmup lesson", "project", "Warm the session cache before the morning peak.", "project_a"),
+        "foreign": ("Decision", "Project B billing rule", "project", "Project B bills customers monthly.", "project_b"),
+        "foreign_shared": ("Decision", "Project B refund rule", "project_shared", "Project B refunds within fourteen days.", "project_b"),
+        "global": ("Decision", "Retry budget rule", "global", "Outbound HTTP calls retry three times with jitter.", None),
+        "shared": ("Decision", "Log format rule", "shared", "Services log structured JSON lines.", "project_b"),
+        "orphan": ("Decision", "Timeout rule", "project", "Upstream calls time out after five seconds.", None),
+    }
+    return {key: repository.add_node(*row).id for key, row in rows.items()}
+
+
+class ProjectIsolationByIdTests(unittest.TestCase):
+    """Tools that take node ids see only nodes visible to the server's project."""
+
+    MISSING_ID = "node_missing000000"
+    HIDDEN = ("foreign", "foreign_shared")
+    VISIBLE = ("own", "global", "shared", "orphan")
+
+    def _server(self, root: Path) -> MemoryMCPServer:
+        return MemoryMCPServer(root, project_id="project_a")
+
+    def test_memory_history_hides_other_projects_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            repository = server.service.repository
+            ids = _seed_two_projects(repository)
+            for node_id in ids.values():
+                repository.record_memory_event(node_id, "updated", actor="test")
+            before = {node_id: repository.list_memory_events(node_id) for node_id in ids.values()}
+            asked = [*(ids[key] for key in self.HIDDEN), self.MISSING_ID, *(ids[key] for key in self.VISIBLE)]
+            replies = _run(server, [_call_tool("memory_history", {"id": node_id}, index) for index, node_id in enumerate(asked)])
+            after = {node_id: repository.list_memory_events(node_id) for node_id in ids.values()}
+
+        for reply, node_id in zip(replies[:3], asked[:3]):
+            with self.subTest(node_id=node_id):
+                self.assertTrue(reply["result"]["isError"])
+                self.assertEqual(reply["result"]["content"][0]["text"], f"Error: memory node not found: {node_id}")
+        for reply, node_id in zip(replies[3:], asked[3:]):
+            with self.subTest(node_id=node_id):
+                payload = _tool_payload(reply["result"])
+                self.assertEqual(payload["id"], node_id)
+                self.assertIn("updated", [event["event_type"] for event in payload["events"]])
+        self.assertEqual(after, before)
+
+    def test_explain_path_skips_other_projects_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            repository = server.service.repository
+            ids = _seed_two_projects(repository)
+            # own -> own2 only through a foreign node; own -> orphan through visible cross-project nodes.
+            for source, target in (("own", "foreign"), ("foreign", "own2"), ("own", "global"), ("global", "shared"), ("shared", "orphan")):
+                repository.add_edge(ids[source], ids[target], "RELATED_TO", "project")
+            pairs = [
+                (ids["own"], ids["own2"]),
+                (ids["own"], ids["foreign"]),
+                (ids["foreign_shared"], ids["own"]),
+                (ids["own"], self.MISSING_ID),
+                (ids["own"], ids["orphan"]),
+            ]
+            replies = _run(server, [
+                _call_tool("memory_explain_path", {"source_id": source, "target_id": target}, index)
+                for index, (source, target) in enumerate(pairs)
+            ])
+
+        bridged = replies[0]["result"]
+        self.assertFalse(bridged["isError"])
+        self.assertFalse(_tool_payload(bridged)["found"])
+        self.assertNotIn(ids["foreign"], bridged["content"][0]["text"])
+        self.assertNotIn("Project B", bridged["content"][0]["text"])
+        missing = replies[3]["result"]
+        self.assertTrue(missing["isError"])
+        for reply in replies[1:3]:
+            self.assertEqual(reply["result"], missing)
+        visible = _tool_payload(replies[4]["result"])
+        self.assertTrue(visible["found"])
+        self.assertEqual(visible["path"], [ids[key] for key in ("own", "global", "shared", "orphan")])
+
+    def test_memory_link_rejects_other_projects_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            repository = server.service.repository
+            ids = _seed_two_projects(repository)
+            hidden_ids = [ids[key] for key in self.HIDDEN]
+
+            def snapshot() -> dict[str, tuple[list[dict], dict]]:
+                return {
+                    node_id: (repository.list_memory_events(node_id), dict(repository.get_node(node_id).metadata or {}))
+                    for node_id in ids.values()
+                }
+
+            before = snapshot()
+            links = [
+                (ids["own"], ids["foreign"], "RELATED_TO"),
+                # SUPERSEDES would also retire the own target if the foreign source got through.
+                (ids["foreign_shared"], ids["own"], "SUPERSEDES"),
+                (ids["own"], self.MISSING_ID, "RELATED_TO"),
+                (ids["own"], ids["global"], "SUPPORTS"),
+                (ids["own"], ids["shared"], "RELATED_TO"),
+                (ids["orphan"], ids["own"], "DEPENDS_ON"),
+            ]
+            replies = _run(server, [
+                _call_tool("memory_link", {"source": source, "target": target, "type": edge_type}, index)
+                for index, (source, target, edge_type) in enumerate(links)
+            ])
+            after = snapshot()
+            hidden_edges = repository.list_edges_touching(hidden_ids)
+            own_edges = {(edge.source, edge.target) for edge in repository.list_edges_touching([ids["own"]])}
+
+        missing = replies[2]["result"]
+        self.assertTrue(missing["isError"])
+        for reply in replies[:2]:
+            self.assertEqual(reply["result"], missing)
+        for reply, (source, target, _) in zip(replies[3:], links[3:]):
+            with self.subTest(source=source, target=target):
+                self.assertFalse(reply["result"]["isError"])
+                self.assertIn((source, target), own_edges)
+        self.assertEqual(hidden_edges, [])
+        self.assertEqual(after, before)
+
+    def test_memory_feedback_skips_other_projects_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            repository = server.service.repository
+            ids = _seed_two_projects(repository)
+            hit_sets = [
+                [ids["foreign"]],
+                [self.MISSING_ID],
+                [*(ids[key] for key in self.VISIBLE), ids["foreign_shared"]],
+            ]
+            replies = _run(server, [
+                _call_tool("memory_feedback", {"rating": 1, "hit_ids": hit_ids, "query": "billing"}, index)
+                for index, hit_ids in enumerate(hit_sets)
+            ])
+            stored = {node_id for item in repository.list_retrieval_feedback() for node_id in item["hit_ids"]}
+            scores = repository.feedback_scores_for_nodes()
+
+        counts = [_tool_payload(reply["result"])["hit_count"] for reply in replies]
+        self.assertEqual(counts, [0, 0, len(self.VISIBLE)])
+        self.assertEqual(replies[0]["result"], replies[1]["result"])
+        visible_ids = {ids[key] for key in self.VISIBLE}
+        self.assertEqual(stored, visible_ids)
+        self.assertEqual(set(scores), visible_ids)
+
+    def test_code_queries_skip_other_projects_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            service = server.service
+            repository = service.repository
+            for project_id, path, source in (
+                ("project_a", "pkg/helpers.py", "def helper():\n    return 1\n"),
+                ("project_a", "pkg/main.py", "from .helpers import helper\n\nclass App:\n    def run(self):\n        return helper()\n"),
+                ("project_b", "billing/charge.py", "def charge():\n    return 2\n"),
+            ):
+                artifact = repository.add_node("Artifact", path, "project", f"file {path}", project_id, metadata={"source": "project_scan", "path": path})
+                service.code_graph.ingest_files([(artifact, path, ".py", source)], project_id)
+            symbols = {node.label: node.id for node in repository.list_nodes(node_type="Symbol")}
+            helper_id = symbols["pkg/helpers.py::helper"]
+            charge_id = symbols["billing/charge.py::charge"]
+            audit_id = repository.add_node("Symbol", "lib/audit.py::audit", "shared", "def audit", "project_b", metadata={"symbol": "audit"}).id
+            trace_id = repository.add_node("Symbol", "lib/trace.py::trace", "project", "def trace", None, metadata={"symbol": "trace"}).id
+            for caller in (charge_id, audit_id, trace_id):
+                repository.add_edge(caller, helper_id, "CALLS", "project")
+            queries = [
+                ("code_neighbors", charge_id),
+                ("code_neighbors", self.MISSING_ID),
+                ("code_impact", charge_id),
+                ("code_impact", self.MISSING_ID),
+                ("code_neighbors", "helper"),
+                ("code_impact", "helper"),
+            ]
+            replies = [_tool_payload(reply["result"]) for reply in _run(server, [
+                _call_tool(name, {"symbol": symbol}, index) for index, (name, symbol) in enumerate(queries)
+            ])]
+
+        for hidden, missing in ((replies[0], replies[1]), (replies[2], replies[3])):
+            self.assertFalse(hidden["found"])
+            self.assertEqual({**hidden, "query": ""}, {**missing, "query": ""})
+        expected = {"pkg/main.py::App.run", "lib/audit.py::audit", "lib/trace.py::trace"}
+        self.assertEqual({caller["label"] for caller in replies[4]["callers"]}, expected)
+        self.assertEqual({item["label"] for item in replies[5]["impacted"] if item["via"] == "CALLS"}, expected)
+        for payload in replies[4:]:
+            self.assertNotIn(charge_id, json.dumps(payload))
 
 
 class ProjectPinTests(unittest.TestCase):

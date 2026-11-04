@@ -445,6 +445,13 @@ class MemoryEmbeddingEngine:
                 return False
         return True
 
+    @staticmethod
+    def node_visible(node: MemoryNode, project_id: str | None) -> bool:
+        """Whether a node looked up by id is visible to ``project_id`` (the search rule, any scope)."""
+        return MemoryEmbeddingEngine._passes_scope_filter(
+            node.scope or "", node.project_id or "", project_id=project_id, scope=None
+        )
+
     def search_scored(
         self,
         query: str,

@@ -941,7 +941,7 @@ class MemoryMCPServer:
         node_id = str(args.get("id") or "").strip()
         if not node_id:
             raise _RpcError(INVALID_PARAMS, "id is required")
-        result = self.service.memory_history(node_id)
+        result = self.service.memory_history(node_id, project_id=self._arg_project_id(args))
         events = result.get("events") or []
         if events:
             lines = [f'- {e.get("timestamp")} {e.get("event_type")}' + (f' by {e.get("actor")}' if e.get("actor") else "") for e in events]
@@ -969,7 +969,7 @@ class MemoryMCPServer:
         target_id = str(args.get("target_id") or "").strip()
         if not source_id or not target_id:
             raise _RpcError(INVALID_PARAMS, "source_id and target_id are required")
-        result = self.service.explain_graph_path(source_id, target_id)
+        result = self.service.explain_graph_path(source_id, target_id, project_id=self._arg_project_id(args))
         summary = str(result.get("explanation") or "No connected path found between selected nodes.")
         return _tool_result(summary, result)
 
@@ -1076,7 +1076,7 @@ class MemoryMCPServer:
             "type": edge_type,
             "scope": str(args.get("scope") or ""),
             "confidence": args.get("confidence"),
-        })
+        }, project_id=self._arg_project_id(args))
         edge = result.get("edge") or {}
         summary = f'Linked {edge.get("source")} -[{edge.get("type")}]-> {edge.get("target")} (edge id {edge.get("id")}).'
         return _tool_result(summary, {
