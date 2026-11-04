@@ -18,7 +18,7 @@ from typing import Any
 
 from .graph_analysis import personalized_pagerank
 from .models import SearchHit
-from .embeddings import tokens
+from .embeddings import MemoryEmbeddingEngine, tokens
 from .search import (
     DEFAULT_CONTEXT_CHAR_BUDGET,
     RULE_LAYER_TYPES,
@@ -239,6 +239,21 @@ class RetrievalServiceMixin:
             )
             if neighbor_order:
                 neighbors = self.repository.list_nodes_by_ids(list(neighbor_order))
+                # Edges cross project boundaries (a shared node links into many
+                # projects), so neighbors get the same project visibility as the
+                # FTS/vector prefilter that produced the seeds.
+                walked = len(neighbors)
+                neighbors = [
+                    node for node in neighbors
+                    if MemoryEmbeddingEngine._passes_scope_filter(
+                        node.scope or "", node.project_id or "", project_id=project_id, scope=scope
+                    )
+                ]
+                if len(neighbors) < walked:
+                    _LOG.debug(
+                        "graph expansion dropped %d of %d neighbors outside project=%s scope=%s",
+                        walked - len(neighbors), walked, project_id, scope,
+                    )
                 if normalized_filters:
                     neighbors = [node for node in neighbors if self._memory_node_matches_filters(node, normalized_filters)]
                 neighbors = [node for node in neighbors if self._memory_node_visible_at(node, as_of)]

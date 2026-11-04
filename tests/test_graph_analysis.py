@@ -143,6 +143,44 @@ class MultiHopExpansionTests(unittest.TestCase):
             self.assertIn(anchor, surfaced)
             self.assertNotIn(one_hop, surfaced)
 
+    def test_context_expansion_skips_other_project_neighbors(self) -> None:
+        # A global node (no project) is visible to every project and links into
+        # two of them; walking it must not pull project B's constraint into A's pack.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            shared = service.add_memory({
+                "label": "Alpha anchor", "type": "Lesson", "scope": "global",
+                "text": "Zephyr alpha anchor unique marker keyword",
+            })["id"]
+            own = service.add_memory({
+                "project_id": "project_a", "label": "Bravo node", "type": "Decision",
+                "scope": "project", "text": "Bravo caching subsystem session cookie eviction",
+            })["id"]
+            foreign = service.add_memory({
+                "project_id": "project_b", "label": "Charlie constraint", "type": "Constraint",
+                "scope": "project", "text": "Charlie deployment pipeline release artifact rollout",
+            })["id"]
+            # Non-project scopes of B must stay hidden too (the scorer only guards project/interface).
+            private = service.add_memory({
+                "project_id": "project_b", "label": "Delta constraint", "type": "Constraint",
+                "scope": "user_private", "text": "Delta localization glossary translation locale",
+            })["id"]
+            for target in (own, foreign, private):
+                service.repository.add_edge(shared, target, "RELATED_TO", "project")
+
+            result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertIn(shared, surfaced)
+            self.assertIn(own, surfaced)  # visible neighbors still join the pack
+            self.assertNotIn(foreign, surfaced)
+            self.assertNotIn(private, surfaced)
+            self.assertNotIn(foreign, result["context"])
+            self.assertNotIn(private, result["context"])
+            # An explicit scope admits only that scope, as in the FTS prefilter.
+            scoped = service.context("zephyr alpha anchor unique", project_id="project_a", scope="global", limit=8)
+            self.assertEqual({hit["node"]["id"] for hit in scoped["hits"]}, {shared})
+
 
 class TemporalSupersedeTests(unittest.TestCase):
     OLD_TS = "2026-01-01T00:00:00+00:00"
