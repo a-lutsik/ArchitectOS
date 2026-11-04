@@ -12,8 +12,9 @@ and measures, per corpus size:
   the injected tokens come from the hook's own ``data/hooks.log`` line.
 
 Default mode is deterministic offline hash embeddings. ``--real-provider`` loads
-./.env and keeps the configured embedding provider; the synthetic corpus is then
-embedded through that provider too, so keep ``--sizes`` small.
+./.env.local then ./.env (the service order) and keeps the configured embedding
+provider; the synthetic corpus is then embedded through it too, so keep
+``--sizes`` small.
 
 Usage:
     python3 scripts/bench_agent.py [--sizes 500,2000,15000] [--queries 20] [--hook-runs 5] [--out bench_agent.json]
@@ -40,7 +41,8 @@ from typing import Any
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from bench_memory import load_env_file, pct  # noqa: E402
+from bench_memory import load_env_file  # noqa: E402
+from backend.architectos.chat_session_service import nearest_rank  # noqa: E402
 from backend.architectos.mcp_server import MemoryMCPServer  # noqa: E402
 from backend.architectos.server import ArchitectOSHandler  # noqa: E402
 from backend.architectos.service import ArchitectOSService  # noqa: E402
@@ -58,7 +60,8 @@ HOOK_EVENTS = (("SessionStart", "session"), ("UserPromptSubmit", "prompt"), ("St
 
 
 def stats(values: list[float]) -> dict[str, float]:
-    return {"p50": pct(values, 0.5), "p95": pct(values, 0.95), "mean": round(statistics.mean(values), 1) if values else 0.0}
+    ordered = sorted(values)
+    return {"p50": nearest_rank(ordered, 0.5), "p95": nearest_rank(ordered, 0.95), "mean": round(statistics.mean(values), 1) if values else 0.0}
 
 
 def build_corpus(service: ArchitectOSService, size: int, rng: random.Random) -> float:
@@ -209,7 +212,12 @@ def bench_size(size: int, args: argparse.Namespace) -> dict[str, Any]:
         ingest_ms = build_corpus(service, size, rng)
         queries = [question(rng) for _ in range(args.queries)]
         facts = [fact(rng, index) for index in range(args.queries)]
-        report: dict[str, Any] = {"nodes": size, "ingest_ms_per_node": ingest_ms}
+        provider = service.memory_embeddings.provider_info()
+        report: dict[str, Any] = {
+            "nodes": size,
+            "embeddings": f"{provider.get('provider')}/{provider.get('model')}",
+            "ingest_ms_per_node": ingest_ms,
+        }
         print(f"[bench] {size} nodes: service and MCP", file=sys.stderr, flush=True)
         report.update(bench_service(service, root, queries))
         report["mcp"] = bench_mcp(service, root, queries, facts)
@@ -262,13 +270,14 @@ def main() -> None:
     parser.add_argument(
         "--real-provider",
         action="store_true",
-        help="Use the embedding provider from ./.env instead of hash; the corpus is embedded through it (network).",
+        help="Use the embedding provider from ./.env.local and ./.env instead of hash; the corpus is embedded through it (network).",
     )
     args = parser.parse_args()
 
     if args.real_provider:
         os.environ.pop("MEMORY_EMBEDDING_PROVIDER", None)
-        load_env_file(REPO / ".env")
+        for filename in (".env.local", ".env"):
+            load_env_file(REPO / filename)
     else:
         os.environ["MEMORY_EMBEDDING_PROVIDER"] = "hash"
 
@@ -282,7 +291,7 @@ def main() -> None:
             "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "machine": f"{platform.system()} {platform.mac_ver()[0] or platform.release()} {platform.machine()}",
             "python": platform.python_version(),
-            "embeddings": os.environ.get("MEMORY_EMBEDDING_PROVIDER") or "configured",
+            "embeddings": sorted({result["embeddings"] for result in results.values()}),
             "queries": args.queries,
             "hook_runs": args.hook_runs,
             "elapsed_s": round(time.perf_counter() - started, 1),
