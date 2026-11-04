@@ -11,6 +11,7 @@ import logging
 import sqlite3
 from typing import Any
 
+from .embeddings import MemoryEmbeddingEngine
 from .models import MemoryNode, utc_now
 
 _LOG = logging.getLogger("architectos.storage")
@@ -58,15 +59,29 @@ class StorageSearchMixin:
                 seen.add(nid)
                 found.append(nid)
 
+        hidden: set[str] = set()
+
+        def _accept_node(node: MemoryNode | None) -> None:
+            if node is None or str(node.status or "") != "active":
+                return
+            # Same visibility as the FTS/vector paths: an exact id must not reach into another project.
+            if not MemoryEmbeddingEngine._passes_scope_filter(
+                node.scope or "", node.project_id or "", project_id=project_id, scope=scope
+            ):
+                hidden.add(node.id)
+                return
+            _accept(node.id)
+
         raw = str(query or "").strip()
         if raw:
-            node = self.get_node(raw)
-            if node is not None and str(node.status or "") == "active":
-                _accept(node.id)
+            _accept_node(self.get_node(raw))
         for node_id in idents.node_ids:
-            node = self.get_node(node_id)
-            if node is not None and str(node.status or "") == "active":
-                _accept(node.id)
+            _accept_node(self.get_node(node_id))
+        if hidden:
+            _LOG.debug(
+                "memory identifier lookup skipped %d nodes outside project=%s scope=%s: %s",
+                len(hidden), project_id, scope, sorted(hidden),
+            )
 
         work_ids = [str(item) for item in idents.work_item_ids if str(item)]
         if work_ids:

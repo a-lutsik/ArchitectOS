@@ -699,6 +699,48 @@ class MemorySearchQualityTests(unittest.TestCase):
             self.assertIn("exact-node-id", search["hits"][0].get("reasons") or [])
             self.assertTrue(search["retrieval"].get("vector_skipped"))
 
+    def test_node_id_search_hides_other_projects_nodes(self) -> None:
+        # An exact id must not bypass the project filter of the FTS/vector paths:
+        # a foreign Decision would otherwise land in the Stable memory section.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            foreign_texts = {
+                "project_shared": "Invoices settle through the Stripe gateway nightly.",
+                "user_private": "Payroll exports go to the accountant every Friday.",
+            }
+            for scope, text in foreign_texts.items():
+                foreign_id = service.add_memory({
+                    "project_id": "project_b", "label": f"Project B {scope} rule",
+                    "type": "Decision", "scope": scope, "text": text,
+                })["id"]
+                with self.subTest(scope=scope):
+                    self.assertEqual(service.search_memory(foreign_id, project_id="project_a")["hits"], [])
+                    packed = service.context(foreign_id, project_id="project_a")
+                    self.assertEqual(packed["hits"], [])
+                    self.assertNotIn(foreign_id, packed["context"])
+                    turn = service.capture_memory_turn(foreign_id, project_id="project_a")
+                    self.assertNotIn(foreign_id, turn["context"])
+                    own = service.search_memory(foreign_id, project_id="project_b")
+                    self.assertEqual(own["hits"][0]["node"]["id"], foreign_id)
+
+            visible_ids = [
+                service.add_memory({
+                    "project_id": "project_a", "label": "Cache eviction rule", "type": "Decision",
+                    "scope": "project", "text": "Session cache entries expire after ten minutes.",
+                })["id"],
+                service.add_memory({
+                    "label": "Retry budget rule", "type": "Decision", "scope": "global",
+                    "text": "Outbound HTTP calls retry three times with jitter.",
+                })["id"],
+                service.repository.add_node(
+                    "Decision", "Log format rule", "shared", "Services log structured JSON lines.", "project_b",
+                ).id,
+            ]
+            for node_id in visible_ids:
+                with self.subTest(node_id=node_id):
+                    hits = service.search_memory(node_id, project_id="project_a")["hits"]
+                    self.assertEqual(hits[0]["node"]["id"], node_id)
+
     def test_thin_followup_blends_prior_user_topic(self) -> None:
         self.assertTrue(ArchitectOSService._is_thin_followup_message("подтяни данные"))
         self.assertFalse(ArchitectOSService._is_thin_followup_message("в памяти есть баг по UOM"))
