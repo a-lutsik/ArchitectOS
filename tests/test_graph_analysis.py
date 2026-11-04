@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.architectos.graph_analysis import (
     compute_degrees,
@@ -244,6 +245,45 @@ class MultiHopExpansionTests(unittest.TestCase):
             self.assertEqual(surfaced, {anchor, active})
             self.assertNotIn(archived, result["context"])
             self.assertNotIn(deleted, result["context"])
+
+    def test_neighbors_changed_after_walk_are_rechecked(self) -> None:
+        # The walk's status/scope lookup can go stale before the payloads load: a
+        # neighbor archived or moved to another project meanwhile must not surface.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            ids = [
+                service.add_memory({
+                    "project_id": "project_a", "label": label, "type": node_type,
+                    "scope": "project", "text": text,
+                })["id"]
+                for label, node_type, text in (
+                    ("Alpha anchor", "Decision", "Zephyr alpha anchor unique marker keyword"),
+                    ("Bravo node", "Decision", "Bravo caching subsystem session cookie eviction"),
+                    ("Charlie constraint", "Constraint", "Charlie deployment pipeline release artifact rollout"),
+                    ("Delta constraint", "Constraint", "Delta localization glossary translation locale"),
+                )
+            ]
+            anchor, active, archived, moved = ids
+            for target in (active, archived, moved):
+                service.repository.add_edge(anchor, target, "RELATED_TO", "project")
+            walk_lookup = service.repository.active_node_scopes_by_ids
+
+            def lookup_then_change(node_ids: set[str]) -> dict[str, tuple[str, str]]:
+                scopes = walk_lookup(node_ids)
+                if archived in scopes:
+                    service.apply_graph_command({"action": "delete", "node_id": archived})
+                    node = service.repository.get_node(moved)
+                    node.project_id = "project_b"
+                    service.repository.upsert_node(node)
+                return scopes
+
+            with mock.patch.object(service.repository, "active_node_scopes_by_ids", side_effect=lookup_then_change):
+                result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertEqual(surfaced, {anchor, active})
+            self.assertNotIn(archived, result["context"])
+            self.assertNotIn(moved, result["context"])
 
 
 class TemporalSupersedeTests(unittest.TestCase):

@@ -243,8 +243,14 @@ class RetrievalServiceMixin:
                 neighbors = self.repository.list_nodes_by_ids(list(neighbor_order))
                 if normalized_filters:
                     neighbors = [node for node in neighbors if self._memory_node_matches_filters(node, normalized_filters)]
-                # Re-check status on the loaded payload: a node may be archived after the walk.
-                neighbors = [node for node in neighbors if node.status == "active" and self._memory_node_visible_at(node, as_of)]
+                # Re-check the loaded payload: a node may be archived or moved after the walk.
+                neighbors = [
+                    node
+                    for node in neighbors
+                    if node.status == "active"
+                    and MemoryEmbeddingEngine._passes_scope_filter(node.scope, node.project_id or "", project_id=project_id, scope=scope)
+                    and self._memory_node_visible_at(node, as_of)
+                ]
                 if scope_gate is not None:
                     neighbors = [node for node in neighbors if self._memory_node_scope_allowed(node, scope_gate)]
                 neighbor_nodes = {node.id: node for node in neighbors}
