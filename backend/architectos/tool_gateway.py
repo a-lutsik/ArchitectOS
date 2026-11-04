@@ -598,7 +598,8 @@ class ToolGateway:
                 target,
                 "Writing files needs your approval.",
             ).as_payload(name)
-        if project_id and "project_id" not in args:
+        # A blank or null project_id from the model must not drop the run's project scope.
+        if project_id and not str(args.get("project_id") or "").strip():
             args["project_id"] = project_id
 
         try:
