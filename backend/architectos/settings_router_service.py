@@ -339,7 +339,10 @@ class SettingsRouterServiceMixin:
             _LOG.warning("embedding warmup skipped: %s", exc)
 
     def _memory_decay_loop(self, *, initial_delay_s: float = 600.0, interval_s: float = 86400.0) -> None:
-        """Daily lifecycle decay so fresh/fading/stale/archived states progress."""
+        """Daily lifecycle decay so fresh/fading/stale/archived states progress.
+
+        The same daily pass compacts memory and prunes old ``agent_turn`` counters.
+        """
         if self._decay_stop.wait(initial_delay_s):
             return
         while not self._decay_stop.is_set():
@@ -358,6 +361,10 @@ class SettingsRouterServiceMixin:
                     )
             except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
                 _LOG.warning("memory compaction failed: %s", exc)
+            try:
+                self.prune_agent_turn_events()
+            except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
+                _LOG.warning("agent turn event pruning failed: %s", exc)
             if self._decay_stop.wait(interval_s):
                 return
 

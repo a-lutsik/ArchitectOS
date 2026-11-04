@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from backend.architectos.chat_session_service import nearest_rank
 from backend.architectos.memory_capture import (
     DEFAULT_MEMORY_CAPTURE,
     capture_from_legacy,
@@ -204,24 +205,75 @@ class CapturePolicyServiceTests(unittest.TestCase):
         self.assertEqual(meta["trigger"], "hook_turn:codex")
         self.assertNotIn("never commit", json.dumps(events[0]).lower())
 
-    def test_stats_aggregate_agent_turn_latency_and_pack_size(self) -> None:
+    def test_stats_split_prompt_and_response_turns(self) -> None:
         empty = self.service.memory_capture_stats(days=7)["agent_turns"]
-        self.assertEqual(empty, {"count": 0, "latency_ms": {"p50": 0.0, "p95": 0.0}, "pack_tokens_avg": 0.0, "empty_pack_share": 0.0})
-        turns = [
-            self.service.capture_memory_turn(DECISION, project_id="architectos"),
-            self.service.capture_memory_turn("Should I commit directly to main?", project_id="architectos"),
-            self.service.capture_memory_turn("Which branch do we commit to: main?", project_id="architectos"),
+        self.assertEqual(empty, {
+            "count": 0,
+            "sources": {"hook": 0, "mcp": 0},
+            "prompt": {"count": 0, "latency_ms": {"p50": 0.0, "p95": 0.0}, "pack_tokens_avg": 0.0, "empty_pack_share": 0.0},
+            "response": {"count": 0, "latency_ms": {"p50": 0.0, "p95": 0.0}},
+        })
+        # Empty store: the prompt turn finds nothing; Stop turns only capture.
+        first = self.service.capture_memory_turn(DECISION, project_id="architectos", client="claude")
+        stops = [
+            self.service.capture_memory_turn("", "Switched the cache to Redis with a 15 minute TTL.", project_id="architectos", client="claude"),
+            self.service.capture_memory_turn("", CONSTRAINT, project_id="architectos", client="cursor"),
         ]
-        stats = self.service.memory_capture_stats(days=7)
-        agent = stats["agent_turns"]
-        latencies = sorted(turn["timing"]["total_ms"] for turn in turns)
-        self.assertEqual(agent["count"], 3)
-        self.assertEqual(agent["latency_ms"], {"p50": latencies[1], "p95": latencies[2]})
-        self.assertEqual(agent["pack_tokens_avg"], round(sum(turn["pack_tokens"] for turn in turns) / 3, 1))
-        self.assertEqual(agent["empty_pack_share"], round(sum(1 for turn in turns if not turn["hits"]) / 3, 3))
-        self.assertEqual(stats["skipped"], 0, "turn events must not leak into the existing counters")
+        second = self.service.capture_memory_turn("Should I commit directly to main?", project_id="architectos")
+        self.assertFalse(first["hits"])
+        self.assertTrue(second["hits"])
+        agent = self.service.memory_capture_stats(days=7)["agent_turns"]
+        self.assertEqual(agent["count"], 4)
+        self.assertEqual(agent["sources"], {"hook": 3, "mcp": 1})
+        prompt = agent["prompt"]
+        self.assertEqual(prompt["count"], 2)
+        self.assertEqual(prompt["latency_ms"]["p95"], max(first["timing"]["total_ms"], second["timing"]["total_ms"]))
+        self.assertEqual(prompt["pack_tokens_avg"], float(second["pack_tokens"]), "a pack with no hits is never injected")
+        self.assertEqual(prompt["empty_pack_share"], 0.5)
+        response = agent["response"]
+        self.assertEqual(response["count"], 2)
+        self.assertEqual(response["latency_ms"]["p95"], max(turn["timing"]["total_ms"] for turn in stops))
         self.assertEqual(self.service.memory_capture_stats(days=7, project_id="other")["agent_turns"]["count"], 0)
 
+    def test_turn_event_records_kind_and_source(self) -> None:
+        self.service.capture_memory_turn(DECISION, project_id="architectos")
+        self.service.capture_memory_turn("", CONSTRAINT, project_id="architectos", client="codex")
+        events = self.service.repository.list_keeper_events("architectos", limit=50)
+        kinds = sorted(
+            (item["metadata"]["turn"], item["metadata"]["source"], item["metadata"]["client"])
+            for item in events if item.get("kind") == "agent_turn"
+        )
+        self.assertEqual(kinds, [("prompt", "mcp", ""), ("response", "hook", "codex")])
+
+    def test_prune_drops_only_old_agent_turn_events(self) -> None:
+        self.service.capture_memory_turn(DECISION, project_id="architectos")
+        repository = self.service.repository
+        old = "2000-01-01T00:00:00Z"
+        for status in ("agent_turn", "skipped"):
+            repository.add_keeper_event({"project_id": "architectos", "chat_id": "c", "kind": "test", "status": status, "message": "old"})
+        with repository._connect() as conn:  # noqa: SLF001 - backdate the rows just written
+            conn.execute("UPDATE keeper_events SET updated_at = ? WHERE chat_id = 'c'", (old,))
+        self.assertEqual(self.service.prune_agent_turn_events(days=30), 1)
+        statuses = [item["status"] for item in repository.list_keeper_events("architectos", limit=50)]
+        self.assertEqual(statuses.count("agent_turn"), 1, "the fresh turn stays")
+        self.assertIn("skipped", statuses, "other keeper events are never pruned")
+
+    def test_keeper_status_index_exists(self) -> None:
+        with self.service.repository._connect() as conn:  # noqa: SLF001 - schema check
+            plan = conn.execute(
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM keeper_events WHERE status = 'agent_turn' AND updated_at >= ?",
+                ("2026-01-01T00:00:00Z",),
+            ).fetchall()
+        self.assertIn("idx_keeper_events_status", " ".join(str(row[-1]) for row in plan))
+
+
+class NearestRankTests(unittest.TestCase):
+    def test_nearest_rank_picks_an_observed_value(self) -> None:
+        self.assertEqual(nearest_rank([], 0.5), 0.0)
+        self.assertEqual(nearest_rank([1.0, 2.0], 0.5), 1.0)
+        self.assertEqual(nearest_rank([1.0, 2.0, 3.0, 4.0], 0.5), 2.0)
+        self.assertEqual(nearest_rank([1.0, 2.0, 3.0, 4.0], 0.95), 4.0)
+        self.assertEqual(nearest_rank([float(value) for value in range(1, 21)], 0.95), 19.0)
 
 if __name__ == "__main__":
     unittest.main()

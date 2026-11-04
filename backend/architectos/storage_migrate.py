@@ -147,6 +147,7 @@ class StorageMigrateMixin:
                 CREATE INDEX IF NOT EXISTS idx_provider_runs_project ON provider_runs(project_id, updated_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_context_summary_type ON chat_context_summaries(chat_id, summary_type);
                 CREATE INDEX IF NOT EXISTS idx_keeper_events_project ON keeper_events(project_id, chat_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_keeper_events_status ON keeper_events(status, updated_at);
                 CREATE TABLE IF NOT EXISTS memory_embeddings (
                     node_id TEXT PRIMARY KEY,
                     scope TEXT NOT NULL,

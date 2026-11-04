@@ -12,6 +12,7 @@ the MRO on :class:`ArchitectOSService`.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,13 +32,19 @@ from .models import stable_id, utc_now
 from .usage import estimate_tokens_from_text
 
 _LOG = logging.getLogger("architectos.service")
+AGENT_TURN_RETENTION_DAYS = 30
 
 
-def _percentile(ordered: list[float], q: float) -> float:
+def nearest_rank(ordered: list[float], q: float) -> float:
     """Nearest-rank percentile of an already sorted list (0.0 when empty)."""
     if not ordered:
         return 0.0
-    return round(ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))], 1)
+    return round(ordered[max(0, math.ceil(q * len(ordered)) - 1)], 1)
+
+
+def _latency(turns: list[dict[str, Any]]) -> dict[str, float]:
+    ordered = sorted(float(turn["total_ms"]) for turn in turns)
+    return {"p50": nearest_rank(ordered, 0.5), "p95": nearest_rank(ordered, 0.95)}
 
 
 class ChatSessionServiceMixin:
@@ -830,7 +837,10 @@ class ChatSessionServiceMixin:
         since = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%dT%H:%M:%SZ")
         counts = self.repository.count_keeper_events_since(since, project_id)
         turns = self.repository.list_agent_turn_metrics_since(since, project_id)
-        latencies = sorted(total_ms for total_ms, _, _ in turns)
+        prompts = [turn for turn in turns if turn["turn"] == "prompt"]
+        responses = [turn for turn in turns if turn["turn"] != "prompt"]
+        # Only a pack with hits can be injected; an empty one keeps the hook silent.
+        packed = [turn["pack_tokens"] for turn in prompts if turn["hits"]]
         return {
             "days": int(days),
             "auto_saved": int(counts.get("auto_accepted", 0)),
@@ -839,14 +849,27 @@ class ChatSessionServiceMixin:
             "skipped": int(counts.get("skipped", 0)),
             "llm_calls": int(counts.get("llm_ok", 0)),
             "llm_fallbacks": int(counts.get("llm_fallback", 0)),
-            # A pack with no hits is the one hooks do not inject.
+            # Prompt turns pay for retrieval before the answer; response turns
+            # (Stop / afterAgentResponse) only capture, so their latency is apart.
             "agent_turns": {
                 "count": len(turns),
-                "latency_ms": {"p50": _percentile(latencies, 0.5), "p95": _percentile(latencies, 0.95)},
-                "pack_tokens_avg": round(sum(tokens for _, tokens, _ in turns) / len(turns), 1) if turns else 0.0,
-                "empty_pack_share": round(sum(1 for _, _, hits in turns if not hits) / len(turns), 3) if turns else 0.0,
+                "sources": {source: sum(1 for turn in turns if turn["source"] == source) for source in ("hook", "mcp")},
+                "prompt": {
+                    "count": len(prompts),
+                    "latency_ms": _latency(prompts),
+                    "pack_tokens_avg": round(sum(packed) / len(packed), 1) if packed else 0.0,
+                    "empty_pack_share": round(1 - len(packed) / len(prompts), 3) if prompts else 0.0,
+                },
+                "response": {"count": len(responses), "latency_ms": _latency(responses)},
             },
         }
+
+    def prune_agent_turn_events(self, days: int = AGENT_TURN_RETENTION_DAYS) -> int:
+        """Drop ``agent_turn`` counters older than ``days``; other keeper events stay."""
+        before = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%dT%H:%M:%SZ")
+        removed = self.repository.delete_keeper_events_before("agent_turn", before)
+        _LOG.info("agent turn events pruned · removed=%s older_than_days=%s", removed, days)
+        return removed
 
     def project_id_for_path(self, path: str | None) -> str | None:
         """Map a working directory to the project that owns it.
@@ -961,6 +984,9 @@ class ChatSessionServiceMixin:
                 "agent_turn",
                 f"Agent turn: {len(hits)} hit(s), {pack_tokens} pack tokens, {timing['total_ms']} ms",
                 {
+                    "turn": "prompt" if user else "response",
+                    "source": "hook" if client else "mcp",
+                    "client": client or "",
                     "trigger": trigger,
                     "timing": timing,
                     "pack_tokens": pack_tokens,

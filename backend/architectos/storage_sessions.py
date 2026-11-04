@@ -152,10 +152,12 @@ class StorageSessionsMixin:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return {str(row["status"]): int(row["n"]) for row in rows}
 
-    def list_agent_turn_metrics_since(self, since: str, project_id: str | None = None) -> list[tuple[float, int, int]]:
-        """``(total_ms, pack_tokens, hits)`` of ``agent_turn`` keeper events since ``since`` (ISO)."""
+    def list_agent_turn_metrics_since(self, since: str, project_id: str | None = None) -> list[dict[str, Any]]:
+        """Turn kind, source, latency, pack tokens and hits of ``agent_turn`` keeper events since ``since`` (ISO)."""
         sql = (
-            "SELECT json_extract(payload, '$.metadata.timing.total_ms') AS total_ms,"
+            "SELECT json_extract(payload, '$.metadata.turn') AS turn,"
+            " json_extract(payload, '$.metadata.source') AS source,"
+            " json_extract(payload, '$.metadata.timing.total_ms') AS total_ms,"
             " json_extract(payload, '$.metadata.pack_tokens') AS pack_tokens,"
             " json_extract(payload, '$.metadata.hits') AS hits"
             " FROM keeper_events WHERE status = 'agent_turn' AND updated_at >= ?"
@@ -166,7 +168,24 @@ class StorageSessionsMixin:
             params.append(project_id)
         with self._connect() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
-        return [(float(row["total_ms"] or 0.0), int(row["pack_tokens"] or 0), int(row["hits"] or 0)) for row in rows]
+        return [
+            {
+                "turn": str(row["turn"] or "prompt"),
+                "source": str(row["source"] or "mcp"),
+                "total_ms": float(row["total_ms"] or 0.0),
+                "pack_tokens": int(row["pack_tokens"] or 0),
+                "hits": int(row["hits"] or 0),
+            }
+            for row in rows
+        ]
+
+    def delete_keeper_events_before(self, status: str, before: str) -> int:
+        """Delete keeper events with ``status`` last updated before ``before`` (ISO); returns the count."""
+        with self._connect() as conn:
+            return conn.execute(
+                "DELETE FROM keeper_events WHERE status = ? AND updated_at < ?",
+                (status, before),
+            ).rowcount
 
     def list_keeper_events(self, project_id: str | None = None, chat_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         sql = "SELECT payload FROM keeper_events"
