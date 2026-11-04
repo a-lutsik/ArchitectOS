@@ -20,7 +20,8 @@ def _run(server: MemoryMCPServer, messages: list[dict]) -> list[dict]:
 
 class MemoryMCPServerTests(unittest.TestCase):
     def _server(self, root: Path) -> MemoryMCPServer:
-        return MemoryMCPServer(root)
+        # cwd keeps a .architectos.json above the checkout from binding the server.
+        return MemoryMCPServer(root, cwd=root)
 
     def test_initialize_and_tools_list(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,6 +360,24 @@ class MemoryMCPServerTests(unittest.TestCase):
         self.assertGreaterEqual(len(payload.get("auto_accepted") or []), 1)
         self.assertEqual(payload["auto_accepted"][0]["type"], "Decision")
         self.assertTrue(payload["auto_accepted"][0]["metadata"].get("auto_accepted"))
+
+    def test_memory_turn_reply_keeps_its_fields_without_service_counters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp))
+            responses = _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_turn", "arguments": {
+                    "user_text": "Architecture decision: never commit directly to main.",
+                    "project_id": "architectos",
+                }}},
+            ])
+        text = responses[0]["result"]["content"][0]["text"]
+        payload = json.loads(text.split("```json", 1)[1].rsplit("```", 1)[0])
+        self.assertEqual(
+            set(payload),
+            {"query", "context", "hits", "queued", "auto_accepted", "kept", "reason", "capture_mode"},
+        )
+        self.assertNotIn("timing", text)
+        self.assertNotIn("pack_tokens", text)
 
     def test_memory_turn_auto_writes_low_risk_lesson(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -770,12 +789,13 @@ class CatalogSizeTests(unittest.TestCase):
     per token) over what the client receives: the JSON of ``tools/list`` and the
     instructions of a bound project with no stable memory yet (the briefing on
     top of them has its own 2 000-char budget). The limits sit just above today's
-    size (3 838 + 257 tokens) so growth fails here; stage 4 of
+    size (3 838 + 257 tokens; 92 for an unbound folder) so growth fails here; stage 4 of
     docs/AGENT_INTEGRATION_PLAN_RU.md lowers the target to <= 2 000 in total (§8).
     """
 
     TOOLS_TOKEN_LIMIT = 3900
     INSTRUCTIONS_TOKEN_LIMIT = 300
+    UNBOUND_INSTRUCTIONS_TOKEN_LIMIT = 110
 
     def test_tool_catalog_stays_under_its_token_limit(self) -> None:
         tokens = estimate_tokens_from_text(json.dumps(TOOLS))
@@ -786,6 +806,13 @@ class CatalogSizeTests(unittest.TestCase):
             instructions = MemoryMCPServer(Path(tmp), project_id="architectos")._startup_instructions()
         tokens = estimate_tokens_from_text(instructions)
         self.assertLessEqual(tokens, self.INSTRUCTIONS_TOKEN_LIMIT, f"startup instructions grew to ~{tokens} tokens")
+
+    def test_unbound_startup_instructions_stay_under_their_token_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            instructions = MemoryMCPServer(Path(tmp), cwd=tmp)._startup_instructions()
+        self.assertIn("memory_list_projects", instructions)
+        tokens = estimate_tokens_from_text(instructions)
+        self.assertLessEqual(tokens, self.UNBOUND_INSTRUCTIONS_TOKEN_LIMIT, f"unbound instructions grew to ~{tokens} tokens")
 
 
 if __name__ == "__main__":

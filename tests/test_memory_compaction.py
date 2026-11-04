@@ -205,7 +205,7 @@ class DuplicatesReviewTests(unittest.TestCase):
 class CompactionMcpTests(unittest.TestCase):
     def test_memory_compact_tool_is_a_read_only_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             repo = server.service.repository
             repo.add_node("Decision", "Деплой", "project", FULL, "architectos", id_salt="full")
             short = repo.add_node("Decision", "Деплой", "project", SHORT, "architectos", id_salt="short")

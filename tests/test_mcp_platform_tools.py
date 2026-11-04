@@ -92,7 +92,7 @@ class MemoryLinkToolTests(unittest.TestCase):
 
     def test_link_creates_edge_and_validates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             a, b = self._two_nodes(server)
             responses = _run(server, [
                 _call("memory_link", {"source": a, "target": b, "type": "supports"}, 1),
@@ -113,7 +113,7 @@ class MemoryLinkToolTests(unittest.TestCase):
 
     def test_link_supersedes_retires_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             a, b = self._two_nodes(server)
             responses = _run(server, [
                 _call("memory_link", {"source": a, "target": b, "type": "SUPERSEDES"}, 1),
@@ -170,7 +170,7 @@ class SourceToolTests(unittest.TestCase):
 
     def test_search_filters_by_source_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             svc = server.service
             src_a = svc.create_source({"project_id": "architectos", "name": "Feed A"})["id"]
             src_b = svc.create_source({"project_id": "architectos", "name": "Feed B"})["id"]
@@ -190,7 +190,7 @@ class SourceToolTests(unittest.TestCase):
 class MemoryHistoryToolTests(unittest.TestCase):
     def test_history_records_lifecycle_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             node_id = _payload(_run(server, [
                 _call("memory_add", {"label": "History subject", "text": "A fact worth tracking over time.",
                                      "project_id": "architectos"}, 1),
@@ -220,7 +220,7 @@ class MemoryHistoryToolTests(unittest.TestCase):
 class MemoryAddBulkToolTests(unittest.TestCase):
     def test_bulk_add_creates_dedupes_and_isolates_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             svc = server.service
             src = svc.create_source({"project_id": "architectos", "name": "Bulk feed"})["id"]
             responses = _run(server, [
@@ -255,7 +255,7 @@ class MemoryAddBulkToolTests(unittest.TestCase):
 class AllowedScopesTests(unittest.TestCase):
     def test_allowed_scopes_excludes_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             svc = server.service
             svc.add_memory({"project_id": "architectos", "label": "Public fact", "type": "Lesson",
                             "scope": "public_knowledge", "text": "Visibility marker shared fact."})
@@ -287,7 +287,7 @@ class AllowedScopesTests(unittest.TestCase):
 
     def test_allowed_scopes_via_mcp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            server = MemoryMCPServer(Path(tmp))
+            server = MemoryMCPServer(Path(tmp), cwd=tmp)
             svc = server.service
             svc.add_memory({"project_id": "architectos", "label": "MCP visible", "type": "Lesson",
                             "scope": "project", "text": "Scope gate marker visible."})
