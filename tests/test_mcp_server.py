@@ -705,7 +705,7 @@ class ProjectIsolationByIdTests(unittest.TestCase):
             for project_id, path, source in (
                 ("project_a", "pkg/helpers.py", "def helper():\n    return 1\n"),
                 ("project_a", "pkg/main.py", "from .helpers import helper\n\nclass App:\n    def run(self):\n        return helper()\n"),
-                ("project_b", "billing/charge.py", "def charge():\n    return 2\n"),
+                ("project_b", "billing/charge.py", "def charge():\n    return 2\n\nclass Ledger:\n    def post(self):\n        return charge()\n"),
             ):
                 artifact = repository.add_node("Artifact", path, "project", f"file {path}", project_id, metadata={"source": "project_scan", "path": path})
                 service.code_graph.ingest_files([(artifact, path, ".py", source)], project_id)
@@ -716,11 +716,11 @@ class ProjectIsolationByIdTests(unittest.TestCase):
             trace_id = repository.add_node("Symbol", "lib/trace.py::trace", "project", "def trace", None, metadata={"symbol": "trace"}).id
             for caller in (charge_id, audit_id, trace_id):
                 repository.add_edge(caller, helper_id, "CALLS", "project")
+            self.assertIn("billing/charge.py::Ledger.post", symbols)
+            # Project B symbols by id, bare name, qualname and path::qualname label, then a missing symbol.
+            lookups = [charge_id, "charge", "post", "Ledger.post", "billing/charge.py::Ledger.post", self.MISSING_ID]
             queries = [
-                ("code_neighbors", charge_id),
-                ("code_neighbors", self.MISSING_ID),
-                ("code_impact", charge_id),
-                ("code_impact", self.MISSING_ID),
+                *((name, symbol) for name in ("code_neighbors", "code_impact") for symbol in lookups),
                 ("code_neighbors", "helper"),
                 ("code_impact", "helper"),
             ]
@@ -728,13 +728,17 @@ class ProjectIsolationByIdTests(unittest.TestCase):
                 _call_tool(name, {"symbol": symbol}, index) for index, (name, symbol) in enumerate(queries)
             ])]
 
-        for hidden, missing in ((replies[0], replies[1]), (replies[2], replies[3])):
-            self.assertFalse(hidden["found"])
-            self.assertEqual({**hidden, "query": ""}, {**missing, "query": ""})
+        for offset in (0, len(lookups)):
+            missing = replies[offset + len(lookups) - 1]
+            for symbol, hidden in zip(lookups, replies[offset:offset + len(lookups) - 1]):
+                with self.subTest(tool=queries[offset][0], symbol=symbol):
+                    self.assertFalse(hidden["found"])
+                    self.assertEqual({**hidden, "query": ""}, {**missing, "query": ""})
+        neighbors, impact = replies[-2:]
         expected = {"pkg/main.py::App.run", "lib/audit.py::audit", "lib/trace.py::trace"}
-        self.assertEqual({caller["label"] for caller in replies[4]["callers"]}, expected)
-        self.assertEqual({item["label"] for item in replies[5]["impacted"] if item["via"] == "CALLS"}, expected)
-        for payload in replies[4:]:
+        self.assertEqual({caller["label"] for caller in neighbors["callers"]}, expected)
+        self.assertEqual({item["label"] for item in impact["impacted"] if item["via"] == "CALLS"}, expected)
+        for payload in (neighbors, impact):
             self.assertNotIn(charge_id, json.dumps(payload))
 
 

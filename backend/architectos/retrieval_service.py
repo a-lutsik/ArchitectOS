@@ -1024,7 +1024,8 @@ class RetrievalServiceMixin:
 
     def record_retrieval_feedback(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = dict(payload or {})
-        project_id = str(payload.get("project_id") or "architectos")
+        explicit_project_id = str(payload.get("project_id") or "").strip()
+        project_id = explicit_project_id or "architectos"
         chat_id = str(payload.get("chat_id") or "").strip()
         message_index = payload.get("message_index")
         hit_ids = [str(item).strip() for item in (payload.get("hit_ids") or []) if str(item).strip()]
@@ -1056,7 +1057,7 @@ class RetrievalServiceMixin:
                     chat["messages"] = messages
                     self.repository.upsert_chat(chat)
 
-        if str(payload.get("project_id") or "").strip() and hit_ids:
+        if explicit_project_id and hit_ids:
             # Ratings feed the ranking of the rated nodes (feedback_scores_for_nodes), so a
             # caller with a project rates only nodes it can see. Missing ids drop out too,
             # so the hit count does not tell a hidden node from an unknown id.
