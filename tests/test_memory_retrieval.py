@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 import tempfile
+import threading
 import unittest
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from backend.architectos.chunking import chunk_text, work_item_comment_chunks, work_item_main_parts
 from backend.architectos.search import pack_memory_context
+from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
 
 
@@ -1924,6 +1929,74 @@ class EmbeddingConnectionTests(unittest.TestCase):
             self.assertEqual(os.environ.get("NEW_KEY"), "added")
             os.environ.pop("OLD_KEY", None)
             os.environ.pop("NEW_KEY", None)
+
+
+class RetrievalFeedbackProjectTests(unittest.TestCase):
+    """Feedback with a project rates only nodes that project can see."""
+
+    MISSING_ID = "node_missing000000"
+
+    def _seed(self, service: ArchitectOSService) -> tuple[list[str], list[str]]:
+        repository = service.repository
+        visible_ids = [
+            repository.add_node("Decision", "Cache eviction rule", "project", "Session cache entries expire after ten minutes.", "project_a").id,
+            repository.add_node("Decision", "Retry budget rule", "global", "Outbound HTTP calls retry three times with jitter.", None).id,
+        ]
+        hidden_ids = [repository.add_node("Decision", "Project B billing rule", "project", "Project B bills customers monthly.", "project_b").id]
+        return visible_ids, hidden_ids
+
+    def test_padded_project_id_still_counts_own_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            visible_ids, hidden_ids = self._seed(service)
+            result = service.record_retrieval_feedback({
+                "project_id": " project_a ",
+                "rating": 1,
+                "hit_ids": [*visible_ids, *hidden_ids, self.MISSING_ID],
+            })
+
+        self.assertEqual(result["hit_count"], len(visible_ids))
+        self.assertEqual(result["feedback"]["hit_ids"], visible_ids)
+        self.assertEqual(result["feedback"]["project_id"], "project_a")
+
+    def test_http_feedback_filters_hit_ids_only_with_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            visible_ids, hidden_ids = self._seed(service)
+            hit_ids = [*visible_ids, *hidden_ids, self.MISSING_ID]
+
+            class TestHandler(ArchitectOSHandler):
+                pass
+
+            TestHandler.service = service
+            server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            def post(body: dict[str, object]) -> dict[str, object]:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/api/memory/feedback",
+                    data=json.dumps(body).encode("utf-8"),
+                    method="POST",
+                    headers={"X-ArchitectOS-Token": service.auth_token, "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            try:
+                scoped = post({"project_id": "project_a", "rating": 1, "hit_ids": hit_ids})
+                unscoped = post({"rating": -1, "hit_ids": hit_ids})
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+                server.server_close()
+
+        self.assertEqual(scoped["hit_count"], len(visible_ids))
+        self.assertEqual(scoped["feedback"]["hit_ids"], visible_ids)
+        # Without a project the UI keeps the old behavior: every id is stored.
+        self.assertEqual(unscoped["hit_count"], len(hit_ids))
+        self.assertEqual(unscoped["feedback"]["hit_ids"], hit_ids)
+        self.assertEqual(unscoped["feedback"]["project_id"], "architectos")
 
 
 if __name__ == "__main__":

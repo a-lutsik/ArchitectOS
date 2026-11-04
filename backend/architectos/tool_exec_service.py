@@ -32,7 +32,6 @@ from .constants import (
     TERMINAL_SHELLS,
 )
 from .embeddings import MemoryEmbeddingEngine
-from .models import MemoryNode
 from .permissions import PermissionRequired
 
 _LOG = logging.getLogger("architectos.service")
@@ -269,15 +268,9 @@ class ToolExecServiceMixin:
         if not node_id:
             raise ValueError("memory_get requires id")
         project_id = str(args.get("project_id") or "").strip() or None
-
-        def _visible(candidate: MemoryNode) -> bool:
-            # Same rule as the search paths: an id must not reach into another project.
-            return MemoryEmbeddingEngine._passes_scope_filter(
-                candidate.scope or "", candidate.project_id or "", project_id=project_id, scope=None
-            )
-
         node = self.repository.get_node(node_id)
-        if node and not _visible(node):
+        # Same rule as the search paths: an id must not reach into another project.
+        if node and not MemoryEmbeddingEngine.node_visible(node, project_id):
             _LOG.debug("memory_get hid node %s of project=%s from project=%s", node_id, node.project_id, project_id)
             node = None
         if not node or node.status not in {"active", "archived"}:
@@ -309,7 +302,7 @@ class ToolExecServiceMixin:
                 related = self.repository.get_node(other)
                 if not related or related.status != "active":
                     continue
-                if not _visible(related):
+                if not MemoryEmbeddingEngine.node_visible(related, project_id):
                     hidden.append(related.id)
                     continue
                 neighbors.append({

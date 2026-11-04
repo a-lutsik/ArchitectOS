@@ -610,14 +610,18 @@ class RetrievalServiceMixin:
         hit["node"] = node
         return hit
 
-    def memory_history(self, node_id: str, limit: int = 200) -> dict[str, Any]:
+    def memory_history(self, node_id: str, limit: int = 200, project_id: str | None = None) -> dict[str, Any]:
         """Event history of a memory node (created/updated/superseded/accessed).
 
         Events are recorded at the mutation points (add, supersede, merge, tool
         reads) into the memory_node_events table; nodes created before history
         tracking still get a synthetic ``created`` event from their timestamp.
+        A node hidden from ``project_id`` answers as a missing id.
         """
         node = self.repository.get_node(str(node_id or "").strip())
+        if node and not MemoryEmbeddingEngine.node_visible(node, project_id):
+            _LOG.debug("memory_history hid node %s of project=%s from project=%s", node.id, node.project_id, project_id)
+            node = None
         if not node:
             raise ValueError(f"memory node not found: {node_id}")
         events = self.repository.list_memory_events(node.id, limit=limit)
@@ -1020,7 +1024,8 @@ class RetrievalServiceMixin:
 
     def record_retrieval_feedback(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = dict(payload or {})
-        project_id = str(payload.get("project_id") or "architectos")
+        explicit_project_id = str(payload.get("project_id") or "").strip()
+        project_id = explicit_project_id or "architectos"
         chat_id = str(payload.get("chat_id") or "").strip()
         message_index = payload.get("message_index")
         hit_ids = [str(item).strip() for item in (payload.get("hit_ids") or []) if str(item).strip()]
@@ -1051,6 +1056,16 @@ class RetrievalServiceMixin:
                     messages[idx] = msg
                     chat["messages"] = messages
                     self.repository.upsert_chat(chat)
+
+        if explicit_project_id and hit_ids:
+            # Ratings feed the ranking of the rated nodes (feedback_scores_for_nodes), so a
+            # caller with a project rates only nodes it can see. Missing ids drop out too,
+            # so the hit count does not tell a hidden node from an unknown id.
+            visible = {node.id for node in self.repository.list_nodes_by_ids(hit_ids) if MemoryEmbeddingEngine.node_visible(node, project_id)}
+            skipped = [node_id for node_id in hit_ids if node_id not in visible]
+            if skipped:
+                _LOG.debug("retrieval feedback skipped %d hit ids missing or outside project=%s: %s", len(skipped), project_id, skipped)
+                hit_ids = [node_id for node_id in hit_ids if node_id in visible]
 
         record = self.repository.add_retrieval_feedback({
             "project_id": project_id,

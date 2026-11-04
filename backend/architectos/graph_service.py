@@ -10,12 +10,13 @@ provider access reach the service through ``self`` via the MRO.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter
 from typing import Any
 
 from .constants import DEFAULT_EXCLUDES, NOISE_FILE_SUFFIXES
-from .embeddings import content_tokens
+from .embeddings import MemoryEmbeddingEngine, content_tokens
 from .graph_analysis import compute_degrees, detect_communities
 from .graph_autolinker import (
     GRAPH_STOPWORDS,
@@ -27,6 +28,8 @@ from .graph_code_service import GraphCodeServiceMixin
 from .graph_suggest_service import GraphSuggestServiceMixin
 from .models import stable_id, utc_now
 from .storage import like_prefilter_supported
+
+_LOG = logging.getLogger(__name__)
 
 # Re-export for backward-compatible imports (service.py and tests).
 __all__ = [
@@ -233,11 +236,14 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
         return out
 
 
-    def explain_graph_path(self, source_id: str, target_id: str) -> dict[str, Any]:
+    def explain_graph_path(self, source_id: str, target_id: str, project_id: str | None = None) -> dict[str, Any]:
         if not source_id or not target_id:
             raise ValueError("source and target are required")
-        nodes = {node.id: node for node in self.repository.list_nodes() if node.status == "active"}
+        # Hidden nodes drop out of the graph: hidden ends answer as missing ids and
+        # the walk never passes through (or names) another project's node.
+        nodes = self._visible_active_nodes(project_id)
         if source_id not in nodes or target_id not in nodes:
+            _LOG.debug("explain_graph_path %s -> %s: end missing or outside project=%s", source_id, target_id, project_id)
             raise ValueError("source and target graph nodes are required")
         adjacency: dict[str, list[tuple[str, str]]] = {node_id: [] for node_id in nodes}
         for edge in self.repository.list_edges():
@@ -633,14 +639,18 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
             "items": items[:200],
         }
 
-    def create_graph_edge(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def create_graph_edge(self, payload: dict[str, Any], project_id: str | None = None) -> dict[str, Any]:
         source = str(payload.get("source") or "").strip()
         target = str(payload.get("target") or "").strip()
         if not source or not target or source == target:
             raise ValueError("source and target graph nodes are required")
         source_node = self.repository.get_node(source)
         target_node = self.repository.get_node(target)
-        if not source_node or not target_node:
+        # Both ends must be visible to the caller's project; a hidden end answers as a missing id.
+        hidden = [node.id for node in (source_node, target_node) if node and not MemoryEmbeddingEngine.node_visible(node, project_id)]
+        if hidden:
+            _LOG.debug("create_graph_edge refused nodes outside project=%s: %s", project_id, hidden)
+        if not source_node or not target_node or hidden:
             raise ValueError("source and target must be durable memory nodes")
         edge_type = str(payload.get("type") or "RELATED_TO")
         scope = str(payload.get("scope") or source_node.scope or target_node.scope or "project")

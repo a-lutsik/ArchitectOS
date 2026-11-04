@@ -1,7 +1,12 @@
 """Code-graph neighbor and impact queries for GraphServiceMixin."""
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+from .embeddings import MemoryEmbeddingEngine
+
+_LOG = logging.getLogger(__name__)
 
 
 class GraphCodeServiceMixin:
@@ -19,19 +24,26 @@ class GraphCodeServiceMixin:
             "language": metadata.get("language"),
         }
 
-    def _resolve_code_symbol(self, identifier: str, project_id: str | None) -> Any | None:
-        """Resolve a Symbol node by id, ``path::qual`` label, qualname, or name."""
+    def _visible_active_nodes(self, project_id: str | None) -> dict[str, Any]:
+        """Active nodes by id that ``project_id`` may see (the search visibility rule)."""
+        return {
+            node.id: node
+            for node in self.repository.list_nodes(status="active")
+            if MemoryEmbeddingEngine.node_visible(node, project_id)
+        }
+
+    @staticmethod
+    def _resolve_code_symbol(identifier: str, nodes: dict[str, Any]) -> Any | None:
+        """Resolve a Symbol node among ``nodes`` by id, ``path::qual`` label, qualname, or name."""
         identifier = str(identifier or "").strip()
         if not identifier:
             return None
-        direct = self.repository.get_node(identifier)
-        if direct is not None and direct.type == "Symbol" and direct.status == "active":
+        direct = nodes.get(identifier)
+        if direct is not None and direct.type == "Symbol":
             return direct
         matches: list[Any] = []
-        for node in self.repository.list_nodes():
-            if node.type != "Symbol" or node.status != "active":
-                continue
-            if project_id and node.project_id not in {project_id, None}:
+        for node in nodes.values():
+            if node.type != "Symbol":
                 continue
             metadata = node.metadata or {}
             qualname = str(metadata.get("symbol") or "")
@@ -50,10 +62,12 @@ class GraphCodeServiceMixin:
         ``identifier`` may be a Symbol node id, a ``path::qualname`` label, a
         qualified name, or a bare symbol name.
         """
-        symbol = self._resolve_code_symbol(identifier, project_id)
+        # Only nodes visible to the project: the symbol itself and every caller/callee/file.
+        nodes = self._visible_active_nodes(project_id)
+        symbol = self._resolve_code_symbol(identifier, nodes)
         if symbol is None:
+            _LOG.debug("code_neighbors found no symbol %r visible to project=%s", identifier, project_id)
             return {"found": False, "query": identifier, "callers": [], "callees": [], "defined_in": None}
-        nodes = {node.id: node for node in self.repository.list_nodes() if node.status == "active"}
         callers: list[dict[str, Any]] = []
         callees: list[dict[str, Any]] = []
         contains: list[dict[str, Any]] = []
@@ -88,11 +102,12 @@ class GraphCodeServiceMixin:
         (callers of callers, up to ``depth``) and adding files that import the
         symbol's defining file.
         """
-        symbol = self._resolve_code_symbol(identifier, project_id)
+        nodes = self._visible_active_nodes(project_id)
+        symbol = self._resolve_code_symbol(identifier, nodes)
         if symbol is None:
+            _LOG.debug("code_impact found no symbol %r visible to project=%s", identifier, project_id)
             return {"found": False, "query": identifier, "impacted": [], "counts": {}}
         depth = max(1, min(int(depth or 3), 6))
-        nodes = {node.id: node for node in self.repository.list_nodes() if node.status == "active"}
         callers_of: dict[str, list[str]] = {}
         importers_of: dict[str, list[str]] = {}
         defines_file: dict[str, str] = {}  # symbol_id -> file_id
