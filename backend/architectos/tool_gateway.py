@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -499,6 +500,11 @@ FS_TOOLS: list[ToolSpec] = [
 ]
 
 _ALL_SPECS = {spec.name: spec for spec in [*MEMORY_TOOLS, *BOARDS_TOOLS, *REPO_TOOLS, *GRANOLA_TOOLS, *FS_TOOLS]}
+# Tools whose project_id is the ArchitectOS project; boards/repo/granola take an Azure
+# DevOps project (or none), where project_id only filters echoed local ids.
+_RUN_PROJECT_TOOL_PREFIXES = ("memory_", "fs_")
+
+_LOG = logging.getLogger(__name__)
 
 
 class ToolGateway:
@@ -598,9 +604,15 @@ class ToolGateway:
                 target,
                 "Writing files needs your approval.",
             ).as_payload(name)
-        # A blank or null project_id from the model must not drop the run's project scope.
-        if project_id and not str(args.get("project_id") or "").strip():
-            args["project_id"] = project_id
+        # The run's project is fixed: a blank, null or different project_id from the model
+        # must not drop or switch the scope of memory and project file tools.
+        requested = str(args.get("project_id") or "").strip()
+        if project_id and requested != project_id:
+            if requested and spec.name.startswith(_RUN_PROJECT_TOOL_PREFIXES):
+                _LOG.warning("tool %s asked for project_id=%s in a run bound to project_id=%s; using the run's project", name, requested, project_id)
+                args["project_id"] = project_id
+            elif not requested:
+                args["project_id"] = project_id
 
         try:
             if spec.name.startswith("memory_"):

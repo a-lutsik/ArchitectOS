@@ -128,6 +128,59 @@ class ToolGatewayUnitTests(unittest.TestCase):
         gateway.execute("boards_get_item", {"id": 84161, "project": "Other-Project"})
         self.assertEqual(mcp.calls[1][2]["project"], "Other-Project")
 
+    def test_run_project_replaces_explicit_project_id_of_memory_tools(self) -> None:
+        # The model must not switch an AI run to another project by naming it.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            repository = service.repository
+            foreign_id = repository.add_node("Decision", "Project B billing rule", "project", "Project B bills customers monthly.", "project_b").id
+            visible_ids = [
+                repository.add_node("Decision", "Cache eviction rule", "project", "Session cache entries expire after ten minutes.", "project_a").id,
+                repository.add_node("Decision", "Retry budget rule", "global", "Outbound HTTP calls retry three times with jitter.", None).id,
+                repository.add_node("Decision", "Log format rule", "shared", "Services log structured JSON lines.", "project_b").id,
+            ]
+            before = repository.list_memory_events(foreign_id)
+            gateway = service.tool_gateway
+            with self.assertLogs(ToolGateway.__module__, "WARNING") as logs:
+                hidden = gateway.execute("memory_get", {"id": foreign_id, "project_id": "project_b"}, project_id="project_a")
+                search = gateway.execute("memory_search", {"query": "bills customers monthly", "project_id": "project_b"}, project_id="project_a")
+            missing = gateway.execute("memory_get", {"id": "node_missing000000", "project_id": "project_b"}, project_id="project_a")
+            visible = [gateway.execute("memory_get", {"id": node_id, "project_id": "project_b"}, project_id="project_a") for node_id in visible_ids]
+            after = repository.list_memory_events(foreign_id)
+
+        self.assertFalse(hidden["ok"])
+        self.assertEqual(hidden["error"].replace(foreign_id, "<id>"), missing["error"].replace("node_missing000000", "<id>"))
+        self.assertTrue(search["ok"])
+        self.assertNotIn(foreign_id, {hit["id"] for hit in search["result"]["hits"]})
+        for reply, node_id in zip(visible, visible_ids):
+            self.assertTrue(reply["ok"], reply)
+            self.assertEqual(reply["result"]["id"], node_id)
+        self.assertEqual(after, before)
+        self.assertEqual(len(logs.records), 2)
+        for record, tool in zip(logs.records, ("memory_get", "memory_search")):
+            message = record.getMessage()
+            self.assertIn(tool, message)
+            self.assertIn("project_b", message)
+            self.assertIn("project_a", message)
+            self.assertNotIn("bills customers", message)
+
+    def test_run_project_leaves_azure_tools_and_runs_without_project(self) -> None:
+        mcp = _FakeMCP({"azure-devops", "filesystem"})
+        seen: list[dict] = []
+
+        def handler(args: dict) -> dict:
+            seen.append(dict(args))
+            return {"ok": True}
+
+        gateway = ToolGateway(mcp, boards_project=lambda: "E-AI", native_handlers={"memory_get": handler, "fs_list": handler})
+        # project_id of Azure tools only filters echoed local ids out of "project".
+        gateway.execute("boards_get_item", {"id": 84161, "project": "project_b", "project_id": "project_b"}, project_id="project_a")
+        gateway.execute("fs_list", {"path": ".", "project_id": "project_b"}, project_id="project_a")
+        gateway.execute("memory_get", {"id": "node_x", "project_id": "project_b"})
+        gateway.execute("memory_get", {"id": "node_x", "project_id": "project_a"}, project_id="project_a")
+        self.assertEqual(mcp.calls[0][2]["project"], "E-AI")
+        self.assertEqual([args["project_id"] for args in seen], ["project_a", "project_b", "project_a"])
+
     def test_boards_empty_payload_is_reported_as_failure(self) -> None:
         class NullPayloadMCP(_FakeMCP):
             def call_tool(self, server_id, tool, arguments=None, timeout=None):
