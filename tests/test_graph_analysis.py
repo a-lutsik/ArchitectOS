@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.architectos.graph_analysis import (
     compute_degrees,
@@ -142,6 +143,147 @@ class MultiHopExpansionTests(unittest.TestCase):
             surfaced = {hit["node"]["id"] for hit in result["hits"]}
             self.assertIn(anchor, surfaced)
             self.assertNotIn(one_hop, surfaced)
+
+    def test_context_expansion_skips_other_project_neighbors(self) -> None:
+        # A global node (no project) is visible to every project and links into
+        # two of them; walking it must not pull project B's constraint into A's pack.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            shared = service.add_memory({
+                "label": "Alpha anchor", "type": "Lesson", "scope": "global",
+                "text": "Zephyr alpha anchor unique marker keyword",
+            })["id"]
+            own = service.add_memory({
+                "project_id": "project_a", "label": "Bravo node", "type": "Decision",
+                "scope": "project", "text": "Bravo caching subsystem session cookie eviction",
+            })["id"]
+            foreign = service.add_memory({
+                "project_id": "project_b", "label": "Charlie constraint", "type": "Constraint",
+                "scope": "project", "text": "Charlie deployment pipeline release artifact rollout",
+            })["id"]
+            # Non-project scopes of B must stay hidden too (the scorer only guards project/interface).
+            private = service.add_memory({
+                "project_id": "project_b", "label": "Delta constraint", "type": "Constraint",
+                "scope": "user_private", "text": "Delta localization glossary translation locale",
+            })["id"]
+            for target in (own, foreign, private):
+                service.repository.add_edge(shared, target, "RELATED_TO", "project")
+
+            result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertIn(shared, surfaced)
+            self.assertIn(own, surfaced)  # visible neighbors still join the pack
+            self.assertNotIn(foreign, surfaced)
+            self.assertNotIn(private, surfaced)
+            self.assertNotIn(foreign, result["context"])
+            self.assertNotIn(private, result["context"])
+            # An explicit scope admits only that scope, as in the FTS prefilter.
+            scoped = service.context("zephyr alpha anchor unique", project_id="project_a", scope="global", limit=8)
+            self.assertEqual({hit["node"]["id"] for hit in scoped["hits"]}, {shared})
+
+    def test_other_project_neighbors_do_not_crowd_out_own(self) -> None:
+        # Project B's many 1-hop neighbors of a shared node must not take the
+        # PageRank slots (or node budget) that A's own 2-hop neighbor needs.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            shared = service.add_memory({
+                "label": "Alpha anchor", "type": "Lesson", "scope": "global",
+                "text": "Zephyr alpha anchor unique marker keyword",
+            })["id"]
+            one_hop = service.add_memory({
+                "project_id": "project_a", "label": "Bravo node", "type": "Decision",
+                "scope": "project", "text": "Bravo caching subsystem session cookie eviction",
+            })["id"]
+            two_hop = service.add_memory({
+                "project_id": "project_a", "label": "Delta node", "type": "Decision",
+                "scope": "project", "text": "Delta localization glossary translation locale",
+            })["id"]
+            service.repository.add_edge(shared, one_hop, "RELATED_TO", "project")
+            service.repository.add_edge(one_hop, two_hop, "RELATED_TO", "project")
+            for word in ("kiwi", "mango", "papaya", "guava", "lychee", "durian",
+                         "quince", "feijoa", "rambutan", "longan", "salak", "jabuticaba"):
+                foreign = service.add_memory({
+                    "project_id": "project_b", "label": f"{word} constraint", "type": "Constraint",
+                    "scope": "project", "text": f"{word} deployment {word} rollout pipeline {word}",
+                })["id"]
+                service.repository.add_edge(shared, foreign, "RELATED_TO", "project")
+
+            result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertEqual(surfaced, {shared, one_hop, two_hop})
+
+    def test_context_expansion_skips_inactive_neighbors(self) -> None:
+        # Soft delete and lifecycle decay keep a node's edges; such a neighbor must
+        # stay out of the pack like it stays out of FTS/vector retrieval.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            ids = [
+                service.add_memory({
+                    "project_id": "project_a", "label": label, "type": node_type,
+                    "scope": "project", "text": text,
+                })["id"]
+                for label, node_type, text in (
+                    ("Alpha anchor", "Decision", "Zephyr alpha anchor unique marker keyword"),
+                    ("Bravo node", "Decision", "Bravo caching subsystem session cookie eviction"),
+                    ("Charlie constraint", "Constraint", "Charlie deployment pipeline release artifact rollout"),
+                    ("Delta constraint", "Constraint", "Delta localization glossary translation locale"),
+                )
+            ]
+            anchor, active, archived, deleted = ids
+            for target in (active, archived, deleted):
+                service.repository.add_edge(anchor, target, "RELATED_TO", "project")
+            service.apply_graph_command({"action": "delete", "node_id": archived})
+            tombstone = service.repository.get_node(deleted)
+            tombstone.status = "deleted"  # as lifecycle decay writes it, edges kept
+            service.repository.upsert_node(tombstone)
+
+            result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertEqual(surfaced, {anchor, active})
+            self.assertNotIn(archived, result["context"])
+            self.assertNotIn(deleted, result["context"])
+
+    def test_neighbors_changed_after_walk_are_rechecked(self) -> None:
+        # The walk's status/scope lookup can go stale before the payloads load: a
+        # neighbor archived or moved to another project meanwhile must not surface.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            ids = [
+                service.add_memory({
+                    "project_id": "project_a", "label": label, "type": node_type,
+                    "scope": "project", "text": text,
+                })["id"]
+                for label, node_type, text in (
+                    ("Alpha anchor", "Decision", "Zephyr alpha anchor unique marker keyword"),
+                    ("Bravo node", "Decision", "Bravo caching subsystem session cookie eviction"),
+                    ("Charlie constraint", "Constraint", "Charlie deployment pipeline release artifact rollout"),
+                    ("Delta constraint", "Constraint", "Delta localization glossary translation locale"),
+                )
+            ]
+            anchor, active, archived, moved = ids
+            for target in (active, archived, moved):
+                service.repository.add_edge(anchor, target, "RELATED_TO", "project")
+            walk_lookup = service.repository.active_node_scopes_by_ids
+
+            def lookup_then_change(node_ids: set[str]) -> dict[str, tuple[str, str]]:
+                scopes = walk_lookup(node_ids)
+                if archived in scopes:
+                    service.apply_graph_command({"action": "delete", "node_id": archived})
+                    node = service.repository.get_node(moved)
+                    node.project_id = "project_b"
+                    service.repository.upsert_node(node)
+                return scopes
+
+            with mock.patch.object(service.repository, "active_node_scopes_by_ids", side_effect=lookup_then_change):
+                result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertEqual(surfaced, {anchor, active})
+            self.assertNotIn(archived, result["context"])
+            self.assertNotIn(moved, result["context"])
 
 
 class TemporalSupersedeTests(unittest.TestCase):

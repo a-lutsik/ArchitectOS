@@ -589,6 +589,24 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
                     by_id[node.id] = node
         return [by_id[node_id] for node_id in ids if node_id in by_id]
 
+    def active_node_scopes_by_ids(self, node_ids: list[str] | set[str]) -> dict[str, tuple[str, str]]:
+        """``(scope, project_id)`` per active node id, without parsing payloads."""
+        ids = [str(item) for item in node_ids if str(item).strip()]
+        if not ids:
+            return {}
+        scopes: dict[str, tuple[str, str]] = {}
+        with self._connect() as conn:
+            for chunk_start in range(0, len(ids), 200):
+                chunk = ids[chunk_start : chunk_start + 200]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT id, scope, project_id FROM memory_nodes WHERE id IN ({placeholders}) AND status = 'active'",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    scopes[str(row["id"])] = (str(row["scope"] or ""), str(row["project_id"] or ""))
+        return scopes
+
     def add_retrieval_feedback(self, payload: dict[str, Any]) -> dict[str, Any]:
         rating = int(payload.get("rating") or 0)
         if rating not in {-1, 1}:
