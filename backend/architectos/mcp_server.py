@@ -1094,6 +1094,7 @@ class MemoryMCPServer:
         payload = self.service._tool_memory_get({
             "id": node_id,
             "include_neighbors": bool(args.get("include_neighbors", True)),
+            "project_id": self._arg_project_id(args),
         })
         summary = f'[{payload.get("type")}] {payload.get("label")} (id {payload.get("id")})\n{payload.get("text") or ""}'
         neighbors = payload.get("neighbors") or []
@@ -1180,7 +1181,11 @@ class MemoryMCPServer:
             if not node_id:
                 raise _RpcError(INVALID_PARAMS, "node id is missing in uri")
             try:
-                payload = self.service._tool_memory_get({"id": node_id, "include_neighbors": True})
+                payload = self.service._tool_memory_get({
+                    "id": node_id,
+                    "include_neighbors": True,
+                    "project_id": self._arg_project_id({}),
+                })
             except ValueError as exc:
                 raise _RpcError(INVALID_PARAMS, str(exc)) from exc
             return _resource_contents(uri, payload)

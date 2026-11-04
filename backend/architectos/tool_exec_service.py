@@ -31,6 +31,8 @@ from .constants import (
     TERMINAL_DESTRUCTIVE_CONFIRM,
     TERMINAL_SHELLS,
 )
+from .embeddings import MemoryEmbeddingEngine
+from .models import MemoryNode
 from .permissions import PermissionRequired
 
 _LOG = logging.getLogger("architectos.service")
@@ -266,7 +268,18 @@ class ToolExecServiceMixin:
         node_id = str(args.get("id") or args.get("node_id") or "").strip()
         if not node_id:
             raise ValueError("memory_get requires id")
+        project_id = str(args.get("project_id") or "").strip() or None
+
+        def _visible(candidate: MemoryNode) -> bool:
+            # Same rule as the search paths: an id must not reach into another project.
+            return MemoryEmbeddingEngine._passes_scope_filter(
+                candidate.scope or "", candidate.project_id or "", project_id=project_id, scope=None
+            )
+
         node = self.repository.get_node(node_id)
+        if node and not _visible(node):
+            _LOG.debug("memory_get hid node %s of project=%s from project=%s", node_id, node.project_id, project_id)
+            node = None
         if not node or node.status not in {"active", "archived"}:
             raise ValueError(f"memory node not found: {node_id}")
         include_neighbors = bool(args.get("include_neighbors", True))
@@ -284,6 +297,7 @@ class ToolExecServiceMixin:
         }
         if include_neighbors:
             neighbors: list[dict[str, Any]] = []
+            hidden: list[str] = []
             for edge in self.repository.list_edges():
                 other = ""
                 if edge.source == node.id:
@@ -295,6 +309,9 @@ class ToolExecServiceMixin:
                 related = self.repository.get_node(other)
                 if not related or related.status != "active":
                     continue
+                if not _visible(related):
+                    hidden.append(related.id)
+                    continue
                 neighbors.append({
                     "edge_type": edge.type,
                     "id": related.id,
@@ -305,6 +322,8 @@ class ToolExecServiceMixin:
                 })
                 if len(neighbors) >= 12:
                     break
+            if hidden:
+                _LOG.debug("memory_get %s skipped %d neighbors outside project=%s: %s", node.id, len(hidden), project_id, hidden)
             payload["neighbors"] = neighbors
         try:
             self.memory_lifecycle.refresh_nodes([node.id], "memory_get")

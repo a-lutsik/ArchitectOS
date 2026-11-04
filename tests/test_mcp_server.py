@@ -150,6 +150,70 @@ class MemoryMCPServerTests(unittest.TestCase):
         self.assertIn("not found", responses[1]["result"]["content"][0]["text"])
         self.assertEqual(responses[2]["error"]["code"], -32602)
 
+    def test_memory_get_hides_other_projects_nodes(self) -> None:
+        # A node id must not reach into another project: memory_get and the node
+        # resource answer as for a missing id, and foreign neighbors are dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            service = server.service
+            foreign_ids = [
+                service.add_memory({
+                    "project_id": "project_b", "label": f"Project B {scope} rule", "type": "Decision",
+                    "scope": scope, "text": f"Project B settles {scope} invoices through Stripe nightly.",
+                })["id"]
+                for scope in ("project", "project_shared")
+            ]
+            own_id = service.add_memory({
+                "project_id": "project_a", "label": "Cache eviction rule", "type": "Decision",
+                "scope": "project", "text": "Session cache entries expire after ten minutes.",
+            })["id"]
+            shared_ids = [
+                service.add_memory({
+                    "label": "Retry budget rule", "type": "Decision", "scope": "global",
+                    "text": "Outbound HTTP calls retry three times with jitter.",
+                })["id"],
+                service.repository.add_node(
+                    "Decision", "Log format rule", "shared", "Services log structured JSON lines.", "project_b",
+                ).id,
+            ]
+            for target in (*shared_ids, *foreign_ids):
+                service.repository.add_edge(own_id, target, "RELATED_TO", "project")
+            node_ids = [*foreign_ids, own_id, *shared_ids]
+            messages: list[dict] = []
+            for index, node_id in enumerate(node_ids):
+                messages.append({"jsonrpc": "2.0", "id": 2 * index + 1, "method": "tools/call",
+                                 "params": {"name": "memory_get", "arguments": {"id": node_id}}})
+                messages.append({"jsonrpc": "2.0", "id": 2 * index + 2, "method": "resources/read",
+                                 "params": {"uri": f"memory://nodes/{node_id}"}})
+            replies = {response["id"]: response for response in _run(server, messages)}
+            # A blank project_id from the model must not lift the run's project scope.
+            gateway_replies = [
+                service.tool_gateway.execute("memory_get", {"id": foreign_ids[0], **blank}, project_id="project_a")
+                for blank in ({}, {"project_id": ""}, {"project_id": None})
+            ]
+
+        for index, node_id in enumerate(foreign_ids):
+            with self.subTest(node_id=node_id):
+                tool = replies[2 * index + 1]["result"]
+                self.assertTrue(tool["isError"])
+                self.assertEqual(tool["content"][0]["text"], f"Error: memory node not found: {node_id}")
+                resource = replies[2 * index + 2]["error"]
+                self.assertEqual(resource["code"], -32602)
+                self.assertEqual(resource["message"], f"memory node not found: {node_id}")
+        for index, node_id in enumerate(node_ids[2:], start=2):
+            with self.subTest(node_id=node_id):
+                text = replies[2 * index + 1]["result"]["content"][0]["text"]
+                tool_payload = json.loads(text.split("```json", 1)[1].rsplit("```", 1)[0])
+                resource_payload = json.loads(replies[2 * index + 2]["result"]["contents"][0]["text"])
+                for payload in (tool_payload, resource_payload):
+                    self.assertEqual(payload["id"], node_id)
+                    neighbor_ids = {neighbor["id"] for neighbor in payload["neighbors"]}
+                    self.assertLessEqual(set(shared_ids) if node_id == own_id else {own_id}, neighbor_ids)
+                    self.assertFalse(neighbor_ids & set(foreign_ids))
+        for reply in gateway_replies:
+            self.assertFalse(reply["ok"])
+            self.assertEqual(reply["error"], f"memory node not found: {foreign_ids[0]}")
+
     def test_memory_feedback_records_rating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server = self._server(Path(tmp))
