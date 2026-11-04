@@ -659,11 +659,16 @@ class RetrievalServiceMixin:
         _LOG.debug("dropped %d node refs outside project=%s: %s", len(hidden), project_id, sorted(hidden))
         return [_drop_node_refs(blob, hidden) for blob in blobs]
 
+    def _nodes_without_hidden_node_refs(self, nodes: list[dict[str, Any]], project_id: str | None) -> list[dict[str, Any]]:
+        """Apply :meth:`_without_hidden_node_refs` to node payloads' metadata, in one lookup."""
+        metadata = self._without_hidden_node_refs([node["metadata"] for node in nodes], project_id)
+        for node, clean in zip(nodes, metadata, strict=True):
+            node["metadata"] = clean
+        return nodes
+
     def _hits_without_hidden_node_refs(self, hits: list[dict[str, Any]], project_id: str | None) -> list[dict[str, Any]]:
-        """Apply :meth:`_without_hidden_node_refs` to compacted hits' node metadata, in one lookup."""
-        metadata = self._without_hidden_node_refs([hit["node"]["metadata"] for hit in hits], project_id)
-        for hit, clean in zip(hits, metadata, strict=True):
-            hit["node"]["metadata"] = clean
+        """Apply :meth:`_without_hidden_node_refs` to hits' node metadata, in one lookup."""
+        self._nodes_without_hidden_node_refs([hit["node"] for hit in hits], project_id)
         return hits
 
     def memory_history(self, node_id: str, limit: int = 200, project_id: str | None = None) -> dict[str, Any]:
@@ -875,7 +880,7 @@ class RetrievalServiceMixin:
                 actual = str(projects[0].get("id") or "architectos")
             else:
                 actual = "architectos"
-        stable = self.list_stable_memory(project_id=actual, limit=limit)
+        stable = self._hits_without_hidden_node_refs(self.list_stable_memory(project_id=actual, limit=limit), actual)
         context = ""
         if stable:
             context = pack_memory_context(
@@ -900,6 +905,7 @@ class RetrievalServiceMixin:
         stable_started = time.perf_counter()
         stable_hits = self.list_stable_memory(project_id=project_id, limit=6, query=query, scope=scope)
         rule_layer_hits = self.list_rule_layer_memory(project_id=project_id, limit=8, query=query, scope=scope)
+        self._hits_without_hidden_node_refs([*stable_hits, *rule_layer_hits], project_id)
         stable_done = time.perf_counter()
         pack_stable = list({
             str((hit.get("node") or {}).get("id") or ""): hit

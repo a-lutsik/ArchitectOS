@@ -489,7 +489,7 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
             allowed_selected = {node.id for node in filtered_nodes}
             all_edges = [edge for edge in all_edges if edge.source in allowed_selected and edge.target in allowed_selected]
             
-        graph_nodes = [node.to_dict() for node in filtered_nodes]
+        graph_nodes = self._nodes_without_hidden_node_refs([node.to_dict() for node in filtered_nodes], project_id)
         graph_edges = [edge.to_dict() for edge in all_edges]
         
         if task_node:

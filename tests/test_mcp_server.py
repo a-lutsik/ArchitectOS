@@ -771,7 +771,8 @@ class ProjectIsolationReferenceTests(unittest.TestCase):
             "target_id": ids["global"],
             "merged_id": ids["foreign"],
             "near_id": self.MISSING_ID,
-            "details": {"candidates": [ids["foreign"], ids["own"], self.MISSING_ID]},
+            # foreign_shared appears only in a nested dict: the scan must recurse into it.
+            "details": {"candidates": [ids["foreign"], ids["own"], self.MISSING_ID], "origin": {"node": ids["foreign_shared"]}},
         })
 
     def test_responses_drop_ids_hidden_from_the_project(self) -> None:
@@ -806,7 +807,7 @@ class ProjectIsolationReferenceTests(unittest.TestCase):
             self.assertNotIn("superseded_by", payload["metadata"])
         events = {event["event_type"]: event["details"] for event in _tool_payload(history_global["result"])["events"]}
         self.assertEqual(set(events["superseded"]), {"invalid_at"})
-        self.assertEqual(events["dedup"], {"action": "merge", "target_id": ids["global"], "details": {"candidates": [ids["own"]]}})
+        self.assertEqual(events["dedup"], {"action": "merge", "target_id": ids["global"], "details": {"candidates": [ids["own"]], "origin": {}}})
         for payload in (_tool_payload(get_shared["result"]), json.loads(resource_shared["result"]["contents"][0]["text"])):
             metadata = payload["metadata"]
             self.assertEqual(metadata["merged_from"], [])
@@ -822,6 +823,65 @@ class ProjectIsolationReferenceTests(unittest.TestCase):
         self.assertEqual(after, stored)
         self.assertEqual(stored["global"]["superseded_by"], ids["foreign"])
         self.assertEqual(stored["shared"]["merged_from"], [ids["foreign_shared"]])
+
+    def test_stable_layer_and_graph_drop_ids_hidden_from_the_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            service = server.service
+            ids = _seed_two_projects(service.repository)
+            self._plant_references(server, ids)
+            context = service.context("retry budget log format", project_id="project_a")
+            briefing = service.memory_briefing(project_id="project_a")
+            graph = service.graph(project_id="project_a")
+            project_b = service.context("retry budget log format", project_id="project_b")
+
+        hidden = (ids["foreign"], ids["foreign_shared"], self.MISSING_ID)
+        payloads = {
+            "context": context,
+            "briefing": briefing,
+            "graph": graph["nodes"],
+        }
+        for name, payload in payloads.items():
+            text = json.dumps(payload, default=str)
+            for node_id in hidden:
+                with self.subTest(response=name, node_id=node_id):
+                    self.assertNotIn(node_id, text)
+        layers = {
+            "stable_hits": context["stable_hits"],
+            "rule_layer_hits": context["rule_layer_hits"],
+            "briefing": briefing["stable"],
+            "graph": [{"node": node} for node in graph["nodes"]],
+        }
+        for name, hits in layers.items():
+            metadata = {hit["node"]["id"]: hit["node"]["metadata"] for hit in hits}
+            with self.subTest(layer=name):
+                self.assertIn("invalid_at", metadata[ids["global"]])
+                self.assertNotIn("superseded_by", metadata[ids["global"]])
+                self.assertEqual(metadata[ids["shared"]]["merged_from"], [])
+                self.assertEqual(metadata[ids["shared"]]["conflicts_with"], ids["own"])
+        stable_b = {hit["node"]["id"]: hit["node"]["metadata"] for hit in project_b["stable_hits"]}
+        self.assertEqual(stable_b[ids["global"]]["superseded_by"], ids["foreign"])
+
+    def test_unscoped_callers_keep_every_stored_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            service = server.service
+            ids = _seed_two_projects(service.repository)
+            self._plant_references(server, ids)
+            stored = {key: self._refs(service.repository, ids[key]) for key in ("global", "shared")}
+            node = service._tool_memory_get({"id": ids["shared"]})
+            history = service.memory_history(ids["global"])
+            graph = {item["id"]: item["metadata"] for item in service.graph()["nodes"]}
+
+        # Without a project nothing is dropped: neither another project's ids nor dangling ones.
+        self.assertEqual({key: node["metadata"][key] for key in self.REF_KEYS if key in node["metadata"]}, stored["shared"])
+        self.assertEqual(node["metadata"]["supersedes"], self.MISSING_ID)
+        dedup = next(event["details"] for event in history["events"] if event["event_type"] == "dedup")
+        self.assertEqual(dedup["near_id"], self.MISSING_ID)
+        self.assertEqual(dedup["merged_id"], ids["foreign"])
+        self.assertEqual(dedup["details"]["origin"], {"node": ids["foreign_shared"]})
+        self.assertEqual(graph[ids["global"]]["superseded_by"], ids["foreign"])
+        self.assertEqual(graph[ids["shared"]]["supersedes"], self.MISSING_ID)
 
     def test_supersedes_only_rewrites_the_projects_own_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

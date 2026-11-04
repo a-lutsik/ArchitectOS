@@ -13,7 +13,7 @@ from unittest import mock
 from backend.architectos.chunking import chunk_text, work_item_comment_chunks, work_item_main_parts
 from backend.architectos.embeddings import cosine, unpack_vector
 from backend.architectos.models import VALID_SCOPES
-from backend.architectos.search import pack_memory_context
+from backend.architectos.search import HybridSearchStrategy, pack_memory_context
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
 
@@ -2048,6 +2048,7 @@ class ExplicitScopeNarrowsTests(unittest.TestCase):
             engine = service.memory_embeddings
             vector = engine._embed_query_cached(self.QUERY)  # noqa: SLF001 - same vector the search uses
             all_ids = " ".join(sorted(scopes))
+            nodes = repository.list_nodes(status="active")
             paths = {
                 "fts": lambda scope: repository.search_memory_fts(self.QUERY, project_id="project_a", scope=scope),
                 "work_item": lambda scope: repository.search_memory_identifiers("AB#4242", project_id="project_a", scope=scope),
@@ -2063,6 +2064,11 @@ class ExplicitScopeNarrowsTests(unittest.TestCase):
                 "search_memory": lambda scope: [
                     hit["node"]["id"]
                     for hit in service.search_memory(self.QUERY, project_id="project_a", scope=scope, limit=40)["hits"]
+                ],
+                # The scorer alone, without the SQL / vector prefilters in front of it.
+                "scorer": lambda scope: [
+                    hit.node.id
+                    for hit in HybridSearchStrategy().search(self.QUERY, nodes, [], "project_a", scope, 40, diversify=False)
                 ],
             }
             for name, lookup in paths.items():
