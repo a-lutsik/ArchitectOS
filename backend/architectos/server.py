@@ -572,7 +572,8 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
         raw_limit = str(payload.get("limit") or "").strip()
         limit = max(1, min(int(raw_limit), 50)) if raw_limit.isdigit() else 8
         raw_exclude = payload.get("exclude_ids")
-        exclude_ids = [str(item) for item in raw_exclude[:2000]] if isinstance(raw_exclude, list) else []
+        # A session lists its ids oldest first; past the cap keep the most recent.
+        exclude_ids = [str(item) for item in raw_exclude[-2000:]] if isinstance(raw_exclude, list) else []
         raw_vector_ms = str(payload.get("vector_timeout_ms") or "").strip()
         self._json(
             self.get_service().capture_memory_turn(

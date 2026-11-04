@@ -736,11 +736,12 @@ def handle_capture(
             turn, root=root, include_stable=include_stable, exclude_ids=exclude_ids, capture=capture
         )
     out = render_stdout(turn, result)
-    if turn.can_inject and not _injected_text(out):
+    injected = _injected_text(out)
+    if turn.can_inject and not injected:
         _LOG.info("injection skipped: kind=%s transport=%s reason=%s", turn.event, transport,
                   "no reply" if result is None else "empty pack")
     if session is not None:
-        session.record(turn, result, _injected_text(out), include_stable=include_stable)
+        session.record(turn, result, injected, include_stable=include_stable)
         if turn.event == EVENT_PROMPT:
             session.keep_prompt(turn.cwd, turn.user_text)
         session.save()
