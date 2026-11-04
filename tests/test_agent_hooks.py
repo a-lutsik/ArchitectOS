@@ -98,9 +98,9 @@ class HookTimeoutTests(unittest.TestCase):
     def _timeouts(self, env: dict[str, str]) -> dict[str, float]:
         seen: dict[str, float] = {}
 
-        def fake_request(url: str, token: str, *, payload: object, timeout: float, root: object = None) -> dict[str, object]:
+        def fake_request(url: str, token: str, *, payload: object, timeout: float, root: object = None) -> tuple[dict[str, object], str]:
             seen["session" if "briefing" in url else ("response" if payload and payload.get("assistant_text") else "prompt")] = timeout  # type: ignore[union-attr]
-            return {"context": "", "hits": []}
+            return {"context": "", "hits": []}, ""
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env), \
                 mock.patch.object(agent_hooks, "_request_json", side_effect=fake_request):
@@ -202,9 +202,9 @@ class HookBudgetTests(unittest.TestCase):
     def test_hook_prompt_asks_the_server_for_the_hook_pack(self) -> None:
         sent: list[dict[str, object]] = []
 
-        def fake_request(url: str, token: str, *, payload: dict[str, object], timeout: float, root: object = None) -> dict[str, object]:
+        def fake_request(url: str, token: str, *, payload: dict[str, object], timeout: float, root: object = None) -> tuple[dict[str, object], str]:
             sent.append(payload)
-            return {"context": "", "hits": []}
+            return {"context": "", "hits": []}, ""
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agent_hooks, "_request_json", side_effect=fake_request):
             root = Path(tmp)
@@ -469,6 +469,143 @@ class HookCaptureOnStopTests(unittest.TestCase):
         self.assertEqual(captured, [("", str(beta)), (self.PROMPT, str(alpha))])
 
 
+class HookOfflineTests(unittest.TestCase):
+    """The app is closed: no runtime.json, the hook must not open the store."""
+
+    QUESTION = "How do we batch ledger writes?"
+
+    def _no_store(self) -> mock._patch:  # type: ignore[type-arg]
+        return mock.patch("backend.architectos.service.ArchitectOSService.__init__", side_effect=AssertionError("store opened"))
+
+    def test_offline_events_use_the_cache_and_spool_without_opening_the_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 8)
+            service.repository.add_node("Constraint", "ledger constraint", "project", "Ledger writes must stay idempotent.", "architectos")
+            service.hook_briefing(cwd=str(root))
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            with self._no_store():
+                start = _hook(root, "SessionStart", cwd=root, session="s1")
+                first = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+                second = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+                stop = _hook(root, "Stop", cwd=root, session="s1", last_assistant_message="Batch them per tenant.")
+            spooled = [json.loads(line) for line in (root / "data" / "hook_spool.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(_stable_section(start))
+        self.assertTrue(_injected_ids(first))
+        self.assertFalse(_stable_section(first), "the stable layer came with SessionStart")
+        self.assertFalse(set(_injected_ids(first)) & set(_injected_ids(second)))
+        self.assertEqual(stop, "")
+        self.assertEqual([(item["project_id"], item["user_text"], item["assistant_text"]) for item in spooled],
+                         [("architectos", self.QUESTION, "Batch them per tenant.")])
+
+    def test_app_replays_the_spool_into_each_records_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            alpha, beta = _two_projects(root, service)
+            service.hook_maintenance()
+            with self._no_store():
+                for cwd, word in ((alpha, "AlphaQuartzRule"), (beta, "BetaQuartzRule")):
+                    _hook(root, "UserPromptSubmit", cwd=cwd, session="same", prompt=f"Remember: {word} must guard every release.")
+                    _hook(root, "Stop", cwd=cwd, session="same", last_assistant_message=f"Noted: {word} guards every release.")
+            with mock.patch.object(service, "capture_memory_turn", wraps=service.capture_memory_turn) as spy:
+                drained = service.drain_hook_spool()
+            alpha_hits = json.dumps(service.search_memory("AlphaQuartzRule BetaQuartzRule", project_id="alpha")["hits"])
+            beta_hits = json.dumps(service.search_memory("AlphaQuartzRule BetaQuartzRule", project_id="beta")["hits"])
+            leftover = list((root / "data").glob("hook_spool*"))
+        self.assertEqual(drained["captured"], 2)
+        self.assertEqual(sorted(call.kwargs["project_id"] for call in spy.call_args_list), ["alpha", "beta"])
+        self.assertIn("AlphaQuartzRule", alpha_hits)
+        self.assertNotIn("BetaQuartzRule", alpha_hits)
+        self.assertIn("BetaQuartzRule", beta_hits)
+        self.assertNotIn("AlphaQuartzRule", beta_hits)
+        self.assertEqual(leftover, [])
+
+    def test_offline_injection_comes_only_from_the_folders_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            alpha, beta = _two_projects(root, service)
+            alpha_ids = set(_seed(service, "alpha", 4))
+            beta_ids = set(_seed(service, "beta", 4))
+            bound = root / "work" / "elsewhere"
+            bound.mkdir()
+            write_mcp_bind_file(bound, "beta", "Beta")
+            for project_id in ("alpha", "beta"):
+                service.capture_memory_turn(self.QUESTION, project_id=project_id, hook=True, capture=False)
+            with self._no_store():
+                in_alpha = set(_injected_ids(_hook(root, "UserPromptSubmit", cwd=alpha, session="same", prompt=self.QUESTION)))
+                in_beta = set(_injected_ids(_hook(root, "UserPromptSubmit", cwd=beta, session="same", prompt=self.QUESTION)))
+                in_bound = set(_injected_ids(_hook(root, "UserPromptSubmit", cwd=bound, prompt=self.QUESTION)))
+        self.assertTrue(in_alpha and in_alpha <= alpha_ids, in_alpha)
+        self.assertTrue(in_beta and in_beta <= beta_ids, in_beta)
+        self.assertTrue(in_bound and in_bound <= beta_ids, in_bound)
+
+    def test_offline_zero_stays_silent_and_spools_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_OFFLINE": "0"}):
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 4)
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False)
+            prompt = _hook(root, "UserPromptSubmit", cwd=root, prompt=self.QUESTION)
+            stop = _hook(root, "Stop", cwd=root, client="codex", last_assistant_message="Batch them.")
+            self.assertFalse((root / "data" / "hook_spool.jsonl").exists())
+        self.assertEqual((prompt, stop), ("", "{}"))
+
+    def test_capture_spools_when_the_app_is_unreachable_but_not_when_it_timed_out(self) -> None:
+        spooled: dict[str, bool] = {}
+        for failure in ("unreachable", "timeout"):
+            with tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(agent_hooks, "_request_json", return_value=(None, failure)):
+                root = Path(tmp)
+                (root / "data").mkdir()
+                (root / "data" / "architectos.runtime.json").write_text(
+                    json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+                )
+                _hook(root, "Stop", cwd=root, last_assistant_message="Batch ledger writes per tenant.")
+                spooled[failure] = (root / "data" / "hook_spool.jsonl").exists()
+        self.assertEqual(spooled, {"unreachable": True, "timeout": False})
+
+    def test_failing_spool_records_are_retried_then_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            agent_hooks.spool_turn(root, {"ts": "2026-11-04T00:00:00+00:00", "project_id": "architectos",
+                                          "cwd": str(root), "client": "claude", "user_text": "", "assistant_text": "Batch it."})
+            with mock.patch.object(service, "capture_memory_turn", side_effect=RuntimeError("db locked")), \
+                    self.assertLogs("architectos.service", level="ERROR"):
+                rounds = [service.drain_hook_spool() for _ in range(3)]
+            left = (root / "data" / "hook_spool.jsonl").exists()
+        self.assertEqual([item["failed"] for item in rounds], [1, 1, 0])
+        self.assertEqual(rounds[-1]["dropped"], 1)
+        self.assertFalse(left)
+
+    def test_app_start_drains_the_spool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            agent_hooks.spool_turn(root, {"ts": "2026-11-04T00:00:00+00:00", "project_id": "architectos", "cwd": str(root),
+                                          "client": "claude", "user_text": "Remember: OnyxGate signs releases.",
+                                          "assistant_text": "Noted, OnyxGate signs every release."})
+            service._chat_session_stop.set()
+            service._chat_session_idle_loop(initial_delay_s=0, interval_s=0)
+            found = json.dumps(service.search_memory("OnyxGate", project_id="architectos")["hits"])
+            self.assertFalse((root / "data" / "hook_spool.jsonl").exists())
+        self.assertIn("OnyxGate", found)
+
+    def test_doctor_reports_the_spool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            for index in range(2):
+                agent_hooks.spool_turn(root, {"ts": "2026-11-04T00:00:00+00:00", "project_id": "architectos",
+                                              "user_text": f"q{index}", "assistant_text": "a"})
+            offline = agent_hooks.status(project_root=root)["offline"]
+        self.assertEqual(offline["spool"]["records"], 2)
+        self.assertGreater(offline["spool"]["bytes"], 0)
+        self.assertGreater(offline["spool"]["oldest_age_s"], 0)
+
+
 class HookRenderTests(unittest.TestCase):
     def test_injecting_client_returns_additional_context(self) -> None:
         turn = agent_hooks.HookTurn(client="codex", event=agent_hooks.EVENT_PROMPT, raw_event="UserPromptSubmit")
@@ -517,7 +654,7 @@ class HookCaptureTests(unittest.TestCase):
     def test_capture_writes_turn_into_memory_then_injects_it_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            ArchitectOSService(root)  # initialise the database
+            service = ArchitectOSService(root)
             first = agent_hooks.handle_capture(
                 json.dumps({
                     "hook_event_name": "UserPromptSubmit",
@@ -530,19 +667,22 @@ class HookCaptureTests(unittest.TestCase):
             )
             self.assertEqual(first, "", "an empty project must not spend tokens on an empty pack")
 
-            found = ArchitectOSService(root).search_memory("UniqueBirchFormatter", project_id="architectos", limit=5)
+            # The app was closed: the turn waits in the spool until the app replays it.
+            self.assertEqual(service.drain_hook_spool()["captured"], 1)
+            found = service.search_memory("UniqueBirchFormatter", project_id="architectos", limit=5)
             self.assertIn("UniqueBirchFormatter", json.dumps(found.get("hits") or []))
 
-            second = agent_hooks.handle_capture(
-                json.dumps({
-                    "hook_event_name": "UserPromptSubmit",
-                    "prompt": "Which formatter should I use, UniqueBirchFormatter or something else?",
-                    "cwd": str(root),
-                }),
-                client="codex",
-                event="prompt",
-                root=root,
-            )
+            with _RunningApp(root, service):
+                second = agent_hooks.handle_capture(
+                    json.dumps({
+                        "hook_event_name": "UserPromptSubmit",
+                        "prompt": "Which formatter should I use, UniqueBirchFormatter or something else?",
+                        "cwd": str(root),
+                    }),
+                    client="codex",
+                    event="prompt",
+                    root=root,
+                )
             injected = json.loads(second)["hookSpecificOutput"]["additionalContext"]
             self.assertIn("UniqueBirchFormatter", injected)
 
@@ -876,9 +1016,13 @@ class HookTimingLogTests(unittest.TestCase):
     def test_debug_log_records_one_offline_timing_line_without_prompt_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": "1"}):
             root = Path(tmp)
-            ArchitectOSService(root)
+            service = ArchitectOSService(root)
+            service.hook_maintenance()  # the app ran once: the cache knows the projects
             self._capture(root, self.PROMPT)
-            out = self._capture(root, "Which formatter should I use, UniqueBirchFormatter or something else?")
+            service.drain_hook_spool()
+            question = "Which formatter should I use, UniqueBirchFormatter or something else?"
+            service.capture_memory_turn(question, hook=True, capture=False)  # the app caches the pack
+            out = self._capture(root, question)
             lines = self._log_lines(root)
         self.assertEqual(len(lines), 2)
         first, second = (self.LINE.match(line) for line in lines)
@@ -945,7 +1089,7 @@ class HookTimingLogTests(unittest.TestCase):
         self.assertEqual((stop, cursor), ("{}", ""))
         self.assertEqual(len(lines), 2)
         self.assertRegex(lines[0], r" event=response client=codex transport=offline ms=\d+\.\d tokens=0 hits=\d+ ")
-        self.assertRegex(lines[1], r" event=prompt client=cursor transport=offline ms=\d+\.\d tokens=0 hits=[1-9]\d* ")
+        self.assertRegex(lines[1], r" event=prompt client=cursor transport=offline ms=\d+\.\d tokens=0 hits=\d+ ")
 
     def test_failure_lines_land_under_the_given_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": "1"}):

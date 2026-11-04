@@ -155,8 +155,29 @@ another's pack, even under the same session id.
 
 The hook prefers the running app: it reads `data/architectos.runtime.json` for the
 port and auth token and calls `POST /api/memory/turn` (or
-`GET /api/memory/briefing`). If the app is not running it opens the store directly,
-so hooks work with the desktop app closed.
+`GET /api/memory/briefing`).
+
+If the app is not running (or does not answer in time) the hook never opens the
+store, so an event costs a few milliseconds instead of a service cold start:
+
+- **Injection** comes from `data/briefing_cache.json`. The app rewrites it on
+  every briefing (the stable layer) and every hook pack (the latest hits) per
+  project, together with the project roots, the hook settings and the default
+  project. The hook resolves the folder's project the way the app does
+  (`.architectos.json` bind, then the deepest root, then the default project)
+  and injects only that project's cached lines, still minus what the session
+  already holds.
+- **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
+  the project resolved for the folder. The app replays the spool through
+  `capture_memory_turn` into each record's own project when it starts and once a
+  minute (the `chat-session-idle` loop); a record that keeps failing is retried
+  three times and then dropped. The spool stops growing at 5 MB. A capture whose
+  HTTP request timed out is *not* spooled: the app already has it.
+- Until the app runs again, spooled facts are not in memory. `doctor` shows how
+  many records wait and how old the oldest one is.
+
+`ARCHITECTOS_HOOK_OFFLINE=0` turns the offline path off: with the app closed the
+hook says nothing and spools nothing.
 
 ## Failure behaviour
 
@@ -173,7 +194,7 @@ prints `{}`.
 | `ARCHITECTOS_HOOK_DISABLED=1` | Turn all hooks into no-ops without editing configs |
 | `ARCHITECTOS_HOOK_INJECT_TIMEOUT` | HTTP timeout in seconds for events that inject (`SessionStart`, prompt submit; default `2`) |
 | `ARCHITECTOS_HOOK_TIMEOUT` | HTTP timeout in seconds for capture on turn end (default `5`) |
-| `ARCHITECTOS_HOOK_OFFLINE=0` | Do not fall back to opening the store directly |
+| `ARCHITECTOS_HOOK_OFFLINE=0` | With the app closed, stay silent: no cached injection, no capture spool |
 | `ARCHITECTOS_HOOK_DEBUG=1` | Append one line per event to `data/hooks.log` (see below) |
 
 With `ARCHITECTOS_HOOK_DEBUG=1` each handled event adds one line with counts and
@@ -183,9 +204,12 @@ timings only, never prompt or answer text:
 2026-11-04T10:00:00+00:00 event=prompt client=claude transport=http ms=312.4 tokens=1003 hits=10 project=architectos queued=0 auto=1
 ```
 
-`transport` is `http` (app running), `offline` (store opened by the hook) or
-`none`; `ms` covers the event inside the hook process, not the interpreter start;
-`tokens` estimates the injected context (0 when the hook stayed silent).
+`transport` is `http` (app running), `offline` (briefing cache and spool),
+`deferred` (Cursor prompt held for turn end) or `none`; `ms` covers the event
+inside the hook process, not the interpreter start;
+`tokens` estimates the injected context (0 when the hook stayed silent). The
+command-line hook also appends its own log lines there (offline cache and spool
+decisions, skipped injections, timeouts), again counts only.
 
 ## Manual check
 

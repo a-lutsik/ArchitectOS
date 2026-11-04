@@ -407,7 +407,12 @@ class ChatSessionServiceMixin:
         return chat
 
     def _chat_session_idle_loop(self, *, initial_delay_s: float = 90.0, interval_s: float = 60.0) -> None:
-        """Finalize idle chat sessions so memory candidates are created after the conversation ends."""
+        """Finalize idle chat sessions so memory candidates are created after the conversation ends.
+
+        Also replays agent-hook captures spooled while the app was closed: at
+        start and on every sweep (see ``hook_maintenance``).
+        """
+        self.hook_maintenance()
         if self._chat_session_stop.wait(initial_delay_s):
             return
         while not self._chat_session_stop.is_set():
@@ -415,6 +420,7 @@ class ChatSessionServiceMixin:
                 self._finalize_idle_chat_sessions()
             except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
                 _LOG.warning("chat session idle sweep failed: %s", exc)
+            self.hook_maintenance()
             if self._chat_session_stop.wait(interval_s):
                 return
 
@@ -946,6 +952,8 @@ class ChatSessionServiceMixin:
                 user or assistant, project_id=actual_project_id, scope=scope, limit=limit,
                 include_stable=include_stable, exclude_ids=exclude_ids, vector_timeout_ms=vector_timeout_ms,
             )
+            if packed.get("context"):
+                self.remember_hook_pack(actual_project_id, pack=str(packed["context"]))
         else:
             packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
         extract_started = time.perf_counter()

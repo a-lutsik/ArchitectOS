@@ -3,9 +3,9 @@
 MCP only fires when the model decides to call something, which leaves a silent
 agent with no memory at all. Cursor, Claude Code and Codex each expose lifecycle
 hooks that fire on their own, so this module normalizes their event payloads into
-one shape, forwards the turn to ``capture_memory_turn`` (over HTTP when the app is
-running, straight through the service otherwise) and renders the reply in the form
-each client accepts.
+one shape, forwards the turn to ``capture_memory_turn`` over HTTP when the app is
+running (otherwise it injects from the app's briefing cache and spools the capture
+for the app to replay) and renders the reply in the form each client accepts.
 
 Capture works for every supported client. Injection only happens where the client
 documents it: Claude Code and Codex add hook output back as model-visible context
@@ -358,7 +358,12 @@ def _request_json(
     payload: dict[str, Any] | None,
     timeout: float,
     root: Path | None = None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str]:
+    """Parsed reply plus why there is none: "" (ok), "timeout", "unreachable" or "error".
+
+    A timeout means the app got the request and may still act on it; only an
+    unreachable app means the event surely went nowhere.
+    """
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     request.add_header("X-ArchitectOS-Token", token)
@@ -367,24 +372,25 @@ def _request_json(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
             body = response.read().decode("utf-8")
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except urllib.error.HTTPError as exc:
         _debug(f"http failed: {exc}", root)
-        return None
+        return None, "error"
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        failure = "timeout" if isinstance(reason, TimeoutError) else "unreachable"
+        _debug(f"http failed: {exc}", root)
+        if failure == "timeout":
+            _LOG.warning("hook request timed out after %.1fs: %s", timeout, urllib.parse.urlsplit(url).path)
+        return None, failure
     try:
         parsed = json.loads(body)
     except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        return None, "error"
+    return (parsed, "") if isinstance(parsed, dict) else (None, "error")
 
 
 def _offline_allowed() -> bool:
     return os.environ.get("ARCHITECTOS_HOOK_OFFLINE", "1").strip() not in {"0", "false", "no", "off"}
-
-
-def _direct_service(root: Path | None = None):
-    from .service import ArchitectOSService
-
-    return ArchitectOSService(root or resolve_project_root())
 
 
 def run_turn(turn: HookTurn, *, root: Path | None = None, timeout: float | None = None, limit: int = 8) -> dict[str, Any] | None:
@@ -417,54 +423,239 @@ def _send_turn(
     """Memory pack plus the transport that produced it: http, offline or none."""
     wait = float(timeout) if timeout is not None else _timeout(turn)
     endpoint = runtime_endpoint(root)
-    if turn.event == EVENT_SESSION:
-        if endpoint:
-            url, token = endpoint
-            query = urllib.parse.urlencode({"cwd": turn.cwd}) if turn.cwd else ""
-            result = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait, root=root)
-            if result is not None:
-                return result, "http"
-        if not _offline_allowed():
-            return None, "none"
-        try:
-            return _direct_service(root).memory_briefing(cwd=turn.cwd or None), "offline"
-        except Exception as exc:  # noqa: BLE001 - hooks must stay silent
-            _debug(f"briefing failed: {exc}", root)
-            return None, "none"
-
-    payload = {
-        "user_text": turn.user_text,
-        "assistant_text": turn.assistant_text,
-        "cwd": turn.cwd,
-        "client": turn.client,
-        "limit": limit,
-        "hook": True,
-        "include_stable": include_stable,
-        "exclude_ids": exclude_ids or [],
-        "capture": capture,
-    }
+    failure = "unreachable"
     if endpoint:
         url, token = endpoint
-        result = _request_json(f"{url}/api/memory/turn", token, payload=payload, timeout=wait, root=root)
+        if turn.event == EVENT_SESSION:
+            query = urllib.parse.urlencode({"cwd": turn.cwd}) if turn.cwd else ""
+            result, failure = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait, root=root)
+        else:
+            payload = {
+                "user_text": turn.user_text,
+                "assistant_text": turn.assistant_text,
+                "cwd": turn.cwd,
+                "client": turn.client,
+                "limit": limit,
+                "hook": True,
+                "include_stable": include_stable,
+                "exclude_ids": exclude_ids or [],
+                "capture": capture,
+            }
+            result, failure = _request_json(f"{url}/api/memory/turn", token, payload=payload, timeout=wait, root=root)
         if result is not None:
             return result, "http"
     if not _offline_allowed():
         return None, "none"
+    # A timed-out capture already reached the app; spooling it too would capture it twice.
+    spool = capture and turn.event != EVENT_SESSION and failure == "unreachable"
+    return _offline_turn(turn, root or resolve_project_root(), include_stable=include_stable,
+                         exclude_ids=exclude_ids or [], spool=spool), "offline"
+
+
+# -- Offline: briefing cache and capture spool -------------------------------
+# With the app closed the hook never opens the store: it injects what the app
+# last cached in data/briefing_cache.json and appends captures to
+# data/hook_spool.jsonl, which the app drains on start and every minute.
+BRIEFING_CACHE = "briefing_cache.json"
+HOOK_SPOOL = "hook_spool.jsonl"
+_SPOOL_MAX_BYTES = 5 * 1024 * 1024
+_BRIEFING_CHAR_BUDGET = 2000
+_HOOK_CHAR_BUDGET = 1600
+# Same bind file and walk as mcp_server.read_mcp_bind_project_id, without its imports.
+_BIND_FILENAME = ".architectos.json"
+# Section titles of search.pack_memory_context: the cache keeps a pack's lines per section.
+STABLE_TITLE = "Stable memory (pinned / constraints / long-term):"
+HITS_TITLE = "Retrieved for this query:"
+
+
+def split_pack(context: str) -> dict[str, Any]:
+    """A rendered pack as ``{header, stable: [[id, line]], hits: [[id, line]]}``."""
+    header: list[str] = []
+    sections: dict[str, list[list[str]]] = {"stable": [], "hits": []}
+    current: str | None = None
+    for line in context.splitlines():
+        stripped = line.strip()
+        if stripped in (STABLE_TITLE, HITS_TITLE):
+            current = "stable" if stripped == STABLE_TITLE else "hits"
+        elif current is None:
+            header.append(line)
+        elif (match := _INJECTED_ID.match(line)) and current in sections:
+            sections[current].append([match.group(1), line])
+        elif stripped:
+            current = ""  # a trailing block (tasks, providers) ends the pack lines
+    return {"header": "\n".join(header).strip(), **sections}
+
+
+def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclude: set[str], budget: int) -> tuple[str, list[str], list[str]]:
+    """Rebuild a pack from cached lines: (context, stable ids, hit ids); "" when nothing is new.
+
+    Like the app's hook pack, a requested stable layer ignores ``exclude``.
+    """
+    header = str(entry.get("header") or "")
+    lines, used, taken = [header], len(header), set()
+    picked: dict[str, list[str]] = {"stable": [], "hits": []}
+    for key, title in (("stable", STABLE_TITLE), ("hits", HITS_TITLE)):
+        if key == "stable" and not include_stable:
+            continue
+        section: list[str] = []
+        cost = used + len(title) + 2
+        for item in entry.get(key) or []:
+            if not (isinstance(item, list) and len(item) == 2):
+                continue
+            node_id, line = str(item[0]), str(item[1])
+            if node_id in taken or (key == "hits" and node_id in exclude) or cost + len(line) + 1 > budget:
+                continue
+            section.append(line)
+            picked[key].append(node_id)
+            taken.add(node_id)
+            cost += len(line) + 1
+        if section:
+            lines.extend(["", title, *section])
+            used = cost
+    if not taken:
+        return "", [], []
+    return "\n".join(lines).strip(), picked["stable"], picked["hits"]
+
+
+def _bound_project_id(cwd: str) -> str:
     try:
-        return _direct_service(root).capture_memory_turn(
-            turn.user_text,
-            turn.assistant_text,
-            cwd=turn.cwd or None,
-            client=turn.client,
-            limit=limit,
-            hook=True,
-            include_stable=include_stable,
-            exclude_ids=exclude_ids or [],
-            capture=capture,
-        ), "offline"
-    except Exception as exc:  # noqa: BLE001 - hooks must stay silent
-        _debug(f"capture failed: {exc}", root)
-        return None, "none"
+        current = Path(cwd).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    for folder in (current, *current.parents):
+        candidate = folder / _BIND_FILENAME
+        try:
+            if not candidate.is_file():
+                continue
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            return ""
+        return str(data.get("project_id") or "").strip() if isinstance(data, dict) else ""
+    return ""
+
+
+def cached_project_for(cwd: str, cache: Mapping[str, Any]) -> str:
+    """The project the app would pick for ``cwd``, without the store.
+
+    Bind file first, then the deepest cached root, then the app's default
+    project (as ``capture_memory_turn`` falls back to it). "" only when the app
+    never wrote a cache, and the offline hook then injects nothing.
+    """
+    bound = _bound_project_id(cwd)
+    if bound:
+        return bound
+    try:
+        target = Path(cwd).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    roots = cache.get("roots")
+    best, best_depth = "", -1
+    for project_id, raw_root in (roots.items() if isinstance(roots, dict) else ()):
+        candidate = Path(str(raw_root))
+        if (candidate == target or candidate in target.parents) and len(candidate.parts) > best_depth:
+            best, best_depth = str(project_id), len(candidate.parts)
+    return best or str(cache.get("default_project") or "")
+
+
+def load_briefing_cache(root: Path) -> dict[str, Any]:
+    path = root / "data" / BRIEFING_CACHE
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        _LOG.warning("briefing cache unreadable, offline hook stays silent: %s", exc)
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def spool_turn(root: Path, record: dict[str, Any]) -> bool:
+    """Append one capture for the app to replay; False when the spool is full or unwritable."""
+    path = root / "data" / HOOK_SPOOL
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    try:
+        size = path.stat().st_size if path.exists() else 0
+        if size + len(line) > _SPOOL_MAX_BYTES:
+            _LOG.warning("hook spool full, capture dropped: bytes=%s limit=%s", size, _SPOOL_MAX_BYTES)
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError as exc:
+        _LOG.warning("hook spool not written: %s", exc)
+        return False
+    return True
+
+
+def spool_status(root: Path) -> dict[str, Any]:
+    """Captures waiting for the app: count, bytes and age of the oldest one (for doctor)."""
+    data = root / "data"
+    files = [data / HOOK_SPOOL, *sorted(data.glob(f"{HOOK_SPOOL}.*.draining"))]
+    records, size, oldest = 0, 0, ""
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    size += len(line.encode("utf-8"))
+                    if not line.strip():
+                        continue
+                    records += 1
+                    if not oldest:
+                        try:
+                            oldest = str(json.loads(line).get("ts") or "")
+                        except (ValueError, AttributeError):
+                            pass
+        except OSError:
+            continue
+    age_s = None
+    if oldest:
+        try:
+            age_s = round((datetime.now(timezone.utc) - datetime.fromisoformat(oldest)).total_seconds())
+        except ValueError:
+            age_s = None
+    return {"path": str(data / HOOK_SPOOL), "records": records, "bytes": size, "oldest_age_s": age_s}
+
+
+def _offline_turn(
+    turn: HookTurn,
+    root: Path,
+    *,
+    include_stable: bool,
+    exclude_ids: list[str],
+    spool: bool,
+) -> dict[str, Any]:
+    """The app is closed: inject from the briefing cache, spool the capture. Never opens the store."""
+    cache = load_briefing_cache(root)
+    project_id = cached_project_for(turn.cwd, cache) if turn.cwd else ""
+    result: dict[str, Any] = {"project_id": project_id, "context": "", "hits": [], "stable": []}
+    settings = cache.get("settings") if isinstance(cache.get("settings"), dict) else {}
+    if "hook_stable_every_turns" in settings:
+        result["stable_every_turns"] = int(settings["hook_stable_every_turns"])
+    if spool:
+        result["spooled"] = spool_turn(root, {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "project_id": project_id,
+            "cwd": turn.cwd,
+            "client": turn.client,
+            "user_text": turn.user_text,
+            "assistant_text": turn.assistant_text,
+        })
+    entry = (cache.get("projects") or {}).get(project_id) if project_id else None
+    if turn.can_inject and isinstance(entry, dict):
+        session = turn.event == EVENT_SESSION
+        context, stable, hits = render_cached_pack(
+            {**entry, "hits": []} if session else entry,  # session start is the briefing: stable layer only
+            include_stable=include_stable or session,
+            exclude=set() if session else set(exclude_ids),
+            budget=_BRIEFING_CHAR_BUDGET if session else int(settings.get("hook_char_budget") or _HOOK_CHAR_BUDGET),
+        )
+        result.update(context=context, stable=stable, hits=hits)
+    _LOG.info(
+        "offline hook: kind=%s project=%s cached=%s injected_ids=%s spooled=%s",
+        turn.event, project_id or "-", isinstance(entry, dict), len(result["hits"]) + len(result["stable"]),
+        result.get("spooled", False),
+    )
+    return result
 
 
 # -- Rendering ---------------------------------------------------------------
@@ -536,6 +727,9 @@ def handle_capture(
             turn, root=root, include_stable=include_stable, exclude_ids=exclude_ids, capture=capture
         )
     out = render_stdout(turn, result)
+    if turn.can_inject and not _injected_text(out):
+        _LOG.info("injection skipped: kind=%s transport=%s reason=%s", turn.event, transport,
+                  "no reply" if result is None else "empty pack")
     if session is not None:
         session.record(turn, result, _injected_text(out), include_stable=include_stable)
         if turn.event == EVENT_PROMPT:
@@ -725,8 +919,14 @@ def install(
 
 
 def status(*, project_root: Path | None = None) -> dict[str, Any]:
-    """What is installed where, plus whether the running app is reachable."""
+    """What is installed where, whether the running app is reachable and what waits for it offline."""
     endpoint = runtime_endpoint()
+    data_root = resolve_project_root()
+    cache = load_briefing_cache(data_root)
+    try:
+        sessions = sum(1 for _ in (data_root / "data" / _SESSION_DIR).glob("*.json"))
+    except OSError:
+        sessions = 0
     clients: list[dict[str, Any]] = []
     for client in CLIENTS:
         for scope, base in (("user", None), ("project", project_root)):
@@ -758,6 +958,15 @@ def status(*, project_root: Path | None = None) -> dict[str, Any]:
         "command": hook_command("codex", "prompt"),
         "server": {"reachable": bool(endpoint), "url": (endpoint or ("", ""))[0]},
         "offline_fallback": _offline_allowed(),
+        "offline": {
+            "spool": spool_status(data_root),
+            "briefing_cache": {
+                "path": str(data_root / "data" / BRIEFING_CACHE),
+                "projects": len(cache.get("projects") or {}),
+                "updated_at": cache.get("updated_at"),
+            },
+            "sessions": sessions,
+        },
         "clients": clients,
     }
 
@@ -800,10 +1009,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _log_to_hooks_file() -> None:
+    """With ARCHITECTOS_HOOK_DEBUG the hook's own log lines (counts only) join data/hooks.log."""
+    try:
+        path = resolve_project_root() / "data" / "hooks.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(path, encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _LOG.addHandler(handler)
+    _LOG.setLevel(logging.INFO)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.command == "capture":
+        if _debug_enabled():
+            _log_to_hooks_file()
         try:
             raw = sys.stdin.read()
         except (OSError, ValueError):

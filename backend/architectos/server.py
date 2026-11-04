@@ -269,7 +269,7 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
 
     def _get_memory_briefing(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         raw_limit = (self._first(query, "limit") or "").strip()
-        self._json(self.get_service().memory_briefing(
+        self._json(self.get_service().hook_briefing(
             project_id=self._first(query, "project_id") or None,
             cwd=self._first(query, "cwd") or None,
             limit=max(1, min(int(raw_limit), 12)) if raw_limit.isdigit() else 6,
