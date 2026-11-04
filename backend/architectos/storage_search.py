@@ -17,6 +17,25 @@ from .models import MemoryNode, utc_now
 _LOG = logging.getLogger("architectos.storage")
 
 
+def scope_visibility_sql(project_id: str | None, scope: str | None) -> tuple[list[str], list[Any]]:
+    """SQL twin of ``MemoryEmbeddingEngine._passes_scope_filter`` over ``scope``/``project_id`` columns.
+
+    An explicit ``scope`` only narrows: the project visibility clause applies with or without it.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if scope:
+        clauses.append("scope = ?")
+        params.append(scope)
+        if scope in {"project", "interface"} and project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+    if project_id:
+        clauses.append("(scope IN ('shared', 'global') OR project_id = ? OR project_id IS NULL OR project_id = '')")
+        params.append(project_id)
+    return clauses, params
+
+
 class StorageSearchMixin:
     def search_memory_fts(
         self,
@@ -96,17 +115,9 @@ class StorageSearchMixin:
             )
             params.extend(work_ids)
             params.extend(work_ids)
-            if scope:
-                clauses.append("scope = ?")
-                params.append(scope)
-                if scope in {"project", "interface"} and project_id:
-                    clauses.append("project_id = ?")
-                    params.append(project_id)
-            elif project_id:
-                clauses.append(
-                    "(scope IN ('shared', 'global') OR project_id = ? OR project_id IS NULL OR project_id = '')"
-                )
-                params.append(project_id)
+            visibility, visibility_params = scope_visibility_sql(project_id, scope)
+            clauses.extend(visibility)
+            params.extend(visibility_params)
             cap = max(1, min(int(limit or 24), 80))
             params.append(cap)
             sql = f"SELECT id FROM memory_nodes WHERE {' AND '.join(clauses)} LIMIT ?"
@@ -131,15 +142,9 @@ class StorageSearchMixin:
         limit = max(1, min(int(limit or 64), 200))
         clauses = ["memory_nodes_fts MATCH ?", "status = 'active'"]
         params: list[Any] = [match]
-        if scope:
-            clauses.append("scope = ?")
-            params.append(scope)
-            if scope in {"project", "interface"} and project_id:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-        elif project_id:
-            clauses.append("(scope IN ('shared', 'global') OR project_id = ? OR project_id IS NULL OR project_id = '')")
-            params.append(project_id)
+        visibility, visibility_params = scope_visibility_sql(project_id, scope)
+        clauses.extend(visibility)
+        params.extend(visibility_params)
         params.append(limit)
         sql = (
             "SELECT node_id FROM memory_nodes_fts "
@@ -420,15 +425,9 @@ class StorageSearchMixin:
         limit = max(1, min(int(limit or 64), 200))
         clauses = ["dimensions = ?", "status = 'active'"]
         params: list[Any] = [dims]
-        if scope:
-            clauses.append("scope = ?")
-            params.append(scope)
-            if scope in {"project", "interface"} and project_id:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-        elif project_id:
-            clauses.append("(scope IN ('shared', 'global') OR project_id = ? OR project_id IS NULL OR project_id = '')")
-            params.append(project_id)
+        visibility, visibility_params = scope_visibility_sql(project_id, scope)
+        clauses.extend(visibility)
+        params.extend(visibility_params)
         sql = f"SELECT node_id, vector FROM memory_embeddings WHERE {' AND '.join(clauses)}"
         query_blob = pack_vector(query_vector)
         try:
