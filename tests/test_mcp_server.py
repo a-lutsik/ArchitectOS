@@ -214,6 +214,76 @@ class MemoryMCPServerTests(unittest.TestCase):
             self.assertFalse(reply["ok"])
             self.assertEqual(reply["error"], f"memory node not found: {foreign_ids[0]}")
 
+    def test_memory_get_leaves_hidden_node_untouched(self) -> None:
+        # Opening a foreign node by id must neither record an access nor refresh its lifecycle.
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            repository = server.service.repository
+            foreign_id = repository.add_node(
+                "Decision", "Project B billing rule", "project", "Project B bills customers monthly.", "project_b",
+            ).id
+            own_id = repository.add_node(
+                "Decision", "Cache eviction rule", "project", "Session cache entries expire after ten minutes.", "project_a",
+            ).id
+            node_ids = [foreign_id, own_id]
+
+            def snapshot() -> dict[str, tuple[list[dict], dict]]:
+                return {
+                    node_id: (repository.list_memory_events(node_id), dict(repository.get_node(node_id).metadata or {}))
+                    for node_id in node_ids
+                }
+
+            before = snapshot()
+            messages: list[dict] = []
+            for index, node_id in enumerate(node_ids):
+                messages.append({"jsonrpc": "2.0", "id": 2 * index + 1, "method": "tools/call",
+                                 "params": {"name": "memory_get", "arguments": {"id": node_id}}})
+                messages.append({"jsonrpc": "2.0", "id": 2 * index + 2, "method": "resources/read",
+                                 "params": {"uri": f"memory://nodes/{node_id}"}})
+            replies = {response["id"]: response for response in _run(server, messages)}
+            after = snapshot()
+
+        self.assertTrue(replies[1]["result"]["isError"])
+        self.assertEqual(replies[2]["error"]["code"], -32602)
+        self.assertEqual(after[foreign_id], before[foreign_id])
+        # Control: the same calls on an own node do record both accesses and refresh it.
+        own_events = [event["event_type"] for event in after[own_id][0][len(before[own_id][0]):]]
+        self.assertEqual(own_events, ["accessed", "accessed"])
+        self.assertEqual(after[own_id][1]["access_count"], int(before[own_id][1].get("access_count") or 0) + 2)
+
+    def test_memory_get_hidden_neighbors_do_not_use_neighbor_limit(self) -> None:
+        # Foreign neighbors come first in edge order; they must not fill the 12-neighbor cap.
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            repository = server.service.repository
+            own_id = repository.add_node(
+                "Decision", "Cache eviction rule", "project", "Session cache entries expire after ten minutes.", "project_a",
+            ).id
+            foreign_ids = [
+                repository.add_node(
+                    "Decision", f"Project B rule {index}", "project", f"Project B rule number {index}.", "project_b",
+                ).id
+                for index in range(12)
+            ]
+            visible_ids = [
+                repository.add_node(
+                    "Decision", f"Project A rule {index}", "project", f"Project A rule number {index}.", "project_a",
+                ).id
+                for index in range(2)
+            ]
+            for target in (*foreign_ids, *visible_ids):
+                repository.add_edge(own_id, target, "RELATED_TO", "project")
+            walk_order = [edge.target for edge in repository.list_edges() if own_id in (edge.source, edge.target)]
+            responses = _run(server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": "memory_get", "arguments": {"id": own_id}}},
+            ])
+
+        self.assertEqual(walk_order, [*foreign_ids, *visible_ids])
+        text = responses[0]["result"]["content"][0]["text"]
+        payload = json.loads(text.split("```json", 1)[1].rsplit("```", 1)[0])
+        self.assertEqual([neighbor["id"] for neighbor in payload["neighbors"]], visible_ids)
+
     def test_memory_feedback_records_rating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server = self._server(Path(tmp))
