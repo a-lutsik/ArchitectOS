@@ -649,9 +649,9 @@ class RetrievalServiceMixin:
         if not refs:
             return blobs
         visible = {
-            node.id
-            for node in self.repository.list_nodes_by_ids(sorted(refs))
-            if MemoryEmbeddingEngine.node_visible(node, project_id)
+            node_id
+            for node_id, (node_scope, node_project) in self.repository.node_scopes_by_ids(sorted(refs)).items()
+            if MemoryEmbeddingEngine._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=None)
         }
         hidden = refs - visible
         if not hidden:

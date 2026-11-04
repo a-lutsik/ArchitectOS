@@ -591,16 +591,21 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
 
     def active_node_scopes_by_ids(self, node_ids: list[str] | set[str]) -> dict[str, tuple[str, str]]:
         """``(scope, project_id)`` per active node id, without parsing payloads."""
+        return self.node_scopes_by_ids(node_ids, active_only=True)
+
+    def node_scopes_by_ids(self, node_ids: list[str] | set[str], *, active_only: bool = False) -> dict[str, tuple[str, str]]:
+        """``(scope, project_id)`` per existing node id (any status unless ``active_only``), without parsing payloads."""
         ids = [str(item) for item in node_ids if str(item).strip()]
         if not ids:
             return {}
+        status_clause = " AND status = 'active'" if active_only else ""
         scopes: dict[str, tuple[str, str]] = {}
         with self._connect() as conn:
             for chunk_start in range(0, len(ids), 200):
                 chunk = ids[chunk_start : chunk_start + 200]
                 placeholders = ",".join("?" for _ in chunk)
                 rows = conn.execute(
-                    f"SELECT id, scope, project_id FROM memory_nodes WHERE id IN ({placeholders}) AND status = 'active'",
+                    f"SELECT id, scope, project_id FROM memory_nodes WHERE id IN ({placeholders}){status_clause}",
                     chunk,
                 ).fetchall()
                 for row in rows:
