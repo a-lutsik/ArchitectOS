@@ -28,7 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -101,6 +101,8 @@ _SESSION_DIR = "hook_sessions"
 _SESSION_TTL_S = 3 * 24 * 3600.0
 _STABLE_EVERY_TURNS = 20
 _INJECTED_ID = re.compile(r"^- id=(\S+)", re.MULTILINE)
+# The question waits in the session file until turn end captures it with the answer.
+_PENDING_PROMPT_MAX_CHARS = 20000
 
 # Which client events we register, and the timeout each one gets.
 _REGISTRATIONS: dict[str, tuple[tuple[str, str, int], ...]] = {
@@ -305,6 +307,15 @@ class HookSession:
         for node_id in _INJECTED_ID.findall(injected):
             entry["seen"][node_id] = entry["turn"]
 
+    def keep_prompt(self, cwd: str, text: str) -> None:
+        """Hold the question until turn end, under the project resolved for ``cwd``."""
+        self.state.setdefault("pending", {})[self.project_for(cwd)] = text[:_PENDING_PROMPT_MAX_CHARS]
+
+    def take_prompt(self, cwd: str) -> str:
+        """The held question for ``cwd``'s project, removed from the file once taken."""
+        pending = self.state.get("pending")
+        return str(pending.pop(self.project_for(cwd), "") or "") if isinstance(pending, dict) else ""
+
     def save(self) -> None:
         self.state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         try:
@@ -401,6 +412,7 @@ def _send_turn(
     limit: int = 8,
     include_stable: bool = True,
     exclude_ids: list[str] | None = None,
+    capture: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
     """Memory pack plus the transport that produced it: http, offline or none."""
     wait = float(timeout) if timeout is not None else _timeout(turn)
@@ -429,6 +441,7 @@ def _send_turn(
         "hook": True,
         "include_stable": include_stable,
         "exclude_ids": exclude_ids or [],
+        "capture": capture,
     }
     if endpoint:
         url, token = endpoint
@@ -447,6 +460,7 @@ def _send_turn(
             hook=True,
             include_stable=include_stable,
             exclude_ids=exclude_ids or [],
+            capture=capture,
         ), "offline"
     except Exception as exc:  # noqa: BLE001 - hooks must stay silent
         _debug(f"capture failed: {exc}", root)
@@ -506,13 +520,26 @@ def handle_capture(
         return _silent(turn.client, turn.event)
     started = time.perf_counter()
     session = HookSession.open(root or resolve_project_root(), turn.session_id) if turn.session_id else None
-    include_stable, exclude_ids = True, []
+    # Turn end never injects, so it skips the stable layer. With a session the
+    # prompt only injects and turn end captures question + answer in one call;
+    # without one, each event captures its own text as before.
+    include_stable, exclude_ids, capture = turn.event != EVENT_RESPONSE, [], True
     if session is not None and turn.event == EVENT_PROMPT:
         include_stable, exclude_ids = session.plan_prompt(turn.cwd)
-    result, transport = _send_turn(turn, root=root, include_stable=include_stable, exclude_ids=exclude_ids)
+        capture = False
+    elif session is not None and turn.event == EVENT_RESPONSE:
+        turn = replace(turn, user_text=session.take_prompt(turn.cwd))
+    if session is not None and turn.event == EVENT_PROMPT and not turn.can_inject:
+        result, transport = None, "deferred"  # nothing to inject; the question waits for turn end
+    else:
+        result, transport = _send_turn(
+            turn, root=root, include_stable=include_stable, exclude_ids=exclude_ids, capture=capture
+        )
     out = render_stdout(turn, result)
     if session is not None:
         session.record(turn, result, _injected_text(out), include_stable=include_stable)
+        if turn.event == EVENT_PROMPT:
+            session.keep_prompt(turn.cwd, turn.user_text)
         session.save()
     if _debug_enabled():
         _debug(_timing_line(turn, transport, (time.perf_counter() - started) * 1000.0, out, result), root)

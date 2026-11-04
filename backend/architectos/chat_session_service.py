@@ -1000,7 +1000,8 @@ class ChatSessionServiceMixin:
                 "agent_turn",
                 f"Agent turn: {len(hits)} hit(s), {pack_tokens} pack tokens, {timing['total_ms']} ms",
                 {
-                    "turn": "prompt" if user else "response",
+                    # A hook capturing question + answer on turn end is a response turn.
+                    "turn": "prompt" if user and not (hook and assistant) else "response",
                     "source": "hook" if client else "mcp",
                     "client": client or "",
                     "trigger": trigger,

@@ -397,6 +397,78 @@ class HookSessionTests(unittest.TestCase):
             self.assertTrue(fresh.exists())
 
 
+class HookCaptureOnStopTests(unittest.TestCase):
+    PROMPT = "Remember: QuartzDeployGate must approve every release from main."
+    ANSWER = "Understood, QuartzDeployGate approves each release before it ships from main."
+
+    def _calls(self, service: ArchitectOSService) -> mock.MagicMock:
+        return mock.patch.object(service, "capture_memory_turn", wraps=service.capture_memory_turn)
+
+    @staticmethod
+    def _captures(spy: mock.MagicMock) -> list[tuple[str, str]]:
+        return [(call.args[0], call.args[1]) for call in spy.call_args_list if call.kwargs.get("capture", True)]
+
+    def test_prompt_only_injects_and_turn_end_captures_question_with_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            with _RunningApp(root, service), self._calls(service) as spy:
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.PROMPT)
+                _hook(root, "Stop", cwd=root, session="s1", last_assistant_message=self.ANSWER)
+            stats = service.memory_capture_stats(days=1, project_id="architectos")["agent_turns"]
+        self.assertEqual(self._captures(spy), [(self.PROMPT, self.ANSWER)])
+        self.assertEqual((stats["prompt"]["count"], stats["response"]["count"]), (1, 1))
+
+    def test_question_leaves_the_session_file_once_captured_and_never_reaches_the_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": "1"}):
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            with _RunningApp(root, service):
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.PROMPT)
+                session_file = next((root / "data" / "hook_sessions").glob("*.json"))
+                held = session_file.read_text(encoding="utf-8")
+                _hook(root, "Stop", cwd=root, session="s1", last_assistant_message=self.ANSWER)
+                after = session_file.read_text(encoding="utf-8")
+            log = (root / "data" / "hooks.log").read_text(encoding="utf-8")
+        self.assertIn("QuartzDeployGate", held)
+        self.assertNotIn("QuartzDeployGate", after)
+        self.assertNotIn("QuartzDeployGate", log)
+
+    def test_cursor_pairs_before_submit_with_after_agent_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            with _RunningApp(root, service), self._calls(service) as spy:
+                prompt_out = _hook(root, "beforeSubmitPrompt", cwd=root, session="c1", client="cursor", prompt=self.PROMPT)
+                calls_after_prompt = spy.call_count
+                _hook(root, "afterAgentResponse", cwd=root, session="c1", client="cursor", text=self.ANSWER)
+        self.assertEqual((prompt_out, calls_after_prompt), ("", 0))
+        self.assertEqual(self._captures(spy), [(self.PROMPT, self.ANSWER)])
+
+    def test_without_session_each_event_still_captures_its_own_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            with _RunningApp(root, service), self._calls(service) as spy:
+                _hook(root, "UserPromptSubmit", cwd=root, prompt=self.PROMPT)
+                _hook(root, "Stop", cwd=root, last_assistant_message=self.ANSWER)
+        self.assertEqual(self._captures(spy), [(self.PROMPT, ""), ("", self.ANSWER)])
+
+    def test_held_question_is_paired_only_within_its_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            alpha, beta = _two_projects(root, service)
+            with _RunningApp(root, service), self._calls(service) as spy:
+                _hook(root, "SessionStart", cwd=alpha, session="same")
+                _hook(root, "SessionStart", cwd=beta, session="same")
+                _hook(root, "UserPromptSubmit", cwd=alpha, session="same", prompt=self.PROMPT)
+                _hook(root, "Stop", cwd=beta, session="same", last_assistant_message="Beta answer about invoices.")
+                _hook(root, "Stop", cwd=alpha, session="same", last_assistant_message=self.ANSWER)
+        captured = [(call.args[0], call.kwargs.get("cwd")) for call in spy.call_args_list if call.kwargs.get("capture", True)]
+        self.assertEqual(captured, [("", str(beta)), (self.PROMPT, str(alpha))])
+
+
 class HookRenderTests(unittest.TestCase):
     def test_injecting_client_returns_additional_context(self) -> None:
         turn = agent_hooks.HookTurn(client="codex", event=agent_hooks.EVENT_PROMPT, raw_event="UserPromptSubmit")

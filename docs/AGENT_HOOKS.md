@@ -66,10 +66,18 @@ Two client-specific steps the installer cannot do for you:
 
 1. **Session start** (Codex, Claude Code) — injects the stable layer: pinned
    memories, constraints and long-term decisions. Same pack as `memory://briefing`.
-2. **Prompt submit** — captures the user message and injects memory retrieved *for
-   that question*, so the briefing is per-turn rather than once per session. An
-   empty project injects nothing rather than spending tokens on an empty pack.
-3. **Turn end** — captures the final assistant message.
+2. **Prompt submit** — injects memory retrieved *for that question*, so the
+   briefing is per-turn rather than once per session. An empty project injects
+   nothing rather than spending tokens on an empty pack. With a `session_id` the
+   question is only held in the session file (Cursor's `beforeSubmitPrompt` does
+   not even call the app, since Cursor cannot inject); without one it is captured
+   at once, as before.
+3. **Turn end** — captures the held question together with the final assistant
+   message in one `capture_memory_turn(user, assistant)` call: one capture and at
+   most one extractor call per turn, and the extractor sees both sides. The
+   question is removed from the session file as soon as it is taken and is never
+   written to `hooks.log`. Cursor pairs `beforeSubmitPrompt` with
+   `afterAgentResponse` the same way.
 
 Capture routes through `capture_memory_turn`, which is the same path MCP's
 `memory_turn` uses, so the governance rules are identical:
