@@ -9,7 +9,10 @@ and measures, per corpus size:
   ``architectos_hook.py`` subprocesses, over HTTP (app running: an in-process
   ArchitectOSHandler on 127.0.0.1) and offline (app closed: the hook opens the
   store itself). Wall time includes the interpreter start; ``in_process_ms`` and
-  the injected tokens come from the hook's own ``data/hooks.log`` line.
+  the injected tokens come from the hook's own ``data/hooks.log`` line. Each
+  transport is one agent session (its own ``session_id``); the node ids the hook
+  injected are read from its stdout, so ``repeat_ids`` counts ids injected more
+  than once in that session (``repeat_hit_ids``: in the query-hit section only).
 
 Default mode is deterministic offline hash embeddings. ``--real-provider`` loads
 ./.env.local then ./.env (the service order) and keeps the configured embedding
@@ -27,6 +30,7 @@ import json
 import os
 import platform
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -57,6 +61,8 @@ WORDS = (
 # Constraint / Requirement) is what context() re-reads on every turn.
 NODE_TYPES = ("Lesson",) * 9 + ("Decision",) * 4 + ("Constraint",) * 2 + ("Requirement",) * 2 + ("Concept",) * 3
 HOOK_EVENTS = (("SessionStart", "session"), ("UserPromptSubmit", "prompt"), ("Stop", "response"))
+INJECTED_ID = re.compile(r"^- id=(\S+)", re.MULTILINE)
+HITS_TITLE = "Retrieved for this query:"
 
 
 def stats(values: list[float]) -> dict[str, float]:
@@ -126,8 +132,18 @@ def bench_mcp(service: ArchitectOSService, root: Path, queries: list[str], facts
     }
 
 
-def hook_payload(raw_event: str, root: Path, rng: random.Random, index: int) -> dict[str, Any]:
-    payload: dict[str, Any] = {"hook_event_name": raw_event, "cwd": str(root), "session_id": "bench"}
+def injected_ids(stdout: str) -> tuple[list[str], list[str]]:
+    """Node ids in the hook's additionalContext: all of them, and those in the query-hit section."""
+    try:
+        context = str(json.loads(stdout)["hookSpecificOutput"]["additionalContext"])
+    except (ValueError, KeyError, TypeError):
+        return [], []
+    hits = context.split(HITS_TITLE, 1)[1] if HITS_TITLE in context else ""
+    return INJECTED_ID.findall(context), INJECTED_ID.findall(hits)
+
+
+def hook_payload(raw_event: str, root: Path, rng: random.Random, index: int, session: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {"hook_event_name": raw_event, "cwd": str(root), "session_id": session}
     if raw_event == "UserPromptSubmit":
         payload["prompt"] = question(rng)
     elif raw_event == "Stop":
@@ -135,10 +151,12 @@ def hook_payload(raw_event: str, root: Path, rng: random.Random, index: int) -> 
     return payload
 
 
-def bench_hooks(root: Path, env: dict[str, str], runs: int, rng: random.Random) -> dict[str, Any]:
+def bench_hooks(root: Path, env: dict[str, str], runs: int, rng: random.Random, session: str) -> dict[str, Any]:
     """Run each hook event ``runs`` times as a subprocess and pair it with its log line."""
     log = root / "data" / "hooks.log"
     report: dict[str, Any] = {}
+    all_ids: list[str] = []
+    hit_ids: list[str] = []
     for raw_event, event in HOOK_EVENTS:
         wall: list[float] = []
         inner: list[float] = []
@@ -148,9 +166,11 @@ def bench_hooks(root: Path, env: dict[str, str], runs: int, rng: random.Random) 
         for index in range(runs):
             before = log.stat().st_size if log.exists() else 0
             started = time.perf_counter()
-            subprocess.run(
+            # One SessionStart opens the measured session; the other runs open throwaway ones.
+            run_session = f"{session}-start-{index}" if event == "session" and index else session
+            proc = subprocess.run(
                 [sys.executable, str(REPO / "architectos_hook.py"), "capture", "--client", "claude", "--event", event],
-                input=json.dumps(hook_payload(raw_event, root, rng, index)),
+                input=json.dumps(hook_payload(raw_event, root, rng, index, run_session)),
                 capture_output=True,
                 text=True,
                 env=env,
@@ -159,6 +179,10 @@ def bench_hooks(root: Path, env: dict[str, str], runs: int, rng: random.Random) 
                 timeout=120,
             )
             wall.append((time.perf_counter() - started) * 1000.0)
+            if run_session == session:
+                ids, hits_only = injected_ids(proc.stdout)
+                all_ids.extend(ids)
+                hit_ids.extend(hits_only)
             with log.open("r", encoding="utf-8") as handle:
                 handle.seek(before)
                 lines = [line for line in handle.read().splitlines() if " event=" in line]
@@ -174,6 +198,11 @@ def bench_hooks(root: Path, env: dict[str, str], runs: int, rng: random.Random) 
             "inject_tokens": stats(tokens),
             "hits": stats(hits),
         }
+    report["session"] = {
+        "injected_ids": len(all_ids),
+        "repeat_ids": len(all_ids) - len(set(all_ids)),
+        "repeat_hit_ids": len(hit_ids) - len(set(hit_ids)),
+    }
     return report
 
 
@@ -195,7 +224,7 @@ def bench_hooks_http(service: ArchitectOSService, root: Path, env: dict[str, str
         encoding="utf-8",
     )
     try:
-        return bench_hooks(root, env, runs, rng)
+        return bench_hooks(root, env, runs, rng, "bench-http")
     finally:
         runtime.unlink(missing_ok=True)
         server.shutdown()
@@ -225,7 +254,7 @@ def bench_size(size: int, args: argparse.Namespace) -> dict[str, Any]:
         print(f"[bench] {size} nodes: hooks over HTTP", file=sys.stderr, flush=True)
         report["hooks_http"] = bench_hooks_http(service, root, env, args.hook_runs, rng)
         print(f"[bench] {size} nodes: hooks offline", file=sys.stderr, flush=True)
-        report["hooks_offline"] = bench_hooks(root, env, args.hook_runs, rng)
+        report["hooks_offline"] = bench_hooks(root, env, args.hook_runs, rng, "bench-offline")
         report["capture_stats"] = service.memory_capture_stats(days=1, project_id=PROJECT)["agent_turns"]
         return report
 
@@ -259,6 +288,29 @@ def print_table(sizes: dict[str, dict[str, Any]]) -> None:
             f"| {_p50(report, 'hooks_offline', 'Stop')} |"
         )
     print("Hook cells: subprocess wall p50 (in-process p50 from hooks.log).")
+    print()
+    header = (
+        "| Nodes | Prompt HTTP wall p50 / p95 | Prompt HTTP in-process p50 / p95 | Prompt HTTP tokens mean "
+        "| SessionStart HTTP tokens | Repeated ids HTTP (hits) | Offline in-process p50 / p95 (worst event) | Offline wall p50 |"
+    )
+    print(header)
+    print("|" + " --- |" * header.count(" | ") + " --- |")
+    for report in sizes.values():
+        http, offline = report.get("hooks_http") or {}, report["hooks_offline"]
+        if "skipped" in http:
+            continue
+        prompt = http["UserPromptSubmit"]
+        events = [offline[name] for name, _ in HOOK_EVENTS]
+        worst = max(events, key=lambda item: item["in_process_ms"]["p95"])
+        print(
+            f"| {report['nodes']} | {prompt['wall_ms']['p50']:.0f} / {prompt['wall_ms']['p95']:.0f} ms "
+            f"| {prompt['in_process_ms']['p50']:.0f} / {prompt['in_process_ms']['p95']:.0f} ms "
+            f"| {prompt['inject_tokens']['mean']:.0f} | {http['SessionStart']['inject_tokens']['mean']:.0f} "
+            f"| {http['session']['repeat_ids']} ({http['session']['repeat_hit_ids']}) "
+            f"| {worst['in_process_ms']['p50']:.1f} / {worst['in_process_ms']['p95']:.1f} ms "
+            f"| {max(item['wall_ms']['p50'] for item in events):.0f} ms |"
+        )
+    print("Stage 2 cells: hooks over HTTP and offline, one session per transport.")
 
 
 def main() -> None:
