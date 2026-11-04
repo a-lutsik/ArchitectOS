@@ -11,6 +11,7 @@ service, so behavior is unchanged.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -33,6 +34,30 @@ from .search import (
 from .usage import memory_token_economy
 
 _LOG = logging.getLogger(__name__)
+
+# A whole metadata / event-detail value naming a memory node (``storage.memory_node_id``).
+_NODE_REF_RE = re.compile(r"node_[0-9a-f]{16}")
+
+
+def _collect_node_refs(value: Any, refs: set[str]) -> None:
+    if isinstance(value, str):
+        if _NODE_REF_RE.fullmatch(value):
+            refs.add(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_node_refs(item, refs)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_node_refs(item, refs)
+
+
+def _drop_node_refs(value: Any, hidden: set[str]) -> Any:
+    """Copy of ``value`` without dict entries or list items that are exactly a hidden id."""
+    if isinstance(value, dict):
+        return {key: _drop_node_refs(item, hidden) for key, item in value.items() if not (isinstance(item, str) and item in hidden)}
+    if isinstance(value, list):
+        return [_drop_node_refs(item, hidden) for item in value if not (isinstance(item, str) and item in hidden)]
+    return value
 
 
 class RetrievalServiceMixin:
@@ -324,7 +349,7 @@ class RetrievalServiceMixin:
                 _LOG.warning("search community context skipped: %s", exc)
         return {
             "query": query,
-            "hits": [self._compact_search_hit(hit.to_dict()) for hit in hits],
+            "hits": self._hits_without_hidden_node_refs([self._compact_search_hit(hit.to_dict()) for hit in hits], project_id),
             **({"communities": communities_ctx} if communities_ctx is not None else {}),
             "retrieval": {
                 "mode": mode,
@@ -533,7 +558,7 @@ class RetrievalServiceMixin:
         hits = [SearchHit(node=node, score=0.0, matched_terms=[], reasons=["list"]) for node in nodes[:limit]]
         return {
             "query": "",
-            "hits": [self._compact_search_hit(hit.to_dict()) for hit in hits],
+            "hits": self._hits_without_hidden_node_refs([self._compact_search_hit(hit.to_dict()) for hit in hits], project_id),
             "retrieval": {
                 "mode": "list",
                 "filters": filters,
@@ -610,6 +635,37 @@ class RetrievalServiceMixin:
         hit["node"] = node
         return hit
 
+    def _without_hidden_node_refs(self, blobs: list[dict[str, Any]], project_id: str | None) -> list[dict[str, Any]]:
+        """``blobs`` (node metadata / event details) minus node ids ``project_id`` cannot see.
+
+        Stored references (``superseded_by``, ``merged_from``, dedup ``target_id`` …) may name
+        another project's node. Missing ids are dropped like hidden ones, so a reference tells no
+        more than ``memory_get`` on that id. The store keeps them; without a project nothing is dropped.
+        """
+        if not project_id:
+            return blobs
+        refs: set[str] = set()
+        _collect_node_refs(blobs, refs)
+        if not refs:
+            return blobs
+        visible = {
+            node.id
+            for node in self.repository.list_nodes_by_ids(sorted(refs))
+            if MemoryEmbeddingEngine.node_visible(node, project_id)
+        }
+        hidden = refs - visible
+        if not hidden:
+            return blobs
+        _LOG.debug("dropped %d node refs outside project=%s: %s", len(hidden), project_id, sorted(hidden))
+        return [_drop_node_refs(blob, hidden) for blob in blobs]
+
+    def _hits_without_hidden_node_refs(self, hits: list[dict[str, Any]], project_id: str | None) -> list[dict[str, Any]]:
+        """Apply :meth:`_without_hidden_node_refs` to compacted hits' node metadata, in one lookup."""
+        metadata = self._without_hidden_node_refs([hit["node"]["metadata"] for hit in hits], project_id)
+        for hit, clean in zip(hits, metadata, strict=True):
+            hit["node"]["metadata"] = clean
+        return hits
+
     def memory_history(self, node_id: str, limit: int = 200, project_id: str | None = None) -> dict[str, Any]:
         """Event history of a memory node (created/updated/superseded/accessed).
 
@@ -634,6 +690,9 @@ class RetrievalServiceMixin:
                 "timestamp": node.created_at,
                 "details": {"synthetic": True, "type": node.type, "scope": node.scope},
             })
+        details = self._without_hidden_node_refs([event.get("details") or {} for event in events], project_id)
+        for event, clean in zip(events, details, strict=True):
+            event["details"] = clean
         return {"id": node.id, "label": node.label, "type": node.type, "events": events}
 
     def _rank_rule_layer_nodes(
