@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -216,6 +217,184 @@ class HookBudgetTests(unittest.TestCase):
                 client="claude", event="prompt", root=root,
             )
         self.assertIs(sent[0]["hook"], True)
+
+
+class _RunningApp:
+    """The app's HTTP handler on 127.0.0.1 with runtime.json pointing the hook at it."""
+
+    def __init__(self, root: Path, service: ArchitectOSService) -> None:
+        handler = type("SessionTestHandler", (ArchitectOSHandler,), {"log_message": lambda self, *args: None})
+        handler.service = service
+        self.runtime = root / "data" / "architectos.runtime.json"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.token = service.auth_token
+
+    def __enter__(self) -> "_RunningApp":
+        self.thread.start()
+        self.runtime.write_text(
+            json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}", "auth_token": self.token}), encoding="utf-8"
+        )
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.runtime.unlink(missing_ok=True)
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+
+
+def _hook(root: Path, raw_event: str, *, cwd: Path, session: str = "", client: str = "claude", **fields: str) -> str:
+    event = {"SessionStart": "session", "UserPromptSubmit": "prompt", "Stop": "response",
+             "beforeSubmitPrompt": "prompt", "afterAgentResponse": "response"}[raw_event]
+    payload: dict[str, str] = {"hook_event_name": raw_event, "cwd": str(cwd), **fields}
+    if session:
+        payload["session_id"] = session
+    return agent_hooks.handle_capture(json.dumps(payload), client=client, event=event, root=root)
+
+
+def _injected_ids(out: str) -> list[str]:
+    if not out or out == "{}":
+        return []
+    return re.findall(r"^- id=(\S+)", json.loads(out)["hookSpecificOutput"]["additionalContext"], re.MULTILINE)
+
+
+def _stable_section(out: str) -> bool:
+    return bool(out) and "Stable memory" in json.loads(out)["hookSpecificOutput"]["additionalContext"]
+
+
+def _two_projects(root: Path, service: ArchitectOSService) -> tuple[Path, Path]:
+    alpha, beta = root / "work" / "alpha", root / "work" / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir(parents=True)
+    service.repository.upsert_project(Project(id="alpha", name="Alpha", root_path=str(alpha)))
+    service.repository.upsert_project(Project(id="beta", name="Beta", root_path=str(beta)))
+    return alpha, beta
+
+
+class HookSessionTests(unittest.TestCase):
+    QUESTIONS = (
+        "How do we batch ledger writes?",
+        "What does the ledger service replicate?",
+        "Where does the ledger archive tier live?",
+        "Which ledger rule covers batching?",
+    )
+
+    def test_a_session_never_gets_the_same_id_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 16)
+            with _RunningApp(root, service):
+                _hook(root, "SessionStart", cwd=root, session="s1", source="startup")
+                turns = [_injected_ids(_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=q)) for q in self.QUESTIONS]
+        flat = [node_id for ids in turns for node_id in ids]
+        self.assertTrue(turns[0] and turns[1], turns)
+        self.assertEqual(len(flat), len(set(flat)), turns)
+
+    def test_stable_layer_returns_only_after_n_prompts_without_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 12)
+            for index in range(3):
+                service.repository.add_node("Constraint", f"ledger constraint {index}", "project",
+                                            f"Ledger writes must stay idempotent, rule {index}.", "architectos")
+            service.repository.set_setting("agent", {"hook_stable_every_turns": 3})
+            with _RunningApp(root, service):
+                start = _hook(root, "SessionStart", cwd=root, session="s1", source="startup")
+                prompts = [_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=q) for q in self.QUESTIONS]
+        self.assertTrue(_stable_section(start))
+        self.assertEqual([_stable_section(out) for out in prompts], [False, False, True, False])
+
+    def test_first_prompt_plays_session_start_for_clients_without_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 12)
+            service.repository.add_node("Constraint", "ledger constraint", "project", "Ledger writes must stay idempotent.", "architectos")
+            with _RunningApp(root, service):
+                first = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0])
+                second = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[1])
+        self.assertTrue(_stable_section(first))
+        self.assertFalse(_stable_section(second))
+
+    def test_compaction_start_lets_earlier_ids_back_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 6)
+            with _RunningApp(root, service):
+                first = _injected_ids(_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0]))
+                again = _injected_ids(_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0]))
+                _hook(root, "SessionStart", cwd=root, session="s1", source="compact")
+                after = _injected_ids(_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0]))
+        self.assertTrue(first)
+        self.assertFalse(set(first) & set(again))
+        self.assertTrue(set(first) & set(after))
+
+    def test_without_session_id_every_prompt_gets_the_full_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 12)
+            with _RunningApp(root, service):
+                first = _injected_ids(_hook(root, "UserPromptSubmit", cwd=root, prompt=self.QUESTIONS[0]))
+                second = _injected_ids(_hook(root, "UserPromptSubmit", cwd=root, prompt=self.QUESTIONS[0]))
+            self.assertFalse((root / "data" / "hook_sessions").exists())
+        self.assertTrue(first)
+        self.assertEqual(set(first), set(second))
+
+    def test_session_state_is_kept_per_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            alpha, beta = _two_projects(root, service)
+            alpha_ids = set(_seed(service, "alpha", 2))
+            beta_ids = set(_seed(service, "beta", 2))
+            shared = service.repository.add_node("Lesson", "ledger rule batch writes before replicating", "global",
+                                                 "Every ledger service batches writes before replicating them.", None).id
+            question = "Which ledger rule says to batch writes before replicating?"
+            with _RunningApp(root, service):
+                in_alpha = [set(_injected_ids(_hook(root, "UserPromptSubmit", cwd=alpha, session="same", prompt=question))) for _ in range(2)]
+                in_beta = set(_injected_ids(_hook(root, "UserPromptSubmit", cwd=beta, session="same", prompt=question)))
+            state = json.loads(next((root / "data" / "hook_sessions").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertIn(shared, in_alpha[0])
+        self.assertNotIn(shared, in_alpha[1], "one project never sees an id twice")
+        self.assertIn(shared, in_beta, "another project's history does not hide a node from this one")
+        self.assertFalse(in_beta & alpha_ids)
+        self.assertFalse((in_alpha[0] | in_alpha[1]) & beta_ids)
+        self.assertEqual(set(state["projects"]), {"alpha", "beta"})
+        self.assertFalse(set(state["projects"]["beta"]["seen"]) & alpha_ids)
+
+    def test_unreadable_session_file_is_replaced_with_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 6)
+            session = agent_hooks.HookSession.open(root, "broken")
+            session.path.parent.mkdir(parents=True)
+            session.path.write_text("{not json", encoding="utf-8")
+            with _RunningApp(root, service), self.assertLogs("backend.architectos.agent_hooks", level="WARNING") as logs:
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="broken", prompt=self.QUESTIONS[0])
+            state = json.loads(session.path.read_text(encoding="utf-8"))
+        self.assertTrue(_injected_ids(out))
+        self.assertIn("unreadable", "\n".join(logs.output))
+        self.assertEqual(state["projects"]["architectos"]["turn"], 1)
+
+    def test_stale_session_files_are_pruned_when_a_session_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "data" / "hook_sessions"
+            folder.mkdir(parents=True)
+            stale, fresh = folder / "stale.json", folder / "fresh.json"
+            stale.write_text("{}", encoding="utf-8")
+            fresh.write_text("{}", encoding="utf-8")
+            old = time.time() - 4 * 24 * 3600
+            os.utime(stale, (old, old))
+            agent_hooks.HookSession.open(root, "new-session")
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
 
 
 class HookRenderTests(unittest.TestCase):

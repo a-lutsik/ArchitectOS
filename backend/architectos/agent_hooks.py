@@ -18,8 +18,11 @@ Every failure is silent by design: a broken memory hook must never break the age
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -32,6 +35,10 @@ from typing import Any, Mapping
 
 from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
+
+_LOG = logging.getLogger(__name__)
+# The hook runs inside the agent's process tree: stay off stderr unless a handler is configured.
+_LOG.addHandler(logging.NullHandler())
 
 CLIENTS: tuple[str, ...] = ("cursor", "claude", "codex")
 
@@ -73,6 +80,8 @@ _ASSISTANT_TEXT_FIELDS = (
 )
 _CWD_FIELDS = ("cwd", "workspace_root", "workspace_roots", "project_root", "root_path")
 _SESSION_FIELDS = ("session_id", "sessionId", "conversation_id", "chat_id")
+# SessionStart sources that open a fresh context window: what was injected before is gone.
+_RESET_SOURCES = frozenset({"clear", "compact"})
 
 # Clients that document adding hook output back into the model's input.
 _INJECTS: frozenset[tuple[str, str]] = frozenset(
@@ -86,6 +95,12 @@ _INJECT_MAX_CHARS = 4000
 # A pack is either ready fast or not worth waiting for; capture may take longer.
 _INJECT_TIMEOUT = 2.0
 _CAPTURE_TIMEOUT = 5.0
+
+# Per-session injection state: data/hook_sessions/<digest of session_id>.json.
+_SESSION_DIR = "hook_sessions"
+_SESSION_TTL_S = 3 * 24 * 3600.0
+_STABLE_EVERY_TURNS = 20
+_INJECTED_ID = re.compile(r"^- id=(\S+)", re.MULTILINE)
 
 # Which client events we register, and the timeout each one gets.
 _REGISTRATIONS: dict[str, tuple[tuple[str, str, int], ...]] = {
@@ -117,6 +132,7 @@ class HookTurn:
     assistant_text: str = ""
     session_id: str = ""
     cwd: str = ""
+    source: str = ""
 
     @property
     def can_inject(self) -> bool:
@@ -184,7 +200,120 @@ def normalize_payload(payload: Mapping[str, Any], *, client: str, event: str | N
         assistant_text=assistant_text,
         session_id=_first_field(payload, _SESSION_FIELDS),
         cwd=_first_field(payload, _CWD_FIELDS) or os.getcwd(),
+        source=_clean(payload.get("source")).lower() if resolved_event == EVENT_SESSION else "",
     )
+
+
+# -- Session state -----------------------------------------------------------
+def prune_hook_sessions(root: Path, *, max_age_s: float = _SESSION_TTL_S) -> int:
+    """Delete session files untouched for ``max_age_s`` so data/ does not grow forever."""
+    cutoff = time.time() - max_age_s
+    removed = 0
+    try:
+        entries = list((root / "data" / _SESSION_DIR).iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        _LOG.info("hook sessions pruned: removed=%s max_age_h=%.0f", removed, max_age_s / 3600.0)
+    return removed
+
+
+class HookSession:
+    """What one agent session has already been shown, per project.
+
+    Each project the session touched keeps a prompt counter, the turn the stable
+    layer was last injected and the ids injected so far (id -> turn). State is
+    keyed by project so one project's ids never steer another's pack, even when a
+    session id is reused across folders. ``cwd`` remembers which project the app
+    resolved for a folder, so the next prompt knows whose ids to exclude.
+    """
+
+    def __init__(self, path: Path, state: dict[str, Any]) -> None:
+        self.path = path
+        self.state = state
+
+    @classmethod
+    def open(cls, root: Path, session_id: str) -> "HookSession":
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        path = root / "data" / _SESSION_DIR / f"{digest}.json"
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            prune_hook_sessions(root)
+            state = {}
+        except (OSError, ValueError) as exc:
+            _LOG.warning("hook session file unreadable, starting fresh: %s (%s)", path.name, exc)
+            state = {}
+        if not isinstance(state, dict):
+            _LOG.warning("hook session file is not an object, starting fresh: %s", path.name)
+            state = {}
+        return cls(path, state)
+
+    def project(self, project_id: str) -> dict[str, Any]:
+        projects = self.state.setdefault("projects", {})
+        entry = projects.get(project_id)
+        if not isinstance(entry, dict) or not isinstance(entry.get("seen"), dict):
+            entry = projects[project_id] = {"turn": 0, "stable_turn": None, "seen": {}}
+        return entry
+
+    def project_for(self, cwd: str) -> str:
+        return str((self.state.get("cwd") or {}).get(cwd) or "")
+
+    def plan_prompt(self, cwd: str) -> tuple[bool, list[str]]:
+        """(include the stable layer?, ids to exclude) for the next prompt in ``cwd``.
+
+        The stable layer is due on the session's first prompt for a project (the
+        start for clients without SessionStart) and again after it has been absent
+        for ``stable_every`` prompts, which covers a client-side compaction.
+        """
+        project_id = self.project_for(cwd)
+        entry = (self.state.get("projects") or {}).get(project_id) if project_id else None
+        if not isinstance(entry, dict):
+            return True, []
+        every = int(self.state.get("stable_every", _STABLE_EVERY_TURNS))
+        stable_turn = entry.get("stable_turn")
+        due = stable_turn is None or (every > 0 and int(entry.get("turn") or 0) + 1 - int(stable_turn) >= every)
+        return due, list(entry.get("seen") or {})
+
+    def record(self, turn: HookTurn, result: dict[str, Any] | None, injected: str, *, include_stable: bool) -> None:
+        """Remember what this event injected, under the project the app resolved."""
+        if result is None:
+            return
+        project_id = str(result.get("project_id") or self.project_for(turn.cwd))
+        if not project_id:
+            return
+        if turn.cwd:
+            self.state.setdefault("cwd", {})[turn.cwd] = project_id
+        if "stable_every_turns" in result:
+            self.state["stable_every"] = int(result["stable_every_turns"])
+        entry = self.project(project_id)
+        if turn.event == EVENT_SESSION:
+            if turn.source in _RESET_SOURCES:
+                entry["seen"] = {}
+            entry["stable_turn"] = int(entry["turn"])
+        elif turn.event == EVENT_PROMPT:
+            entry["turn"] = int(entry["turn"]) + 1
+            if include_stable:
+                entry["stable_turn"] = entry["turn"]
+        for node_id in _INJECTED_ID.findall(injected):
+            entry["seen"][node_id] = entry["turn"]
+
+    def save(self) -> None:
+        self.state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            scratch = self.path.with_suffix(".tmp")
+            scratch.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
+            os.replace(scratch, self.path)
+        except OSError as exc:
+            _LOG.warning("hook session file not saved: %s (%s)", self.path.name, exc)
 
 
 # -- Transport ---------------------------------------------------------------
@@ -270,6 +399,8 @@ def _send_turn(
     root: Path | None = None,
     timeout: float | None = None,
     limit: int = 8,
+    include_stable: bool = True,
+    exclude_ids: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """Memory pack plus the transport that produced it: http, offline or none."""
     wait = float(timeout) if timeout is not None else _timeout(turn)
@@ -296,6 +427,8 @@ def _send_turn(
         "client": turn.client,
         "limit": limit,
         "hook": True,
+        "include_stable": include_stable,
+        "exclude_ids": exclude_ids or [],
     }
     if endpoint:
         url, token = endpoint
@@ -312,6 +445,8 @@ def _send_turn(
             client=turn.client,
             limit=limit,
             hook=True,
+            include_stable=include_stable,
+            exclude_ids=exclude_ids or [],
         ), "offline"
     except Exception as exc:  # noqa: BLE001 - hooks must stay silent
         _debug(f"capture failed: {exc}", root)
@@ -370,11 +505,25 @@ def handle_capture(
     if turn.event == EVENT_RESPONSE and not turn.assistant_text:
         return _silent(turn.client, turn.event)
     started = time.perf_counter()
-    result, transport = _send_turn(turn, root=root)
+    session = HookSession.open(root or resolve_project_root(), turn.session_id) if turn.session_id else None
+    include_stable, exclude_ids = True, []
+    if session is not None and turn.event == EVENT_PROMPT:
+        include_stable, exclude_ids = session.plan_prompt(turn.cwd)
+    result, transport = _send_turn(turn, root=root, include_stable=include_stable, exclude_ids=exclude_ids)
     out = render_stdout(turn, result)
+    if session is not None:
+        session.record(turn, result, _injected_text(out), include_stable=include_stable)
+        session.save()
     if _debug_enabled():
         _debug(_timing_line(turn, transport, (time.perf_counter() - started) * 1000.0, out, result), root)
     return out
+
+
+def _injected_text(out: str) -> str:
+    """The additionalContext a rendered reply carries ("" when the hook stayed silent)."""
+    if not out or out == "{}":
+        return ""
+    return str(json.loads(out).get("hookSpecificOutput", {}).get("additionalContext") or "")
 
 
 def _timing_line(turn: HookTurn, transport: str, elapsed_ms: float, out: str, result: dict[str, Any] | None) -> str:
@@ -383,9 +532,7 @@ def _timing_line(turn: HookTurn, transport: str, elapsed_ms: float, out: str, re
     ``tokens`` estimates what was actually injected (0 when the hook stayed silent).
     """
     data = result or {}
-    injected = ""
-    if out and out != "{}":
-        injected = str(json.loads(out).get("hookSpecificOutput", {}).get("additionalContext") or "")
+    injected = _injected_text(out)
     return (
         f"event={turn.event} client={turn.client} transport={transport} ms={elapsed_ms:.1f} "
         f"tokens={estimate_tokens_from_text(injected)} hits={len(data.get('hits') or data.get('stable') or [])} "

@@ -118,11 +118,30 @@ hit left (and no stable layer due) is not injected at all. Both knobs live in th
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `agent.hook_char_budget` | `1600` | Character budget of the hook pack, clamped to 1 200–6 000 (the pack header alone is ~420) |
+| `agent.hook_stable_every_turns` | `20` | A session gets the stable layer again after this many prompts without it (`0` = only at session start) |
 | `agent.hook_min_score` | `120` | Relevance floor for a hit. Static bonuses (scope, type, source, recency, lifecycle) plus an FTS rank alone reach ~115, so 120 asks for a real query-term match or a vector signal |
 
 `POST /api/memory/turn` takes the same pack with `"hook": true`; `capture: false`
 packs without capturing, `exclude_ids` and `include_stable` shape it, and
 `vector_timeout_ms` overrides the vector-search timeout for that request.
+
+## Session state
+
+When the client sends a `session_id` (Claude Code and Codex always do), the hook
+keeps `data/hook_sessions/<digest>.json`: per project, a prompt counter, the turn
+the stable layer was last injected and every node id injected so far. The project
+is the one the app resolved for the folder, so one project's history never steers
+another's pack, even under the same session id.
+
+- Prompt submit sends the ids the session already holds as `exclude_ids`: each
+  node is injected once per session, and the budget goes to new hits.
+- The stable layer comes with `SessionStart`; on prompts it returns only after
+  `agent.hook_stable_every_turns` prompts without it. A client without
+  `SessionStart` (Cursor) gets it on the session's first prompt.
+- `SessionStart` with `source` `clear` or `compact` opens a new context window, so
+  the injected-id history of that project is forgotten.
+- Files untouched for 3 days are deleted when a new session file is created.
+- Without a `session_id` nothing is kept and every prompt gets the full hook pack.
 
 ## Transport
 

@@ -1022,6 +1022,7 @@ class ChatSessionServiceMixin:
             "context": context,
             "hits": hits,
             "stable": packed.get("stable") or [],
+            **({"stable_every_turns": packed["stable_every_turns"]} if "stable_every_turns" in packed else {}),
             "kept": kept,
             "reason": reason,
             "extractor": extraction.get("extractor"),
