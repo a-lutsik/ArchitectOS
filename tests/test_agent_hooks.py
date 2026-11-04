@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.architectos import agent_hooks
+from backend.architectos.mcp_server import MemoryMCPServer, write_mcp_bind_file
 from backend.architectos.models import Project
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
@@ -203,6 +204,30 @@ class HookProjectResolutionTests(unittest.TestCase):
 
             self.assertEqual(service.project_id_for_path(str(inner / "src")), "api")
             self.assertEqual(service.project_id_for_path(str(outer / "docs")), "mono")
+
+    def test_bind_file_wins_over_project_root_for_hook_and_mcp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            workspace = root / "workspaces" / "shop"
+            (workspace / "src").mkdir(parents=True)
+            service.repository.upsert_project(Project(id="shop", name="Shop", root_path=str(workspace)))
+            service.repository.upsert_project(Project(id="bound", name="Bound"))
+            write_mcp_bind_file(workspace, "bound", "Bound")
+            cwd = str(workspace / "src")
+
+            prompt = agent_hooks.run_turn(
+                agent_hooks.HookTurn(client="claude", event=agent_hooks.EVENT_PROMPT, user_text="How do we deploy?", cwd=cwd),
+                root=root,
+            )
+            session = agent_hooks.run_turn(
+                agent_hooks.HookTurn(client="claude", event=agent_hooks.EVENT_SESSION, cwd=cwd),
+                root=root,
+            )
+
+            self.assertEqual(MemoryMCPServer(root, cwd=cwd).project_id, "bound")
+            self.assertEqual((prompt or {}).get("project_id"), "bound")
+            self.assertEqual((session or {}).get("project_id"), "bound")
 
     def test_unknown_path_resolves_to_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

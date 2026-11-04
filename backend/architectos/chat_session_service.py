@@ -25,6 +25,7 @@ from .chat_memory import (
     facts_from_markdown_summary,
     infer_fact_subject,
 )
+from .mcp_server import MCP_BIND_FILENAME, read_mcp_bind_project_id
 from .memory_capture import annotate_fact, auto_threshold, filter_facts_for_policy
 from .models import stable_id, utc_now
 from .usage import estimate_tokens_from_text
@@ -848,10 +849,13 @@ class ChatSessionServiceMixin:
         }
 
     def project_id_for_path(self, path: str | None) -> str | None:
-        """Map a working directory to the project that owns it (longest root wins).
+        """Map a working directory to the project that owns it.
 
         Agent hooks only know the cwd they fired in, so the caller cannot supply a
-        project id. Returns None when no project root contains the path.
+        project id. The MCP server's folder bind (``.architectos.json`` walked up
+        from the path) wins, so a hook and the MCP server in one folder always
+        agree; otherwise the longest matching project root wins. Returns None when
+        neither applies.
         """
         raw = str(path or "").strip()
         if not raw:
@@ -860,6 +864,10 @@ class ChatSessionServiceMixin:
             target = Path(raw).expanduser().resolve()
         except (OSError, RuntimeError, ValueError):
             return None
+        bound_id = read_mcp_bind_project_id(target)
+        if bound_id:
+            _LOG.debug("project for %s: %s from %s", target, bound_id, MCP_BIND_FILENAME)
+            return bound_id
         best_id: str | None = None
         best_depth = -1
         for project in self.repository.list_projects():
@@ -876,6 +884,7 @@ class ChatSessionServiceMixin:
             if depth > best_depth:
                 best_id = str(project.id)
                 best_depth = depth
+        _LOG.debug("project for %s: %s by root_path (no project_id in %s)", target, best_id, MCP_BIND_FILENAME)
         return best_id
 
     def capture_memory_turn(
