@@ -213,6 +213,38 @@ class MultiHopExpansionTests(unittest.TestCase):
             surfaced = {hit["node"]["id"] for hit in result["hits"]}
             self.assertEqual(surfaced, {shared, one_hop, two_hop})
 
+    def test_context_expansion_skips_inactive_neighbors(self) -> None:
+        # Soft delete and lifecycle decay keep a node's edges; such a neighbor must
+        # stay out of the pack like it stays out of FTS/vector retrieval.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            ids = [
+                service.add_memory({
+                    "project_id": "project_a", "label": label, "type": node_type,
+                    "scope": "project", "text": text,
+                })["id"]
+                for label, node_type, text in (
+                    ("Alpha anchor", "Decision", "Zephyr alpha anchor unique marker keyword"),
+                    ("Bravo node", "Decision", "Bravo caching subsystem session cookie eviction"),
+                    ("Charlie constraint", "Constraint", "Charlie deployment pipeline release artifact rollout"),
+                    ("Delta constraint", "Constraint", "Delta localization glossary translation locale"),
+                )
+            ]
+            anchor, active, archived, deleted = ids
+            for target in (active, archived, deleted):
+                service.repository.add_edge(anchor, target, "RELATED_TO", "project")
+            service.apply_graph_command({"action": "delete", "node_id": archived})
+            tombstone = service.repository.get_node(deleted)
+            tombstone.status = "deleted"  # as lifecycle decay writes it, edges kept
+            service.repository.upsert_node(tombstone)
+
+            result = service.context("zephyr alpha anchor unique", project_id="project_a", limit=8)
+
+            surfaced = {hit["node"]["id"] for hit in result["hits"]}
+            self.assertEqual(surfaced, {anchor, active})
+            self.assertNotIn(archived, result["context"])
+            self.assertNotIn(deleted, result["context"])
+
 
 class TemporalSupersedeTests(unittest.TestCase):
     OLD_TS = "2026-01-01T00:00:00+00:00"

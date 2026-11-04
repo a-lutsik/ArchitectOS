@@ -243,7 +243,8 @@ class RetrievalServiceMixin:
                 neighbors = self.repository.list_nodes_by_ids(list(neighbor_order))
                 if normalized_filters:
                     neighbors = [node for node in neighbors if self._memory_node_matches_filters(node, normalized_filters)]
-                neighbors = [node for node in neighbors if self._memory_node_visible_at(node, as_of)]
+                # Re-check status on the loaded payload: a node may be archived after the walk.
+                neighbors = [node for node in neighbors if node.status == "active" and self._memory_node_visible_at(node, as_of)]
                 if scope_gate is not None:
                     neighbors = [node for node in neighbors if self._memory_node_scope_allowed(node, scope_gate)]
                 neighbor_nodes = {node.id: node for node in neighbors}
@@ -363,9 +364,10 @@ class RetrievalServiceMixin:
         hop count and a node budget to keep context builds fast. Returns the
         subgraph edges plus the neighbor ids in descending PageRank order.
 
-        Only nodes visible to ``project_id``/``scope`` (the FTS/vector prefilter
-        rule) are walked: a shared node links into many projects, and other
-        projects' nodes must neither surface nor spend the budget and PageRank mass.
+        Only active nodes visible to ``project_id``/``scope`` (the FTS/vector
+        prefilter rule) are walked: a shared node links into many projects, soft
+        deletes keep their edges, and neither other projects' nor inactive nodes
+        may surface or spend the budget and PageRank mass.
         """
         seed_set = {sid for sid in seeds if sid}
         if not seed_set:
@@ -388,7 +390,7 @@ class RetrievalServiceMixin:
                         next_frontier.add(endpoint)
             visible = {
                 node_id
-                for node_id, (node_scope, node_project) in self.repository.node_scopes_by_ids(next_frontier).items()
+                for node_id, (node_scope, node_project) in self.repository.active_node_scopes_by_ids(next_frontier).items()
                 if MemoryEmbeddingEngine._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope)
             }
             hidden |= next_frontier - visible
@@ -401,7 +403,7 @@ class RetrievalServiceMixin:
             frontier = [nid for nid in sorted(next_frontier) if nid in visited]
         if hidden:
             _LOG.debug(
-                "graph expansion skipped %d invisible or missing nodes for project=%s scope=%s (walked %d)",
+                "graph expansion skipped %d inactive, invisible or missing nodes for project=%s scope=%s (walked %d)",
                 len(hidden), project_id, scope, len(visited),
             )
 
