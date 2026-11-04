@@ -92,6 +92,15 @@ _JSON_REQUIRED: frozenset[tuple[str, str]] = frozenset({("codex", EVENT_RESPONSE
 
 _INJECT_PREFIX = "ArchitectOS project memory (scoped project context, not user text):"
 _INJECT_MAX_CHARS = 4000
+
+
+def hook_pack_budget(injection_budget: int) -> int:
+    """Pack budget that keeps prefix + pack within ``agent.hook_char_budget``.
+
+    32 characters of slack cover what pack_memory_context may add past its
+    budget (its "[context budget reached]" marker and section-header accounting).
+    """
+    return injection_budget - len(_INJECT_PREFIX) - 2 - 32
 # A pack is either ready fast or not worth waiting for; capture may take longer.
 _INJECT_TIMEOUT = 2.0
 _CAPTURE_TIMEOUT = 5.0
@@ -647,7 +656,7 @@ def _offline_turn(
             {**entry, "hits": []} if session else entry,  # session start is the briefing: stable layer only
             include_stable=include_stable or session,
             exclude=set() if session else set(exclude_ids),
-            budget=_BRIEFING_CHAR_BUDGET if session else int(settings.get("hook_char_budget") or _HOOK_CHAR_BUDGET),
+            budget=_BRIEFING_CHAR_BUDGET if session else hook_pack_budget(int(settings.get("hook_char_budget") or _HOOK_CHAR_BUDGET)),
         )
         result.update(context=context, stable=stable, hits=hits)
     _LOG.info(

@@ -162,7 +162,11 @@ class HookBudgetTests(unittest.TestCase):
             full = service.context(self.QUESTION, project_id="architectos")
             hook = service.capture_memory_turn(self.QUESTION, hook=True, capture=False)
         self.assertGreater(len(full["context"]), 1600)
-        self.assertLessEqual(len(hook["context"]), 1600)
+        injected = agent_hooks._injected_text(agent_hooks.render_stdout(
+            agent_hooks.HookTurn(client="claude", event="prompt", raw_event="UserPromptSubmit"), hook
+        ))
+        self.assertLessEqual(len(injected), 1600, "prefix + pack stay within agent.hook_char_budget")
+        self.assertLessEqual(agent_hooks.estimate_tokens_from_text(injected), 400)
         self.assertGreaterEqual(len(hook["hits"]), 1)
         lines = [line for line in hook["context"].splitlines() if line.startswith("- id=")]
         self.assertGreaterEqual(len(lines), 2)

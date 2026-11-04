@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .agent_hooks import BRIEFING_CACHE, HOOK_SPOOL, prune_hook_sessions, split_pack, spool_turn
+from .agent_hooks import BRIEFING_CACHE, HOOK_SPOOL, hook_pack_budget, prune_hook_sessions, split_pack, spool_turn
 from .search import DEFAULT_CONTEXT_CHAR_BUDGET, pack_memory_context
 
 _LOG = logging.getLogger("architectos.service")
@@ -116,7 +116,7 @@ class AgentHookServiceMixin:
                 hits,
                 project_id=project_id,
                 scope=scope,
-                char_budget=int(settings["hook_char_budget"]),
+                char_budget=hook_pack_budget(int(settings["hook_char_budget"])),
                 node_text_chars=HOOK_NODE_TEXT_CHARS,
                 tools_available=True,
                 stable_hits=stable,

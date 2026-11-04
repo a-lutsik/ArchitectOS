@@ -125,7 +125,7 @@ hit left (and no stable layer due) is not injected at all. Both knobs live in th
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `agent.hook_char_budget` | `1600` | Character budget of the hook pack, clamped to 1 200–6 000 (the pack header alone is ~420) |
+| `agent.hook_char_budget` | `1600` | Character budget of the whole prompt injection (hook prefix + pack), clamped to 1 200–6 000; the pack header alone is ~420 and a pack never goes below 1 200 |
 | `agent.hook_stable_every_turns` | `20` | A session gets the stable layer again after this many prompts without it (`0` = only at session start) |
 | `agent.hook_min_score` | `120` | Relevance floor for a hit. Static bonuses (scope, type, source, recency, lifecycle) plus an FTS rank alone reach ~115, so 120 asks for a real query-term match or a vector signal |
 
