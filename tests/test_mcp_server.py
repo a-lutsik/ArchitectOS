@@ -823,6 +823,40 @@ class ProjectIsolationReferenceTests(unittest.TestCase):
         self.assertEqual(stored["global"]["superseded_by"], ids["foreign"])
         self.assertEqual(stored["shared"]["merged_from"], [ids["foreign_shared"]])
 
+    def test_supersedes_only_rewrites_the_projects_own_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            repository = server.service.repository
+            ids = _seed_two_projects(repository)
+            before = {key: dict(repository.get_node(ids[key]).metadata) for key in ("global", "shared", "orphan")}
+            links = [
+                (ids["own"], ids["shared"], "SUPERSEDES"),
+                (ids["own"], ids["global"], "SUPERSEDES"),
+                (ids["own"], ids["orphan"], "SUPERSEDES"),
+                (ids["own"], ids["shared"], "RELATED_TO"),
+                (ids["own"], ids["global"], "SUPPORTS"),
+                (ids["shared"], ids["own2"], "SUPERSEDES"),
+            ]
+            replies = _run(server, [
+                _call_tool("memory_link", {"source": source, "target": target, "type": edge_type}, index)
+                for index, (source, target, edge_type) in enumerate(links)
+            ])
+            after = {key: dict(repository.get_node(ids[key]).metadata) for key in ("global", "shared", "orphan")}
+            edges = {(edge.source, edge.target, edge.type) for edge in repository.list_edges_touching([ids["own"], ids["own2"]])}
+            own2 = repository.get_node(ids["own2"]).metadata
+
+        for reply, link in zip(replies[:3], links[:3]):
+            with self.subTest(link=link):
+                self.assertTrue(reply["result"]["isError"])
+                self.assertEqual(reply["result"]["content"][0]["text"], "Error: SUPERSEDES target must belong to project project_a")
+                self.assertNotIn(link, edges)
+        self.assertEqual(after, before)
+        for reply, link in zip(replies[3:], links[3:]):
+            with self.subTest(link=link):
+                self.assertFalse(reply["result"]["isError"])
+                self.assertIn(link, edges)
+        self.assertEqual(own2["superseded_by"], ids["shared"])
+
 
 class ProjectPinTests(unittest.TestCase):
     def test_pinned_project_id_scopes_writes_and_search(self) -> None:
