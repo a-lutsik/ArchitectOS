@@ -16,7 +16,7 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from .adapters_base import is_local_memory_stub_text
 from .candidate_identity import candidate_origin_key
@@ -1114,9 +1114,11 @@ class ChatSessionServiceMixin:
             return None
 
     @staticmethod
-    def _auto_saved(promoted: dict[str, Any] | None) -> bool:
+    def _auto_saved(promoted: dict[str, Any] | None) -> TypeGuard[dict[str, Any]]:
         """Whether auto-accept wrote memory: a held candidate is answered too, but rejected."""
-        return bool(promoted and promoted.get("memory")) and str((promoted.get("candidate") or {}).get("status") or "") == "promoted"
+        if not promoted or not promoted.get("memory"):
+            return False
+        return str((promoted.get("candidate") or {}).get("status") or "") == "promoted"
 
     def _auto_accept_near_duplicate(self, candidate: dict[str, Any], caller_project_id: str | None = None) -> bool:
         """Block auto-write when the atom restates or nearly restates an existing node."""
