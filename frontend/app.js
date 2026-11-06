@@ -83,7 +83,7 @@ function bindEvents() {
         }),
       });
       form.reset();
-      showSnackbar(saved?.dedup_held ? "Already in memory" : "Memory saved", saved?.dedup_held ? "info" : "success");
+      showSnackbar(saved?.dedup_held ? t("dup.held") : "Memory saved", saved?.dedup_held ? "info" : "success");
       await refreshWorkspace();
       scheduleGraphLoad();
     } catch (error) {

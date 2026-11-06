@@ -402,7 +402,7 @@ async function loadMemoryCandidates({ resetPage = false } = {}) {
       const result = await api(`/api/memory/candidates/${button.dataset.promoteCandidate}/promote`, { method: "POST", body: "{}" });
       const candidate = result?.candidate || {};
       if (candidate.status !== "promoted" && (candidate.metadata || {}).dedup_held_by) {
-        showSnackbar(candidate.reject_reason || "Already stored by another project", "info");
+        showSnackbar(t("dup.heldBy"), "info");
       }
       await refreshAfterCandidateChange({ promoted: candidate.status === "promoted" });
     } catch (error) {
@@ -709,7 +709,7 @@ function renderCandidateCard(candidate) {
         </div>
         ${path ? `<p class="candidate-card-path" title="${escapeHtml(candidate.source_ref || path)}">${escapeHtml(path)}</p>` : ""}
         <p class="candidate-card-why">${escapeHtml(candidateWhy(candidate))}</p>
-        ${heldBy ? `<p class="candidate-card-why">${escapeHtml(candidate.reject_reason || "already stored by another project")}: <span class="memory-dup-open"${memoryItemOpenAttrs({ id: heldBy, label: heldBy })}>${escapeHtml(heldBy)}</span></p>` : ""}
+        ${heldBy ? `<p class="candidate-card-why">${escapeHtml(t("dup.heldBy"))}: <span class="memory-dup-open"${memoryItemOpenAttrs({ id: heldBy, label: heldBy })}>${escapeHtml(heldBy)}</span></p>` : ""}
         <pre class="candidate-card-preview">${escapeHtml(candidatePreviewText(candidate))}</pre>
         ${fullText.length > 220 ? `<details class="candidate-card-more"><summary>View full text</summary><pre>${escapeHtml(fullText)}</pre></details>` : ""}
       </div>
@@ -765,7 +765,7 @@ async function batchUpdateCandidates(body) {
     summary.className = errCount ? "provider-test error candidates-batch-summary" : "provider-test ok candidates-batch-summary";
     const parts = [
       payload.action === "promote" ? `Accepted ${payload.promoted || 0}` : `Rejected ${payload.rejected || 0}`,
-      payload.held ? `${payload.held} held: already stored by another project` : "",
+      payload.held ? t("dup.heldCount").replace("{count}", String(payload.held)) : "",
       payload.matched != null ? `matched ${payload.matched}` : "",
       payload.skipped ? `skipped ${payload.skipped}` : "",
       payload.counts ? `pending now ${payload.counts.pending ?? payload.pending ?? 0}` : "",
@@ -775,7 +775,7 @@ async function batchUpdateCandidates(body) {
   }
   if (payload.counts) renderCandidateStatusStats(payload.counts);
   const changed = Number(payload.promoted || 0) + Number(payload.rejected || 0);
-  const heldNote = payload.held ? `${payload.held} held: already stored by another project` : "";
+  const heldNote = payload.held ? t("dup.heldCount").replace("{count}", String(payload.held)) : "";
   if (changed) {
     const done = payload.action === "promote" ? `Accepted ${payload.promoted || 0}` : `Rejected ${payload.rejected || 0}`;
     showSnackbar([done, heldNote].filter(Boolean).join(" · "), "success");
