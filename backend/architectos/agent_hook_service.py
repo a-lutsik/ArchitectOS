@@ -87,6 +87,9 @@ class AgentHookServiceMixin:
         for again exactly when the session may have lost it. An empty ``context``
         means there is nothing worth injecting. Open tasks, providers and the
         token-economy pass of ``context()`` are skipped: they do not fit the budget.
+        So is graph expansion: on the gold queries over a real 11k-node project it
+        left the expected hit and MRR unchanged while doubling the search time, and
+        the ~2 hits that fit the budget are direct matches anyway.
         """
         started = time.perf_counter()
         settings = self.agent_hook_settings()
@@ -96,7 +99,7 @@ class AgentHookServiceMixin:
             project_id=project_id,
             scope=scope,
             limit=max(limit, 10),
-            expand_graph=True,
+            expand_graph=False,
             vector_timeout_ms=HOOK_VECTOR_TIMEOUT_MS if vector_timeout_ms is None else vector_timeout_ms,
         )
         searched = time.perf_counter()
@@ -121,6 +124,9 @@ class AgentHookServiceMixin:
                 tools_available=True,
                 stable_hits=stable,
             )
+        pack_done = time.perf_counter()
+        if context and project_id:
+            self.remember_hook_pack(project_id, pack=context)
         finished = time.perf_counter()
         retrieval = search.get("retrieval") or {}
         _LOG.debug(
@@ -138,7 +144,8 @@ class AgentHookServiceMixin:
             "timing": {
                 "search_ms": round((searched - started) * 1000.0, 1),
                 "stable_ms": round((stable_done - searched) * 1000.0, 1),
-                "pack_ms": round((finished - stable_done) * 1000.0, 1),
+                "pack_ms": round((pack_done - stable_done) * 1000.0, 1),
+                "cache_ms": round((finished - pack_done) * 1000.0, 1),
             },
         }
 

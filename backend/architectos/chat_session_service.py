@@ -952,8 +952,6 @@ class ChatSessionServiceMixin:
                 user or assistant, project_id=actual_project_id, scope=scope, limit=limit,
                 include_stable=include_stable, exclude_ids=exclude_ids, vector_timeout_ms=vector_timeout_ms,
             )
-            if packed.get("context"):
-                self.remember_hook_pack(actual_project_id, pack=str(packed["context"]))
         else:
             packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
         extract_started = time.perf_counter()
@@ -993,6 +991,7 @@ class ChatSessionServiceMixin:
             "search_ms": float(context_timing.get("search_ms") or 0.0),
             "stable_ms": float(context_timing.get("stable_ms") or 0.0),
             "pack_ms": float(context_timing.get("pack_ms") or 0.0),
+            **({"cache_ms": float(context_timing["cache_ms"])} if "cache_ms" in context_timing else {}),
             "extractor_ms": round((capture_started - extract_started) * 1000.0, 1),
             "capture_ms": round((finished - capture_started) * 1000.0, 1),
             "total_ms": round((finished - started) * 1000.0, 1),

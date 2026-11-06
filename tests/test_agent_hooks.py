@@ -279,6 +279,51 @@ def _two_projects(root: Path, service: ArchitectOSService) -> tuple[Path, Path]:
     return alpha, beta
 
 
+class HookServerModeTests(unittest.TestCase):
+    QUESTION = "How do we batch ledger writes before replicating?"
+
+    def test_hook_pack_skips_graph_expansion_other_callers_keep_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            _seed(service, "architectos", 4)
+            expansion = service._pagerank_graph_expansion  # noqa: SLF001
+            with mock.patch.object(service, "_pagerank_graph_expansion", wraps=expansion) as walk:
+                hook = service.capture_memory_turn(self.QUESTION, hook=True, capture=False)
+                hook_walks = walk.call_count
+                service.context(self.QUESTION, project_id="architectos")
+                context_walks = walk.call_count - hook_walks
+                service.capture_memory_turn(self.QUESTION, capture=False)
+                mcp_walks = walk.call_count - hook_walks - context_walks
+        self.assertEqual((hook_walks, context_walks, mcp_walks), (0, 1, 1))
+        self.assertGreaterEqual(len(hook["hits"]), 1)
+        self.assertIn("cache_ms", hook["timing"])
+
+    def test_hook_mode_keeps_project_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            service = ArchitectOSService(root)
+            alpha, beta = _two_projects(root, service)
+            alpha_ids = _seed(service, "alpha", 2)
+            beta_ids = _seed(service, "beta", 2)
+            shared = service.repository.add_node(
+                "Lesson", "ledger rule shared", "global", "The ledger service must batch writes everywhere.",
+                None, None, 0.8, {"source": "test"},
+            ).id
+            # A cross-project edge must not carry a beta node into alpha's pack either.
+            service.repository.add_edge(alpha_ids[0], beta_ids[0], "RELATED_TO", "project")
+            with _RunningApp(root, service):
+                out = _hook(root, "UserPromptSubmit", cwd=alpha, session="iso", prompt=self.QUESTION)
+            cache = json.loads((root / "data" / agent_hooks.BRIEFING_CACHE).read_text(encoding="utf-8"))
+        injected = set(_injected_ids(out))
+        self.assertTrue(injected & set(alpha_ids))
+        self.assertIn(shared, injected)
+        self.assertFalse(injected & set(beta_ids))
+        self.assertEqual(set(cache["projects"]), {"alpha"})
+        cached = {node_id for node_id, _line in cache["projects"]["alpha"]["hits"]}
+        self.assertFalse(cached & set(beta_ids))
+
+
 class HookSessionTests(unittest.TestCase):
     QUESTIONS = (
         "How do we batch ledger writes?",
