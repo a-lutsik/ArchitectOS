@@ -1432,13 +1432,17 @@ class MemoryLifecycleApplicationTests(unittest.TestCase):
             ]
             transaction = service.repository.transaction
             with mock.patch.object(service.repository, "transaction", wraps=transaction) as opened, \
-                    mock.patch.object(service.repository, "get_node", wraps=service.repository.get_node) as single:
+                    mock.patch.object(service.repository, "get_node", wraps=service.repository.get_node) as single, \
+                    mock.patch.object(service.repository, "_sync_memory_fts_row") as fts:
                 result = service.memory_lifecycle.refresh_nodes([*ids, ids[0]], "search")
             counts = [int(service.repository.get_node(node_id).metadata.get("access_count") or 0) for node_id in ids]
+            found = service.repository.search_memory_fts("zephyr batching", project_id="architectos", limit=10)
         self.assertEqual(result["refreshed"], 5)
         self.assertEqual(counts, [1] * 5)
         self.assertEqual(opened.call_count, 1)
         self.assertEqual(single.call_count, 0, "hits are read in one query, not one get_node each")
+        self.assertEqual(fts.call_count, 0, "a metadata-only bump leaves the FTS rows alone")
+        self.assertEqual(set(found), set(ids))
 
     def test_decay_loop_runs_decay_once_then_stops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
