@@ -122,10 +122,12 @@ async function saveVoiceMemory(event) {
   voiceStatus("Saving voice memory...");
   if (submitBtn) submitBtn.disabled = true;
   try {
-    await api("/api/memory", { method: "POST", body: JSON.stringify(payload) });
+    const saved = await api("/api/memory", { method: "POST", body: JSON.stringify(payload) });
     document.querySelector("#voice-memory-form")?.reset();
-    voiceStatus("Voice memory saved", "ok");
-    showSnackbar("Voice memory saved", "success");
+    // Held: another project already stored this fact, nothing new was written.
+    const message = saved?.dedup_held ? "Already in memory" : "Voice memory saved";
+    voiceStatus(message, "ok");
+    showSnackbar(message, saved?.dedup_held ? "info" : "success");
     await refreshWorkspace();
     await runSearch("voice memory");
     scheduleGraphLoad();

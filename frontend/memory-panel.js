@@ -399,8 +399,12 @@ async function loadMemoryCandidates({ resetPage = false } = {}) {
   container.querySelectorAll("[data-promote-candidate]").forEach(button => button.addEventListener("click", async () => {
     button.disabled = true;
     try {
-      await api(`/api/memory/candidates/${button.dataset.promoteCandidate}/promote`, { method: "POST", body: "{}" });
-      await refreshAfterCandidateChange({ promoted: true });
+      const result = await api(`/api/memory/candidates/${button.dataset.promoteCandidate}/promote`, { method: "POST", body: "{}" });
+      const candidate = result?.candidate || {};
+      if (candidate.status !== "promoted" && (candidate.metadata || {}).dedup_held_by) {
+        showSnackbar(candidate.reject_reason || "Already stored by another project", "info");
+      }
+      await refreshAfterCandidateChange({ promoted: candidate.status === "promoted" });
     } catch (error) {
       button.disabled = false;
       showError(error);
@@ -668,7 +672,9 @@ function renderCandidateCard(candidate) {
   const isDuplicate = Boolean(meta.duplicate) && !isRevision;
   const duplicateKind = String(meta.duplicate_kind || (isDuplicate ? "memory" : ""));
   const isCandidateDup = isDuplicate && duplicateKind === "candidate";
-  const canPromote = candidate.status !== "promoted";
+  // Held by the project gate: another project already stored this fact; Accept would only be held again.
+  const heldBy = String(meta.dedup_held_by || "");
+  const canPromote = candidate.status !== "promoted" && !heldBy;
   const canReject = candidate.status === "candidate";
   const status = String(candidate.status || "candidate");
   el.className = `candidate-card${isRevision ? " is-revision" : ""}${isDuplicate ? (isCandidateDup ? " is-duplicate-candidate" : " is-duplicate") : ""}`;
@@ -703,6 +709,7 @@ function renderCandidateCard(candidate) {
         </div>
         ${path ? `<p class="candidate-card-path" title="${escapeHtml(candidate.source_ref || path)}">${escapeHtml(path)}</p>` : ""}
         <p class="candidate-card-why">${escapeHtml(candidateWhy(candidate))}</p>
+        ${heldBy ? `<p class="candidate-card-why">${escapeHtml(candidate.reject_reason || "already stored by another project")}: <span class="memory-dup-open"${memoryItemOpenAttrs({ id: heldBy, label: heldBy })}>${escapeHtml(heldBy)}</span></p>` : ""}
         <pre class="candidate-card-preview">${escapeHtml(candidatePreviewText(candidate))}</pre>
         ${fullText.length > 220 ? `<details class="candidate-card-more"><summary>View full text</summary><pre>${escapeHtml(fullText)}</pre></details>` : ""}
       </div>
@@ -758,6 +765,7 @@ async function batchUpdateCandidates(body) {
     summary.className = errCount ? "provider-test error candidates-batch-summary" : "provider-test ok candidates-batch-summary";
     const parts = [
       payload.action === "promote" ? `Accepted ${payload.promoted || 0}` : `Rejected ${payload.rejected || 0}`,
+      payload.held ? `${payload.held} held: already stored by another project` : "",
       payload.matched != null ? `matched ${payload.matched}` : "",
       payload.skipped ? `skipped ${payload.skipped}` : "",
       payload.counts ? `pending now ${payload.counts.pending ?? payload.pending ?? 0}` : "",
@@ -767,8 +775,12 @@ async function batchUpdateCandidates(body) {
   }
   if (payload.counts) renderCandidateStatusStats(payload.counts);
   const changed = Number(payload.promoted || 0) + Number(payload.rejected || 0);
+  const heldNote = payload.held ? `${payload.held} held: already stored by another project` : "";
   if (changed) {
-    showSnackbar(payload.action === "promote" ? `Accepted ${payload.promoted || 0}` : `Rejected ${payload.rejected || 0}`, "success");
+    const done = payload.action === "promote" ? `Accepted ${payload.promoted || 0}` : `Rejected ${payload.rejected || 0}`;
+    showSnackbar([done, heldNote].filter(Boolean).join(" · "), "success");
+  } else if (heldNote) {
+    showSnackbar(heldNote, "info");
   } else if (!payload.error_count) {
     showSnackbar("Nothing in this filter to update", "info");
   }
