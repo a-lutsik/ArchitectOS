@@ -1422,6 +1422,24 @@ class MemoryLifecycleApplicationTests(unittest.TestCase):
             self.assertTrue(search["hits"])
             self.assertEqual(spy, [])
 
+    def test_access_bump_writes_all_hits_in_one_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            ids = [
+                service.repository.add_node("Lesson", f"Zephyr rule {index}", "project", "Zephyr batching rule.",
+                                            "architectos", None, 0.8, {"source": "manual"}).id
+                for index in range(5)
+            ]
+            transaction = service.repository.transaction
+            with mock.patch.object(service.repository, "transaction", wraps=transaction) as opened, \
+                    mock.patch.object(service.repository, "get_node", wraps=service.repository.get_node) as single:
+                result = service.memory_lifecycle.refresh_nodes([*ids, ids[0]], "search")
+            counts = [int(service.repository.get_node(node_id).metadata.get("access_count") or 0) for node_id in ids]
+        self.assertEqual(result["refreshed"], 5)
+        self.assertEqual(counts, [1] * 5)
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(single.call_count, 0, "hits are read in one query, not one get_node each")
+
     def test_decay_loop_runs_decay_once_then_stops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
