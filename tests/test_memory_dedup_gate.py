@@ -5,6 +5,7 @@ import io
 import json
 import re
 import tempfile
+import threading
 import unittest
 from http import HTTPStatus
 from pathlib import Path
@@ -252,6 +253,11 @@ class GateWritePathTests(unittest.TestCase):
         self.assertFalse(self.service._auto_accept_near_duplicate(fresh))
 
 
+def caller_salt(caller: str, text: str) -> str:
+    """Id salt of a fact the caller writes beside a node it does not own."""
+    return f"{caller}:{content_salt(text)}"
+
+
 def mcp_call(root: Path, project_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """One MCP tools/call on a server bound to ``project_id``; returns the tool's JSON data."""
     server = MemoryMCPServer(root, project_id=project_id)
@@ -413,7 +419,7 @@ class CallerProjectGateTests(unittest.TestCase):
                 self.assertEqual(new["dedup"]["action"], "new")
                 self.assertEqual(new["dedup"]["details"]["suggested_action"], action)
                 created = self._assert_beside(old["id"], incoming, new)
-                self.assertEqual(created.id, self._shared_id(node_type, label, content_salt(f"project_a\n{incoming}")))
+                self.assertEqual(created.id, self._shared_id(node_type, label, caller_salt("project_a", incoming)))
                 self.assertEqual(created.metadata["possible_duplicate_of"], old["id"])
                 self.assertEqual(created.metadata["dedup_suggestion"]["target_id"], old["id"])
                 self.assertEqual(self._edge_types(new["id"], old["id"]), set())
@@ -503,7 +509,7 @@ class CallerProjectGateTests(unittest.TestCase):
                     written = self._add("project_a", label, text)
                     ids.add(written["id"])
                     self._set_status(written["id"], "archived")
-                expected = self._shared_id("Decision", label, "" if slot == "free" else content_salt(f"project_a\n{text}"))
+                expected = self._shared_id("Decision", label, "" if slot == "free" else caller_salt("project_a", text))
                 self.assertEqual(ids, {expected})
 
     def test_secret_never_reaches_the_id_and_repeats_find_one_node(self) -> None:
@@ -518,7 +524,7 @@ class CallerProjectGateTests(unittest.TestCase):
                 stored = self.repo.get_node(ids.pop())
                 assert stored is not None
                 self.assertEqual(stored.text, redacted)
-                self.assertEqual(stored.id, self._shared_id("Decision", label, content_salt(f"project_a\n{stored.text}")))
+                self.assertEqual(stored.id, self._shared_id("Decision", label, caller_salt("project_a", stored.text)))
         # Without a caller the label-collision salt hashes the redacted text too.
         self._add(None, "CI token ui", "CI runs on every push to main.")
         written = self._add(None, "CI token ui", raw)
@@ -656,15 +662,20 @@ class CallerProjectGateTests(unittest.TestCase):
 
     def test_own_exact_copy_wins_over_a_held_one(self) -> None:
         text = "Deploys always run through GitHub Actions."
-        foreign = self._mcp_add("project_b", "Decision", "Deploy", text)
-        own = self._add("project_a", "Deploy", text, dedup=False)
-        self.assertNotEqual(own["id"], foreign["id"])
-        before = self._snapshot(foreign["id"])
-        again = self._mcp_add("project_a", "Decision", "Deploy", text)
-        self.assertFalse(again["dedup_held"])
-        self.assertEqual(again["id"], own["id"])
-        self.assertEqual(self.repo.get_node(own["id"]).metadata.get("dedup_hits"), 1)
-        self.assertEqual(self._snapshot(foreign["id"]), before)
+        orders = set()
+        # The index meets the copies in node-id order: these labels put either copy first.
+        for label in ("Deploy", "Lint"):
+            with self.subTest(label=label):
+                foreign = self._mcp_add("project_b", "Decision", label, text)
+                own = self._add("project_a", label, text, dedup=False)
+                orders.add(foreign["id"] < own["id"])
+                before = self._snapshot(foreign["id"])
+                again = self._mcp_add("project_a", "Decision", label, text)
+                self.assertFalse(again["dedup_held"])
+                self.assertEqual(again["id"], own["id"])
+                self.assertEqual(self.repo.get_node(own["id"]).metadata.get("dedup_hits"), 1)
+                self.assertEqual(self._snapshot(foreign["id"]), before)
+        self.assertEqual(orders, {True, False})
 
     def test_dedup_off_with_a_caller_stores_an_own_copy(self) -> None:
         text = "Deploys always run through GitHub Actions."
@@ -673,7 +684,7 @@ class CallerProjectGateTests(unittest.TestCase):
         self.repo.set_setting("memory_dedup", {"mode": "off"})
         copies = {self._add("project_a", "Deploy", text)["id"] for _ in range(2)}
         copies |= {self._add("project_a", "Deploy", text, dedup=False)["id"]}
-        self.assertEqual(copies, {self._shared_id("Decision", "Deploy", content_salt(f"project_a\n{text}"))})
+        self.assertEqual(copies, {self._shared_id("Decision", "Deploy", caller_salt("project_a", text))})
         self.assertEqual(self._snapshot(foreign["id"]), before)
 
     def test_promoting_a_held_fact_never_writes_or_overwrites(self) -> None:
@@ -710,6 +721,121 @@ class CallerProjectGateTests(unittest.TestCase):
         self.assertEqual((replies[1]["held"], replies[1]["promoted"]), (1, 0))
         self.assertEqual([item["status"] for item in replies[1]["results"]], ["held"])
         self.assertEqual(self._snapshot(existing["id"]), before)
+
+    def test_a_concurrent_writer_never_takes_the_chosen_id(self) -> None:
+        # Another MCP process: its own service and connections on the same store.
+        other = ArchitectOSService(self.root)
+        real_add_node = self.repo.add_node
+        failures: list[BaseException] = []
+
+        def write_b() -> None:
+            try:
+                other.add_memory({"label": "Lint config", "text": "Lint runs on every pull request.", "type": "Decision",
+                                  "scope": "shared", "project_id": "project_b"}, caller_project_id="project_b")
+            except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+                failures.append(exc)
+
+        writer = threading.Thread(target=write_b)
+
+        def add_node_while_b_writes(*args: Any, **kwargs: Any) -> MemoryNode:
+            # A has chosen its id; B runs now and gets a second to land in between.
+            self.repo.add_node = real_add_node
+            writer.start()
+            writer.join(timeout=1.0)
+            return real_add_node(*args, **kwargs)
+
+        self.repo.add_node = add_node_while_b_writes
+        a = self._add("project_a", "Lint config", "Shared lint config lives in tools/lint.toml.")
+        writer.join(timeout=60)
+        self.assertEqual(failures, [])
+        nodes = {node.author_project_id: node for node in self.repo.list_nodes() if node.label == "Lint config"}
+        self.assertEqual(set(nodes), {"project_a", "project_b"})
+        self.assertEqual(nodes["project_a"].id, a["id"])
+        self.assertEqual(nodes["project_a"].text, "Shared lint config lives in tools/lint.toml.")
+        self.assertEqual(nodes["project_b"].text, "Lint runs on every pull request.")
+
+    def test_another_projects_text_cannot_take_the_callers_salted_id(self) -> None:
+        text = "Shared lint config lives in tools/lint.toml."
+        plain = self._add("project_b", "Lint config", "Lint runs on every pull request.")
+        squat = self._add("project_b", "Lint config", f"project_a {text}")
+        before = [self._snapshot(plain["id"]), self._snapshot(squat["id"])]
+        written = self._add("project_a", "Lint config", text)
+        self.assertEqual(written["id"], self._shared_id("Decision", "Lint config", caller_salt("project_a", text)))
+        self.assertNotIn(written["id"], {plain["id"], squat["id"]})
+        self.assertEqual([self._snapshot(plain["id"]), self._snapshot(squat["id"])], before)
+
+    def test_undo_of_a_fold_restores_the_fact_under_its_author(self) -> None:
+        _, label, stored, incoming = self.FACTS["enrich"]
+        first = self._add("project_a", label, stored, source="mcp")
+        folded = self._add("project_a", label, incoming, source="mcp")
+        self.assertEqual((folded["id"], folded["dedup"]["action"]), (first["id"], "enrich"))
+        undone = self.service.undo_memory_dedup({"event_id": folded["dedup"]["event_id"]})
+        restored = self.repo.get_node(undone["restored"]["id"])
+        self.assertEqual((restored.text, restored.author_project_id), (incoming, "project_a"))
+
+    def test_contradicting_another_projects_fact_links_without_changing_it(self) -> None:
+        old = self._mcp_add("project_b", "Decision", "Кэш", "Используем Redis для кэша сессий")
+        before = self._snapshot(old["id"])
+        new = self._mcp_add("project_a", "Decision", "Кэш", "Не используем Redis для кэша сессий")
+        self.assertEqual(new["dedup"]["action"], "conflict")
+        self.assertEqual(self._edge_types(new["id"], old["id"]), {"CONTRADICTS"})
+        self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_suggest_mode_with_a_caller_never_holds(self) -> None:
+        text = "Deploys always run through GitHub Actions."
+        foreign = self._mcp_add("project_b", "Decision", "Deploy", text)
+        before = self._snapshot(foreign["id"])
+        self.repo.set_setting("memory_dedup", {"mode": "suggest"})
+        written = self._add("project_a", "Deploy", text)
+        self.assertFalse(written.get("dedup_held"))
+        created = self._assert_beside(foreign["id"], text, written)
+        self.assertEqual(created.metadata["dedup_suggestion"]["target_id"], foreign["id"])
+        self.assertEqual(self._snapshot(foreign["id"]), before)
+
+    def test_judged_own_match_wins_over_an_earlier_foreign_one(self) -> None:
+        foreign = self._add("project_b", "Release cadence B", "Weekly releases happen on Tuesdays via the bot.")
+        own = self._add("project_a", "Release cadence A", "Weekly releases happen on Tuesdays via the bot, owned by us.")
+        before = self._snapshot(foreign["id"])
+        self.repo.set_setting("memory_dedup", {"llm_judge": True, "llm_max_candidates": 2})
+        judged: list[str] = []
+
+        def judge(label: str, text: str, node_type: str, candidate: dict[str, Any], *args: Any) -> dict[str, Any]:
+            judged.append(candidate["node_id"])
+            return {"action": "duplicate", "confidence": 0.95, "reason": "same release rule", "provider": "test"}
+
+        scores = {foreign["id"]: 0.97, own["id"]: 0.9}
+        with (
+            mock.patch.object(self.service, "_semantic_dedup_scores", return_value=scores),
+            mock.patch.object(self.service, "_judge_dedup_pair", side_effect=judge),
+        ):
+            written = self._add("project_a", "Release schedule", "Releases are cut every Tuesday by the release bot.")
+        self.assertEqual(judged[0], foreign["id"])
+        self.assertTrue(written.get("dedup_merged"))
+        self.assertEqual(written["id"], own["id"])
+        self.assertEqual(self._snapshot(foreign["id"]), before)
+        # Only the foreign match is judged a duplicate: stored beside it, flagged, never folded.
+        with (
+            mock.patch.object(self.service, "_semantic_dedup_scores", return_value={foreign["id"]: 0.97}),
+            mock.patch.object(self.service, "_judge_dedup_pair", side_effect=judge),
+        ):
+            beside = self._add("project_a", "Release plan", "Release trains leave on Tuesday with the bot.")
+        self.assertFalse(beside.get("dedup_merged"))
+        self.assertEqual(beside["dedup"]["details"]["suggested_action"], "duplicate")
+        self.assertEqual(self.repo.get_node(beside["id"]).metadata["possible_duplicate_of"], foreign["id"])
+        self.assertEqual(self._snapshot(foreign["id"]), before)
+
+    def test_the_gate_sets_aside_at_most_eight_foreign_targets(self) -> None:
+        text = "Deploys always run through GitHub Actions."
+        first = None
+        for index in range(10):
+            node = self.repo.add_node("Decision", "Deploy", "shared", text, None, id_salt=f"seed{index}", author_project_id=f"project_{index}")
+            first = first or node
+        real_classify = self.service.memory_dedup.classify
+        with mock.patch.object(self.service.memory_dedup, "classify", side_effect=real_classify) as classify:
+            held = self._add("project_a", "Deploy", text)
+        self.assertEqual(classify.call_count, 9)
+        self.assertTrue(held["dedup_held"])
+        self.assertEqual(len([node for node in self.repo.list_nodes() if node.label == "Deploy"]), 10)
 
 class CallerProjectMatrixTests(unittest.TestCase):
     """Every write entry under a caller project × every kind of node already holding the fact."""
@@ -822,7 +948,7 @@ class CallerProjectMatrixTests(unittest.TestCase):
                     self.assertNotEqual(result["id"], seeded)
                     created = self.repo.get_node(result["id"])
                     self.assertEqual((created.status, created.author_project_id), ("active", "project_a"))
-                    self.assertEqual(created.id, self.repo.memory_node_id("Decision", label, "shared", None, None, content_salt(f"project_a\n{self.TEXT}")))
+                    self.assertEqual(created.id, self.repo.memory_node_id("Decision", label, "shared", None, None, caller_salt("project_a", self.TEXT)))
                     if case == "foreign_other":
                         self.assertEqual(created.metadata.get("possible_duplicate_of"), seeded)
                         self.assertEqual(created.metadata["dedup_suggestion"]["target_id"], seeded)

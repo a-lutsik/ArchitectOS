@@ -401,6 +401,45 @@ class CallerProjectCaptureTests(unittest.TestCase):
         self.assertEqual(undone["candidate"]["status"], "rejected")
         self.assertEqual(service.repository.get_node(foreign.id).status, "active")
 
+    def test_undo_of_an_unbound_capture_archives_the_node_as_before(self) -> None:
+        service = self.service
+        turn = service.capture_memory_turn("I prefer answers in Russian with short bullet lists.")
+        candidate = service.repository.get_memory_candidate(turn["auto_accepted"][0]["id"])
+        self.assertEqual(candidate["project_id"], "architectos")
+        node = service.repository.get_node(candidate["promoted_node_id"])
+        self.assertEqual((node.scope, node.author_project_id), ("global", None))
+        undone = service.undo_auto_capture({"candidate_id": candidate["id"]})
+        self.assertEqual(undone["candidate"]["status"], "rejected")
+        self.assertEqual(service.repository.get_node(node.id).status, "archived")
+        self.assertIsNone(candidate["metadata"]["auto_accepted_by"])
+
+    def test_auto_accept_classifies_an_atom_once(self) -> None:
+        for project_id in ("project_a", None):
+            with self.subTest(project=project_id):
+                service = ArchitectOSService(Path(self._tmp.name) / str(project_id))
+                real_classify = service.memory_dedup.classify
+                with mock.patch.object(service.memory_dedup, "classify", side_effect=real_classify) as classify:
+                    turn = service.capture_memory_turn(DECISION, project_id=project_id)
+                self.assertEqual(len(turn["auto_accepted"]), 1)
+                self.assertEqual(classify.call_count, 1)
+                candidate = service.repository.get_memory_candidate(turn["auto_accepted"][0]["id"])
+                self.assertEqual(candidate["metadata"]["auto_accepted_by"], project_id)
+
+    def test_finalize_summary_candidate_runs_under_the_chat_project(self) -> None:
+        service = self.service
+        chat = service.post_chat_message({"project_id": "project_a", "message": DECISION, "provider_id": "local-memory"})
+        summary = {"has_facts": True, "facts": [{"text": DECISION}], "text": f"Session summary: {DECISION}", "type": "Decision", "confidence": 0.9}
+        with (
+            mock.patch.object(service, "_summarize_chat_session", return_value=summary),
+            mock.patch.object(service, "_enqueue_session_fact_atoms", return_value=[]),
+            mock.patch.object(service, "_facts_already_captured_as_mcp", return_value=False),
+            mock.patch.object(service, "_maybe_auto_accept_chat_candidate", return_value=None) as auto_accept,
+        ):
+            service.finalize_chat_session(chat["chat"]["id"], force=True, trigger="manual")
+        auto_accept.assert_called_once()
+        self.assertEqual(auto_accept.call_args.args[0]["metadata"]["template"], "chat_session_summary")
+        self.assertEqual(auto_accept.call_args.kwargs["caller_project_id"], "project_a")
+
 class NearestRankTests(unittest.TestCase):
     def test_nearest_rank_picks_an_observed_value(self) -> None:
         self.assertEqual(nearest_rank([], 0.5), 0.0)

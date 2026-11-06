@@ -96,12 +96,14 @@ class IngestionCandidatesMixin:
         project_root_cache: dict[str, Any] | None = None,
         refresh_duplicates: bool = True,
         caller_project_id: str | None = None,
+        gate_decision: tuple[DedupDecision, MemoryNode | None] | None = None,
     ) -> dict[str, Any]:
         """Write a reviewed candidate as a memory node.
 
         ``caller_project_id`` is the project the accept runs under (Review accept,
         batch and auto-accept pass the candidate's project; internal ingestion
-        passes none): the node records it as its author.
+        passes none): the node records it as its author. ``gate_decision`` is a
+        ``_gate_decision`` result already taken for this candidate (auto-accept).
         """
         candidate = self.repository.get_memory_candidate(candidate_id)
         if not candidate:
@@ -127,12 +129,12 @@ class IngestionCandidatesMixin:
         node_text = str(payload.get("text") or candidate.get("text") or "")
         node_project = self._memory_project_id_for_scope(node_scope, str(candidate.get("project_id") or "architectos"))
         confidence = float(payload.get("confidence") or candidate.get("confidence") or 0.72)
-        id_salt = ""
         decision = DedupDecision()
         if interface_id is None:
             # The same fact already stored (and owned by the caller project) takes
             # the accept as a repeat; anything else is stored beside, never over it.
-            decision, held = self._gate_decision(
+            # Auto-accept passes the decision it already took (``gate_decision``).
+            decision, held = gate_decision or self._gate_decision(
                 node_label, node_text, node_type, node_scope, node_project, caller_project_id, allow_llm=False,
             )
             if held is not None:
@@ -147,6 +149,7 @@ class IngestionCandidatesMixin:
                         "source": "memory_candidate", "source_type": candidate.get("source_type") or "",
                     },
                     decision,
+                    caller_project_id,
                 )
                 candidate["status"] = "promoted"
                 candidate["promoted_node_id"] = holder.id
@@ -159,12 +162,6 @@ class IngestionCandidatesMixin:
             if not decision.details.get("suggested_action"):
                 # Value updates and contradictions are linked by revisions, not by an accept.
                 decision = DedupDecision()
-            if caller_project_id is not None:
-                id_salt = self._caller_id_salt(
-                    node_type, node_label, node_scope, node_project, None, node_text, caller_project_id
-                )
-            else:
-                id_salt = self._label_collision_salt(node_type, node_label, node_scope, node_project, None, node_text)
         metadata = self.memory_lifecycle.seed_metadata(
             node_type=node_type,
             created_at=created_at,
@@ -172,18 +169,28 @@ class IngestionCandidatesMixin:
             source="promoted_candidate",
             label=str(payload.get("label") or candidate.get("label") or ""),
         )
-        node = self.repository.add_node(
-            node_type,
-            node_label,
-            node_scope,
-            node_text,
-            node_project,
-            interface_id,
-            confidence,
-            metadata,
-            id_salt=id_salt,
-            author_project_id=caller_project_id,
-        )
+        # The id check and the INSERT OR REPLACE hold one write lock (see add_memory).
+        with self.repository.transaction():
+            if interface_id is not None:
+                id_salt = ""
+            elif caller_project_id is not None:
+                id_salt = self._caller_id_salt(
+                    node_type, node_label, node_scope, node_project, None, node_text, caller_project_id
+                )
+            else:
+                id_salt = self._label_collision_salt(node_type, node_label, node_scope, node_project, None, node_text)
+            node = self.repository.add_node(
+                node_type,
+                node_label,
+                node_scope,
+                node_text,
+                node_project,
+                interface_id,
+                confidence,
+                metadata,
+                id_salt=id_salt,
+                author_project_id=caller_project_id,
+            )
         # Lifecycle already seeded — initialize_node is a no-op write skip.
         node = self.memory_lifecycle.initialize_node(node, "promoted_candidate")
         if decision.near_id:

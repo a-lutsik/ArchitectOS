@@ -16,6 +16,7 @@ import logging
 import re
 import threading
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -406,31 +407,34 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             # The gate only targets nodes owned by the caller project.
             existing = self.repository.get_node(decision.target_id)
             if existing is not None and existing.status == "active":
-                return self._fold_into_existing(existing, payload, decision)
+                return self._fold_into_existing(existing, payload, decision, caller_project_id)
             decision = DedupDecision()
 
         interface_id = payload.get("interface_id")
         # Node ids derive from type+scope+label, so a second, different fact
-        # under an existing label used to replace the first one in place.
-        if caller_project_id is not None:
-            id_salt = self._caller_id_salt(node_type, label, scope, project_id, interface_id, text, caller_project_id)
-        elif dedup_enabled or _force_new:
-            id_salt = self._label_collision_salt(node_type, label, scope, project_id, interface_id, text)
-        else:
-            id_salt = ""
-        node = self.repository.add_node(
-            node_type,
-            label,
-            scope,
-            text,
-            project_id,
-            interface_id,
-            float(payload.get("confidence") or 0.8),
-            {"source": str(payload.get("source") or "ui"), "source_type": str(payload.get("source_type") or payload.get("source") or "manual")},
-            source_id=source_id,
-            id_salt=id_salt,
-            author_project_id=caller_project_id,
-        )
+        # under an existing label used to replace the first one in place. The id
+        # check and the INSERT OR REPLACE hold one write lock: a concurrent writer
+        # (another MCP process) cannot take the chosen id in between.
+        with self.repository.transaction():
+            if caller_project_id is not None:
+                id_salt = self._caller_id_salt(node_type, label, scope, project_id, interface_id, text, caller_project_id)
+            elif dedup_enabled or _force_new:
+                id_salt = self._label_collision_salt(node_type, label, scope, project_id, interface_id, text)
+            else:
+                id_salt = ""
+            node = self.repository.add_node(
+                node_type,
+                label,
+                scope,
+                text,
+                project_id,
+                interface_id,
+                float(payload.get("confidence") or 0.8),
+                {"source": str(payload.get("source") or "ui"), "source_type": str(payload.get("source_type") or payload.get("source") or "manual")},
+                source_id=source_id,
+                id_salt=id_salt,
+                author_project_id=caller_project_id,
+            )
         node = self.memory_lifecycle.initialize_node(node, "ui")
         try:
             self.repository.record_memory_event(
@@ -574,6 +578,8 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
 
     # Gate actions that change the target node (fold, enrich, SUPERSEDES).
     _REWRITING_DEDUP_ACTIONS = frozenset({"duplicate", "enrich", "update"})
+    # Targets not owned by the caller set aside before the gate stores the fact beside them.
+    _GATE_MAX_EXCLUDED = 8
 
     def _gate_decision(
         self,
@@ -613,6 +619,13 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             foreign = foreign or decision
             if held is None and decision.reason == "exact restatement" and settings["mode"] == "auto":
                 held = target
+            if len(excluded) >= self._GATE_MAX_EXCLUDED:
+                _LOG.debug(
+                    "dedup gate stopped after %d targets not owned by project=%s; storing beside them",
+                    len(excluded), caller_project_id,
+                )
+                decision = DedupDecision()
+                break
             excluded.add(target.id)
             decision = self.memory_dedup.classify(label, text, node_type, scope, project_id, exclude_ids=excluded)
         if decision.action in self._REWRITING_DEDUP_ACTIONS:
@@ -621,7 +634,10 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             _LOG.info("dedup gate held a write: node %s already holds the fact, not owned by project=%s", held.id, caller_project_id)
             return DedupDecision(), held
         if decision.action == "new":
-            decision = self._dedup_gray_zone(decision, label, text, node_type, scope, project_id, settings, allow_llm)
+            decision = self._dedup_gray_zone(
+                decision, label, text, node_type, scope, project_id, settings, allow_llm,
+                caller_project_id=caller_project_id, exclude_ids=excluded,
+            )
             if decision.action != "new" and self._foreign_dedup_target(decision, caller_project_id) is not None:
                 foreign = foreign or decision
                 decision = DedupDecision(near_id=decision.near_id, near_score=decision.near_score)
@@ -677,9 +693,18 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         project_id: str | None,
         settings: dict[str, Any],
         allow_llm: bool,
+        *,
+        caller_project_id: str | None = None,
+        exclude_ids: Iterable[str] = (),
     ) -> DedupDecision:
+        """Embedding neighbours and the optional LLM judge for a rules-``new`` fact.
+
+        With ``caller_project_id`` a judged match the caller owns wins over an
+        earlier one it does not own; ``exclude_ids`` are targets the rules
+        already set aside as not owned.
+        """
         semantic = self._semantic_dedup_scores(label, text, scope, project_id, settings)
-        candidate_ids = set(semantic)
+        candidate_ids = set(semantic) - set(exclude_ids)
         if decision.near_id:
             candidate_ids.add(decision.near_id)
         if not candidate_ids:
@@ -693,11 +718,12 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             gray = self.memory_dedup.gray_candidates(
                 incoming, rows, node_type, semantic_scores=semantic, settings=settings,
             )
+            foreign: DedupDecision | None = None
             for candidate in gray[: settings["llm_max_candidates"]]:
                 verdict = self._judge_dedup_pair(label, text, node_type, candidate, project_id, settings)
                 action = verdict.get("action")
                 if action in {"duplicate", "enrich"} and float(verdict.get("confidence") or 0.0) >= settings["llm_min_confidence"]:
-                    return DedupDecision(
+                    judged = DedupDecision(
                         action,
                         target_id=candidate["node_id"],
                         target_label=candidate["label"],
@@ -712,6 +738,12 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                             "cosine": round(candidate["cosine"], 3),
                         },
                     )
+                    if caller_project_id is None or self._foreign_dedup_target(judged, caller_project_id) is None:
+                        return judged
+                    # Not the caller's: a judged match it owns further down the list still wins.
+                    foreign = foreign or judged
+            if foreign is not None:
+                return foreign
         if decision.near_score < self.NEAR_DUPLICATE_SIMILARITY:
             typed = [
                 row for row in rows
@@ -847,9 +879,11 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         The plain label id is used when it is free or holds the caller's own
         inactive node (revived in place); a second fact beside the caller's own
         active node gets the content salt; a node the caller does not own, of
-        any status, moves the write to an id salted with the caller project.
-        Salts hash the redacted text, so a repeat with or without the secret
-        lands on the same node.
+        any status, moves the write to an id salted with the caller project:
+        ``"<caller>:<content salt>"``. A content salt is plain hex, so no text
+        can produce that salt for another project. Salts hash the redacted
+        text, so a repeat with or without the secret lands on the same node.
+        Callers hold ``repository.transaction()`` around this and the write.
         """
         def occupant(salt: str) -> Any:
             return self.repository.get_node(self.repository.memory_node_id(node_type, label, scope, project_id, interface_id, salt))
@@ -870,10 +904,11 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             "id of node %s (project=%s author=%s status=%s) is not owned by project=%s; salting with the caller",
             holder.id, holder.project_id, holder.author_project_id, holder.status, caller_project_id,
         )
-        salt = content_salt(f"{caller_project_id}\n{redacted}")
+        salt = f"{caller_project_id}:{content_salt(redacted)}"
         holder = occupant(salt)
         if holder is not None and not owned_by(holder, caller_project_id):
-            # Only a projectless write of a crafted text lands here; refuse rather than overwrite.
+            # Not reachable through a salt; only a crafted label ("label|salt" hashes like a
+            # salted id) or a hand-edited store. Refuse rather than overwrite.
             _LOG.warning("caller-salted id %s is held by a node outside project=%s; write refused", holder.id, caller_project_id)
             raise ValueError(f"memory id is taken by a node outside project {caller_project_id}")
         return salt
@@ -942,19 +977,29 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         return str(event.get("id") or "")
 
     @staticmethod
-    def _dedup_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
-        """Incoming fact as undo needs it. Redacted like a stored node: no secrets in the DB."""
+    def _dedup_snapshot(payload: dict[str, Any], caller_project_id: str | None = None) -> dict[str, Any]:
+        """Incoming fact as undo needs it. Redacted like a stored node: no secrets in the DB.
+
+        ``caller_project_id`` is kept so the restored fact is written under (and
+        authored by) the same project.
+        """
         snapshot = {
             key: payload.get(key)
             for key in ("type", "scope", "project_id", "interface_id", "source", "source_type", "source_id", "confidence")
             if payload.get(key) not in (None, "")
         }
+        if caller_project_id:
+            snapshot["caller_project_id"] = caller_project_id
         snapshot["label"] = sanitize_text(str(payload.get("label") or ""))[0]
         snapshot["text"] = sanitize_text(str(payload.get("text") or ""))[0]
         return snapshot
 
     def _fold_into_existing(
-        self, existing: Any, payload: dict[str, Any], decision: DedupDecision | None = None
+        self,
+        existing: Any,
+        payload: dict[str, Any],
+        decision: DedupDecision | None = None,
+        caller_project_id: str | None = None,
     ) -> dict[str, Any]:
         """Fold a re-added (``duplicate``) or fuller (``enrich``) fact into a stored node.
 
@@ -1000,7 +1045,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         except (TypeError, ValueError):
             pass
         existing = self.repository.upsert_node(existing)
-        details = {**decision.to_dict(), "incoming": self._dedup_snapshot(payload)}
+        details = {**decision.to_dict(), "incoming": self._dedup_snapshot(payload, caller_project_id)}
         if existing.type != previous_type:
             details.update({"type_from": previous_type, "type_to": existing.type})
         if existing.text != previous_text:
@@ -1080,7 +1125,8 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         node = self.repository.upsert_node(node)
         if action in {"duplicate", "enrich"}:
             incoming = dict(details.get("incoming") or {})
-            restored = self.add_memory(incoming, _force_new=True)
+            caller_project_id = str(incoming.pop("caller_project_id", "") or "").strip() or None
+            restored = self.add_memory(incoming, _force_new=True, caller_project_id=caller_project_id)
             restored_node = self.repository.get_node(str(restored.get("id") or ""))
             if restored_node is not None:
                 restored_node.metadata["dedup_restored_from"] = event_id
