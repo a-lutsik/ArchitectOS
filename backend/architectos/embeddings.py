@@ -434,12 +434,15 @@ class MemoryEmbeddingEngine:
         project_id: str | None,
         scope: str | None,
     ) -> bool:
+        """Search visibility; an explicit ``scope`` only narrows the ``scope=None`` set.
+
+        ``storage_search.scope_visibility_sql`` is the SQL twin; keep them in step.
+        """
         if scope:
             if node_scope != scope:
                 return False
             if scope in {"project", "interface"} and project_id and node_project != project_id:
                 return False
-            return True
         if project_id:
             if node_scope not in {"shared", "global"} and node_project and node_project != project_id:
                 return False

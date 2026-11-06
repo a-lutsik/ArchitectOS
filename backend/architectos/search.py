@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
-from .embeddings import content_tokens, expand_query_terms, tokens
+from .embeddings import MemoryEmbeddingEngine, content_tokens, expand_query_terms, tokens
 from .models import MemoryEdge, MemoryNode, SearchHit
 
 SCOPE_BONUS = {"interface": 40.0, "project": 30.0, "shared": 12.0, "global": 8.0}
@@ -404,15 +404,10 @@ class HybridSearchStrategy:
                 return 0.0, [], reasons
         return score, sorted(set(matched_terms)), reasons
     def _scope_matches(self, node: MemoryNode, project_id: str | None, requested_scope: str | None) -> bool:
-        if requested_scope:
-            if node.scope != requested_scope:
-                return False
-            if node.scope in {"project", "interface"} and project_id and node.project_id != project_id:
-                return False
-            return True
-        if node.scope in {"project", "interface"} and project_id and node.project_id != project_id:
-            return False
-        return True
+        # Same rule as the FTS/vector prefilters that produced ``nodes``.
+        return MemoryEmbeddingEngine._passes_scope_filter(
+            node.scope or "", node.project_id or "", project_id=project_id, scope=requested_scope
+        )
 
     def _document_frequency(self, nodes: list[MemoryNode], query_terms: list[str]) -> dict[str, int]:
         frequency = dict.fromkeys(query_terms, 0)

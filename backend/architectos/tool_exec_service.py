@@ -285,7 +285,7 @@ class ToolExecServiceMixin:
             "status": node.status,
             "confidence": node.confidence,
             "text": node.text,
-            "metadata": dict(node.metadata or {}),
+            "metadata": self._without_hidden_node_refs([dict(node.metadata or {})], project_id)[0],
             "evidence": list(node.evidence or []),
         }
         if include_neighbors:

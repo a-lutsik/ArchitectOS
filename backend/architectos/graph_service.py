@@ -31,6 +31,9 @@ from .storage import like_prefilter_supported
 
 _LOG = logging.getLogger(__name__)
 
+# Edge types whose creation rewrites the target node (SUPERSEDES stamps invalid_at / superseded_by).
+_TARGET_MUTATING_EDGE_TYPES = frozenset({"SUPERSEDES"})
+
 # Re-export for backward-compatible imports (service.py and tests).
 __all__ = [
     "GRAPH_STOPWORDS",
@@ -486,7 +489,7 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
             allowed_selected = {node.id for node in filtered_nodes}
             all_edges = [edge for edge in all_edges if edge.source in allowed_selected and edge.target in allowed_selected]
             
-        graph_nodes = [node.to_dict() for node in filtered_nodes]
+        graph_nodes = self._nodes_without_hidden_node_refs([node.to_dict() for node in filtered_nodes], project_id)
         graph_edges = [edge.to_dict() for edge in all_edges]
         
         if task_node:
@@ -653,6 +656,13 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
         if not source_node or not target_node or hidden:
             raise ValueError("source and target must be durable memory nodes")
         edge_type = str(payload.get("type") or "RELATED_TO")
+        # A visible shared/global node of another project (or of none) may be linked, not rewritten.
+        if project_id and edge_type in _TARGET_MUTATING_EDGE_TYPES and target_node.project_id != project_id:
+            _LOG.info(
+                "create_graph_edge refused %s %s -> %s: target project=%s, caller project=%s",
+                edge_type, source, target, target_node.project_id, project_id,
+            )
+            raise ValueError(f"{edge_type} target must belong to project {project_id}")
         scope = str(payload.get("scope") or source_node.scope or target_node.scope or "project")
         edge = self.repository.add_edge(source, target, edge_type, scope, float(payload.get("confidence") or 0.72))
         if edge_type == "SUPERSEDES":

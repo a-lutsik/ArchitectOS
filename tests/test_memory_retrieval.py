@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import threading
@@ -7,9 +8,12 @@ import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 from backend.architectos.chunking import chunk_text, work_item_comment_chunks, work_item_main_parts
-from backend.architectos.search import pack_memory_context
+from backend.architectos.embeddings import cosine, unpack_vector
+from backend.architectos.models import VALID_SCOPES
+from backend.architectos.search import HybridSearchStrategy, pack_memory_context
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
 
@@ -1997,6 +2001,114 @@ class RetrievalFeedbackProjectTests(unittest.TestCase):
         self.assertEqual(unscoped["hit_count"], len(hit_ids))
         self.assertEqual(unscoped["feedback"]["hit_ids"], hit_ids)
         self.assertEqual(unscoped["feedback"]["project_id"], "architectos")
+
+
+class ExplicitScopeNarrowsTests(unittest.TestCase):
+    """An explicit ``scope`` only narrows the ``scope=None`` result; it never reaches into another project."""
+
+    QUERY = "refund window fourteen days"
+
+    def _seed(self, service: ArchitectOSService) -> tuple[dict[str, str], set[str]]:
+        """One node per (project, scope); returns scope by id and the ids project_a must not see."""
+        scopes: dict[str, str] = {}
+        hidden: set[str] = set()
+        for project_id in ("project_a", "project_b"):
+            for scope in sorted(VALID_SCOPES):
+                node = service.repository.add_node(
+                    "Decision",
+                    f"Refund rule {project_id} {scope}",
+                    scope,
+                    "Customers get a refund window of fourteen days.",
+                    project_id,
+                    metadata={"work_item_id": 4242},
+                )
+                scopes[node.id] = scope
+                if project_id == "project_b" and scope not in {"shared", "global"}:
+                    hidden.add(node.id)
+        service.memory_embeddings.rebuild_all()
+        return scopes, hidden
+
+    def _assert_narrows(self, name: str, lookup, scopes: dict[str, str], hidden: set[str]) -> None:
+        unscoped = set(lookup(None))
+        self.assertTrue(unscoped, name)
+        self.assertFalse(unscoped & hidden, name)
+        for scope in sorted(VALID_SCOPES):
+            with self.subTest(path=name, scope=scope):
+                found = set(lookup(scope))
+                self.assertTrue(found)  # project_a's own node in that scope
+                self.assertFalse(found & hidden)
+                self.assertLessEqual(found, unscoped)
+                self.assertEqual({scopes[node_id] for node_id in found} - {scope}, set())
+
+    def test_every_search_path_keeps_project_visibility_under_explicit_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            scopes, hidden = self._seed(service)
+            repository = service.repository
+            engine = service.memory_embeddings
+            vector = engine._embed_query_cached(self.QUERY)  # noqa: SLF001 - same vector the search uses
+            all_ids = " ".join(sorted(scopes))
+            nodes = repository.list_nodes(status="active")
+            paths = {
+                "fts": lambda scope: repository.search_memory_fts(self.QUERY, project_id="project_a", scope=scope),
+                "work_item": lambda scope: repository.search_memory_identifiers("AB#4242", project_id="project_a", scope=scope),
+                "exact_id": lambda scope: repository.search_memory_identifiers(all_ids, project_id="project_a", scope=scope, limit=80),
+                "vector_sql": lambda scope: [
+                    node_id for node_id, _ in repository.search_memory_vectors_scored(
+                        vector, project_id="project_a", scope=scope, min_score=-1.0
+                    )
+                ],
+                "vector_ram": lambda scope: [
+                    node_id for node_id, _ in engine.search_scored(self.QUERY, project_id="project_a", scope=scope, min_score=-1.0)
+                ],
+                "search_memory": lambda scope: [
+                    hit["node"]["id"]
+                    for hit in service.search_memory(self.QUERY, project_id="project_a", scope=scope, limit=40)["hits"]
+                ],
+                # The scorer alone, without the SQL / vector prefilters in front of it.
+                "scorer": lambda scope: [
+                    hit.node.id
+                    for hit in HybridSearchStrategy().search(self.QUERY, nodes, [], "project_a", scope, 40, diversify=False)
+                ],
+            }
+            for name, lookup in paths.items():
+                self._assert_narrows(name, lookup, scopes, hidden)
+
+            def _fake_load(conn) -> bool:
+                conn.create_function("vec_distance_cosine", 2, lambda left, right: 1.0 - cosine(unpack_vector(left), unpack_vector(right)))
+                return True
+
+            with mock.patch("backend.architectos.vecsql.sqlite_vec_available", return_value=True), mock.patch(
+                "backend.architectos.storage.sqlite_vec_available", return_value=True
+            ), mock.patch("backend.architectos.storage.load_sqlite_vec", side_effect=_fake_load), mock.patch.object(
+                repository, "vector_backend", return_value="sqlite-vec"
+            ):
+                self._assert_narrows("sqlite_vec", paths["vector_ram"], scopes, hidden)
+
+    def test_memory_search_tool_scope_does_not_reach_other_projects(self) -> None:
+        from backend.architectos.mcp_server import MemoryMCPServer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            scopes, hidden = self._seed(server.service)
+            stdin_lines = [
+                json.dumps({"jsonrpc": "2.0", "id": index, "method": "tools/call", "params": {
+                    "name": "memory_search", "arguments": {"query": self.QUERY, "scope": scope, "limit": 50},
+                }})
+                for index, scope in enumerate(sorted(VALID_SCOPES))
+            ]
+            stdin = io.StringIO("\n".join(stdin_lines) + "\n")
+            stdout = io.StringIO()
+            server.serve(stdin=stdin, stdout=stdout)
+            replies = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
+
+        for reply, scope in zip(replies, sorted(VALID_SCOPES), strict=True):
+            with self.subTest(scope=scope):
+                text = reply["result"]["content"][0]["text"]
+                hits = json.loads(text.split("```json", 1)[1].rsplit("```", 1)[0])["hits"]
+                self.assertTrue(hits)
+                self.assertFalse({hit["id"] for hit in hits} & hidden)
+                self.assertEqual({scopes[hit["id"]] for hit in hits}, {scope})
 
 
 if __name__ == "__main__":
