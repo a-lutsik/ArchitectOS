@@ -11,7 +11,7 @@ import threading
 from typing import Any
 
 from .candidate_identity import candidate_origin_key
-from .memory_dedup import content_salt, incoming_features
+from .memory_dedup import DedupDecision
 from .models import utc_now
 
 _LOG = logging.getLogger(__name__)
@@ -128,37 +128,41 @@ class IngestionCandidatesMixin:
         node_project = self._memory_project_id_for_scope(node_scope, str(candidate.get("project_id") or "architectos"))
         confidence = float(payload.get("confidence") or candidate.get("confidence") or 0.72)
         id_salt = ""
+        decision = DedupDecision()
         if interface_id is None:
-            # The node id derives from type+scope+label: a live node under the
-            # same label is either this very fact (fold into it) or another
-            # fact that must not be overwritten (store beside it).
-            holder = self.repository.get_node(
-                self.repository.memory_node_id(node_type, node_label, node_scope, node_project)
+            # The same fact already stored (and owned by the caller project) takes
+            # the accept as a repeat; anything else is stored beside, never over it.
+            decision = self._gate_decision(
+                node_label, node_text, node_type, node_scope, node_project, caller_project_id, allow_llm=False,
             )
+            holder = self.repository.get_node(decision.target_id) if decision.action in {"duplicate", "enrich"} else None
             if holder is not None and holder.status == "active":
-                verdict = self.memory_dedup.compare(
-                    incoming_features(node_label, node_text), self.memory_dedup.node_features(holder)
+                folded = self._fold_into_existing(
+                    holder,
+                    {
+                        "label": node_label, "text": node_text, "type": node_type, "scope": node_scope,
+                        "project_id": node_project, "confidence": confidence,
+                        "source": "memory_candidate", "source_type": candidate.get("source_type") or "",
+                    },
+                    decision,
                 )
-                if verdict.action in {"duplicate", "enrich"} and self.memory_dedup_settings()["mode"] == "auto":
-                    verdict.target_id, verdict.target_label = holder.id, str(holder.label or "")
-                    folded = self._fold_into_existing(
-                        holder,
-                        {
-                            "label": node_label, "text": node_text, "type": node_type, "scope": node_scope,
-                            "project_id": node_project, "confidence": confidence,
-                            "source": "memory_candidate", "source_type": candidate.get("source_type") or "",
-                        },
-                        verdict,
-                    )
-                    candidate["status"] = "promoted"
-                    candidate["promoted_node_id"] = holder.id
-                    candidate["promoted_at"] = utc_now()
-                    candidate["metadata"] = {**dict(candidate.get("metadata") or {}), "dedup_merged": True}
-                    candidate = self.repository.update_memory_candidate(candidate)
-                    if refresh_duplicates:
-                        self._schedule_candidate_duplicate_refresh(candidate)
-                    return {"candidate": candidate, "memory": folded}
-                id_salt = content_salt(node_text)
+                candidate["status"] = "promoted"
+                candidate["promoted_node_id"] = holder.id
+                candidate["promoted_at"] = utc_now()
+                candidate["metadata"] = {**dict(candidate.get("metadata") or {}), "dedup_merged": True}
+                candidate = self.repository.update_memory_candidate(candidate)
+                if refresh_duplicates:
+                    self._schedule_candidate_duplicate_refresh(candidate)
+                return {"candidate": candidate, "memory": folded}
+            if not decision.details.get("suggested_action"):
+                # Value updates and contradictions are linked by revisions, not by an accept.
+                decision = DedupDecision()
+            if caller_project_id is not None:
+                id_salt = self._caller_id_salt(
+                    node_type, node_label, node_scope, node_project, None, node_text, caller_project_id
+                )
+            else:
+                id_salt = self._label_collision_salt(node_type, node_label, node_scope, node_project, None, node_text)
         metadata = self.memory_lifecycle.seed_metadata(
             node_type=node_type,
             created_at=created_at,
@@ -180,6 +184,9 @@ class IngestionCandidatesMixin:
         )
         # Lifecycle already seeded — initialize_node is a no-op write skip.
         node = self.memory_lifecycle.initialize_node(node, "promoted_candidate")
+        if decision.near_id:
+            # Stored beside a node the caller does not own (or mode=suggest): flag it for review.
+            node, _ = self._apply_dedup_relation(node, decision, {"source": "memory_candidate"}, caller_project_id)
         if nodes_snapshot is not None:
             nodes_snapshot.append(node)
         self.graph_auto_linker.link_node(

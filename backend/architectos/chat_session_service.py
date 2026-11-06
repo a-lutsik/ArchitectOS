@@ -1085,7 +1085,7 @@ class ChatSessionServiceMixin:
         if meta.get("revision"):
             # Human fact updates stay in Review for explicit accept → SUPERSEDES.
             return None
-        if self._auto_accept_near_duplicate(candidate):
+        if self._auto_accept_near_duplicate(candidate, caller_project_id):
             return None
         meta["auto_accepted"] = True
         candidate["metadata"] = meta
@@ -1096,7 +1096,7 @@ class ChatSessionServiceMixin:
             _LOG.warning("chat auto-accept failed for %s: %s", candidate.get("id"), exc)
             return None
 
-    def _auto_accept_near_duplicate(self, candidate: dict[str, Any]) -> bool:
+    def _auto_accept_near_duplicate(self, candidate: dict[str, Any], caller_project_id: str | None = None) -> bool:
         """Block auto-write when the atom restates or nearly restates an existing node."""
         meta = dict(candidate.get("metadata") or {})
         if meta.get("revision"):
@@ -1104,12 +1104,13 @@ class ChatSessionServiceMixin:
             return False
         scope = str(candidate.get("scope") or "project")
         try:
-            decision = self._dedup_decide(
+            decision = self._gate_decision(
                 str(candidate.get("label") or ""),
                 str(candidate.get("text") or ""),
                 str(candidate.get("type") or "Lesson"),
                 scope,
                 self._memory_project_id_for_scope(scope, candidate.get("project_id")),
+                caller_project_id,
                 allow_llm=False,
             )
         except Exception:  # noqa: BLE001 - never fail a chat/MCP turn on dedup

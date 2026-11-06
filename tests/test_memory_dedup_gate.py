@@ -7,11 +7,14 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from http import HTTPStatus
 from typing import Any
 
 from backend.architectos.mcp_server import MemoryMCPServer
-from backend.architectos.memory_dedup import MemoryDedupGate, fact_features, stem
+from backend.architectos.memory_dedup import MemoryDedupGate, content_salt, fact_features, stem
 from backend.architectos.models import MemoryNode, owned_by
+from backend.architectos.sdk import ArchitectOS
+from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
 
 
@@ -328,6 +331,294 @@ class AuthorOwnershipTests(unittest.TestCase):
         for module in modules:
             with self.subTest(module=module):
                 self.assertEqual(pattern.findall((backend / f"{module}.py").read_text(encoding="utf-8")), [])
+
+
+
+def http_handler(service: ArchitectOSService) -> tuple[ArchitectOSHandler, list[dict[str, Any]]]:
+    """A request handler without a socket: route methods run as-is, replies are collected."""
+
+    class TestHandler(ArchitectOSHandler):
+        pass
+
+    TestHandler.service = service
+    handler = TestHandler.__new__(TestHandler)
+    replies: list[dict[str, Any]] = []
+    handler._json = lambda payload, status=HTTPStatus.OK: replies.append(payload)
+    return handler, replies
+
+
+class CallerProjectGateTests(unittest.TestCase):
+    """With a caller project the gate changes only nodes that project owns."""
+
+    # action -> (type, label, stored text, incoming text)
+    FACTS = {
+        "update": ("Constraint", "Лимит API", "Лимит запросов 5000 в час", "Лимит запросов 9000 в час"),
+        "enrich": ("Decision", "Деплой", "Деплой через GitHub Actions", "Деплой через GitHub Actions на каждый push в main ветку"),
+        "duplicate": ("Decision", "Кэш", "Мы используем Redis для кэша", "Для кэша мы используем Redis"),
+    }
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.service = ArchitectOSService(self.root)
+        self.repo = self.service.repository
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _mcp_add(self, project_id: str, node_type: str, label: str, text: str, scope: str = "shared") -> dict[str, Any]:
+        written = mcp_call(self.root, project_id, "memory_add", {"label": label, "text": text, "type": node_type, "scope": scope})
+        self.assertNotIn("error", written)
+        return written
+
+    def _add(self, caller: str | None, label: str, text: str, node_type: str = "Decision", **extra: Any) -> dict[str, Any]:
+        payload = {"label": label, "text": text, "type": node_type, "scope": "shared", "project_id": caller or "architectos", **extra}
+        return self.service.add_memory(payload, caller_project_id=caller)
+
+    def _snapshot(self, node_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        node = self.repo.get_node(node_id)
+        assert node is not None
+        return node.to_dict(), self.repo.list_memory_events(node_id)
+
+    def _set_status(self, node_id: str, status: str) -> None:
+        node = self.repo.get_node(node_id)
+        assert node is not None
+        node.status = status
+        self.repo.upsert_node(node)
+
+    def _edge_types(self, source: str, target: str) -> set[str]:
+        return {edge.type for edge in self.repo.list_edges_touching([source]) if edge.source == source and edge.target == target}
+
+    def _shared_id(self, node_type: str, label: str, salt: str = "") -> str:
+        return self.repo.memory_node_id(node_type, label, "shared", None, None, salt)
+
+    def _assert_beside(self, old_id: str, text: str, written: dict[str, Any], caller: str = "project_a") -> MemoryNode:
+        """The new fact is the caller's own active node; the node it does not own is untouched."""
+        self.assertFalse(written.get("dedup_held"))
+        self.assertNotEqual(written["id"], old_id)
+        node = self.repo.get_node(written["id"])
+        assert node is not None
+        self.assertEqual((node.status, node.text, node.author_project_id), ("active", text, caller))
+        return node
+
+    def test_shared_fact_of_another_project_is_not_rewritten(self) -> None:
+        for action, (node_type, label, stored, incoming) in self.FACTS.items():
+            with self.subTest(action=action):
+                old = self._mcp_add("project_b", node_type, label, stored)
+                before = self._snapshot(old["id"])
+                new = self._mcp_add("project_a", node_type, label, incoming)
+
+                self.assertEqual(self._snapshot(old["id"]), before)
+                self.assertEqual(new["dedup"]["action"], "new")
+                self.assertEqual(new["dedup"]["details"]["suggested_action"], action)
+                created = self._assert_beside(old["id"], incoming, new)
+                self.assertEqual(created.id, self._shared_id(node_type, label, content_salt(f"project_a\n{incoming}")))
+                self.assertEqual(created.metadata["possible_duplicate_of"], old["id"])
+                self.assertEqual(created.metadata["dedup_suggestion"]["target_id"], old["id"])
+                self.assertEqual(self._edge_types(new["id"], old["id"]), set())
+
+    def test_legacy_shared_node_without_an_author_belongs_to_no_project(self) -> None:
+        for caller in ("project_a", "architectos"):
+            for action, (node_type, label, stored, incoming) in self.FACTS.items():
+                with self.subTest(caller=caller, action=action):
+                    label = f"{label} {caller}"
+                    old = self._add(None, label, stored, node_type)
+                    before = self._snapshot(old["id"])
+                    new = self._mcp_add(caller, node_type, label, incoming)
+                    self.assertEqual(new["dedup"]["details"]["suggested_action"], action)
+                    self._assert_beside(old["id"], incoming, new, caller)
+                    self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_own_project_nodes_are_still_superseded_and_enriched(self) -> None:
+        for scope in ("project", "shared"):
+            for action, (node_type, label, stored, incoming) in self.FACTS.items():
+                with self.subTest(scope=scope, action=action):
+                    label = f"{label} {scope}"
+                    old = self._mcp_add("project_a", node_type, label, stored, scope)
+                    new = self._mcp_add("project_a", node_type, label, incoming, scope)
+                    kept = self.repo.get_node(old["id"])
+                    assert kept is not None
+                    self.assertEqual(new["dedup"]["action"], action)
+                    if action == "update":
+                        self.assertEqual(kept.metadata.get("superseded_by"), new["id"])
+                        self.assertTrue(kept.metadata.get("invalid_at"))
+                        self.assertIn("SUPERSEDES", self._edge_types(new["id"], old["id"]))
+                    else:
+                        self.assertEqual(new["id"], old["id"])
+                        self.assertEqual(kept.metadata.get("dedup_hits"), 1)
+                        self.assertEqual(kept.text, incoming if action == "enrich" else stored)
+
+    def test_without_caller_project_the_gate_rewrites_shared_nodes_as_before(self) -> None:
+        for action, (node_type, label, stored, incoming) in self.FACTS.items():
+            with self.subTest(action=action):
+                old = self._mcp_add("project_b", node_type, label, stored)
+                new = self.service.add_memory({"label": label, "text": incoming, "type": node_type, "scope": "shared", "project_id": "project_a"})
+                kept = self.repo.get_node(old["id"])
+                assert kept is not None
+                self.assertEqual(new["dedup"]["action"], action)
+                if action == "update":
+                    self.assertEqual(kept.metadata.get("superseded_by"), new["id"])
+                else:
+                    self.assertTrue(new["dedup_merged"])
+                    self.assertEqual(kept.text, incoming if action == "enrich" else stored)
+
+    def test_inactive_node_of_another_project_never_blocks_or_changes(self) -> None:
+        text = "Deploys always run through GitHub Actions."
+        for status in ("archived", "deleted"):
+            for repeat in ("same", "other"):
+                with self.subTest(status=status, repeat=repeat):
+                    label = f"Deploy rule {status} {repeat}"
+                    old = self._mcp_add("project_b", "Decision", label, text)
+                    self._set_status(old["id"], status)
+                    before = self._snapshot(old["id"])
+                    incoming = text if repeat == "same" else "Deploys now run through ArgoCD on every merge."
+                    written = self._mcp_add("project_a", "Decision", label, incoming)
+                    self.assertEqual(written["dedup"]["action"], "new")
+                    self._assert_beside(old["id"], incoming, written)
+                    self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_repeats_after_a_foreign_near_duplicate_fold_into_one_own_node(self) -> None:
+        node_type, label, stored, incoming = self.FACTS["duplicate"]
+        old = self._mcp_add("project_b", node_type, label, stored)
+        before = self._snapshot(old["id"])
+        written = [self._mcp_add("project_a", node_type, label, incoming) for _ in range(3)]
+        self.assertEqual({item["id"] for item in written}, {written[0]["id"]})
+        own = self.repo.get_node(written[0]["id"])
+        assert own is not None
+        self.assertEqual((own.author_project_id, own.metadata.get("dedup_hits")), ("project_a", 2))
+        self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_archive_and_readd_cycles_reuse_one_id(self) -> None:
+        text = "Shared lint config lives in tools/lint.toml."
+        for slot in ("free", "foreign_active", "foreign_archived"):
+            with self.subTest(slot=slot):
+                label = f"Lint config {slot}"
+                if slot != "free":
+                    old = self._mcp_add("project_b", "Decision", label, "Lint runs on every pull request.")
+                    if slot == "foreign_archived":
+                        self._set_status(old["id"], "archived")
+                ids = set()
+                for _ in range(12):
+                    written = self._add("project_a", label, text)
+                    ids.add(written["id"])
+                    self._set_status(written["id"], "archived")
+                expected = self._shared_id("Decision", label, "" if slot == "free" else content_salt(f"project_a\n{text}"))
+                self.assertEqual(ids, {expected})
+
+    def test_secret_never_reaches_the_id_and_repeats_find_one_node(self) -> None:
+        raw = "CI deploy uses token: ghs_deploykey and rotates it monthly."
+        redacted = "CI deploy uses [REDACTED] and rotates it monthly."
+        for extras in ({}, {"dedup": False}):
+            with self.subTest(dedup=extras.get("dedup", True)):
+                label = f"CI token {len(extras)}"
+                self._mcp_add("project_b", "Decision", label, "CI runs on every push to main.")
+                ids = {self._add("project_a", label, text, **extras)["id"] for text in (raw, raw, redacted)}
+                self.assertEqual(len(ids), 1)
+                stored = self.repo.get_node(ids.pop())
+                assert stored is not None
+                self.assertEqual(stored.text, redacted)
+                self.assertEqual(stored.id, self._shared_id("Decision", label, content_salt(f"project_a\n{stored.text}")))
+        # Without a caller the label-collision salt hashes the redacted text too.
+        self._add(None, "CI token ui", "CI runs on every push to main.")
+        written = self._add(None, "CI token ui", raw)
+        self.assertEqual(written["id"], self._shared_id("Decision", "CI token ui", content_salt(redacted)))
+
+    def test_inactive_or_different_fact_under_the_label_never_blocks_a_new_fact(self) -> None:
+        cases = {
+            # (stored text, status of the stored node, incoming text, payload extras)
+            "archived_same_fact": ("Deploys always run through GitHub Actions.", "archived", "Deploys always run through GitHub Actions.", {}),
+            "archived_other_fact": ("Deploys run through Jenkins nightly.", "archived", "Deploys now run through ArgoCD on every merge.", {}),
+            "active_other_fact_dedup_off": ("Releases ship every second Tuesday.", "active", "Hotfixes may ship any weekday after QA sign-off.", {"dedup": False}),
+        }
+        for name, (stored, status, incoming, extras) in cases.items():
+            for path in ("add_memory", "bulk"):
+                with self.subTest(case=name, path=path):
+                    label = f"Rule {name} {path}"
+                    old = self._mcp_add("project_b", "Decision", label, stored)
+                    self._set_status(old["id"], status)
+                    before = self._snapshot(old["id"])
+                    item = {"label": label, "text": incoming, "type": "Decision", **extras}
+                    written_ids = []
+                    for _ in range(2):
+                        if path == "add_memory":
+                            written = self._add("project_a", label, incoming, **extras)
+                        else:
+                            bulk = self.service.add_memory_bulk({"project_id": "project_a", "scope": "shared", "items": [item]}, caller_project_id="project_a")
+                            self.assertEqual(bulk["stats"]["errors"], 0)
+                            written = self.repo.get_node(bulk["results"][0]["id"]).to_dict()
+                        self._assert_beside(old["id"], incoming, written)
+                        written_ids.append(written["id"])
+                    self.assertEqual(written_ids[0], written_ids[1])
+                    self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_bulk_and_split_writes_keep_the_callers_project(self) -> None:
+        node_type, label, stored, incoming = self.FACTS["update"]
+        old = self._add(None, label, stored, node_type, project_id="project_b")
+        before = self._snapshot(old["id"])
+        bulk = mcp_call(self.root, "project_a", "memory_add_bulk", {"scope": "shared", "items": [{"label": label, "text": incoming, "type": node_type}]})
+        self.assertEqual(bulk["stats"]["superseded"], 0)
+        self.assertEqual(self._snapshot(old["id"]), before)
+        # Two durable lines: add_memory_from_agent splits them into one write each.
+        limit = self._mcp_add("project_b", "Constraint", "API limit", "The API rate limit must stay at 5000 requests per hour.")
+        limit_before = self._snapshot(limit["id"])
+        split = self._mcp_add(
+            "project_a", "Constraint", "API limit",
+            "- The API rate limit must stay at 9000 requests per hour.\n- Deploys must always run through GitHub Actions on every push.",
+        )
+        self.assertTrue(split["also_created"])
+        self.assertEqual(split["dedup"]["details"]["suggested_action"], "update")
+        self.assertEqual(self._snapshot(limit["id"]), limit_before)
+
+    def test_http_and_sdk_writes_with_a_project_keep_it(self) -> None:
+        node_type, label, stored, incoming = self.FACTS["update"]
+        old = self._mcp_add("project_b", node_type, label, stored)
+        before = self._snapshot(old["id"])
+        handler, replies = http_handler(self.service)
+        handler._post_memory(None, {}, {"label": label, "text": incoming, "type": node_type, "scope": "shared", "project_id": "project_a"})
+        self.assertEqual(replies[0]["dedup"]["details"]["suggested_action"], "update")
+        self.assertEqual(replies[0]["author_project_id"], "project_a")
+        added = ArchitectOS(self.root).add("Лимит запросов 7000 в час", label=label, type=node_type, project_id="project_c", scope="shared")
+        self.assertEqual(added["author_project_id"], "project_c")
+        self.assertNotEqual(added["id"], old["id"])
+        self.assertEqual(self._snapshot(old["id"]), before)
+
+    def _candidate(self, cid: str, project_id: str, label: str, text: str, node_type: str = "Decision") -> None:
+        self.repo.upsert_memory_candidate({
+            "id": cid, "project_id": project_id, "source_type": "mcp", "source_ref": f"{cid}.md",
+            "label": label, "type": node_type, "scope": "shared", "text": text, "status": "candidate", "metadata": {},
+        })
+
+    def test_promote_does_not_fold_into_another_projects_node(self) -> None:
+        existing = self._mcp_add("project_b", "Decision", "Архитектура", "Сервер и UI работают локально")
+        before = self._snapshot(existing["id"])
+        self._candidate("cand-a", "project_a", "Архитектура", "Локально работают сервер и UI")
+        self._candidate("cand-none", "project_a", "Архитектура", "сервер и UI работают локально.")
+        beside = self.service.promote_memory_candidate("cand-a", caller_project_id="project_a")
+        self.assertEqual(self._snapshot(existing["id"]), before)
+        self.assertEqual(beside["candidate"]["status"], "promoted")
+        node = self._assert_beside(existing["id"], "Локально работают сервер и UI", beside["memory"])
+        self.assertEqual(node.metadata["possible_duplicate_of"], existing["id"])
+        # Without a caller project (internal promote) the fold works as before.
+        folded = self.service.promote_memory_candidate("cand-none")
+        self.assertEqual(folded["memory"]["id"], existing["id"])
+        self.assertTrue(folded["memory"]["dedup_merged"])
+
+    def test_promote_beside_an_archived_node_of_another_project(self) -> None:
+        old = self._mcp_add("project_b", "Decision", "Архитектура", "Сервер и UI работают локально")
+        self._set_status(old["id"], "archived")
+        before = self._snapshot(old["id"])
+        self._candidate("cand-a", "project_a", "Архитектура", "Сервер и UI работают локально")
+        promoted = self.service.promote_memory_candidate("cand-a", caller_project_id="project_a")
+        self.assertEqual(promoted["candidate"]["status"], "promoted")
+        self._assert_beside(old["id"], "Сервер и UI работают локально", promoted["memory"])
+        self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_promote_folds_into_the_callers_own_shared_node(self) -> None:
+        own = self._mcp_add("project_a", "Decision", "Архитектура", "Сервер и UI работают локально")
+        self._candidate("cand-a", "project_a", "Архитектура", "Локально работают сервер и UI")
+        folded = self.service.promote_memory_candidate("cand-a", caller_project_id="project_a")
+        self.assertEqual(folded["memory"]["id"], own["id"])
+        self.assertEqual(folded["candidate"]["promoted_node_id"], own["id"])
 
 
 if __name__ == "__main__":

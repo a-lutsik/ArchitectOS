@@ -34,7 +34,7 @@ from .memory_ingestion import (
     _token_set,
     _token_similarity,
 )
-from .models import utc_now
+from .models import owned_by, utc_now
 from .source_service import SourceRegistryMixin
 from .storage import sanitize_text
 
@@ -396,11 +396,12 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
 
         dedup_enabled = payload.get("dedup", True) is not False and not _force_new
         decision = (
-            self._dedup_decide(label, text, node_type, scope, project_id)
+            self._gate_decision(label, text, node_type, scope, project_id, caller_project_id)
             if dedup_enabled
             else DedupDecision()
         )
         if decision.action in {"duplicate", "enrich"}:
+            # The gate only targets nodes owned by the caller project.
             existing = self.repository.get_node(decision.target_id)
             if existing is not None and existing.status == "active":
                 return self._fold_into_existing(existing, payload, decision)
@@ -409,11 +410,12 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         interface_id = payload.get("interface_id")
         # Node ids derive from type+scope+label, so a second, different fact
         # under an existing label used to replace the first one in place.
-        id_salt = (
-            self._label_collision_salt(node_type, label, scope, project_id, interface_id, text)
-            if dedup_enabled or _force_new
-            else ""
-        )
+        if caller_project_id is not None:
+            id_salt = self._caller_id_salt(node_type, label, scope, project_id, interface_id, text, caller_project_id)
+        elif dedup_enabled or _force_new:
+            id_salt = self._label_collision_salt(node_type, label, scope, project_id, interface_id, text)
+        else:
+            id_salt = ""
         node = self.repository.add_node(
             node_type,
             label,
@@ -437,7 +439,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             )
         except Exception as exc:  # history is best-effort, never blocks ingestion
             _LOG.warning("memory created event skipped: %s", exc)
-        node, event_id = self._apply_dedup_relation(node, decision, payload)
+        node, event_id = self._apply_dedup_relation(node, decision, payload, caller_project_id)
         self.graph_auto_linker.link_node(node, payload.get("project_id") or "architectos")
         result = node.to_dict()
         if dedup_enabled:
@@ -565,12 +567,78 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         if decision.action == "new":
             decision = self._dedup_gray_zone(decision, label, text, node_type, scope, project_id, settings, allow_llm)
         if settings["mode"] == "suggest" and decision.action != "new":
-            return DedupDecision(
-                near_id=decision.target_id,
-                near_score=max(decision.score, decision.near_score),
-                details={**decision.details, "suggested_action": decision.action, "suggested_reason": decision.reason},
-            )
+            return self._dedup_suggestion(decision)
         return decision
+
+    # Gate actions that change the target node (fold, enrich, SUPERSEDES).
+    _REWRITING_DEDUP_ACTIONS = frozenset({"duplicate", "enrich", "update"})
+
+    def _gate_decision(
+        self,
+        label: str,
+        text: str,
+        node_type: str,
+        scope: str,
+        project_id: str | None,
+        caller_project_id: str | None,
+        *,
+        allow_llm: bool = True,
+    ) -> DedupDecision:
+        """``_dedup_decide`` for a write under ``caller_project_id``: rewrite only owned nodes.
+
+        Without a caller project this is ``_dedup_decide`` as is. With one, a
+        duplicate / enrich / update of a node the caller does not own is set
+        aside and the index is asked again without it, so the caller's own node
+        wins when there is one. When none is left, the new node is stored
+        beside the first such node with a ``dedup_suggestion`` pointing at it.
+        A contradiction may still be linked: CONTRADICTS does not change its target.
+        """
+        if caller_project_id is None:
+            return self._dedup_decide(label, text, node_type, scope, project_id, allow_llm=allow_llm)
+        settings = self.memory_dedup_settings()
+        if settings["mode"] == "off":
+            return DedupDecision()
+        excluded: set[str] = set()
+        foreign: DedupDecision | None = None
+        decision = self.memory_dedup.classify(label, text, node_type, scope, project_id)
+        while decision.action in self._REWRITING_DEDUP_ACTIONS and not self._dedup_target_owned(decision, caller_project_id):
+            foreign = foreign or decision
+            excluded.add(decision.target_id)
+            decision = self.memory_dedup.classify(label, text, node_type, scope, project_id, exclude_ids=excluded)
+        if decision.action == "new":
+            decision = self._dedup_gray_zone(decision, label, text, node_type, scope, project_id, settings, allow_llm)
+            if decision.action != "new" and not self._dedup_target_owned(decision, caller_project_id):
+                foreign = foreign or decision
+                decision = DedupDecision(near_id=decision.near_id, near_score=decision.near_score)
+        if foreign is not None and decision.action == "new":
+            _LOG.info(
+                "dedup gate stores a new node beside %s (%s) not owned by project=%s",
+                foreign.target_id, foreign.action, caller_project_id,
+            )
+            return self._dedup_suggestion(foreign)
+        if settings["mode"] == "suggest" and decision.action != "new":
+            return self._dedup_suggestion(decision)
+        return decision
+
+    def _dedup_target_owned(self, decision: DedupDecision, caller_project_id: str | None) -> bool:
+        """Whether the gate may change ``decision``'s target for ``caller_project_id``."""
+        target = self.repository.get_node(decision.target_id) if decision.target_id else None
+        owned = target is None or owned_by(target, caller_project_id)
+        if not owned:
+            _LOG.debug(
+                "dedup %s target %s (project=%s author=%s) is not owned by project=%s",
+                decision.action, decision.target_id, target.project_id, target.author_project_id, caller_project_id,
+            )
+        return owned
+
+    @staticmethod
+    def _dedup_suggestion(decision: DedupDecision) -> DedupDecision:
+        """A ``new`` decision that records the gate's verdict for review instead of applying it."""
+        return DedupDecision(
+            near_id=decision.target_id,
+            near_score=max(decision.score, decision.near_score),
+            details={**decision.details, "suggested_action": decision.action, "suggested_reason": decision.reason},
+        )
 
     def _dedup_gray_zone(
         self,
@@ -734,10 +802,57 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         existing = self.repository.get_node(existing_id)
         if existing is None or existing.status != "active":
             return ""
-        return content_salt(text)
+        # Stored text is redacted: the salt never hashes a secret.
+        return content_salt(sanitize_text(text)[0])
+
+    def _caller_id_salt(
+        self,
+        node_type: str,
+        label: str,
+        scope: str,
+        project_id: str | None,
+        interface_id: Any,
+        text: str,
+        caller_project_id: str,
+    ) -> str:
+        """Id salt of a node written under ``caller_project_id``; never lands on a node it does not own.
+
+        The plain label id is used when it is free or holds the caller's own
+        inactive node (revived in place); a second fact beside the caller's own
+        active node gets the content salt; a node the caller does not own, of
+        any status, moves the write to an id salted with the caller project.
+        Salts hash the redacted text, so a repeat with or without the secret
+        lands on the same node.
+        """
+        def occupant(salt: str) -> Any:
+            return self.repository.get_node(self.repository.memory_node_id(node_type, label, scope, project_id, interface_id, salt))
+
+        holder = occupant("")
+        if holder is None:
+            return ""
+        redacted = sanitize_text(text)[0]
+        if owned_by(holder, caller_project_id):
+            if holder.status != "active":
+                return ""
+            # A projectless write may have taken the content-salted id of the same text.
+            salt = content_salt(redacted)
+            holder = occupant(salt)
+            if holder is None or owned_by(holder, caller_project_id):
+                return salt
+        _LOG.debug(
+            "id of node %s (project=%s author=%s status=%s) is not owned by project=%s; salting with the caller",
+            holder.id, holder.project_id, holder.author_project_id, holder.status, caller_project_id,
+        )
+        salt = content_salt(f"{caller_project_id}\n{redacted}")
+        holder = occupant(salt)
+        if holder is not None and not owned_by(holder, caller_project_id):
+            # Only a projectless write of a crafted text lands here; refuse rather than overwrite.
+            _LOG.warning("caller-salted id %s is held by a node outside project=%s; write refused", holder.id, caller_project_id)
+            raise ValueError(f"memory id is taken by a node outside project {caller_project_id}")
+        return salt
 
     def _apply_dedup_relation(
-        self, node: Any, decision: DedupDecision, payload: dict[str, Any]
+        self, node: Any, decision: DedupDecision, payload: dict[str, Any], caller_project_id: str | None = None
     ) -> tuple[Any, str]:
         """Link a freshly created node to the fact it updates or contradicts."""
         target_id = decision.target_id
@@ -752,7 +867,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                     "type": edge_type,
                     "scope": node.scope,
                     "confidence": 0.9 if decision.action == "update" else 0.8,
-                })
+                }, project_id=caller_project_id)
                 edge_id = str((edge.get("edge") or {}).get("id") or "")
             except ValueError as exc:
                 _LOG.warning("dedup %s edge skipped: %s", edge_type, exc)
