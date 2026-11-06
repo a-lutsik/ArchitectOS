@@ -125,29 +125,31 @@ class MemoryLifecycleEngine:
             return {"refreshed": 0, "promoted": 0}
         refreshed = 0
         promoted = 0
-        for node_id in dict.fromkeys(node_ids):
-            node = self.repository.get_node(node_id)
-            if not node or node.status != "active":
-                continue
-            node = self.initialize_node(node, reason)
-            metadata = dict(node.metadata or {})
-            metadata["access_count"] = int(metadata.get("access_count") or 0) + 1
-            metadata["last_accessed_at"] = utc_now()
-            metadata["last_refresh_reason"] = reason
-            if metadata.get("memory_tier") != "long_term":
-                metadata["lifecycle_state"] = "fresh"
-            if metadata.get("memory_tier") != "long_term" and self._should_promote(node, metadata, settings):
-                metadata["memory_tier"] = "long_term"
-                metadata["lifecycle_state"] = "stable"
-                metadata["decay_enabled"] = False
-                metadata["retention_policy"] = "keep"
-                metadata["promoted_to_long_term_at"] = utc_now()
-                promoted += 1
-            metadata["memory_score"] = self._score(node, metadata, settings)
-            node.metadata = metadata
-            # Metadata-only bump (label/text unchanged): skip embedding reindex.
-            self.repository.upsert_node(node, notify=False)
-            refreshed += 1
+        # One transaction for the whole batch: read-modify-write stays atomic, and a
+        # connection plus a commit per hit cost a search more than the ranking itself.
+        with self.repository.transaction():
+            for node in self.repository.list_nodes_by_ids(list(dict.fromkeys(node_ids))):
+                if node.status != "active":
+                    continue
+                node = self.initialize_node(node, reason)
+                metadata = dict(node.metadata or {})
+                metadata["access_count"] = int(metadata.get("access_count") or 0) + 1
+                metadata["last_accessed_at"] = utc_now()
+                metadata["last_refresh_reason"] = reason
+                if metadata.get("memory_tier") != "long_term":
+                    metadata["lifecycle_state"] = "fresh"
+                if metadata.get("memory_tier") != "long_term" and self._should_promote(node, metadata, settings):
+                    metadata["memory_tier"] = "long_term"
+                    metadata["lifecycle_state"] = "stable"
+                    metadata["decay_enabled"] = False
+                    metadata["retention_policy"] = "keep"
+                    metadata["promoted_to_long_term_at"] = utc_now()
+                    promoted += 1
+                metadata["memory_score"] = self._score(node, metadata, settings)
+                node.metadata = metadata
+                # Metadata-only bump (label/text unchanged): skip embedding reindex.
+                self.repository.upsert_node(node, notify=False)
+                refreshed += 1
         return {"refreshed": refreshed, "promoted": promoted}
 
     def promote_long_term(self, node_id: str, reason: str = "manual") -> dict[str, Any]:
