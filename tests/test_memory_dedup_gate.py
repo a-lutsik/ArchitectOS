@@ -1,12 +1,17 @@
 """Stage 1 dedup gate: one classifier for every memory write path."""
 from __future__ import annotations
 
+import io
+import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+from backend.architectos.mcp_server import MemoryMCPServer
 from backend.architectos.memory_dedup import MemoryDedupGate, fact_features, stem
+from backend.architectos.models import MemoryNode, owned_by
 from backend.architectos.service import ArchitectOSService
 
 
@@ -241,6 +246,88 @@ class GateWritePathTests(unittest.TestCase):
         fresh = dict(update, label="Шрифт", text="Интерфейс использует шрифт Inter")
         self.assertTrue(self.service._auto_accept_near_duplicate(update))
         self.assertFalse(self.service._auto_accept_near_duplicate(fresh))
+
+
+def mcp_call(root: Path, project_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """One MCP tools/call on a server bound to ``project_id``; returns the tool's JSON data."""
+    server = MemoryMCPServer(root, project_id=project_id)
+    message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
+    stdout = io.StringIO()
+    server.serve(stdin=io.StringIO(json.dumps(message) + "\n"), stdout=stdout)
+    result = json.loads(stdout.getvalue().splitlines()[0])["result"]
+    if result["isError"]:
+        return {"error": result["content"][0]["text"]}
+    return json.loads(result["content"][0]["text"].split("```json", 1)[1].rsplit("```", 1)[0])
+
+
+class AuthorOwnershipTests(unittest.TestCase):
+    """Shared/global nodes record the project that wrote them; only that project owns them."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.service = ArchitectOSService(self.root)
+        self.repo = self.service.repository
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _shared(self, project_id: str, label: str, text: str) -> dict[str, Any]:
+        return mcp_call(self.root, project_id, "memory_add", {"label": label, "text": text, "type": "Decision", "scope": "shared"})
+
+    def test_shared_write_records_its_author_under_the_plain_id(self) -> None:
+        written = self._shared("project_a", "Lint config", "Shared lint config lives in tools/lint.toml.")
+        node = self.repo.get_node(written["id"])
+        assert node is not None
+        self.assertEqual((node.project_id, node.author_project_id), (None, "project_a"))
+        self.assertEqual(node.id, self.repo.memory_node_id("Decision", "Lint config", "shared", None, None))
+        self.assertEqual(MemoryNode.from_dict(node.to_dict()).author_project_id, "project_a")
+        seen = mcp_call(self.root, "project_b", "memory_get", {"id": node.id})
+        self.assertNotIn("error", seen)
+        self.assertEqual(seen["id"], node.id)
+
+    def test_project_nodes_belong_to_their_project_and_legacy_shared_ones_to_none(self) -> None:
+        own = MemoryNode(id="n1", type="Lesson", label="l", scope="project", text="t", project_id="project_a")
+        authored = MemoryNode(id="n2", type="Lesson", label="l", scope="shared", text="t", author_project_id="project_a")
+        legacy = MemoryNode(id="n3", type="Lesson", label="l", scope="shared", text="t")
+        self.assertEqual([owned_by(node, "project_a") for node in (own, authored, legacy)], [True, True, False])
+        self.assertEqual([owned_by(node, "project_b") for node in (own, authored, legacy)], [False, False, False])
+        self.assertEqual([owned_by(node, None) for node in (own, authored, legacy)], [True, True, True])
+
+    def test_only_the_author_may_supersede_a_shared_node(self) -> None:
+        old = self._shared("project_a", "Lint config", "Shared lint config lives in tools/lint.toml.")
+        newer = self._shared("project_a", "Lint config v2", "Shared lint config moved to tools/lint/ruff.toml.")
+        legacy = self.service.add_memory({"label": "Legacy rule", "text": "Legacy shared rule without an author.", "type": "Decision", "scope": "shared"})
+        legacy_node = self.repo.get_node(legacy["id"])
+        assert legacy_node is not None
+        self.assertIsNone(legacy_node.author_project_id)
+
+        refused = mcp_call(self.root, "project_b", "memory_link", {"source": newer["id"], "target": old["id"], "type": "SUPERSEDES"})
+        self.assertIn("target must belong to project project_b", refused["error"])
+        for project_id in ("project_a", "project_b"):
+            with self.subTest(legacy_for=project_id):
+                refused = mcp_call(self.root, project_id, "memory_link", {"source": newer["id"], "target": legacy["id"], "type": "SUPERSEDES"})
+                self.assertIn("target must belong to project", refused["error"])
+        stored = self.repo.get_node(old["id"])
+        assert stored is not None
+        self.assertNotIn("superseded_by", stored.metadata)
+
+        linked = mcp_call(self.root, "project_a", "memory_link", {"source": newer["id"], "target": old["id"], "type": "SUPERSEDES"})
+        self.assertNotIn("error", linked)
+        stored = self.repo.get_node(old["id"])
+        assert stored is not None
+        self.assertEqual(stored.metadata.get("superseded_by"), newer["id"])
+        # Without a caller project (UI) the legacy node may still be superseded as before.
+        self.service.create_graph_edge({"source": newer["id"], "target": legacy["id"], "type": "SUPERSEDES"})
+        self.assertTrue(self.repo.get_node(legacy["id"]).metadata.get("invalid_at"))
+
+    def test_ownership_is_compared_only_through_owned_by(self) -> None:
+        modules = ("graph_service", "ingestion_service", "ingestion_candidates", "chat_session_service")
+        pattern = re.compile(r"\b(?:project_id|author_project_id)\s*(?:==|!=)\s*\w*(?:caller|project)")
+        backend = Path(__file__).resolve().parents[1] / "backend" / "architectos"
+        for module in modules:
+            with self.subTest(module=module):
+                self.assertEqual(pattern.findall((backend / f"{module}.py").read_text(encoding="utf-8")), [])
 
 
 if __name__ == "__main__":

@@ -841,16 +841,17 @@ class MemoryMCPServer:
         return _tool_result(summary, data)
 
     def _tool_add(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = self._write_project_id(args)
         node = self.service.add_memory_from_agent({
             "label": args.get("label"),
             "text": args.get("text"),
             "type": args.get("type") or "Lesson",
             "scope": args.get("scope") or "project",
-            "project_id": self._write_project_id(args),
+            "project_id": project_id,
             "confidence": args.get("confidence"),
             "source_id": args.get("source_id"),
             "source": "mcp",
-        })
+        }, caller_project_id=project_id)
         extras = [item for item in (node.get("also_created") or []) if item]
         dedup = dict(node.get("dedup") or {})
         action = str(dedup.get("action") or "")
@@ -895,14 +896,15 @@ class MemoryMCPServer:
         raw_items: Any = args.get("items")
         if not isinstance(raw_items, list) or not raw_items:
             raise _RpcError(INVALID_PARAMS, "items must be a non-empty list")
+        project_id = self._write_project_id(args)
         result = self.service.add_memory_bulk({
             "items": raw_items,
-            "project_id": self._write_project_id(args),
+            "project_id": project_id,
             "scope": args.get("scope"),
             "source_id": args.get("source_id"),
             "type": args.get("type"),
             "source": "mcp",
-        })
+        }, caller_project_id=project_id)
         stats = result.get("stats") or {}
         summary = (
             f'Bulk stored {stats.get("created", 0)} memor(y/ies)'

@@ -95,7 +95,14 @@ class IngestionCandidatesMixin:
         nodes_snapshot: list[Any] | None = None,
         project_root_cache: dict[str, Any] | None = None,
         refresh_duplicates: bool = True,
+        caller_project_id: str | None = None,
     ) -> dict[str, Any]:
+        """Write a reviewed candidate as a memory node.
+
+        ``caller_project_id`` is the project the accept runs under (Review accept,
+        batch and auto-accept pass the candidate's project; internal ingestion
+        passes none): the node records it as its author.
+        """
         candidate = self.repository.get_memory_candidate(candidate_id)
         if not candidate:
             raise ValueError("memory candidate not found")
@@ -169,6 +176,7 @@ class IngestionCandidatesMixin:
             confidence,
             metadata,
             id_salt=id_salt,
+            author_project_id=caller_project_id,
         )
         # Lifecycle already seeded — initialize_node is a no-op write skip.
         node = self.memory_lifecycle.initialize_node(node, "promoted_candidate")
@@ -534,6 +542,7 @@ class IngestionCandidatesMixin:
                         nodes_snapshot=nodes_snapshot,
                         project_root_cache=project_root_cache,
                         refresh_duplicates=False,
+                        caller_project_id=str(candidate.get("project_id") or "").strip() or None,
                     )
                     memory = result.get("memory") or {}
                     memory_id = memory.get("id")

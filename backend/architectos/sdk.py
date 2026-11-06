@@ -48,7 +48,7 @@ class ArchitectOS:
             "type": type,
             "project_id": project_id or "architectos",
             "scope": scope,
-        })
+        }, caller_project_id=project_id or None)
 
     def capture_turn(
         self,

@@ -389,6 +389,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
         metadata: dict[str, Any] | None = None,
         source_id: str | None = None,
         id_salt: str = "",
+        author_project_id: str | None = None,
     ) -> MemoryNode:
         clean_text, redacted = sanitize_text(text)
         clean_label, label_redacted = sanitize_text(label)
@@ -408,6 +409,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
             metadata=dict(metadata or {}),
             created_at=now,
             updated_at=now,
+            author_project_id=author_project_id,
         )
         if source_id:
             node.metadata.setdefault("source_id", source_id)

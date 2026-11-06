@@ -370,11 +370,16 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
 
     NEAR_DUPLICATE_SIMILARITY = MemoryDedupGate.NEAR_DUPLICATE_SIMILARITY
 
-    def add_memory(self, payload: dict[str, Any], *, _force_new: bool = False) -> dict[str, Any]:
+    def add_memory(
+        self, payload: dict[str, Any], *, _force_new: bool = False, caller_project_id: str | None = None
+    ) -> dict[str, Any]:
         """Store one fact through the dedup gate (see ``memory_dedup``).
 
         ``_force_new`` skips the gate but still avoids overwriting a node that
-        holds the same label (used by undo).
+        holds the same label (used by undo). ``caller_project_id`` is the
+        project the request runs under (MCP, SDK, HTTP with a project, agent
+        capture; ``None`` for the UI and internal callers): the new node records
+        it as its author, and the gate changes only nodes ``owned_by`` it.
         """
         label = str(payload.get("label") or "").strip()
         text = str(payload.get("text") or "").strip()
@@ -420,6 +425,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             {"source": str(payload.get("source") or "ui"), "source_type": str(payload.get("source_type") or payload.get("source") or "manual")},
             source_id=source_id,
             id_salt=id_salt,
+            author_project_id=caller_project_id,
         )
         node = self.memory_lifecycle.initialize_node(node, "ui")
         try:
@@ -440,27 +446,27 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 result["dedup"]["event_id"] = event_id
         return result
 
-    def add_memory_from_agent(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def add_memory_from_agent(self, payload: dict[str, Any], *, caller_project_id: str | None = None) -> dict[str, Any]:
         """Persist an explicit MCP memory_add, splitting multi-fact blobs into nodes."""
         from .chat_memory import facts_from_memory_blob
 
         facts = facts_from_memory_blob(str(payload.get("text") or ""))
         if len(facts) < 2:
-            return self.add_memory(payload)
+            return self.add_memory(payload, caller_project_id=caller_project_id)
         created: list[dict[str, Any]] = []
         for index, fact in enumerate(facts):
             item = dict(payload)
             item["text"] = fact["text"]
             item["type"] = fact["type"]
             item["label"] = str(payload.get("label") or "").strip() if index == 0 else fact["text"][:72]
-            created.append(self.add_memory(item))
+            created.append(self.add_memory(item, caller_project_id=caller_project_id))
         primary = dict(created[0])
         primary["also_created"] = [node.get("id") for node in created[1:] if node.get("id")]
         return primary
 
     BULK_ADD_MAX_ITEMS = 200
 
-    def add_memory_bulk(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def add_memory_bulk(self, payload: dict[str, Any], *, caller_project_id: str | None = None) -> dict[str, Any]:
         """Store a batch of memory nodes in one call (News→Event-style pipelines).
 
         Each item goes through the regular ``add_memory`` path (redaction,
@@ -490,7 +496,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 stats["errors"] += 1
                 continue
             try:
-                node = self.add_memory({**defaults, **item})
+                node = self.add_memory({**defaults, **item}, caller_project_id=caller_project_id)
             except Exception as exc:  # noqa: BLE001 - per-item isolation is the contract
                 results.append({"index": index, "status": "error", "error": str(exc)})
                 stats["errors"] += 1

@@ -493,7 +493,9 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
         self._json(self.get_service().discover_sources_from_mcp(payload), HTTPStatus.CREATED)
 
     def _post_memory(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
-        self._json(self.get_service().add_memory(payload), HTTPStatus.CREATED)
+        # A write that names a project runs under it; without one it is a plain UI write.
+        caller_project_id = str(payload.get("project_id") or "").strip() or None
+        self._json(self.get_service().add_memory(payload, caller_project_id=caller_project_id), HTTPStatus.CREATED)
 
     def _post_memory_dedup_preview(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().preview_memory_dedup(payload))
@@ -588,7 +590,15 @@ class ArchitectOSHandler(SimpleHTTPRequestHandler):
         self._json(self.get_service().promote_memory_long_term(match.group("memory_id"), payload), HTTPStatus.CREATED)
 
     def _post_memory_candidate_promote(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
-        self._json(self.get_service().promote_memory_candidate(match.group("candidate_id"), payload), HTTPStatus.CREATED)
+        service = self.get_service()
+        candidate_id = match.group("candidate_id")
+        # Accept runs under the candidate's own project; another project cannot accept it.
+        candidate = service.repository.get_memory_candidate(candidate_id) or {}
+        caller_project_id = str(candidate.get("project_id") or "").strip() or None
+        requested = str(payload.get("project_id") or "").strip()
+        if requested and requested != caller_project_id:
+            raise ValueError(f"memory candidate belongs to project {caller_project_id}, not {requested}")
+        self._json(service.promote_memory_candidate(candidate_id, payload, caller_project_id=caller_project_id), HTTPStatus.CREATED)
 
     def _post_memory_candidate_reject(self, match: re.Match[str], query: dict[str, list[str]], payload: dict[str, Any]) -> None:
         self._json(self.get_service().reject_memory_candidate(match.group("candidate_id"), payload), HTTPStatus.CREATED)

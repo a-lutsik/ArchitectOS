@@ -63,7 +63,8 @@ class ChatSessionServiceMixin:
         if not chat:
             raise ValueError("chat not found")
         chat = dict(chat)
-        actual_project_id = str(chat.get("project_id") or project_id or "architectos")
+        caller_project_id = str(chat.get("project_id") or project_id or "").strip() or None
+        actual_project_id = caller_project_id or "architectos"
         life = self.memory_lifecycle.settings()
         policy = self.memory_capture_settings()
         mode = policy["chat_memory_mode"]
@@ -149,6 +150,7 @@ class ChatSessionServiceMixin:
                     facts,
                     mode=mode,
                     trigger=trigger,
+                    caller_project_id=caller_project_id,
                 )
                 if not atoms and summary.get("has_facts"):
                     candidate = {
@@ -189,7 +191,7 @@ class ChatSessionServiceMixin:
                     {"trigger": trigger, "revision": revision},
                 )
             elif saved:
-                promoted = self._maybe_auto_accept_chat_candidate(saved, policy)
+                promoted = self._maybe_auto_accept_chat_candidate(saved, policy, caller_project_id=caller_project_id)
                 if promoted and promoted.get("memory"):
                     self._record_keeper_event(
                         actual_project_id,
@@ -296,6 +298,7 @@ class ChatSessionServiceMixin:
         source_type: str = "chat",
         template: str = "chat_session_atom",
         id_kind: str = "chat_session_atom",
+        caller_project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """One candidate per durable fact, not one blob for the whole chat.
 
@@ -354,7 +357,7 @@ class ChatSessionServiceMixin:
             saved = self.repository.upsert_memory_candidate(prepared[0])
             if not saved:
                 continue
-            promoted = self._maybe_auto_accept_chat_candidate(saved, policy)
+            promoted = self._maybe_auto_accept_chat_candidate(saved, policy, caller_project_id=caller_project_id)
             if promoted and promoted.get("memory"):
                 saved = self.repository.get_memory_candidate(str(saved.get("id") or "")) or saved
                 self._record_keeper_event(
@@ -931,7 +934,8 @@ class ChatSessionServiceMixin:
         event, which ``memory_capture_stats`` aggregates.
         """
         started = time.perf_counter()
-        actual_project_id = str(project_id or self.project_id_for_path(cwd) or "architectos")
+        caller_project_id = str(project_id or self.project_id_for_path(cwd) or "").strip() or None
+        actual_project_id = caller_project_id or "architectos"
         user = str(user_text or "").strip()
         assistant = str(assistant_text or "").strip()
         packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
@@ -960,6 +964,7 @@ class ChatSessionServiceMixin:
                 source_type="mcp",
                 template="mcp_turn_atom",
                 id_kind="mcp_turn_atom",
+                caller_project_id=caller_project_id,
             )
         queued = [item for item in atoms if str(item.get("status") or "") == "candidate"]
         accepted = [item for item in atoms if str(item.get("status") or "") == "promoted"]
@@ -1044,7 +1049,13 @@ class ChatSessionServiceMixin:
             known_hits=known_hits, chat_id=chat_id, trigger=trigger, policy=policy,
         )
 
-    def _maybe_auto_accept_chat_candidate(self, candidate: dict[str, Any] | None, settings: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    def _maybe_auto_accept_chat_candidate(
+        self,
+        candidate: dict[str, Any] | None,
+        settings: dict[str, Any] | None = None,
+        *,
+        caller_project_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """Write an extracted fact at once when the capture policy is ``auto``.
 
         Requires a fact template, source_ref and confidence ≥
@@ -1080,7 +1091,7 @@ class ChatSessionServiceMixin:
         candidate["metadata"] = meta
         self.repository.update_memory_candidate(candidate)
         try:
-            return self.promote_memory_candidate(str(candidate.get("id") or ""))
+            return self.promote_memory_candidate(str(candidate.get("id") or ""), caller_project_id=caller_project_id)
         except Exception as exc:  # noqa: BLE001 - auto-accept must never break the chat turn
             _LOG.warning("chat auto-accept failed for %s: %s", candidate.get("id"), exc)
             return None
