@@ -711,5 +711,121 @@ class CallerProjectGateTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in replies[1]["results"]], ["held"])
         self.assertEqual(self._snapshot(existing["id"]), before)
 
+class CallerProjectMatrixTests(unittest.TestCase):
+    """Every write entry under a caller project × every kind of node already holding the fact."""
+
+    TEXT = "Deploys always run through GitHub Actions on every push."
+    # Same content words, not the same wording: a near duplicate, never held.
+    OTHER = "On every push deploys always run through GitHub Actions."
+    ENTRIES = ("mcp_add", "mcp_bulk", "http", "sdk", "promote", "batch", "auto_accept")
+    CASES = ("own_active", "own_archived", "foreign_exact", "foreign_other", "foreign_archived", "legacy_exact")
+
+    def _fresh_store(self) -> None:
+        """One store per cell: candidates or nodes of another cell must not take part."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.service = ArchitectOSService(self.root)
+        self.repo = self.service.repository
+
+    def _view(self, node_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        node = self.repo.get_node(node_id)
+        assert node is not None
+        return node.to_dict(), self.repo.list_memory_events(node_id)
+
+    def _write(self, entry: str, label: str, text: str) -> dict[str, Any]:
+        """Write as project_a through ``entry``; returns {"id", "held", "candidate"} (id None when nothing landed)."""
+        item = {"label": label, "text": text, "type": "Decision"}
+        if entry == "mcp_add":
+            written = mcp_call(self.root, "project_a", "memory_add", {**item, "scope": "shared"})
+            return {"id": written["id"], "held": written["dedup_held"]}
+        if entry == "mcp_bulk":
+            bulk = mcp_call(self.root, "project_a", "memory_add_bulk", {"scope": "shared", "items": [item]})
+            return {"id": bulk["results"][0]["id"], "held": bulk["results"][0]["status"] == "held"}
+        if entry == "http":
+            handler, replies = http_handler(self.service)
+            handler._post_memory(None, {}, {**item, "scope": "shared", "project_id": "project_a"})
+            return {"id": replies[0]["id"], "held": bool(replies[0].get("dedup_held"))}
+        if entry == "sdk":
+            added = ArchitectOS(self.root).add(text, label=label, type="Decision", project_id="project_a", scope="shared")
+            return {"id": added["id"], "held": bool(added.get("dedup_held"))}
+        cid = f"cand-{entry}-{label}"
+        self.repo.upsert_memory_candidate({
+            "id": cid, "project_id": "project_a", "source_type": "mcp", "source_ref": "turn-1", "label": label,
+            "type": "Decision", "scope": "shared", "text": text, "status": "candidate", "confidence": 0.95,
+            "metadata": {"template": "mcp_turn_atom", "kind": "project"},
+        })
+        if entry == "promote":
+            handler, replies = http_handler(self.service)
+            handler._post_memory_candidate_promote(re.match(r"(?P<candidate_id>.+)", cid), {}, {})
+        elif entry == "batch":
+            handler, replies = http_handler(self.service)
+            handler._post_memory_candidates_batch(None, {}, {"project_id": "project_a", "action": "accept", "status": "candidate"})
+        else:
+            self.service._maybe_auto_accept_chat_candidate(self.repo.get_memory_candidate(cid), caller_project_id="project_a")
+        candidate = self.repo.get_memory_candidate(cid)
+        held = bool(candidate["metadata"].get("dedup_held_by"))
+        node_id = candidate.get("promoted_node_id") or candidate["metadata"].get("dedup_held_by") or None
+        return {"id": node_id, "held": held, "candidate": candidate}
+
+    def _seed(self, case: str, label: str) -> str:
+        text = self.OTHER if case == "foreign_other" else self.TEXT
+        if case == "legacy_exact":
+            return self.service.add_memory({"label": label, "text": text, "type": "Decision", "scope": "shared"})["id"]
+        owner = "project_a" if case.startswith("own") else "project_b"
+        node_id = mcp_call(self.root, owner, "memory_add", {"label": label, "text": text, "type": "Decision", "scope": "shared"})["id"]
+        if case.endswith("archived"):
+            node = self.repo.get_node(node_id)
+            node.status = "archived"
+            self.repo.upsert_node(node)
+        return node_id
+
+    def test_matrix(self) -> None:
+        for case in self.CASES:
+            for entry in self.ENTRIES:
+                with self.subTest(case=case, entry=entry):
+                    self._fresh_store()
+                    label = "Deploy pipeline"
+                    seeded = self._seed(case, label)
+                    before = self._view(seeded)
+                    nodes_before = len(self.repo.list_nodes())
+                    result = self._write(entry, label, self.TEXT)
+                    stored = self.repo.get_node(seeded)
+                    if case.startswith("own"):
+                        self.assertFalse(result["held"])
+                        if case == "own_active" and entry == "auto_accept":
+                            # A repeat of a stored fact stays in review rather than auto-writing.
+                            self.assertEqual(result["candidate"]["status"], "candidate")
+                            self.assertEqual(self._view(seeded), before)
+                            continue
+                        self.assertEqual(result["id"], seeded)
+                        self.assertEqual(stored.status, "active")
+                        if case == "own_active":
+                            self.assertEqual(stored.metadata.get("dedup_hits"), 1)
+                        continue
+                    # Never changed by a project that does not own it.
+                    self.assertEqual(self._view(seeded), before)
+                    if case in {"foreign_exact", "legacy_exact"}:
+                        self.assertTrue(result["held"])
+                        self.assertEqual(result["id"], seeded)
+                        self.assertEqual(len(self.repo.list_nodes()), nodes_before)
+                        if "candidate" in result:
+                            self.assertEqual(result["candidate"]["status"], "rejected")
+                            self.assertFalse(result["candidate"].get("promoted_node_id"))
+                            self.assertNotIn("auto_accepted", result["candidate"]["metadata"])
+                        continue
+                    self.assertFalse(result["held"])
+                    if case == "foreign_other" and entry == "auto_accept":
+                        # A near duplicate (even of another project's fact) stays in review.
+                        self.assertEqual(result["candidate"]["status"], "candidate")
+                        continue
+                    self.assertNotEqual(result["id"], seeded)
+                    created = self.repo.get_node(result["id"])
+                    self.assertEqual((created.status, created.author_project_id), ("active", "project_a"))
+                    self.assertEqual(created.id, self.repo.memory_node_id("Decision", label, "shared", None, None, content_salt(f"project_a\n{self.TEXT}")))
+                    if case == "foreign_other":
+                        self.assertEqual(created.metadata.get("possible_duplicate_of"), seeded)
+                        self.assertEqual(created.metadata["dedup_suggestion"]["target_id"], seeded)
+
 if __name__ == "__main__":
     unittest.main()
