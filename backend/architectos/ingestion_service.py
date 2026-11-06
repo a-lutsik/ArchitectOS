@@ -628,9 +628,8 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 break
             excluded.add(target.id)
             decision = self.memory_dedup.classify(label, text, node_type, scope, project_id, exclude_ids=excluded)
-        if decision.action in self._REWRITING_DEDUP_ACTIONS:
-            held = None  # the caller's own node takes the write
-        elif held is not None:
+        # A target the caller owns takes the write even when a foreign copy holds the fact.
+        if held is not None and decision.action not in self._REWRITING_DEDUP_ACTIONS:
             _LOG.info("dedup gate held a write: node %s already holds the fact, not owned by project=%s", held.id, caller_project_id)
             return DedupDecision(), held
         if decision.action == "new":
