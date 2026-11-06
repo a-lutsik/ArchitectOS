@@ -23,15 +23,12 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
@@ -132,9 +129,12 @@ _REGISTRATIONS: dict[str, tuple[tuple[str, str, int], ...]] = {
 }
 
 
-@dataclass(frozen=True)
-class HookTurn:
-    """One normalized agent event, independent of which client produced it."""
+class HookTurn(NamedTuple):
+    """One normalized agent event, independent of which client produced it.
+
+    A NamedTuple rather than a dataclass: dataclasses pulls in inspect, ~20 ms
+    of import on every hook run.
+    """
 
     client: str
     event: str
@@ -360,6 +360,32 @@ def runtime_endpoint(root: Path | None = None) -> tuple[str, str] | None:
     return url.rstrip("/"), token
 
 
+def _exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+    """One HTTP/1.0 request to the app's loopback server: (status, response body).
+
+    The app serves plain HTTP on 127.0.0.1 and closes the connection after each
+    reply, so a socket is all the hook needs; urllib.request would add ~45 ms of
+    imports (http.client, email, ssl) to every agent turn.
+    """
+    authority, _, path = url.split("://", 1)[-1].partition("/")
+    host, _, port = authority.rpartition(":")
+    lines = [
+        f"{'GET' if body is None else 'POST'} /{path} HTTP/1.0",
+        f"Host: {authority}",
+        f"X-ArchitectOS-Token: {token}",
+        "Connection: close",
+    ]
+    if body is not None:
+        lines += ["Content-Type: application/json", f"Content-Length: {len(body)}"]
+    chunks: list[bytes] = []
+    with socket.create_connection((host or "127.0.0.1", int(port or 80)), timeout=timeout) as conn:
+        conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b""))
+        while chunk := conn.recv(65536):
+            chunks.append(chunk)
+    head, _, reply = b"".join(chunks).partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), reply
+
+
 def _request_json(
     url: str,
     token: str,
@@ -374,25 +400,23 @@ def _request_json(
     unreachable app means the event surely went nowhere.
     """
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
-    request.add_header("X-ArchitectOS-Token", token)
-    if data:
-        request.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
+        status, body = _exchange(url, token, data, timeout)
+    except TimeoutError as exc:
         _debug(f"http failed: {exc}", root)
+        _LOG.warning("hook request timed out after %.1fs: %s", timeout, url.split("?", 1)[0])
+        return None, "timeout"
+    except OSError as exc:
+        _debug(f"http failed: {exc}", root)
+        return None, "unreachable"
+    except (ValueError, IndexError) as exc:
+        _debug(f"http failed: malformed reply ({exc})", root)
         return None, "error"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-        failure = "timeout" if isinstance(reason, TimeoutError) else "unreachable"
-        _debug(f"http failed: {exc}", root)
-        if failure == "timeout":
-            _LOG.warning("hook request timed out after %.1fs: %s", timeout, urllib.parse.urlsplit(url).path)
-        return None, failure
+    if status >= 400:
+        _debug(f"http failed: HTTP {status}", root)
+        return None, "error"
     try:
-        parsed = json.loads(body)
+        parsed = json.loads(body.decode("utf-8"))
     except ValueError:
         return None, "error"
     return (parsed, "") if isinstance(parsed, dict) else (None, "error")
@@ -436,7 +460,9 @@ def _send_turn(
     if endpoint:
         url, token = endpoint
         if turn.event == EVENT_SESSION:
-            query = urllib.parse.urlencode({"cwd": turn.cwd}) if turn.cwd else ""
+            from urllib.parse import urlencode  # only the session briefing needs it; keep prompt turns lean
+
+            query = urlencode({"cwd": turn.cwd}) if turn.cwd else ""
             result, failure = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait, root=root)
         else:
             payload = {
@@ -728,7 +754,7 @@ def handle_capture(
         include_stable, exclude_ids = session.plan_prompt(turn.cwd)
         capture = False
     elif session is not None and turn.event == EVENT_RESPONSE:
-        turn = replace(turn, user_text=session.take_prompt(turn.cwd))
+        turn = turn._replace(user_text=session.take_prompt(turn.cwd))
     if session is not None and turn.event == EVENT_PROMPT and not turn.can_inject:
         result, transport = None, "deferred"  # nothing to inject; the question waits for turn end
     else:

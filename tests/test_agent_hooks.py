@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
-import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -98,14 +98,14 @@ def _seed(service: ArchitectOSService, project_id: str, count: int, word: str = 
 class HookTimeoutTests(unittest.TestCase):
     def _timeouts(self, env: dict[str, str]) -> dict[str, float]:
         seen: dict[str, float] = {}
+        events = iter(("session", "prompt", "response"))
 
-        def fake_urlopen(request: urllib.request.Request, timeout: float) -> object:
-            body = json.loads(request.data or b"{}")
-            seen["session" if "briefing" in request.full_url else ("response" if body.get("assistant_text") else "prompt")] = timeout
-            raise urllib.error.URLError(ConnectionRefusedError("app closed"))
+        def refuse(address: tuple[str, int], timeout: float) -> object:
+            seen[next(events)] = timeout
+            raise ConnectionRefusedError("app closed")
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {**env, "ARCHITECTOS_HOOK_OFFLINE": "0"}), \
-                mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+                mock.patch.object(socket, "create_connection", side_effect=refuse):
             root = Path(tmp)
             (root / "data").mkdir()
             (root / "data" / "architectos.runtime.json").write_text(
@@ -206,14 +206,11 @@ class HookBudgetTests(unittest.TestCase):
         self.assertGreaterEqual(len(open_floor["hits"]), 1)
 
     def test_hook_prompt_asks_the_server_for_the_hook_pack(self) -> None:
-        sent: list[dict[str, object]] = []
-
-        def fake_urlopen(request: urllib.request.Request, timeout: float) -> object:
-            sent.append(json.loads(request.data or b"{}"))
-            raise urllib.error.URLError(ConnectionRefusedError("app closed"))
+        connection = mock.MagicMock()
+        connection.__enter__.return_value.recv.return_value = b""
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_OFFLINE": "0"}), \
-                mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+                mock.patch.object(socket, "create_connection", return_value=connection):
             root = Path(tmp)
             (root / "data").mkdir()
             (root / "data" / "architectos.runtime.json").write_text(
@@ -223,7 +220,9 @@ class HookBudgetTests(unittest.TestCase):
                 json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": self.QUESTION, "cwd": str(root)}),
                 client="claude", event="prompt", root=root,
             )
-        self.assertIs(sent[0]["hook"], True)
+        request = connection.__enter__.return_value.sendall.call_args.args[0]
+        self.assertTrue(request.startswith(b"POST /api/memory/turn HTTP/1.0"))
+        self.assertIs(json.loads(request.split(b"\r\n\r\n", 1)[1])["hook"], True)
 
 
 class _RunningApp:
