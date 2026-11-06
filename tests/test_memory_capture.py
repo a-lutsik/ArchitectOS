@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from backend.architectos.chat_session_service import nearest_rank
 from backend.architectos.memory_capture import (
@@ -15,6 +16,7 @@ from backend.architectos.memory_capture import (
     legacy_mirror,
     normalize_capture_settings,
 )
+from backend.architectos.memory_dedup import DedupDecision
 from backend.architectos.service import ArchitectOSService
 
 DECISION = "Architecture decision: never commit directly to main."
@@ -266,6 +268,138 @@ class CapturePolicyServiceTests(unittest.TestCase):
             ).fetchall()
         self.assertIn("idx_keeper_events_status", " ".join(str(row[-1]) for row in plan))
 
+
+class CallerProjectCaptureTests(unittest.TestCase):
+    """Auto-accept runs the gate under the project the capture ran under."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.service = ArchitectOSService(Path(self._tmp.name))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _promote_callers(self, run: Any) -> list[str | None]:
+        service = self.service
+        with mock.patch.object(service, "promote_memory_candidate", wraps=service.promote_memory_candidate) as promote:
+            run()
+        self.assertTrue(promote.called)
+        return [call.kwargs.get("caller_project_id") for call in promote.call_args_list]
+
+    # Retrieval (memory_turn packs context first) records reads on the hits it returns.
+    _READ_KEYS = frozenset({"access_count", "last_accessed_at", "memory_score", "last_refresh_reason"})
+
+    def _gate_view(self, node_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """A node and its events as the dedup gate could change them (retrieval read stats left out)."""
+        node = self.service.repository.get_node(node_id).to_dict()
+        node["metadata"] = {key: value for key, value in node["metadata"].items() if key not in self._READ_KEYS}
+        node.pop("updated_at")
+        return node, self.service.repository.list_memory_events(node_id)
+
+    def _statuses(self, project_id: str) -> set[str]:
+        return {str(event.get("status")) for event in self.service.repository.list_keeper_events(project_id=project_id, limit=200)}
+
+    def test_turn_auto_accept_passes_the_callers_project_to_promote(self) -> None:
+        callers = self._promote_callers(lambda: self.service.capture_memory_turn(DECISION, project_id="project_a"))
+        self.assertEqual(set(callers), {"project_a"})
+
+    def test_unbound_turn_has_no_caller_project(self) -> None:
+        turns: list[dict[str, Any]] = []
+        callers = self._promote_callers(lambda: turns.append(self.service.capture_memory_turn(DECISION)))
+        self.assertEqual(set(callers), {None})
+        self.assertEqual(turns[0]["project_id"], "architectos")
+
+    def test_ask_chat_finalize_passes_the_chat_project(self) -> None:
+        def finalize() -> None:
+            chat = self.service.post_chat_message({"project_id": "project_a", "message": DECISION, "provider_id": "local-memory"})
+            self.service.finalize_chat_session(chat["chat"]["id"], force=True, trigger="manual")
+
+        self.assertEqual(set(self._promote_callers(finalize)), {"project_a"})
+
+    def test_held_auto_accept_writes_and_queues_nothing(self) -> None:
+        service = self.service
+        # The gate is stubbed to answer held; the node's text must not flag the atoms as duplicates first.
+        held_node = service.repository.add_node(
+            "Decision", "Release train", "shared", "Release trains leave every second Tuesday.", None, author_project_id="project_b",
+        )
+        before = service.memory_capture_stats(project_id="project_a")["auto_saved"]
+        with (
+            mock.patch.object(service, "_gate_decision", return_value=(DedupDecision(), held_node)),
+            mock.patch.object(service, "promote_memory_candidate") as promote,
+        ):
+            chat = service.post_chat_message({"project_id": "project_a", "message": DECISION, "provider_id": "local-memory"})
+            service.finalize_chat_session(chat["chat"]["id"], force=True, trigger="manual")
+            turn = service.capture_memory_turn("Architecture decision: always squash merge pull requests.", project_id="project_a")
+        promote.assert_not_called()
+        self.assertEqual((turn["auto_accepted"], turn["queued"]), ([], []))
+        self.assertEqual(service.memory_capture_stats(project_id="project_a")["auto_saved"], before)
+        held = service.repository.list_memory_candidates(project_id="project_a", status="rejected", limit=50)
+        self.assertEqual({item["metadata"]["template"] for item in held}, {"chat_session_atom", "mcp_turn_atom"})
+        # Atoms below the auto threshold still queue for review; held ones are neither saved nor queued.
+        logged = {
+            str((event.get("metadata") or {}).get("candidate_id"))
+            for event in service.repository.list_keeper_events(project_id="project_a", limit=200)
+            if event.get("status") in {"auto_accepted", "candidate_created"}
+        }
+        self.assertTrue(logged)
+        self.assertFalse(logged & {item["id"] for item in held})
+        for candidate in held:
+            self.assertEqual(candidate["metadata"]["dedup_held_by"], held_node.id)
+            self.assertNotIn("auto_accepted", candidate["metadata"])
+            with self.assertRaisesRegex(ValueError, "not auto-captured"):
+                service.undo_auto_capture({"candidate_id": candidate["id"]})
+
+    def test_capture_of_a_fact_another_project_stored_saves_nothing(self) -> None:
+        # A user preference is a global (projectless) fact: project_b's copy is not project_a's.
+        service = self.service
+        preference = "I prefer answers in Russian with short bullet lists."
+        stored = service.capture_memory_turn(preference, project_id="project_b")["auto_accepted"]
+        self.assertTrue(stored)
+        node = service.repository.get_node(stored[0]["promoted_node_id"])
+        self.assertEqual(node.author_project_id, "project_b")
+        snapshot = self._gate_view(node.id)
+        nodes_before = len(service.repository.list_nodes())
+        before = service.memory_capture_stats(project_id="project_a")["auto_saved"]
+        turn = service.capture_memory_turn(preference, project_id="project_a")
+        self.assertEqual(turn["auto_accepted"], [])
+        self.assertEqual(service.memory_capture_stats(project_id="project_a")["auto_saved"], before)
+        self.assertEqual(len(service.repository.list_nodes()), nodes_before)
+        self.assertEqual(self._gate_view(node.id), snapshot)
+
+    def test_failed_auto_accept_stays_an_ordinary_review_candidate(self) -> None:
+        service = self.service
+        with mock.patch.object(service, "promote_memory_candidate", side_effect=ValueError("boom")):
+            turn = service.capture_memory_turn(DECISION, project_id="project_a")
+        self.assertEqual(turn["auto_accepted"], [])
+        self.assertEqual(len(turn["queued"]), 1)
+        candidate = service.repository.get_memory_candidate(turn["queued"][0]["id"])
+        self.assertEqual(candidate["status"], "candidate")
+        self.assertNotIn("auto_accepted", candidate["metadata"])
+        self.assertIn("candidate_created", self._statuses("project_a"))
+        self.assertNotIn("auto_accepted", self._statuses("project_a"))
+
+    def test_failure_after_a_written_auto_accept_keeps_it_undoable(self) -> None:
+        service = self.service
+        with mock.patch.object(service, "_schedule_candidate_duplicate_refresh", side_effect=RuntimeError("refresh failed")):
+            turn = service.capture_memory_turn(DECISION, project_id="project_a")
+        self.assertEqual(len(turn["auto_accepted"]), 1)
+        candidate = service.repository.get_memory_candidate(turn["auto_accepted"][0]["id"])
+        self.assertEqual(candidate["status"], "promoted")
+        self.assertTrue(candidate["metadata"].get("auto_accepted"))
+        self.assertIn("auto_accepted", self._statuses("project_a"))
+        undone = service.undo_auto_capture({"candidate_id": candidate["id"]})
+        self.assertEqual(undone["memory"]["status"], "archived")
+
+    def test_undo_never_archives_a_node_the_project_does_not_own(self) -> None:
+        service = self.service
+        turn = service.capture_memory_turn(DECISION, project_id="project_a")
+        candidate = service.repository.get_memory_candidate(turn["auto_accepted"][0]["id"])
+        foreign = service.repository.add_node("Decision", "Branching", "shared", DECISION, None, author_project_id="project_b")
+        candidate["promoted_node_id"] = foreign.id
+        service.repository.update_memory_candidate(candidate)
+        undone = service.undo_auto_capture({"candidate_id": candidate["id"]})
+        self.assertEqual(undone["candidate"]["status"], "rejected")
+        self.assertEqual(service.repository.get_node(foreign.id).status, "active")
 
 class NearestRankTests(unittest.TestCase):
     def test_nearest_rank_picks_an_observed_value(self) -> None:

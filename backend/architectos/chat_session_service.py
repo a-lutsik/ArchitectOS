@@ -28,7 +28,7 @@ from .chat_memory import (
 )
 from .mcp_server import MCP_BIND_FILENAME, read_mcp_bind_project_id
 from .memory_capture import annotate_fact, auto_threshold, filter_facts_for_policy
-from .models import stable_id, utc_now
+from .models import MemoryNode, owned_by, stable_id, utc_now
 from .usage import estimate_tokens_from_text
 
 _LOG = logging.getLogger("architectos.service")
@@ -192,7 +192,7 @@ class ChatSessionServiceMixin:
                 )
             elif saved:
                 promoted = self._maybe_auto_accept_chat_candidate(saved, policy, caller_project_id=caller_project_id)
-                if promoted and promoted.get("memory"):
+                if self._auto_saved(promoted):
                     self._record_keeper_event(
                         actual_project_id,
                         chat_id,
@@ -201,7 +201,7 @@ class ChatSessionServiceMixin:
                         f"Auto-accepted session summary: {saved.get('label')}",
                         {"candidate_id": saved.get("id"), "node_id": (promoted.get("memory") or {}).get("id"), "trigger": trigger},
                     )
-                else:
+                elif not promoted:
                     self._record_keeper_event(
                         actual_project_id,
                         chat_id,
@@ -358,8 +358,9 @@ class ChatSessionServiceMixin:
             if not saved:
                 continue
             promoted = self._maybe_auto_accept_chat_candidate(saved, policy, caller_project_id=caller_project_id)
-            if promoted and promoted.get("memory"):
+            if promoted:
                 saved = self.repository.get_memory_candidate(str(saved.get("id") or "")) or saved
+            if self._auto_saved(promoted):
                 self._record_keeper_event(
                     project_id,
                     chat_id,
@@ -374,7 +375,7 @@ class ChatSessionServiceMixin:
                         "template": str((saved.get("metadata") or {}).get("template") or "chat_session_atom"),
                     },
                 )
-            else:
+            elif not promoted:
                 self._record_keeper_event(
                     project_id,
                     chat_id,
@@ -811,7 +812,11 @@ class ChatSessionServiceMixin:
         if not meta.get("auto_accepted") or candidate.get("status") != "promoted":
             raise ValueError("candidate was not auto-captured")
         node = self.repository.get_node(str(candidate.get("promoted_node_id") or ""))
-        if node is not None and node.status == "active":
+        caller_project_id = str(candidate.get("project_id") or "").strip() or None
+        if node is not None and node.status == "active" and not owned_by(node, caller_project_id):
+            # A fold into a node the candidate's project does not own: never archive it.
+            _LOG.info("undo of candidate %s leaves node %s (author=%s) outside project=%s", candidate_id, node.id, node.author_project_id, caller_project_id)
+        elif node is not None and node.status == "active":
             node.status = "archived"
             node.metadata["archived_at"] = utc_now()
             node.metadata["archived_reason"] = "auto_capture_undo"
@@ -1085,26 +1090,51 @@ class ChatSessionServiceMixin:
         if meta.get("revision"):
             # Human fact updates stay in Review for explicit accept → SUPERSEDES.
             return None
-        if self._auto_accept_near_duplicate(candidate, caller_project_id):
+        blocked, held = self._auto_accept_verdict(candidate, caller_project_id)
+        if held is not None:
+            # Another project already stored this fact: nothing to write or to review.
+            return self._hold_memory_candidate(candidate, held)
+        if blocked:
             return None
-        meta["auto_accepted"] = True
-        candidate["metadata"] = meta
+        candidate["metadata"] = {**meta, "auto_accepted": True}
         self.repository.update_memory_candidate(candidate)
+        candidate_id = str(candidate.get("id") or "")
         try:
-            return self.promote_memory_candidate(str(candidate.get("id") or ""), caller_project_id=caller_project_id)
+            return self.promote_memory_candidate(candidate_id, caller_project_id=caller_project_id)
         except Exception as exc:  # noqa: BLE001 - auto-accept must never break the chat turn
-            _LOG.warning("chat auto-accept failed for %s: %s", candidate.get("id"), exc)
+            current = self.repository.get_memory_candidate(candidate_id) or candidate
+            if str(current.get("status") or "") == "promoted":
+                # The node is written; only a later step failed. It stays auto-accepted (undoable).
+                _LOG.warning("chat auto-accept of %s wrote node %s, then failed: %s", candidate_id, current.get("promoted_node_id"), exc)
+                node = self.repository.get_node(str(current.get("promoted_node_id") or ""))
+                return {"candidate": current, "memory": node.to_dict() if node else None}
+            _LOG.warning("chat auto-accept failed for %s, left in review: %s", candidate_id, exc)
+            current["metadata"] = {key: value for key, value in dict(current.get("metadata") or {}).items() if key != "auto_accepted"}
+            self.repository.update_memory_candidate(current)
             return None
+
+    @staticmethod
+    def _auto_saved(promoted: dict[str, Any] | None) -> bool:
+        """Whether auto-accept wrote memory: a held candidate is answered too, but rejected."""
+        return bool(promoted and promoted.get("memory")) and str((promoted.get("candidate") or {}).get("status") or "") == "promoted"
 
     def _auto_accept_near_duplicate(self, candidate: dict[str, Any], caller_project_id: str | None = None) -> bool:
         """Block auto-write when the atom restates or nearly restates an existing node."""
+        return self._auto_accept_verdict(candidate, caller_project_id)[0]
+
+    def _auto_accept_verdict(self, candidate: dict[str, Any], caller_project_id: str | None) -> tuple[bool, MemoryNode | None]:
+        """``(blocked, held)``: whether the gate keeps the atom in review, and the node holding it.
+
+        ``held`` is a node another project owns that already states this very
+        fact (only with a caller project); the atom is then neither written nor queued.
+        """
         meta = dict(candidate.get("metadata") or {})
         if meta.get("revision"):
             # Revisions must promote as a new node + SUPERSEDES, not be blocked as near-dups.
-            return False
+            return False, None
         scope = str(candidate.get("scope") or "project")
         try:
-            decision = self._gate_decision(
+            decision, held = self._gate_decision(
                 str(candidate.get("label") or ""),
                 str(candidate.get("text") or ""),
                 str(candidate.get("type") or "Lesson"),
@@ -1114,14 +1144,16 @@ class ChatSessionServiceMixin:
                 allow_llm=False,
             )
         except Exception:  # noqa: BLE001 - never fail a chat/MCP turn on dedup
-            return False
+            return False, None
+        if held is not None:
+            return True, held
         # Duplicates, enrichments, value updates and contradictions stay in
         # review: a person (not an auto-accepted chat turn) decides whether the
         # stored fact changed. So do suggestions and close (lexical or semantic)
         # neighbours.
         if decision.action != "new" or decision.details.get("suggested_action"):
-            return True
-        return bool(decision.near_id) and decision.near_score >= self.memory_dedup.NEAR_DUPLICATE_SIMILARITY
+            return True, None
+        return bool(decision.near_id) and decision.near_score >= self.memory_dedup.NEAR_DUPLICATE_SIMILARITY, None
 
     def _capture_favorite_message_candidate(self, project_id: str, chat_id: str, message_index: int, user_text: str, assistant_text: str) -> dict[str, Any] | None:
         # Explicit ★ save always creates a candidate (opt-in), but still prefer facts when possible.

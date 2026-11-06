@@ -12,7 +12,7 @@ from typing import Any
 
 from .candidate_identity import candidate_origin_key
 from .memory_dedup import DedupDecision
-from .models import utc_now
+from .models import MemoryNode, utc_now
 
 _LOG = logging.getLogger(__name__)
 
@@ -132,9 +132,11 @@ class IngestionCandidatesMixin:
         if interface_id is None:
             # The same fact already stored (and owned by the caller project) takes
             # the accept as a repeat; anything else is stored beside, never over it.
-            decision = self._gate_decision(
+            decision, held = self._gate_decision(
                 node_label, node_text, node_type, node_scope, node_project, caller_project_id, allow_llm=False,
             )
+            if held is not None:
+                return self._hold_memory_candidate(candidate, held, refresh_duplicates=refresh_duplicates)
             holder = self.repository.get_node(decision.target_id) if decision.action in {"duplicate", "enrich"} else None
             if holder is not None and holder.status == "active":
                 folded = self._fold_into_existing(
@@ -209,8 +211,33 @@ class IngestionCandidatesMixin:
             self._schedule_candidate_duplicate_refresh(candidate)
         return {"candidate": candidate, "memory": node.to_dict()}
 
+    def _hold_memory_candidate(
+        self, candidate: dict[str, Any], held: MemoryNode, *, refresh_duplicates: bool = True
+    ) -> dict[str, Any]:
+        """Close a candidate whose fact another project already stored: rejected, nothing written.
+
+        ``dedup_held_by`` names that node; ``promoted_node_id`` stays empty, so
+        ``undo_auto_capture`` never archives it.
+        """
+        candidate["status"] = "rejected"
+        candidate["rejected_at"] = utc_now()
+        candidate["reject_reason"] = "already stored by another project"
+        candidate["metadata"] = {**dict(candidate.get("metadata") or {}), "dedup_held_by": held.id}
+        candidate = self.repository.update_memory_candidate(candidate)
+        _LOG.info(
+            "memory candidate %s of project=%s held by node %s (author=%s)",
+            candidate.get("id"), candidate.get("project_id"), held.id, held.author_project_id,
+        )
+        if refresh_duplicates:
+            self._schedule_candidate_duplicate_refresh(candidate)
+        return {"candidate": candidate, "memory": self._held_duplicate_result(held)}
+
     def _apply_revision_supersede(self, new_node: Any, old_id: str, candidate: dict[str, Any]) -> None:
-        """Link new revision → old via SUPERSEDES and stamp invalid_at on the predecessor."""
+        """Link new revision → old via SUPERSEDES and stamp invalid_at on the predecessor.
+
+        Not checked against the caller project yet (follow-up): revisions come from
+        file sources of the candidate's own project.
+        """
         old = self.repository.get_node(old_id)
         if not old:
             return
@@ -505,6 +532,7 @@ class IngestionCandidatesMixin:
 
         promoted = 0
         rejected = 0
+        held = 0
         skipped = 0
         errors: list[str] = []
         results: list[dict[str, Any]] = []
@@ -552,6 +580,10 @@ class IngestionCandidatesMixin:
                         caller_project_id=str(candidate.get("project_id") or "").strip() or None,
                     )
                     memory = result.get("memory") or {}
+                    if (result.get("candidate") or {}).get("status") != "promoted":
+                        held += 1
+                        results.append({"id": candidate_id, "status": "held", "memory_id": memory.get("id")})
+                        continue
                     memory_id = memory.get("id")
                     if memory_id and by_work_item is not None:
                         work_item_id = str((memory.get("metadata") or {}).get("work_item_id") or "").strip()
@@ -578,7 +610,7 @@ class IngestionCandidatesMixin:
             except Exception as exc:  # noqa: BLE001 - continue batch on single failures
                 errors.append(f"{candidate_id}: {exc}")
 
-        if promoted or rejected:
+        if promoted or rejected or held:
             self._refresh_candidate_duplicate_flags(project_id=project_id)
 
         counts = self.repository.count_memory_candidates_by_status(project_id)
@@ -594,6 +626,7 @@ class IngestionCandidatesMixin:
             "matched": len(selected),
             "promoted": promoted,
             "rejected": rejected,
+            "held": held,
             "skipped": skipped,
             "errors": errors[:50],
             "error_count": len(errors),

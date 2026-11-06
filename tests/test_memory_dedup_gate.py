@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from http import HTTPStatus
 from typing import Any
+from unittest import mock
 
 from backend.architectos.mcp_server import MemoryMCPServer
 from backend.architectos.memory_dedup import MemoryDedupGate, content_salt, fact_features, stem
@@ -620,6 +621,95 @@ class CallerProjectGateTests(unittest.TestCase):
         self.assertEqual(folded["memory"]["id"], own["id"])
         self.assertEqual(folded["candidate"]["promoted_node_id"], own["id"])
 
+
+    def test_exact_restatement_of_another_projects_fact_is_held(self) -> None:
+        cases = {
+            # (stored label, stored text, incoming label, incoming text)
+            "case_and_punctuation": ("Deploy.", "Deploys always run through GitHub Actions.", "deploy", "deploys ALWAYS run through github actions"),
+            "secret_redacted": ("CI token", "CI deploy uses token: ghs_deploykey and rotates it monthly.", "CI token", "CI deploy uses token: ghs_deploykey and rotates it monthly."),
+        }
+        for name, (stored_label, stored, label, incoming) in cases.items():
+            with self.subTest(case=name):
+                old = self._mcp_add("project_b", "Decision", stored_label, stored)
+                before = self._snapshot(old["id"])
+                count = len(self.repo.list_nodes())
+                for _ in range(3):
+                    held = self._mcp_add("project_a", "Decision", label, incoming)
+                    self.assertTrue(held["dedup_held"])
+                    self.assertEqual((held["id"], held["dedup"]["target_id"]), (old["id"], old["id"]))
+                self.assertEqual(len(self.repo.list_nodes()), count)
+                self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_a_held_fact_under_a_salted_id_is_found_through_the_index(self) -> None:
+        self._mcp_add("project_b", "Decision", "Lint config", "Lint runs on every pull request.")
+        text = "Shared lint config lives in tools/lint.toml."
+        salted = self._mcp_add("project_b", "Decision", "Lint config", text)
+        self.assertNotEqual(salted["id"], self._shared_id("Decision", "Lint config"))
+        before = self._snapshot(salted["id"])
+        held = self._mcp_add("project_a", "Decision", "Lint config", text)
+        self.assertTrue(held["dedup_held"])
+        self.assertEqual(held["id"], salted["id"])
+        bulk = mcp_call(self.root, "project_a", "memory_add_bulk", {"scope": "shared", "items": [{"label": "Lint config", "text": text, "type": "Decision"}]})
+        self.assertEqual((bulk["stats"]["held"], bulk["stats"]["created"], bulk["results"][0]["status"]), (1, 0, "held"))
+        self.assertEqual(bulk["results"][0]["id"], salted["id"])
+        self.assertEqual(self._snapshot(salted["id"]), before)
+
+    def test_own_exact_copy_wins_over_a_held_one(self) -> None:
+        text = "Deploys always run through GitHub Actions."
+        foreign = self._mcp_add("project_b", "Decision", "Deploy", text)
+        own = self._add("project_a", "Deploy", text, dedup=False)
+        self.assertNotEqual(own["id"], foreign["id"])
+        before = self._snapshot(foreign["id"])
+        again = self._mcp_add("project_a", "Decision", "Deploy", text)
+        self.assertFalse(again["dedup_held"])
+        self.assertEqual(again["id"], own["id"])
+        self.assertEqual(self.repo.get_node(own["id"]).metadata.get("dedup_hits"), 1)
+        self.assertEqual(self._snapshot(foreign["id"]), before)
+
+    def test_dedup_off_with_a_caller_stores_an_own_copy(self) -> None:
+        text = "Deploys always run through GitHub Actions."
+        foreign = self._mcp_add("project_b", "Decision", "Deploy", text)
+        before = self._snapshot(foreign["id"])
+        self.repo.set_setting("memory_dedup", {"mode": "off"})
+        copies = {self._add("project_a", "Deploy", text)["id"] for _ in range(2)}
+        copies |= {self._add("project_a", "Deploy", text, dedup=False)["id"]}
+        self.assertEqual(copies, {self._shared_id("Decision", "Deploy", content_salt(f"project_a\n{text}"))})
+        self.assertEqual(self._snapshot(foreign["id"]), before)
+
+    def test_promoting_a_held_fact_never_writes_or_overwrites(self) -> None:
+        existing = self._mcp_add("project_b", "Decision", "Архитектура", "Сервер и UI работают локально")
+        before = self._snapshot(existing["id"])
+        count = len(self.repo.list_nodes())
+        for cid, project_id in (("cand-1", "project_a"), ("cand-2", "project_a"), ("cand-3", "project_c")):
+            self._candidate(cid, project_id, "Архитектура", "сервер и UI работают локально.")
+            with self.subTest(candidate=cid):
+                held = self.service.promote_memory_candidate(cid, caller_project_id=project_id)
+                self.assertTrue(held["memory"]["dedup_held"])
+                self.assertEqual(held["memory"]["id"], existing["id"])
+                self.assertEqual(held["candidate"]["status"], "rejected")
+                self.assertEqual(held["candidate"]["metadata"]["dedup_held_by"], existing["id"])
+                self.assertFalse(held["candidate"].get("promoted_node_id"))
+        self.assertEqual(len(self.repo.list_nodes()), count)
+        self.assertEqual(self._snapshot(existing["id"]), before)
+
+    def test_review_accept_and_batch_of_a_held_candidate(self) -> None:
+        existing = self._mcp_add("project_b", "Decision", "Архитектура", "Сервер и UI работают локально")
+        before = self._snapshot(existing["id"])
+        for cid in ("cand-1", "cand-2"):
+            self._candidate(cid, "project_c", "Архитектура", "сервер и UI работают локально.")
+        handler, replies = http_handler(self.service)
+        with self.assertRaisesRegex(ValueError, "belongs to project project_c"):
+            handler._post_memory_candidate_promote(re.match(r"(?P<candidate_id>.+)", "cand-1"), {}, {"project_id": "project_b"})
+        # What Review sends: Accept with an empty body, and Accept-all for the project.
+        handler._post_memory_candidate_promote(re.match(r"(?P<candidate_id>.+)", "cand-1"), {}, {})
+        with mock.patch.object(type(self.service), "_refresh_candidate_duplicate_flags", autospec=True) as refresh:
+            handler._post_memory_candidates_batch(None, {}, {"project_id": "project_c", "action": "accept", "status": "candidate"})
+        refresh.assert_called_once()
+        self.assertEqual(replies[0]["candidate"]["status"], "rejected")
+        self.assertEqual(replies[0]["memory"]["id"], existing["id"])
+        self.assertEqual((replies[1]["held"], replies[1]["promoted"]), (1, 0))
+        self.assertEqual([item["status"] for item in replies[1]["results"]], ["held"])
+        self.assertEqual(self._snapshot(existing["id"]), before)
 
 if __name__ == "__main__":
     unittest.main()

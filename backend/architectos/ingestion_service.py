@@ -34,7 +34,7 @@ from .memory_ingestion import (
     _token_set,
     _token_similarity,
 )
-from .models import owned_by, utc_now
+from .models import MemoryNode, owned_by, utc_now
 from .source_service import SourceRegistryMixin
 from .storage import sanitize_text
 
@@ -395,11 +395,13 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             raise ValueError(f"source not found: {source_id}")
 
         dedup_enabled = payload.get("dedup", True) is not False and not _force_new
-        decision = (
+        decision, held = (
             self._gate_decision(label, text, node_type, scope, project_id, caller_project_id)
             if dedup_enabled
-            else DedupDecision()
+            else (DedupDecision(), None)
         )
+        if held is not None:
+            return self._held_duplicate_result(held)
         if decision.action in {"duplicate", "enrich"}:
             # The gate only targets nodes owned by the caller project.
             existing = self.repository.get_node(decision.target_id)
@@ -490,7 +492,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             if payload.get(key) is not None
         }
         results: list[dict[str, Any]] = []
-        stats = {"created": 0, "deduplicated": 0, "enriched": 0, "superseded": 0, "conflicts": 0, "errors": 0}
+        stats = {"created": 0, "deduplicated": 0, "held": 0, "enriched": 0, "superseded": 0, "conflicts": 0, "errors": 0}
         ids: list[str] = []
         for index, item in enumerate(items):
             if not isinstance(item, dict):
@@ -503,7 +505,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 results.append({"index": index, "status": "error", "error": str(exc)})
                 stats["errors"] += 1
                 continue
-            status = "deduplicated" if node.get("dedup_merged") else "created"
+            status = "held" if node.get("dedup_held") else "deduplicated" if node.get("dedup_merged") else "created"
             stats[status] += 1
             action = str((node.get("dedup") or {}).get("action") or "")
             if action == "update":
@@ -583,31 +585,44 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         caller_project_id: str | None,
         *,
         allow_llm: bool = True,
-    ) -> DedupDecision:
-        """``_dedup_decide`` for a write under ``caller_project_id``: rewrite only owned nodes.
+    ) -> tuple[DedupDecision, MemoryNode | None]:
+        """``_dedup_decide`` for a write under ``caller_project_id``: ``(decision, held)``.
 
         Without a caller project this is ``_dedup_decide`` as is. With one, a
         duplicate / enrich / update of a node the caller does not own is set
         aside and the index is asked again without it, so the caller's own node
-        wins when there is one. When none is left, the new node is stored
-        beside the first such node with a ``dedup_suggestion`` pointing at it.
-        A contradiction may still be linked: CONTRADICTS does not change its target.
+        wins when there is one. Otherwise, in mode ``auto``, an exact
+        restatement of such an active node is ``held``: the fact is already in
+        memory and nothing is written. Any other such match stores the new node
+        beside the first one with a ``dedup_suggestion`` pointing at it. A
+        contradiction may still be linked: CONTRADICTS does not change its target.
         """
         if caller_project_id is None:
-            return self._dedup_decide(label, text, node_type, scope, project_id, allow_llm=allow_llm)
+            return self._dedup_decide(label, text, node_type, scope, project_id, allow_llm=allow_llm), None
         settings = self.memory_dedup_settings()
         if settings["mode"] == "off":
-            return DedupDecision()
+            return DedupDecision(), None
         excluded: set[str] = set()
         foreign: DedupDecision | None = None
+        held: MemoryNode | None = None
         decision = self.memory_dedup.classify(label, text, node_type, scope, project_id)
-        while decision.action in self._REWRITING_DEDUP_ACTIONS and not self._dedup_target_owned(decision, caller_project_id):
+        while decision.action in self._REWRITING_DEDUP_ACTIONS:
+            target = self._foreign_dedup_target(decision, caller_project_id)
+            if target is None:
+                break
             foreign = foreign or decision
-            excluded.add(decision.target_id)
+            if held is None and decision.reason == "exact restatement" and settings["mode"] == "auto":
+                held = target
+            excluded.add(target.id)
             decision = self.memory_dedup.classify(label, text, node_type, scope, project_id, exclude_ids=excluded)
+        if decision.action in self._REWRITING_DEDUP_ACTIONS:
+            held = None  # the caller's own node takes the write
+        elif held is not None:
+            _LOG.info("dedup gate held a write: node %s already holds the fact, not owned by project=%s", held.id, caller_project_id)
+            return DedupDecision(), held
         if decision.action == "new":
             decision = self._dedup_gray_zone(decision, label, text, node_type, scope, project_id, settings, allow_llm)
-            if decision.action != "new" and not self._dedup_target_owned(decision, caller_project_id):
+            if decision.action != "new" and self._foreign_dedup_target(decision, caller_project_id) is not None:
                 foreign = foreign or decision
                 decision = DedupDecision(near_id=decision.near_id, near_score=decision.near_score)
         if foreign is not None and decision.action == "new":
@@ -615,21 +630,33 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
                 "dedup gate stores a new node beside %s (%s) not owned by project=%s",
                 foreign.target_id, foreign.action, caller_project_id,
             )
-            return self._dedup_suggestion(foreign)
+            return self._dedup_suggestion(foreign), None
         if settings["mode"] == "suggest" and decision.action != "new":
-            return self._dedup_suggestion(decision)
-        return decision
+            return self._dedup_suggestion(decision), None
+        return decision, None
 
-    def _dedup_target_owned(self, decision: DedupDecision, caller_project_id: str | None) -> bool:
-        """Whether the gate may change ``decision``'s target for ``caller_project_id``."""
+    def _foreign_dedup_target(self, decision: DedupDecision, caller_project_id: str) -> MemoryNode | None:
+        """``decision``'s target node when ``caller_project_id`` does not own it, else ``None``."""
         target = self.repository.get_node(decision.target_id) if decision.target_id else None
-        owned = target is None or owned_by(target, caller_project_id)
-        if not owned:
-            _LOG.debug(
-                "dedup %s target %s (project=%s author=%s) is not owned by project=%s",
-                decision.action, decision.target_id, target.project_id, target.author_project_id, caller_project_id,
-            )
-        return owned
+        if target is None or owned_by(target, caller_project_id):
+            return None
+        _LOG.debug(
+            "dedup %s target %s (project=%s author=%s) is not owned by project=%s",
+            decision.action, target.id, target.project_id, target.author_project_id, caller_project_id,
+        )
+        return target
+
+    @staticmethod
+    def _held_duplicate_result(node: MemoryNode) -> dict[str, Any]:
+        """Answer a held write as a repeat of ``node``: nothing written, nothing changed."""
+        result = node.to_dict()
+        result["dedup_merged"] = True
+        result["dedup_held"] = True
+        result["dedup"] = DedupDecision(
+            "duplicate", target_id=node.id, target_label=str(node.label or ""), score=1.0,
+            reason="already stored by another project; left unchanged",
+        ).to_dict()
+        return result
 
     @staticmethod
     def _dedup_suggestion(decision: DedupDecision) -> DedupDecision:
