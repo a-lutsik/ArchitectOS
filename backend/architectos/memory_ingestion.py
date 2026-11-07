@@ -8,6 +8,7 @@ carries the fingerprint/similarity engine. ``graph_autolinker`` and
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from typing import Any
 
@@ -23,8 +24,10 @@ from .code_revision import (
     code_revision_delta,
     content_hash,
 )
-from .models import stable_id
+from .models import owned_by, stable_id
 from .storage import SQLiteMemoryRepository
+
+_LOG = logging.getLogger(__name__)
 
 CANDIDATE_DUPLICATE_KEYS = (
     "duplicate",
@@ -593,6 +596,7 @@ class MemoryIngestionEngine:
         decided: set[str] = set()
         pending: dict[str, dict[str, Any]] = {}
         live_by_origin: dict[str, dict[str, Any]] = {}
+        owned_origins: set[str] = set()
         for item in self.repository.list_memory_candidates(project_id, status=None, limit=None):
             key = candidate_origin_key(item)
             if not key:
@@ -613,6 +617,14 @@ class MemoryIngestionEngine:
             if not key:
                 continue
             decided.add(key)
+            # The project's own revision stays the live origin over a shared node it does
+            # not own: a revision supersedes only nodes it owns, so a foreign one stays live.
+            owned = owned_by(node, project_id)
+            if not owned and key in owned_origins:
+                _LOG.debug("origin %s of project=%s: own node preferred over %s (author=%s)", key, project_id, node.id, node.author_project_id)
+                continue
+            if owned:
+                owned_origins.add(key)
             live_by_origin[key] = {
                 "id": node.id,
                 "label": node.label,

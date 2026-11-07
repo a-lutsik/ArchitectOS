@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from backend.architectos.candidate_identity import origin_key_from_memory_node
 from backend.architectos.mcp_server import MemoryMCPServer
 from backend.architectos.memory_dedup import MemoryDedupGate, content_salt, fact_features, stem
-from backend.architectos.models import MemoryNode, owned_by
+from backend.architectos.models import MemoryNode, owned_by, stable_id
 from backend.architectos.sdk import ArchitectOS
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
@@ -896,6 +897,184 @@ class CallerProjectGateTests(unittest.TestCase):
         self.assertEqual(written["id"], self._shared_id("Decision", "Lint config", caller_salt("project_a", text)))
         self.assertNotIn(written["id"], {plain["id"], squat["id"]})
         self.assertEqual([self._snapshot(plain["id"]), self._snapshot(squat["id"])], before)
+
+    def test_a_pipe_in_a_label_or_interface_id_cannot_take_the_callers_salted_id(self) -> None:
+        text = "Shared lint config lives in tools/lint.toml."
+        salt = caller_salt("project_a", text)
+        plain = self._add("project_b", "Lint config", "Lint runs on every pull request.")
+        # Joined with "|", each of these used to hash exactly like "Lint config" salted for project_a.
+        squats = [
+            self._add("project_b", f"Lint config|{salt}", "Lint is optional for drafts."),
+            self._add("project_b", salt, "Lint is optional for spikes.", interface_id="|Lint config"),
+        ]
+        before = [self._snapshot(node["id"]) for node in (plain, *squats)]
+        written = self._add("project_a", "Lint config", text)
+        self.assertEqual(written["id"], self._shared_id("Decision", "Lint config", salt))
+        self.assertNotIn(written["id"], {node["id"] for node in (plain, *squats)})
+        self._assert_beside(plain["id"], text, written)
+        self.assertEqual([self._snapshot(node["id"]) for node in (plain, *squats)], before)
+
+    def test_ids_of_labels_without_a_pipe_are_unchanged(self) -> None:
+        for salt in ("", content_salt("Lint runs on every pull request."), caller_salt("project_a", "Lint runs nightly.")):
+            with self.subTest(salt=salt):
+                parts = ("Decision", "shared", "", "iface_lint", "Lint config", salt) if salt else ("Decision", "shared", "", "iface_lint", "Lint config")
+                self.assertEqual(
+                    self.repo.memory_node_id("Decision", "Lint config", "shared", None, "iface_lint", salt),
+                    stable_id("node", *parts),
+                )
+
+    def _revision_candidate(self, cid: str, project_id: str, revision_of: str, label: str, text: str, scope: str = "shared") -> None:
+        self.repo.upsert_memory_candidate({
+            "id": cid, "project_id": project_id, "source_type": "docs", "source_ref": f"{cid}.md",
+            "label": label, "type": "Doc", "scope": scope, "text": text, "status": "candidate",
+            "metadata": {"revision": True, "revision_of": revision_of, "content_hash": f"hash-{cid}"},
+        })
+
+    def test_a_revision_never_supersedes_a_node_the_caller_does_not_own(self) -> None:
+        stored, revised = "Deploy guide: deploys run through Jenkins nightly.", "Deploy guide: deploys run through ArgoCD on every merge."
+        for owner in ("project_b", None):
+            with self.subTest(owner=owner):
+                label = f"Deploy guide {owner}"
+                old = self._mcp_add(owner, "Doc", label, stored) if owner else self._add(None, label, stored, "Doc")
+                before = self._snapshot(old["id"])
+                self._revision_candidate(f"rev-a-{owner}", "project_a", old["id"], label, revised)
+                promoted = self.service.promote_memory_candidate(f"rev-a-{owner}", caller_project_id="project_a")
+                node = self._assert_beside(old["id"], revised, promoted["memory"])
+                self.assertEqual(self._snapshot(old["id"]), before)
+                self.assertEqual(self._edge_types(node.id, old["id"]), set())
+                self.assertEqual(node.metadata["possible_duplicate_of"], old["id"])
+                self.assertEqual(node.metadata["dedup_suggestion"]["action"], "update")
+                self.assertEqual(promoted["memory"]["metadata"]["possible_duplicate_of"], old["id"])
+                # Without a caller project (internal ingestion) the revision supersedes as before.
+                self._revision_candidate(f"rev-none-{owner}", "project_a", old["id"], label, f"{revised} Rollbacks are manual.")
+                internal = self.service.promote_memory_candidate(f"rev-none-{owner}")
+                self.assertEqual(self.repo.get_node(old["id"]).metadata.get("superseded_by"), internal["memory"]["id"])
+
+    def test_own_revisions_beside_a_foreign_predecessor_keep_one_live_chain(self) -> None:
+        origins = {
+            "file": {"source_type": "docs", "source_ref": "docs/deploy_guide.md"},
+            "fact_subject": {"source_type": "chat", "source_ref": "chat-1", "template": "chat_session_atom", "fact_subject": "deploy pipeline"},
+        }
+        for name, origin in origins.items():
+            with self.subTest(origin=name):
+                label = f"Deploy guide {name}"
+                foreign = self.repo.add_node(
+                    "Doc", label, "shared", "Deploy guide v0: Jenkins nightly.", None,
+                    metadata={**origin, "fact_key": "jenkins nightly"}, author_project_id="project_b",
+                )
+                with self.repo._connect() as conn:
+                    # The foreign node is the oldest: last in list_nodes' updated_at DESC order.
+                    conn.execute("UPDATE memory_nodes SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?", (foreign.id,))
+                before = self._snapshot(foreign.id)
+                revisions = []
+                for step, text in enumerate(("Deploy guide v1: ArgoCD on merge.", "Deploy guide v2: ArgoCD with canary.")):
+                    _, _, live = self.service.ingestion_engine._origin_indexes("project_a")
+                    key = origin_key_from_memory_node(foreign)
+                    # A second revision of one origin gets a fresh candidate id from the repository.
+                    candidate = self.repo.upsert_memory_candidate({
+                        "id": f"rev-{name}-{step}", "project_id": "project_a", "source_type": origin["source_type"], "source_ref": origin["source_ref"],
+                        "label": label, "type": "Doc", "scope": "shared", "text": text, "status": "candidate",
+                        "metadata": {**origin, "fact_key": f"step {step}", "revision": True, "revision_of": live[key]["id"], "content_hash": f"hash-{name}-{step}"},
+                    })
+                    revisions.append(self.service.promote_memory_candidate(candidate["id"], caller_project_id="project_a")["memory"]["id"])
+                first = self.repo.get_node(revisions[0])
+                self.assertEqual(first.metadata.get("possible_duplicate_of"), foreign.id)
+                self.assertEqual(first.metadata.get("superseded_by"), revisions[1])
+                self.assertIn("SUPERSEDES", self._edge_types(revisions[1], revisions[0]))
+                live_own = [
+                    node.id for node in self.repo.list_nodes()
+                    if node.label == label and node.author_project_id == "project_a"
+                    and node.status == "active" and not node.metadata.get("invalid_at")
+                ]
+                self.assertEqual(live_own, [revisions[1]])
+                self.assertEqual(self._snapshot(foreign.id), before)
+
+    def _origin_node(self, label: str, author: str, age: str) -> MemoryNode:
+        """A live shared Doc of ``docs/deploy_guide.md`` written by ``author``; ``age`` orders updated_at."""
+        node = self.repo.add_node(
+            "Doc", label, "shared", f"Deploy guide by {author}: Jenkins nightly.", None,
+            metadata={"source_type": "docs", "source_ref": "docs/deploy_guide.md"}, author_project_id=author,
+        )
+        with self.repo._connect() as conn:
+            conn.execute("UPDATE memory_nodes SET updated_at = ? WHERE id = ?", (age, node.id))
+        return node
+
+    def test_without_a_caller_a_revision_replaces_the_own_origin_not_the_foreign_one(self) -> None:
+        foreign = self._origin_node("Deploy guide b", "project_b", "2020-01-01T00:00:00Z")
+        own = self._origin_node("Deploy guide a", "project_a", "2021-01-01T00:00:00Z")
+        before = self._snapshot(foreign.id)
+        _, _, live = self.service.ingestion_engine._origin_indexes("project_a")
+        key = origin_key_from_memory_node(own)
+        self.assertEqual(live[key]["id"], own.id)
+        self.repo.upsert_memory_candidate({
+            "id": "rev-internal", "project_id": "project_a", "source_type": "docs", "source_ref": "docs/deploy_guide.md",
+            "label": "Deploy guide a", "type": "Doc", "scope": "shared", "text": "Deploy guide v2: ArgoCD on merge.", "status": "candidate",
+            "metadata": {"revision": True, "revision_of": live[key]["id"], "content_hash": "hash-internal"},
+        })
+        promoted = self.service.promote_memory_candidate("rev-internal")
+        self.assertEqual(self.repo.get_node(own.id).metadata.get("superseded_by"), promoted["memory"]["id"])
+        self.assertEqual(self._snapshot(foreign.id), before)
+        self.assertEqual(self.repo.get_node(foreign.id).status, "active")
+
+    def test_without_foreign_nodes_the_live_origin_is_the_oldest_as_before(self) -> None:
+        oldest = self._origin_node("Deploy guide old", "project_a", "2020-01-01T00:00:00Z")
+        self._origin_node("Deploy guide new", "project_a", "2021-01-01T00:00:00Z")
+        _, _, live = self.service.ingestion_engine._origin_indexes("project_a")
+        self.assertEqual(live[origin_key_from_memory_node(oldest)]["id"], oldest.id)
+
+    def test_a_revision_of_an_own_node_marks_only_own_facts_stale(self) -> None:
+        own = self.repo.add_node(
+            "Doc", "Deploy guide", "project", "Deploy guide v1: Jenkins nightly.", "project_a",
+            metadata={"source_ref": "docs/deploy_guide.md"},
+        )
+        facts = {
+            project_id: self.repo.add_node("Lesson", f"Release lesson {project_id}", "project", "Read docs/deploy_guide.md before a release.", project_id)
+            for project_id in ("project_a", "project_b")
+        }
+        foreign_before = self._snapshot(facts["project_b"].id)
+        self._revision_candidate("rev-own", "project_a", own.id, "Deploy guide", "Deploy guide v2: ArgoCD on every merge.", "project")
+        promoted = self.service.promote_memory_candidate("rev-own", caller_project_id="project_a")
+        self.assertEqual(self.repo.get_node(own.id).metadata.get("superseded_by"), promoted["memory"]["id"])
+        self.assertIn("SUPERSEDES", self._edge_types(promoted["memory"]["id"], own.id))
+        self.assertEqual(self.repo.get_node(facts["project_a"].id).metadata.get("source_stale_from"), promoted["memory"]["id"])
+        self.assertEqual(self._snapshot(facts["project_b"].id), foreign_before)
+
+    def test_dedup_preview_with_a_project_answers_like_the_write(self) -> None:
+        handler, replies = http_handler(self.service)
+        cases = {**self.FACTS, "held": ("Decision", "Deploy", "Deploys always run through GitHub Actions.", "deploys ALWAYS run through github actions")}
+        for action, (node_type, label, stored, incoming) in cases.items():
+            with self.subTest(action=action):
+                old = self._mcp_add("project_b", node_type, label, stored)
+                payload = {"label": label, "text": incoming, "type": node_type, "scope": "shared", "project_id": "project_a"}
+                handler._post_memory_dedup_preview(None, {}, payload)
+                preview = replies[-1]
+                handler._post_memory(None, {}, payload)
+                written = replies[-1]
+                self.assertEqual(preview["dedup"], written["dedup"])
+                self.assertEqual(preview.get("dedup_held", False), written.get("dedup_held", False))
+                self.assertEqual(preview["dedup"].get("details", {}).get("suggested_action", "held"), action)
+                self.assertIn(old["id"], {preview["dedup"].get("target_id"), preview["dedup"].get("near_id")})
+        # A project-only fact of another project is invisible to the preview, as to the write.
+        hidden = self._mcp_add("project_b", "Decision", "Queue", "Jobs go through the Redis queue.", "project")
+        handler._post_memory_dedup_preview(None, {}, {"label": "Queue", "text": "Jobs go through the Redis queue.", "type": "Decision", "project_id": "project_a"})
+        self.assertEqual(replies[-1]["dedup"], {"action": "new"})
+        self.assertNotIn(hidden["id"], json.dumps(replies[-1]))
+
+    def test_reaccepting_an_interface_id_beside_another_projects_node_rewrites_one_own_copy(self) -> None:
+        old = self.service.add_memory({"type": "Decision", "scope": "shared", "label": "Lint config", "interface_id": "iface_lint",
+                                       "text": "Lint runs on every pull request.", "project_id": "project_b"}, caller_project_id="project_b")
+        before = self._snapshot(old["id"])
+        ids = []
+        for cid, text in (("cand-a1", "Lint is optional for drafts."), ("cand-a2", "Lint is optional for drafts and spikes.")):
+            self._candidate(cid, "project_a", "Lint config", text)
+            promoted = self.service.promote_memory_candidate(cid, {"interface_id": "iface_lint"}, caller_project_id="project_a")
+            self._assert_beside(old["id"], text, promoted["memory"])
+            ids.append(promoted["memory"]["id"])
+        self.assertEqual(ids[0], ids[1])
+        self.assertEqual(ids[0], self.repo.memory_node_id("Decision", "Lint config", "shared", None, "iface_lint", "project_a:"))
+        own = [node for node in self.repo.list_nodes() if node.author_project_id == "project_a" and node.status == "active"]
+        self.assertEqual([(node.id, node.text) for node in own], [(ids[0], "Lint is optional for drafts and spikes.")])
+        self.assertEqual(self._snapshot(old["id"]), before)
 
     def test_undo_of_a_fold_restores_the_fact_under_its_author(self) -> None:
         _, label, stored, incoming = self.FACTS["enrich"]

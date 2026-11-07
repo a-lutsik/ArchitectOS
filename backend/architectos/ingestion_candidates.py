@@ -12,7 +12,7 @@ from typing import Any
 
 from .candidate_identity import candidate_origin_key
 from .memory_dedup import DedupDecision
-from .models import MemoryNode, utc_now
+from .models import MemoryNode, owned_by, utc_now
 
 _LOG = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ class IngestionCandidatesMixin:
         self._link_azure_boards_relations(node, candidate, by_work_item=by_work_item)
         self._link_chat_session_relations(node, candidate)
         if is_revision and revision_of and revision_of != node.id:
-            self._apply_revision_supersede(node, revision_of, candidate)
+            node = self._apply_revision_supersede(node, revision_of, candidate, caller_project_id)
         candidate["status"] = "promoted"
         candidate["promoted_node_id"] = node.id
         candidate["promoted_at"] = utc_now()
@@ -242,15 +242,30 @@ class IngestionCandidatesMixin:
             self._schedule_candidate_duplicate_refresh(candidate)
         return {"candidate": candidate, "memory": self._held_duplicate_result(held)}
 
-    def _apply_revision_supersede(self, new_node: Any, old_id: str, candidate: dict[str, Any]) -> None:
+    def _apply_revision_supersede(
+        self, new_node: Any, old_id: str, candidate: dict[str, Any], caller_project_id: str | None = None
+    ) -> Any:
         """Link new revision → old via SUPERSEDES and stamp invalid_at on the predecessor.
 
-        Not checked against the caller project yet (follow-up): revisions come from
-        file sources of the candidate's own project.
+        Under ``caller_project_id`` a predecessor the project does not own is left
+        as is, like a gate ``update`` of it: the new revision is flagged
+        ``possible_duplicate_of`` it with an ``update`` suggestion for review.
+        Returns the new node.
         """
         old = self.repository.get_node(old_id)
         if not old:
-            return
+            return new_node
+        if not owned_by(old, caller_project_id):
+            _LOG.warning(
+                "revision %s of node %s (project=%s author=%s) not owned by project=%s: not superseded, flagged for review",
+                new_node.id, old.id, old.project_id, old.author_project_id, caller_project_id,
+            )
+            suggestion = self._dedup_suggestion(DedupDecision(
+                "update", target_id=old.id, target_label=str(old.label or ""),
+                reason="revision of a node not owned by the caller project",
+            ))
+            new_node, _ = self._apply_dedup_relation(new_node, suggestion, {"source": "memory_candidate"}, caller_project_id)
+            return new_node
         try:
             self.create_graph_edge({
                 "source": new_node.id,
@@ -271,10 +286,14 @@ class IngestionCandidatesMixin:
                 meta["superseded_by"] = new_node.id
                 old.metadata = meta
                 self.repository.upsert_node(old)
-        self._mark_related_facts_source_stale(old, new_node)
+        self._mark_related_facts_source_stale(old, new_node, caller_project_id)
+        return new_node
 
-    def _mark_related_facts_source_stale(self, old_node: Any, new_node: Any) -> None:
-        """Downrank Lesson/Decision nodes that reference the revised code path (not auto-SUPERSEDES)."""
+    def _mark_related_facts_source_stale(self, old_node: Any, new_node: Any, caller_project_id: str | None = None) -> None:
+        """Downrank Lesson/Decision nodes that reference the revised code path (not auto-SUPERSEDES).
+
+        Under ``caller_project_id`` only nodes that project owns are marked.
+        """
         path = str(dict(old_node.metadata or {}).get("source_ref") or dict(old_node.metadata or {}).get("path") or "").strip()
         if not path:
             return
@@ -287,7 +306,7 @@ class IngestionCandidatesMixin:
         from .models import utc_now as _utc_now
         when = str(getattr(new_node, "created_at", "") or _utc_now())
         for node in self.repository.list_nodes():
-            if node.status != "active" or node.id in {old_node.id, new_node.id}:
+            if node.status != "active" or node.id in {old_node.id, new_node.id} or not owned_by(node, caller_project_id):
                 continue
             if str(node.type or "") not in {"Lesson", "Decision", "Requirement"}:
                 continue

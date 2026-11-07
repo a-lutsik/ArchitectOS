@@ -529,7 +529,12 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         return {"ids": ids, "results": results, "stats": stats}
 
     def preview_memory_dedup(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """What the dedup gate would do with this fact, without writing anything."""
+        """What the dedup gate would do with this fact, without writing anything.
+
+        A payload ``project_id`` is the caller project, as in ``POST /api/memory``:
+        the preview answers with that write's decision (held, or stored beside a
+        node the project does not own).
+        """
         label = str(payload.get("label") or "").strip()
         text = str(payload.get("text") or "").strip()
         if not label and not text:
@@ -537,10 +542,22 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         scope = str(payload.get("scope") or "project")
         node_type = str(payload.get("type") or "Lesson")
         project_id = self._memory_project_id_for_scope(scope, payload.get("project_id") or "architectos")
-        decision = self._dedup_decide(
-            label, text, node_type, scope, project_id, allow_llm=payload.get("use_llm", True) is not False,
+        caller_project_id = str(payload.get("project_id") or "").strip() or None
+        decision, held = self._gate_decision(
+            label, text, node_type, scope, project_id, caller_project_id,
+            allow_llm=payload.get("use_llm", True) is not False,
         )
-        return {"label": label, "type": node_type, "scope": scope, "project_id": project_id, "dedup": decision.to_dict()}
+        result = {"label": label, "type": node_type, "scope": scope, "project_id": project_id}
+        if held is not None:
+            result["dedup"] = self._held_duplicate_result(held)["dedup"]
+            result["dedup_held"] = True
+        else:
+            result["dedup"] = decision.to_dict()
+        _LOG.debug(
+            "dedup preview for project=%s scope=%s: %s (held=%s)",
+            caller_project_id, scope, result["dedup"]["action"], held is not None,
+        )
+        return result
 
     def memory_dedup_settings(self) -> dict[str, Any]:
         return dedup_settings(self.repository.get_setting("memory_dedup"))
@@ -883,9 +900,11 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         skipped the gate, e.g. an interface-id accept) rewrites that node in
         place as before; a node the caller does not own, of
         any status, moves the write to an id salted with the caller project:
-        ``"<caller>:<content salt>"``. A content salt is plain hex, so no text
-        can produce that salt for another project. Salts hash the redacted
-        text, so a repeat with or without the secret lands on the same node.
+        ``"<caller>:<content salt>"``, or ``"<caller>:"`` with ``replace_own``,
+        so a re-accept with changed text rewrites the caller's one copy. A
+        content salt is plain hex, so no text can produce that salt for another
+        project. Salts hash the redacted text, so a repeat with or without the
+        secret lands on the same node.
         Callers hold ``repository.transaction()`` around this and the write.
         """
         def occupant(salt: str) -> Any:
@@ -904,14 +923,14 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             if holder is None or owned_by(holder, caller_project_id):
                 return salt
         _LOG.debug(
-            "id of node %s (project=%s author=%s status=%s) is not owned by project=%s; salting with the caller",
-            holder.id, holder.project_id, holder.author_project_id, holder.status, caller_project_id,
+            "id of node %s (project=%s author=%s status=%s) is not owned by project=%s; salting with the caller (replace_own=%s)",
+            holder.id, holder.project_id, holder.author_project_id, holder.status, caller_project_id, replace_own,
         )
-        salt = f"{caller_project_id}:{content_salt(redacted)}"
+        salt = f"{caller_project_id}:" if replace_own else f"{caller_project_id}:{content_salt(redacted)}"
         holder = occupant(salt)
         if holder is not None and not owned_by(holder, caller_project_id):
-            # Not reachable through a salt; only a crafted label ("label|salt" hashes like a
-            # salted id) or a hand-edited store. Refuse rather than overwrite.
+            # Not reachable through a salt or a label (a "|" in an id part is escaped);
+            # only a hand-edited store. Refuse rather than overwrite.
             _LOG.warning("caller-salted id %s is held by a node outside project=%s; write refused", holder.id, caller_project_id)
             raise ValueError(f"memory id is taken by a node outside project {caller_project_id}")
         return salt

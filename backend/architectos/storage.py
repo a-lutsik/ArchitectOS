@@ -35,6 +35,8 @@ __all__ = [
 
 _SECURITY_POLICY = SecurityPolicy()
 _LOG = logging.getLogger("architectos.storage")
+# Stands in for "|" inside a node id part; anything without "|" keeps the parts apart.
+_NODE_ID_PIPE = "\x00"
 
 
 def sanitize_text(value: str) -> tuple[str, bool]:
@@ -380,12 +382,15 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
 
         ``id_salt`` is appended only when set, which keeps every existing id
         stable while letting a caller store a second fact under the same label.
+        ``stable_id`` joins the parts with ``|``, so a ``|`` inside a part is
+        replaced: a label or interface id cannot spill into the next part and
+        hash like another project's salted id. Parts without ``|`` keep their id.
         """
         clean_label, _ = sanitize_text(label)
         parts = [node_type, scope, project_id or "", interface_id or "", clean_label]
         if id_salt:
             parts.append(id_salt)
-        return stable_id("node", *parts)
+        return stable_id("node", *(str(part or "").replace("|", _NODE_ID_PIPE) for part in parts))
 
     def add_node(
         self,
