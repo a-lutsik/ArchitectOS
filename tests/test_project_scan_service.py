@@ -64,6 +64,9 @@ class ProjectScanServiceTests(unittest.TestCase):
             (tree / "node_modules" / "pkg" / "index.js").write_text("module.exports = {};\n", encoding="utf-8")
             (tree / ".git").mkdir()
             (tree / ".git" / "config").write_text("[core]\n\tbare = false\n", encoding="utf-8")
+            # Nested git worktrees repeat the same sources and are skipped too.
+            (tree / ".claude" / "worktrees" / "feature").mkdir(parents=True)
+            (tree / ".claude" / "worktrees" / "feature" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
             # Lockfiles and logs are noise even though they decode as text.
             (tree / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
             (tree / "debug.log").write_text("noise line\n", encoding="utf-8")
