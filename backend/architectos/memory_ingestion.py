@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from typing import Any
 
 from .candidate_identity import (
@@ -198,7 +199,14 @@ class MemoryIngestionEngine:
             existing = by_fingerprint.get(fingerprint)
             if existing is None or (existing.get("kind") != "memory" and reference.get("kind") == "memory"):
                 by_fingerprint[fingerprint] = reference
-        decided_origins, pending_by_origin, live_by_origin = self._origin_indexes(project_id)
+        decided_hashes: dict[str, tuple[str, str]] = {}
+        started = time.monotonic()
+        decided_origins, pending_by_origin, live_by_origin = self._origin_indexes(project_id, decided_hashes)
+        _LOG.debug(
+            "prepare_candidates project=%s batch=%d: origin indexes decided=%d decided_hashes=%d pending=%d live=%d references=%d in %.3fs",
+            project_id, len(candidates), len(decided_origins), len(decided_hashes),
+            len(pending_by_origin), len(live_by_origin), len(references), time.monotonic() - started,
+        )
         prepared: list[dict[str, Any]] = []
         seen_fingerprints: set[str] = set()
         skipped_reviewed = 0
@@ -210,7 +218,7 @@ class MemoryIngestionEngine:
             origin_key = candidate_origin_key(enriched)
             if origin_key:
                 enriched["metadata"]["origin_key"] = origin_key
-                revision_hit = self._classify_origin_revision(enriched, origin_key, live_by_origin)
+                revision_hit = self._classify_origin_revision(enriched, origin_key, live_by_origin, decided_hashes)
                 if revision_hit is False:
                     # Identical or noise-only change against a live/decided origin.
                     skipped_reviewed += 1
@@ -591,8 +599,16 @@ class MemoryIngestionEngine:
         return sorted(members, key=sort_key)[0]
 
     def _origin_indexes(
-        self, project_id: str
+        self,
+        project_id: str,
+        decided_hashes: dict[str, tuple[str, str]] | None = None,
     ) -> tuple[set[str], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Origin indexes for one prepare run.
+
+        ``decided_hashes``, when given, is filled in the same pass with
+        origin → (content_hash, status) of the last promoted/rejected candidate
+        that carries a hash, so revision checks need no per-candidate scan.
+        """
         decided: set[str] = set()
         pending: dict[str, dict[str, Any]] = {}
         live_by_origin: dict[str, dict[str, Any]] = {}
@@ -604,6 +620,10 @@ class MemoryIngestionEngine:
             status = str(item.get("status") or "")
             if status in {"promoted", "rejected"}:
                 decided.add(key)
+                if decided_hashes is not None:
+                    item_hash = str(dict(item.get("metadata") or {}).get("content_hash") or "").strip()
+                    if item_hash:
+                        decided_hashes[key] = (item_hash, status)
             elif status in {"candidate", "duplicate"} and key not in pending:
                 pending[key] = item
         for node in self.repository.list_nodes():
@@ -642,6 +662,7 @@ class MemoryIngestionEngine:
         candidate: dict[str, Any],
         origin_key: str,
         live_by_origin: dict[str, dict[str, Any]],
+        decided_hashes: dict[str, tuple[str, str]],
     ) -> dict[str, Any] | bool | None:
         """Return revision metadata, False to skip, or None for default sticky skip.
 
@@ -659,7 +680,7 @@ class MemoryIngestionEngine:
 
         live = live_by_origin.get(origin_key)
         if not live:
-            return self._revision_vs_decided_candidate(candidate, origin_key)
+            return self._revision_vs_decided_candidate(candidate, origin_key, decided_hashes)
 
         old_meta = dict(live.get("metadata") or {})
         old_hash = str(old_meta.get("content_hash") or "").strip()
@@ -709,26 +730,14 @@ class MemoryIngestionEngine:
         self,
         candidate: dict[str, Any],
         origin_key: str,
+        decided_hashes: dict[str, tuple[str, str]],
     ) -> dict[str, Any] | bool | None:
         """When origin was rejected/promoted but no live node remains, compare hashes."""
-        metadata = dict(candidate.get("metadata") or {})
-        new_hash = str(metadata.get("content_hash") or "").strip()
-        best_hash = ""
-        best_status = ""
-        for item in self.repository.list_memory_candidates(
-            str(candidate.get("project_id") or ""), status=None, limit=None
-        ):
-            if candidate_origin_key(item) != origin_key:
-                continue
-            status = str(item.get("status") or "")
-            if status not in {"promoted", "rejected"}:
-                continue
-            item_hash = str(dict(item.get("metadata") or {}).get("content_hash") or "").strip()
-            if item_hash:
-                best_hash = item_hash
-                best_status = status
-        if not best_hash:
+        decided = decided_hashes.get(origin_key)
+        if not decided:
             return None
+        best_hash, best_status = decided
+        new_hash = str(dict(candidate.get("metadata") or {}).get("content_hash") or "").strip()
         if new_hash and new_hash == best_hash:
             return False
         if new_hash and new_hash != best_hash:
