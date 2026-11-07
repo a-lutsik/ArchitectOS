@@ -872,12 +872,16 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
         interface_id: Any,
         text: str,
         caller_project_id: str,
+        *,
+        replace_own: bool = False,
     ) -> str:
         """Id salt of a node written under ``caller_project_id``; never lands on a node it does not own.
 
         The plain label id is used when it is free or holds the caller's own
         inactive node (revived in place); a second fact beside the caller's own
-        active node gets the content salt; a node the caller does not own, of
+        active node gets the content salt, unless ``replace_own`` (a write that
+        skipped the gate, e.g. an interface-id accept) rewrites that node in
+        place as before; a node the caller does not own, of
         any status, moves the write to an id salted with the caller project:
         ``"<caller>:<content salt>"``. A content salt is plain hex, so no text
         can produce that salt for another project. Salts hash the redacted
@@ -892,7 +896,7 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             return ""
         redacted = sanitize_text(text)[0]
         if owned_by(holder, caller_project_id):
-            if holder.status != "active":
+            if replace_own or holder.status != "active":
                 return ""
             # A projectless write may have taken the content-salted id of the same text.
             salt = content_salt(redacted)

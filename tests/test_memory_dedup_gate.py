@@ -731,6 +731,14 @@ class CallerProjectGateTests(unittest.TestCase):
         write lock B lands first (and A would overwrite it), with it B waits for A.
         """
         other = ArchitectOSService(self.root)
+        # A holds its lock for up to 3 s below: give B's busy wait a wide margin under load.
+        real_prepare = other.repository._prepare_connection
+
+        def patient_connection(conn: Any) -> None:
+            real_prepare(conn)
+            conn.execute("PRAGMA busy_timeout=15000")
+
+        other.repository._prepare_connection = patient_connection
         reached, written = threading.Event(), threading.Event()
         failures: list[BaseException] = []
         real_transaction = other.repository.transaction
@@ -811,6 +819,15 @@ class CallerProjectGateTests(unittest.TestCase):
             writer.join(timeout=60)
         self.assertEqual(self.repo.get_node(written["id"]).author_project_id, "project_b")
 
+    def test_a_write_outside_a_transaction_notifies_at_once(self) -> None:
+        seen: list[str] = []
+        self.repo.register_node_upsert_listener(lambda node: seen.append(node.id))
+        node = self.repo.add_node("Decision", "Direct", "shared", "This write runs without a transaction.", None)
+        self.assertEqual(seen, [node.id])
+        node.status = "archived"
+        self.repo.upsert_node(node)
+        self.assertEqual(seen, [node.id, node.id])
+
     def test_a_rolled_back_transaction_notifies_no_listener(self) -> None:
         seen: list[str] = []
         self.repo.register_node_upsert_listener(lambda node: seen.append(node.id))
@@ -833,6 +850,30 @@ class CallerProjectGateTests(unittest.TestCase):
         promoted = self.service.promote_memory_candidate("cand-a", {"interface_id": "iface_lint"}, caller_project_id="project_a")
         self._assert_beside(old["id"], "Lint is optional for drafts.", promoted["memory"])
         self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_interface_id_accepts_rewrite_the_callers_own_node_in_place(self) -> None:
+        def accept(cid: str, text: str, payload: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+            self._candidate(cid, "project_a", "Lint config", text)
+            if metadata:
+                candidate = self.repo.get_memory_candidate(cid)
+                self.repo.update_memory_candidate({**candidate, "metadata": metadata})
+            return self.service.promote_memory_candidate(cid, payload, caller_project_id="project_a")["memory"]
+
+        def active() -> list[MemoryNode]:
+            return [node for node in self.repo.list_nodes() if node.label == "Lint config" and node.status == "active"]
+
+        first = accept("c1", "Lint runs on every pull request.", {"interface_id": "iface_lint"})
+        again = accept("c2", "Lint runs on every pull request.", {"interface_id": "iface_lint"})
+        self.assertEqual((again["id"], len(active())), (first["id"], 1))
+        changed = accept("c3", "Lint runs nightly, not on pull requests.", {"interface_id": "iface_lint"})
+        self.assertEqual(changed["id"], first["id"])
+        self.assertEqual([(node.id, node.text) for node in active()], [(first["id"], "Lint runs nightly, not on pull requests.")])
+        for node in active():
+            node.status = "archived"
+            self.repo.upsert_node(node)
+        revisions = [accept(cid, "Lint config moved to tools/lint.toml.", metadata={"revision": True, "content_hash": "h1"}) for cid in ("r1", "r2")]
+        self.assertEqual(revisions[0]["id"], revisions[1]["id"])
+        self.assertEqual([(node.interface_id, node.author_project_id) for node in active()], [("rev:h1", "project_a")])
 
     def test_undo_of_a_review_accept_fold_restores_the_fact_under_its_author(self) -> None:
         _, label, stored, incoming = self.FACTS["enrich"]
