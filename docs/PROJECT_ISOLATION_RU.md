@@ -47,17 +47,11 @@ HTTP/UI без проекта, внутренние compaction и dedup) пов�
 | `6a41736` | `memory_get` и `memory://nodes/{id}`: чужой узел отвечает как несуществующий; пустой `project_id` в gateway заменяется проектом рана |
 | `e44bb53` | `memory_history`, `memory_explain_path`, `memory_link`, `memory_feedback`, `code_neighbors`/`code_impact`. В AI-ране `memory_*` и `fs_*` всегда получают проект рана, чужой `project_id` от модели перезаписывается с WARN |
 | `fc89491` | Явный `scope` только сужает поиск. Id скрытых узлов вырезаются из ссылок. SUPERSEDES через `memory_link` разрешён только на свои узлы |
+| `100341c` | Dedup-gate по владельцу. `author_project_id` и `owned_by`. `_gate_decision`: своя цель побеждает чужую, held ищется по dedup-индексу. Id копии рядом с чужим узлом — `"<caller>:<content salt>"`, без перебора. Выбор id и запись идут в одной `BEGIN IMMEDIATE`, listener-ы (эмбеддинг) запускаются после commit. UI показывает held в формах и в Review. Изменение прошло четыре раунда независимого ревью и UI-проверку через Playwright |
 
 ## 4. В работе
 
-- **Dedup-gate по владельцу**, ветка `claude/gate-ownership-efd9c1`:
-  - `author_project_id`, `owned_by`, `_gate_decision`;
-  - held ищется по dedup-индексу, id новых копий считается без перебора;
-  - выбор id и запись идут в `BEGIN IMMEDIATE`, listener-ы запускаются после commit;
-  - UI показывает held.
-
-  Ветка прошла три раунда независимого ревью и UI-проверку. Сейчас идёт
-  финальное ревью последней правки, после него ветка вливается.
+Нет.
 
 ## 5. Принятые решения
 
@@ -87,6 +81,15 @@ HTTP/UI без проекта, внутренние compaction и dedup) пов�
 - Если авто-запись свернула факт в существующий узел своего проекта,
   `undo_auto_capture` архивирует этот узел. Так было и до изоляции.
 - Опциональный backfill автора для legacy-узлов по истории кандидатов.
+- Ситуация: голый слот занят чужим узлом, а promote с явным `interface_id` идёт
+  с изменённым текстом. Тогда у вызывающего появляется ещё одна своя копия рядом,
+  без связи со старой: соль копии зависит от текста. Чужой узел при этом не
+  меняется. Вариант исправления: при `replace_own` солить только проектом
+  вызывающего.
+- Held срабатывает только при совпадении и метки, и текста (exact restatement).
+  Если тот же текст пришёл с другой меткой, например голосовая запись без метки
+  получает метку из текста, рядом с чужим узлом создаётся новый узел с
+  `possible_duplicate_of`.
 
 ## 7. Как проверять
 
@@ -96,7 +99,8 @@ HTTP/UI без проекта, внутренние compaction и dedup) пов�
 - `tests/test_memory_retrieval.py`: `ExplicitScopeNarrowsTests`;
 - `tests/test_graph_analysis.py`: `MultiHopExpansionTests`;
 - `tests/test_tool_gateway.py`: `ToolGatewayUnitTests`;
-- после вливания gate — `tests/test_memory_dedup_gate.py` (матрица «вход × случай»).
+- `tests/test_memory_dedup_gate.py`: матрица «вход × случай», `AuthorOwnershipTests`, гонки, отложенные listener-ы;
+- `tests/test_memory_capture.py`: `CallerProjectCaptureTests`.
 
 Изменения в этой области считаются изменениями высокого риска: каждое проходит
 независимое ревью, полный прогон тестов, а тесты на новое поведение должны падать
