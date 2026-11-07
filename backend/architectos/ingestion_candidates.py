@@ -170,13 +170,15 @@ class IngestionCandidatesMixin:
             label=str(payload.get("label") or candidate.get("label") or ""),
         )
         # The id check and the INSERT OR REPLACE hold one write lock (see add_memory).
+        # With an interface id (revisions, explicit payload) the gate is skipped, but the id
+        # still never lands on a node the caller does not own.
         with self.repository.transaction():
-            if interface_id is not None:
-                id_salt = ""
-            elif caller_project_id is not None:
+            if caller_project_id is not None:
                 id_salt = self._caller_id_salt(
-                    node_type, node_label, node_scope, node_project, None, node_text, caller_project_id
+                    node_type, node_label, node_scope, node_project, interface_id, node_text, caller_project_id
                 )
+            elif interface_id is not None:
+                id_salt = ""
             else:
                 id_salt = self._label_collision_salt(node_type, node_label, node_scope, node_project, None, node_text)
             node = self.repository.add_node(

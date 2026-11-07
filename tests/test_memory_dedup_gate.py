@@ -7,6 +7,8 @@ import re
 import tempfile
 import threading
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -722,11 +724,31 @@ class CallerProjectGateTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in replies[1]["results"]], ["held"])
         self.assertEqual(self._snapshot(existing["id"]), before)
 
-    def test_a_concurrent_writer_never_takes_the_chosen_id(self) -> None:
-        # Another MCP process: its own service and connections on the same store.
+    def _race_project_b(self, write_a: Any) -> None:
+        """Run project B's write (another MCP process: its own service) right after A chose its id.
+
+        A waits until B either wrote or reached its own id transaction: without A's
+        write lock B lands first (and A would overwrite it), with it B waits for A.
+        """
         other = ArchitectOSService(self.root)
-        real_add_node = self.repo.add_node
+        reached, written = threading.Event(), threading.Event()
         failures: list[BaseException] = []
+        real_transaction = other.repository.transaction
+        real_other_add_node = other.repository.add_node
+
+        @contextmanager
+        def announced_transaction() -> Iterator[Any]:
+            reached.set()
+            with real_transaction() as conn:
+                yield conn
+
+        def add_node_then_announce(*args: Any, **kwargs: Any) -> MemoryNode:
+            node = real_other_add_node(*args, **kwargs)
+            written.set()
+            return node
+
+        other.repository.transaction = announced_transaction
+        other.repository.add_node = add_node_then_announce
 
         def write_b() -> None:
             try:
@@ -734,25 +756,95 @@ class CallerProjectGateTests(unittest.TestCase):
                                   "scope": "shared", "project_id": "project_b"}, caller_project_id="project_b")
             except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
                 failures.append(exc)
+            finally:
+                reached.set()
 
         writer = threading.Thread(target=write_b)
+        real_add_node = self.repo.add_node
 
         def add_node_while_b_writes(*args: Any, **kwargs: Any) -> MemoryNode:
-            # A has chosen its id; B runs now and gets a second to land in between.
             self.repo.add_node = real_add_node
             writer.start()
-            writer.join(timeout=1.0)
+            self.assertTrue(reached.wait(timeout=60))
+            # Without the lock B's insert follows at once; with it B is blocked until A commits.
+            written.wait(timeout=3)
             return real_add_node(*args, **kwargs)
 
         self.repo.add_node = add_node_while_b_writes
-        a = self._add("project_a", "Lint config", "Shared lint config lives in tools/lint.toml.")
+        write_a()
         writer.join(timeout=60)
         self.assertEqual(failures, [])
         nodes = {node.author_project_id: node for node in self.repo.list_nodes() if node.label == "Lint config"}
         self.assertEqual(set(nodes), {"project_a", "project_b"})
-        self.assertEqual(nodes["project_a"].id, a["id"])
         self.assertEqual(nodes["project_a"].text, "Shared lint config lives in tools/lint.toml.")
         self.assertEqual(nodes["project_b"].text, "Lint runs on every pull request.")
+
+    def test_a_concurrent_writer_never_takes_the_chosen_id(self) -> None:
+        self._race_project_b(lambda: self._add("project_a", "Lint config", "Shared lint config lives in tools/lint.toml."))
+
+    def test_a_concurrent_writer_never_takes_the_id_a_promote_chose(self) -> None:
+        self._candidate("cand-a", "project_a", "Lint config", "Shared lint config lives in tools/lint.toml.")
+        self._race_project_b(lambda: self.service.promote_memory_candidate("cand-a", caller_project_id="project_a"))
+
+    def test_embedding_runs_after_the_write_lock_is_released(self) -> None:
+        # No background worker (an MCP stdio process): the upsert listener embeds inline.
+        other = ArchitectOSService(self.root)
+        self.assertFalse(self.service._embedding_worker_started)
+        provider = self.service.memory_embeddings.provider
+        real_embed = provider.embed
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_embed(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            release.wait(timeout=60)  # a slow remote provider
+            return real_embed(*args, **kwargs)
+
+        provider.embed = slow_embed
+        writer = threading.Thread(target=lambda: self._add("project_a", "Lint config", "Lint runs on every pull request."))
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(timeout=60))
+            written = other.add_memory({"label": "Deploy", "text": "Deploys run through GitHub Actions.", "type": "Decision",
+                                        "scope": "shared", "project_id": "project_b"}, caller_project_id="project_b")
+        finally:
+            release.set()
+            writer.join(timeout=60)
+        self.assertEqual(self.repo.get_node(written["id"]).author_project_id, "project_b")
+
+    def test_a_rolled_back_transaction_notifies_no_listener(self) -> None:
+        seen: list[str] = []
+        self.repo.register_node_upsert_listener(lambda node: seen.append(node.id))
+        with self.assertRaises(RuntimeError), self.repo.transaction():
+            self.repo.add_node("Decision", "Rolled back", "shared", "This write is rolled back.", None)
+            self.assertEqual(seen, [])
+            raise RuntimeError("abort")
+        self.assertEqual(seen, [])
+        with self.repo.transaction():
+            with self.repo.transaction():
+                node = self.repo.add_node("Decision", "Committed", "shared", "This write is committed.", None)
+            self.assertEqual(seen, [])
+        self.assertEqual(seen, [node.id])
+
+    def test_promote_with_an_interface_id_never_overwrites_another_projects_node(self) -> None:
+        old = self.service.add_memory({"type": "Decision", "scope": "shared", "label": "Lint config", "interface_id": "iface_lint",
+                                       "text": "Lint runs on every pull request.", "project_id": "project_b"}, caller_project_id="project_b")
+        before = self._snapshot(old["id"])
+        self._candidate("cand-a", "project_a", "Lint config", "Lint is optional for drafts.")
+        promoted = self.service.promote_memory_candidate("cand-a", {"interface_id": "iface_lint"}, caller_project_id="project_a")
+        self._assert_beside(old["id"], "Lint is optional for drafts.", promoted["memory"])
+        self.assertEqual(self._snapshot(old["id"]), before)
+
+    def test_undo_of_a_review_accept_fold_restores_the_fact_under_its_author(self) -> None:
+        _, label, stored, incoming = self.FACTS["enrich"]
+        own = self._add("project_a", label, stored)
+        self._candidate("cand-a", "project_a", label, incoming)
+        handler, replies = http_handler(self.service)
+        handler._post_memory_candidate_promote(re.match(r"(?P<candidate_id>.+)", "cand-a"), {}, {})
+        folded = replies[0]["memory"]
+        self.assertEqual((folded["id"], folded["dedup"]["action"]), (own["id"], "enrich"))
+        undone = self.service.undo_memory_dedup({"event_id": folded["dedup"]["event_id"]})
+        restored = self.repo.get_node(undone["restored"]["id"])
+        self.assertEqual((restored.text, restored.author_project_id), (incoming, "project_a"))
 
     def test_another_projects_text_cannot_take_the_callers_salted_id(self) -> None:
         text = "Shared lint config lives in tools/lint.toml."
