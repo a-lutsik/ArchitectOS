@@ -165,6 +165,9 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
         exception re-raises. The connection is pinned to the creating thread via
         ``self._local`` (sqlite3 connections must stay on their creating thread);
         nested ``transaction()`` calls in the same thread reuse the active one.
+
+        Node-upsert listeners (embedding indexing may call a remote provider) run
+        after the outermost commit, never under the write lock; a rollback drops them.
         """
         active = getattr(self._local, "transaction_connection", None)
         if active is not None:
@@ -174,6 +177,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
         conn.row_factory = sqlite3.Row
         self._prepare_connection(conn)
         self._local.transaction_connection = conn
+        self._local.pending_upserts = {}
         try:
             conn.execute("BEGIN IMMEDIATE")
             yield conn
@@ -184,7 +188,13 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
             conn.commit()
         finally:
             self._local.transaction_connection = None
+            pending: dict[str, MemoryNode] = self._local.pending_upserts
+            self._local.pending_upserts = {}
             conn.close()
+        if pending:
+            _LOG.debug("notifying node upsert listeners for %d node(s) after commit", len(pending))
+        for node in pending.values():
+            self._notify_node_upsert(node)
 
     def health_check(self) -> dict[str, Any]:
         try:
@@ -389,6 +399,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
         metadata: dict[str, Any] | None = None,
         source_id: str | None = None,
         id_salt: str = "",
+        author_project_id: str | None = None,
     ) -> MemoryNode:
         clean_text, redacted = sanitize_text(text)
         clean_label, label_redacted = sanitize_text(label)
@@ -408,6 +419,7 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
             metadata=dict(metadata or {}),
             created_at=now,
             updated_at=now,
+            author_project_id=author_project_id,
         )
         if source_id:
             node.metadata.setdefault("source_id", source_id)
@@ -426,12 +438,19 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
             self._sync_memory_fts_row(conn, node)
             self._sync_dedup_index_row(conn, node)
         if notify:
-            for listener in self._node_upsert_listeners:
-                try:
-                    listener(node)
-                except Exception:
-                    _LOG.exception("node upsert listener failed for node %s", node.id)
+            if getattr(self._local, "transaction_connection", None) is not None:
+                # Inside transaction(): run after commit, with the latest version of the node.
+                self._local.pending_upserts[node.id] = node
+            else:
+                self._notify_node_upsert(node)
         return node
+
+    def _notify_node_upsert(self, node: MemoryNode) -> None:
+        for listener in self._node_upsert_listeners:
+            try:
+                listener(node)
+            except Exception:
+                _LOG.exception("node upsert listener failed for node %s", node.id)
 
     def get_node(self, node_id: str) -> MemoryNode | None:
         with self._connect() as conn:

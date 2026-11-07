@@ -72,7 +72,7 @@ function bindEvents() {
     }
     if (submitBtn) submitBtn.disabled = true;
     try {
-      await api("/api/memory", {
+      const saved = await api("/api/memory", {
         method: "POST",
         body: JSON.stringify({
           project_id: state.projectId,
@@ -83,7 +83,7 @@ function bindEvents() {
         }),
       });
       form.reset();
-      showSnackbar("Memory saved", "success");
+      showSnackbar(saved?.dedup_held ? t("dup.held") : "Memory saved", saved?.dedup_held ? "info" : "success");
       await refreshWorkspace();
       scheduleGraphLoad();
     } catch (error) {

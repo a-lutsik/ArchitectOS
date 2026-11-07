@@ -824,6 +824,22 @@ class ProjectIsolationReferenceTests(unittest.TestCase):
         self.assertEqual(stored["global"]["superseded_by"], ids["foreign"])
         self.assertEqual(stored["shared"]["merged_from"], [ids["foreign_shared"]])
 
+    def test_refs_to_the_projects_archived_nodes_stay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = MemoryMCPServer(Path(tmp), project_id="project_a")
+            repository = server.service.repository
+            ids = _seed_two_projects(repository)
+            own2 = repository.get_node(ids["own2"])
+            own2.status = "archived"
+            repository.upsert_node(own2)
+            node = repository.get_node(ids["global"])
+            node.metadata.update({"merged_from": [ids["own2"], ids["foreign"]]})
+            repository.upsert_node(node)
+            reply = _run(server, [_call_tool("memory_get", {"id": ids["global"]})])[0]
+
+        # Visibility, not status, decides: an archived node of the project is still its own.
+        self.assertEqual(_tool_payload(reply["result"])["metadata"]["merged_from"], [ids["own2"]])
+
     def test_stable_layer_and_graph_drop_ids_hidden_from_the_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server = MemoryMCPServer(Path(tmp), project_id="project_a")

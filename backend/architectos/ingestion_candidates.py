@@ -11,8 +11,8 @@ import threading
 from typing import Any
 
 from .candidate_identity import candidate_origin_key
-from .memory_dedup import content_salt, incoming_features
-from .models import utc_now
+from .memory_dedup import DedupDecision
+from .models import MemoryNode, utc_now
 
 _LOG = logging.getLogger(__name__)
 
@@ -95,7 +95,16 @@ class IngestionCandidatesMixin:
         nodes_snapshot: list[Any] | None = None,
         project_root_cache: dict[str, Any] | None = None,
         refresh_duplicates: bool = True,
+        caller_project_id: str | None = None,
+        gate_decision: tuple[DedupDecision, MemoryNode | None] | None = None,
     ) -> dict[str, Any]:
+        """Write a reviewed candidate as a memory node.
+
+        ``caller_project_id`` is the project the accept runs under (Review accept,
+        batch and auto-accept pass the candidate's project; internal ingestion
+        passes none): the node records it as its author. ``gate_decision`` is a
+        ``_gate_decision`` result already taken for this candidate (auto-accept).
+        """
         candidate = self.repository.get_memory_candidate(candidate_id)
         if not candidate:
             raise ValueError("memory candidate not found")
@@ -120,38 +129,39 @@ class IngestionCandidatesMixin:
         node_text = str(payload.get("text") or candidate.get("text") or "")
         node_project = self._memory_project_id_for_scope(node_scope, str(candidate.get("project_id") or "architectos"))
         confidence = float(payload.get("confidence") or candidate.get("confidence") or 0.72)
-        id_salt = ""
+        decision = DedupDecision()
         if interface_id is None:
-            # The node id derives from type+scope+label: a live node under the
-            # same label is either this very fact (fold into it) or another
-            # fact that must not be overwritten (store beside it).
-            holder = self.repository.get_node(
-                self.repository.memory_node_id(node_type, node_label, node_scope, node_project)
+            # The same fact already stored (and owned by the caller project) takes
+            # the accept as a repeat; anything else is stored beside, never over it.
+            # Auto-accept passes the decision it already took (``gate_decision``).
+            decision, held = gate_decision or self._gate_decision(
+                node_label, node_text, node_type, node_scope, node_project, caller_project_id, allow_llm=False,
             )
+            if held is not None:
+                return self._hold_memory_candidate(candidate, held, refresh_duplicates=refresh_duplicates)
+            holder = self.repository.get_node(decision.target_id) if decision.action in {"duplicate", "enrich"} else None
             if holder is not None and holder.status == "active":
-                verdict = self.memory_dedup.compare(
-                    incoming_features(node_label, node_text), self.memory_dedup.node_features(holder)
+                folded = self._fold_into_existing(
+                    holder,
+                    {
+                        "label": node_label, "text": node_text, "type": node_type, "scope": node_scope,
+                        "project_id": node_project, "confidence": confidence,
+                        "source": "memory_candidate", "source_type": candidate.get("source_type") or "",
+                    },
+                    decision,
+                    caller_project_id,
                 )
-                if verdict.action in {"duplicate", "enrich"} and self.memory_dedup_settings()["mode"] == "auto":
-                    verdict.target_id, verdict.target_label = holder.id, str(holder.label or "")
-                    folded = self._fold_into_existing(
-                        holder,
-                        {
-                            "label": node_label, "text": node_text, "type": node_type, "scope": node_scope,
-                            "project_id": node_project, "confidence": confidence,
-                            "source": "memory_candidate", "source_type": candidate.get("source_type") or "",
-                        },
-                        verdict,
-                    )
-                    candidate["status"] = "promoted"
-                    candidate["promoted_node_id"] = holder.id
-                    candidate["promoted_at"] = utc_now()
-                    candidate["metadata"] = {**dict(candidate.get("metadata") or {}), "dedup_merged": True}
-                    candidate = self.repository.update_memory_candidate(candidate)
-                    if refresh_duplicates:
-                        self._schedule_candidate_duplicate_refresh(candidate)
-                    return {"candidate": candidate, "memory": folded}
-                id_salt = content_salt(node_text)
+                candidate["status"] = "promoted"
+                candidate["promoted_node_id"] = holder.id
+                candidate["promoted_at"] = utc_now()
+                candidate["metadata"] = {**dict(candidate.get("metadata") or {}), "dedup_merged": True}
+                candidate = self.repository.update_memory_candidate(candidate)
+                if refresh_duplicates:
+                    self._schedule_candidate_duplicate_refresh(candidate)
+                return {"candidate": candidate, "memory": folded}
+            if not decision.details.get("suggested_action"):
+                # Value updates and contradictions are linked by revisions, not by an accept.
+                decision = DedupDecision()
         metadata = self.memory_lifecycle.seed_metadata(
             node_type=node_type,
             created_at=created_at,
@@ -159,19 +169,36 @@ class IngestionCandidatesMixin:
             source="promoted_candidate",
             label=str(payload.get("label") or candidate.get("label") or ""),
         )
-        node = self.repository.add_node(
-            node_type,
-            node_label,
-            node_scope,
-            node_text,
-            node_project,
-            interface_id,
-            confidence,
-            metadata,
-            id_salt=id_salt,
-        )
+        # The id check and the INSERT OR REPLACE hold one write lock (see add_memory).
+        # With an interface id (revisions, explicit payload) the gate is skipped: the caller's
+        # own node at that id is rewritten in place, a node it does not own never is.
+        with self.repository.transaction():
+            if caller_project_id is not None:
+                id_salt = self._caller_id_salt(
+                    node_type, node_label, node_scope, node_project, interface_id, node_text, caller_project_id,
+                    replace_own=interface_id is not None,
+                )
+            elif interface_id is not None:
+                id_salt = ""
+            else:
+                id_salt = self._label_collision_salt(node_type, node_label, node_scope, node_project, None, node_text)
+            node = self.repository.add_node(
+                node_type,
+                node_label,
+                node_scope,
+                node_text,
+                node_project,
+                interface_id,
+                confidence,
+                metadata,
+                id_salt=id_salt,
+                author_project_id=caller_project_id,
+            )
         # Lifecycle already seeded — initialize_node is a no-op write skip.
         node = self.memory_lifecycle.initialize_node(node, "promoted_candidate")
+        if decision.near_id:
+            # Stored beside a node the caller does not own (or mode=suggest): flag it for review.
+            node, _ = self._apply_dedup_relation(node, decision, {"source": "memory_candidate"}, caller_project_id)
         if nodes_snapshot is not None:
             nodes_snapshot.append(node)
         self.graph_auto_linker.link_node(
@@ -194,8 +221,33 @@ class IngestionCandidatesMixin:
             self._schedule_candidate_duplicate_refresh(candidate)
         return {"candidate": candidate, "memory": node.to_dict()}
 
+    def _hold_memory_candidate(
+        self, candidate: dict[str, Any], held: MemoryNode, *, refresh_duplicates: bool = True
+    ) -> dict[str, Any]:
+        """Close a candidate whose fact another project already stored: rejected, nothing written.
+
+        ``dedup_held_by`` names that node; ``promoted_node_id`` stays empty, so
+        ``undo_auto_capture`` never archives it.
+        """
+        candidate["status"] = "rejected"
+        candidate["rejected_at"] = utc_now()
+        candidate["reject_reason"] = "already stored by another project"
+        candidate["metadata"] = {**dict(candidate.get("metadata") or {}), "dedup_held_by": held.id}
+        candidate = self.repository.update_memory_candidate(candidate)
+        _LOG.info(
+            "memory candidate %s of project=%s held by node %s (author=%s)",
+            candidate.get("id"), candidate.get("project_id"), held.id, held.author_project_id,
+        )
+        if refresh_duplicates:
+            self._schedule_candidate_duplicate_refresh(candidate)
+        return {"candidate": candidate, "memory": self._held_duplicate_result(held)}
+
     def _apply_revision_supersede(self, new_node: Any, old_id: str, candidate: dict[str, Any]) -> None:
-        """Link new revision → old via SUPERSEDES and stamp invalid_at on the predecessor."""
+        """Link new revision → old via SUPERSEDES and stamp invalid_at on the predecessor.
+
+        Not checked against the caller project yet (follow-up): revisions come from
+        file sources of the candidate's own project.
+        """
         old = self.repository.get_node(old_id)
         if not old:
             return
@@ -490,6 +542,7 @@ class IngestionCandidatesMixin:
 
         promoted = 0
         rejected = 0
+        held = 0
         skipped = 0
         errors: list[str] = []
         results: list[dict[str, Any]] = []
@@ -534,8 +587,13 @@ class IngestionCandidatesMixin:
                         nodes_snapshot=nodes_snapshot,
                         project_root_cache=project_root_cache,
                         refresh_duplicates=False,
+                        caller_project_id=str(candidate.get("project_id") or "").strip() or None,
                     )
                     memory = result.get("memory") or {}
+                    if (result.get("candidate") or {}).get("status") != "promoted":
+                        held += 1
+                        results.append({"id": candidate_id, "status": "held", "memory_id": memory.get("id")})
+                        continue
                     memory_id = memory.get("id")
                     if memory_id and by_work_item is not None:
                         work_item_id = str((memory.get("metadata") or {}).get("work_item_id") or "").strip()
@@ -562,7 +620,7 @@ class IngestionCandidatesMixin:
             except Exception as exc:  # noqa: BLE001 - continue batch on single failures
                 errors.append(f"{candidate_id}: {exc}")
 
-        if promoted or rejected:
+        if promoted or rejected or held:
             self._refresh_candidate_duplicate_flags(project_id=project_id)
 
         counts = self.repository.count_memory_candidates_by_status(project_id)
@@ -578,6 +636,7 @@ class IngestionCandidatesMixin:
             "matched": len(selected),
             "promoted": promoted,
             "rejected": rejected,
+            "held": held,
             "skipped": skipped,
             "errors": errors[:50],
             "error_count": len(errors),
