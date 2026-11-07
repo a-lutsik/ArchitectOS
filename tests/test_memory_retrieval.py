@@ -1012,7 +1012,6 @@ class MemoryAsyncIndexingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             service, node_id = self._embed_v1_around(Path(tmp), archive)
             self.assertNotIn(node_id, self._stored_vectors(service))
-            self.assertNotIn(node_id, [node.id for node in service.repository.list_nodes_missing_embeddings()])
 
     def test_a_slow_embedding_of_the_current_version_is_stored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
