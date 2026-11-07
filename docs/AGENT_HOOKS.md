@@ -81,6 +81,10 @@ Capture routes through `capture_memory_turn`, which is the same path MCP's
   **review queue** with a 7-day TTL; `off` captures nothing but explicit saves.
   Conflicts, changed values and duplicates found by the dedup gate wait for a
   person in every mode. See `docs/MEMORY_CAPTURE_RU.md`.
+- Capture runs as the hook's project: it never rewrites another project's node. A
+  fact that restates another project's active node is held (nothing is written);
+  a similar but different fact becomes a new node linked by `possible_duplicate_of`.
+  See `docs/PROJECT_ISOLATION_RU.md`.
 - Each fact carries a kind — `user` (preferences about the person, stored as a
   global `Preference`), `feedback` (corrections and confirmed approaches),
   `project` (decisions the code does not state) or `reference` (where to look

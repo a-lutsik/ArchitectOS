@@ -293,6 +293,7 @@ All documentation lives in [`docs/`](docs):
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [CODE_GRAPH.md](docs/CODE_GRAPH.md) | Architecture and code-map. |
 | [SEARCH_MEMORY_GUIDE.md](docs/SEARCH_MEMORY_GUIDE.md) | Searching and managing memory. |
 | [MEMORY_DEDUP_RU.md](docs/MEMORY_DEDUP_RU.md) | Memory dedup & compaction design (RU). |
+| [PROJECT_ISOLATION_RU.md](docs/PROJECT_ISOLATION_RU.md) | Memory isolation between projects: visibility and ownership rules, status, open follow-ups (RU). |
 | [MEMORY_CAPTURE_RU.md](docs/MEMORY_CAPTURE_RU.md) | Auto-capture of important facts: Claude vs ArchitectOS analysis and proposal (RU). |
 | [GUIDE_RU.md](docs/GUIDE_RU.md) · [PROJECT_RU.md](docs/PROJECT_RU.md) | Russian user guide & project documentation. |
 
