@@ -6,13 +6,15 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from collections.abc import Callable
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from backend.architectos.chunking import chunk_text, work_item_comment_chunks, work_item_main_parts
-from backend.architectos.embeddings import cosine, unpack_vector
-from backend.architectos.models import VALID_SCOPES
+from backend.architectos.embeddings import cosine, node_embedding_text, pack_vector, unpack_vector
+from backend.architectos.models import VALID_SCOPES, MemoryNode
 from backend.architectos.search import HybridSearchStrategy, pack_memory_context
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
@@ -952,6 +954,75 @@ class MemoryAsyncIndexingTests(unittest.TestCase):
             })
             missing = service.repository.list_nodes_missing_embeddings()
             self.assertNotIn(node["id"], [item.id for item in missing])
+
+    def _embed_v1_around(self, root: Path, interleave: Callable[[ArchitectOSService, str], None]) -> tuple[ArchitectOSService, str]:
+        """Write v1 in this process with a slow provider; ``interleave`` runs in another process meanwhile."""
+        service = ArchitectOSService(root)
+        other = ArchitectOSService(root)  # another process on the same database, fast provider
+        provider = service.memory_embeddings.provider
+        real_embed = provider.embed
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_embed(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            release.wait(timeout=60)  # a slow remote provider, v1 vector computed after the wait
+            return real_embed(*args, **kwargs)
+
+        provider.embed = slow_embed
+        node_id = service.repository.memory_node_id("Decision", "Deploy", "shared", "architectos")
+        writer = threading.Thread(
+            target=lambda: service.repository.add_node("Decision", "Deploy", "shared", "Deploys run through Jenkins.", "architectos")
+        )
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(timeout=60))
+            interleave(other, node_id)
+        finally:
+            release.set()
+            writer.join(timeout=60)
+        self.assertFalse(writer.is_alive())
+        provider.embed = real_embed
+        return service, node_id
+
+    @staticmethod
+    def _stored_vectors(service: ArchitectOSService) -> dict[str, bytes]:
+        return {row["node_id"]: row["vector"] for row in service.repository.list_memory_embedding_rows()}
+
+    def test_a_slow_stale_embedding_never_overwrites_a_newer_version(self) -> None:
+        newer: list[MemoryNode] = []
+
+        def write_v2(other: ArchitectOSService, node_id: str) -> None:
+            node = other.repository.get_node(node_id)
+            assert node is not None
+            node.text = "Deploys run through GitHub Actions."
+            newer.append(other.repository.upsert_node(node))  # its listener embeds v2 at once
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service, node_id = self._embed_v1_around(Path(tmp), write_v2)
+            expected = pack_vector(service.memory_embeddings.provider.embed(node_embedding_text(newer[0]), purpose="document"))
+            self.assertEqual(self._stored_vectors(service).get(node_id), expected)
+
+    def test_a_slow_stale_embedding_never_revives_an_archived_node(self) -> None:
+        def archive(other: ArchitectOSService, node_id: str) -> None:
+            node = other.repository.get_node(node_id)
+            assert node is not None
+            node.status = "archived"
+            other.repository.upsert_node(node)  # its listener drops the vector row
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service, node_id = self._embed_v1_around(Path(tmp), archive)
+            self.assertNotIn(node_id, self._stored_vectors(service))
+            self.assertNotIn(node_id, [node.id for node in service.repository.list_nodes_missing_embeddings()])
+
+    def test_a_slow_embedding_of_the_current_version_is_stored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, node_id = self._embed_v1_around(Path(tmp), lambda other, node_id: None)
+            node = service.repository.get_node(node_id)
+            assert node is not None
+            expected = pack_vector(service.memory_embeddings.provider.embed(node_embedding_text(node), purpose="document"))
+            self.assertEqual(self._stored_vectors(service).get(node_id), expected)
+            row = next(row for row in service.repository.list_memory_embedding_rows() if row["node_id"] == node_id)
+            self.assertEqual((row["scope"], row["project_id"]), ("shared", "architectos"))
 
     def test_query_embedding_cache_avoids_repeat_calls(self) -> None:
         from backend.architectos.embeddings import HashEmbeddingProvider, MemoryEmbeddingEngine

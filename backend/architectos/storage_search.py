@@ -252,35 +252,35 @@ class StorageSearchMixin:
         self,
         *,
         node_id: str,
-        scope: str,
-        project_id: str | None,
-        status: str,
+        label: str,
+        text: str,
         provider_id: str,
         model: str,
         dimensions: int,
         vector: list[float],
-    ) -> None:
+    ) -> bool:
+        """Store the vector only while the node is active and still holds the embedded ``label``/``text``.
+
+        The embedding is computed after commit, so another process may have rewritten or
+        archived the node meanwhile; its own listener indexes the newer version. The check
+        and the write are one statement, and scope/project come from the current row.
+        False: the vector is stale and nothing was written.
+        """
         from .embeddings import pack_vector
 
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR REPLACE INTO memory_embeddings(
                     node_id, scope, project_id, status, provider, model, dimensions, vector, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                )
+                SELECT id, scope, project_id, status, ?, ?, ?, ?, ?
+                FROM memory_nodes
+                WHERE id = ? AND status = 'active' AND label = ? AND coalesce(json_extract(payload, '$.text'), '') = ?
                 """,
-                (
-                    node_id,
-                    scope or "project",
-                    project_id,
-                    status or "active",
-                    provider_id,
-                    model,
-                    int(dimensions),
-                    pack_vector(vector),
-                    utc_now(),
-                ),
+                (provider_id, model, int(dimensions), pack_vector(vector), utc_now(), node_id, label, text),
             )
+            return cursor.rowcount > 0
 
     def delete_memory_embedding(self, node_id: str) -> None:
         with self._connect() as conn:
