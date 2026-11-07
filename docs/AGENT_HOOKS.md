@@ -118,8 +118,10 @@ projects, and asks the agent to call `memory_list_projects` then
 
 Prompt-submit injection uses a smaller pack than Ask's `context()`: a
 1 600-character budget (≈ 400 tokens), 220-character node excerpts, at most four
-stable-layer nodes, no open tasks or providers, and an 800 ms cap on vector
-search. Hits scoring below the relevance floor are dropped, and a pack with no
+stable-layer nodes, no open tasks or providers, no graph expansion (the ~2 hits
+that fit the budget are direct matches; on the gold queries expansion changed none
+of them and doubled the search time), and an 800 ms cap on vector search. Hits
+scoring below the relevance floor are dropped, and a pack with no
 hit left (and no stable layer due) is not injected at all. Both knobs live in the
 `agent` setting:
 
@@ -131,7 +133,8 @@ hit left (and no stable layer due) is not injected at all. Both knobs live in th
 
 `POST /api/memory/turn` takes the same pack with `"hook": true`; `capture: false`
 packs without capturing, `exclude_ids` and `include_stable` shape it, and
-`vector_timeout_ms` overrides the vector-search timeout for that request.
+`vector_timeout_ms` overrides the vector-search timeout for that request. Its
+`timing` adds `cache_ms`, the write of the offline briefing cache.
 
 ## Session state
 
@@ -155,7 +158,9 @@ another's pack, even under the same session id.
 
 The hook prefers the running app: it reads `data/architectos.runtime.json` for the
 port and auth token and calls `POST /api/memory/turn` (or
-`GET /api/memory/briefing`).
+`GET /api/memory/briefing`). Each agent turn starts a new interpreter, so the hook
+keeps its imports to a few stdlib modules and speaks HTTP/1.0 over a plain socket
+to the app's loopback server rather than through `urllib`.
 
 If the app is not running (or does not answer in time) the hook never opens the
 store, so an event costs a few milliseconds instead of a service cold start:
