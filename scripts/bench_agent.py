@@ -163,6 +163,13 @@ def bench_hooks(root: Path, env: dict[str, str], runs: int, rng: random.Random, 
         tokens: list[float] = []
         hits: list[float] = []
         transports: set[str] = set()
+        # One unmeasured run in a throwaway session writes the bytecode cache, as an
+        # agent's first hook of the day does; the measured runs then start warm.
+        subprocess.run(
+            [sys.executable, str(REPO / "architectos_hook.py"), "capture", "--client", "claude", "--event", event],
+            input=json.dumps(hook_payload(raw_event, root, rng, -1, f"{session}-warmup")),
+            capture_output=True, text=True, env=env, cwd=root, check=True, timeout=120,
+        )
         for index in range(runs):
             before = log.stat().st_size if log.exists() else 0
             started = time.perf_counter()
@@ -251,6 +258,9 @@ def bench_size(size: int, args: argparse.Namespace) -> dict[str, Any]:
         report.update(bench_service(service, root, queries))
         report["mcp"] = bench_mcp(service, root, queries, facts)
         env = {**os.environ, "ARCHITECTOS_ROOT": str(root), "ARCHITECTOS_HOOK_DEBUG": "1", "ARCHITECTOS_HOOK_OFFLINE": "1"}
+        # Agents run hooks with Python's bytecode cache; a shell that disables it would
+        # charge every run a recompile of the hook modules.
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
         print(f"[bench] {size} nodes: hooks over HTTP", file=sys.stderr, flush=True)
         report["hooks_http"] = bench_hooks_http(service, root, env, args.hook_runs, rng)
         print(f"[bench] {size} nodes: hooks offline", file=sys.stderr, flush=True)
