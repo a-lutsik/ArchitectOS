@@ -137,6 +137,7 @@ hit left (and no stable layer due) is not injected at all. Both knobs live in th
 | --- | --- | --- |
 | `agent.hook_char_budget` | `1600` | Character budget of the whole prompt injection (hook prefix + pack), clamped to 1 301–6 000: a pack never goes below 1 200 (its header alone is ~420), and the hook prefix comes on top |
 | `agent.hook_stable_every_turns` | `20` | A session gets the stable layer again after this many prompts without it (`0` = only at session start) |
+| `agent.hook_cache_ttl_hours` | `24` | The offline hook ignores a project's cached stable lines or hit lines written longer ago than this (`0` = no limit) |
 | `agent.hook_min_score` | `120` | Relevance floor for a hit. Static bonuses (scope, type, source, recency, lifecycle) plus an FTS rank alone reach ~115, so 120 asks for a real query-term match or a vector signal |
 
 `POST /api/memory/turn` takes the same pack with `"hook": true`; `capture: false`
@@ -182,7 +183,11 @@ store, so an event costs a few milliseconds instead of a service cold start:
   project. The hook resolves the folder's project the way the app does
   (`.architectos.json` bind, then the deepest root, then the default project)
   and injects only that project's cached lines, still minus what the session
-  already holds.
+  already holds. A cached memory leaves the cache as soon as its status, scope,
+  project, author project, validity (`invalid_at`), label or text changes (in the
+  app or in any MCP server process; access telemetry does not count), when it is
+  wiped, and a project's entry goes with a project wipe or once the project no
+  longer exists. Lines older than `agent.hook_cache_ttl_hours` are not injected.
 - **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
   the project resolved for the folder. The app replays the spool through
   `capture_memory_turn` into each record's own project when it starts and once a

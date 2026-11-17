@@ -377,7 +377,7 @@ class HookServerModeTests(unittest.TestCase):
         self.assertIn(shared, injected)
         self.assertFalse(injected & set(beta_ids))
         self.assertEqual(set(cache["projects"]), {"alpha"})
-        cached = {node_id for node_id, _line in cache["projects"]["alpha"]["hits"]}
+        cached = {item[0] for item in cache["projects"]["alpha"]["hits"]}
         self.assertFalse(cached & set(beta_ids))
 
 
@@ -674,6 +674,93 @@ class HookCaptureOnStopTests(unittest.TestCase):
                 _hook(root, "Stop", cwd=alpha, session="same", last_assistant_message=self.ANSWER)
         captured = [(call.args[0], call.kwargs.get("cwd")) for call in spy.call_args_list if call.kwargs.get("capture", True)]
         self.assertEqual(captured, [("", str(beta)), (self.PROMPT, str(alpha))])
+
+
+class HookCacheInvalidationTests(unittest.TestCase):
+    """The offline briefing cache follows the store: what changed or left a project leaves the cache."""
+
+    QUESTION = "How do we batch ledger writes?"
+
+    def _cached(self, root: Path) -> tuple[ArchitectOSService, str, list[str]]:
+        """A service whose cache holds the stable layer and a hits pack; (service, stable id, hit ids)."""
+        service = ArchitectOSService(root)
+        hit_ids = _seed(service, "architectos", 8)
+        stable = service.repository.add_node("Constraint", "ledger constraint", "project", "Ledger writes must stay idempotent.", "architectos")
+        service.hook_briefing(cwd=str(root))
+        service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+        return service, stable.id, hit_ids
+
+    @staticmethod
+    def _cache_ids(root: Path, project_id: str = "architectos") -> set[str]:
+        entry = json.loads((root / "data" / "briefing_cache.json").read_text(encoding="utf-8"))["projects"].get(project_id) or {}
+        return {str(item[0]) for key in ("stable", "hits") for item in entry.get(key) or []}
+
+    def test_archived_or_moved_memory_leaves_the_offline_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            cached = self._cache_ids(root)
+            moved_id = next(node_id for node_id in cached if node_id != stable_id)
+            stable = service.repository.get_node(stable_id)
+            moved = service.repository.get_node(moved_id)
+            assert stable is not None and moved is not None
+            stable.status = "archived"
+            moved.project_id = "beta"
+            service.repository.upsert_node(stable)
+            service.repository.upsert_node(moved)
+            start = _hook(root, "SessionStart", cwd=root, session="s1")
+            prompt = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+        self.assertIn(stable_id, cached)
+        shown = set(_injected_ids(start)) | set(_injected_ids(prompt))
+        self.assertNotIn(stable_id, shown)
+        self.assertNotIn(moved_id, shown)
+
+    def test_access_telemetry_keeps_the_cached_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            cached = self._cache_ids(root)
+            nodes = [node for node in (service.repository.get_node(node_id) for node_id in cached) if node is not None]
+            service.memory_lifecycle.refresh_nodes([node.id for node in nodes])  # the access bump of a search
+            for node in nodes:
+                node.metadata = {**node.metadata, "access_count": 99, "memory_score": 0.9}
+                service.repository.upsert_node(node)  # a metadata-only rewrite
+            after = self._cache_ids(root)
+        self.assertGreaterEqual(len(cached), 2)
+        self.assertEqual(after, cached)
+
+    def test_wiping_a_project_drops_its_cache_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            before = self._cache_ids(root)
+            service.repository.upsert_project(Project(id="architectos", name="ArchitectOS", root_path=str(root)))
+            service.wipe_project_memory("architectos", confirm=True)
+            after = self._cache_ids(root)
+            prompt = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+        self.assertTrue(before)
+        self.assertEqual(after, set())
+        self.assertEqual(_injected_ids(prompt), [])
+
+    def test_cache_ttl_counts_from_each_projects_own_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            alpha, beta = _two_projects(root, service)
+            _seed(service, "alpha", 6)
+            _seed(service, "beta", 6)
+            service.capture_memory_turn(self.QUESTION, cwd=str(alpha), hook=True, capture=False, include_stable=False)
+            path = root / "data" / "briefing_cache.json"
+            cache = json.loads(path.read_text(encoding="utf-8"))
+            stale = "2000-01-01T00:00:00+00:00"
+            cache["projects"]["alpha"] = {**cache["projects"]["alpha"], "updated_at": stale, "stable_at": stale, "hits_at": stale}
+            path.write_text(json.dumps(cache), encoding="utf-8")
+            # A later write for another project must not renew alpha's lines.
+            service.capture_memory_turn(self.QUESTION, cwd=str(beta), hook=True, capture=False, include_stable=False)
+            from_alpha = _hook(root, "UserPromptSubmit", cwd=alpha, session="a", prompt=self.QUESTION)
+            from_beta = _hook(root, "UserPromptSubmit", cwd=beta, session="b", prompt=self.QUESTION)
+        self.assertEqual(_injected_ids(from_alpha), [])
+        self.assertTrue(_injected_ids(from_beta))
 
 
 class HookOfflineTests(unittest.TestCase):

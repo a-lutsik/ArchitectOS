@@ -98,6 +98,7 @@ class MemoryWipeMixin:
             evidence_paths=evidence_paths,
             project_id=project_id,
         )
+        self.forget_hook_memories(projects=[project_id])
         try:
             self._ensure_project_memory_root(project)
         except Exception:
@@ -268,6 +269,7 @@ class MemoryWipeMixin:
                 )
 
         evidence_removed = self._delete_evidence_files(evidence_paths)
+        self.forget_hook_memories(node_ids)
         return {
             "nodes": nodes_deleted,
             "edges": edges_deleted,

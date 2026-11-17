@@ -94,6 +94,7 @@ module = [
     "architectos.lifecycle_service",
     "architectos.lsp_fallback",
     "architectos.memory_ingestion",
+    "architectos.memory_wipe_service",
     "architectos.project_files_service",
     "architectos.project_git_ingest",
     "architectos.project_granola_ingest",

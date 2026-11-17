@@ -602,6 +602,8 @@ BRIEFING_CACHE = "briefing_cache.json"
 HOOK_SPOOL = "hook_spool.jsonl"
 _SPOOL_MAX_BYTES = 5 * 1024 * 1024
 _BRIEFING_CHAR_BUDGET = 2000
+# Mirrors agent_hook_service.HOOK_CACHE_TTL_HOURS for a cache written before the setting existed.
+_CACHE_TTL_HOURS = 24.0
 _HOOK_CHAR_BUDGET = 1600
 # Same bind file and walk as mcp_server.read_mcp_bind_project_id, without its imports.
 _BIND_FILENAME = ".architectos.json"
@@ -654,7 +656,7 @@ def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclud
         section: list[str] = []
         cost = used + len(title) + 2
         for item in entry.get(key) or []:
-            if not (isinstance(item, list) and len(item) == 2):
+            if not (isinstance(item, list) and len(item) >= 2):  # [id, line] or [id, line, signature]
                 continue
             node_id, line = str(item[0]), str(item[1])
             if node_id in taken or (key == "hits" and node_id in exclude) or cost + len(line) + 1 > budget:
@@ -669,6 +671,27 @@ def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclud
     if not taken:
         return "", [], []
     return "\n".join(lines).strip(), picked["stable"], picked["hits"]
+
+
+def _fresh_sections(entry: Mapping[str, Any], ttl_hours: float) -> dict[str, Any]:
+    """``entry`` without the sections the app cached more than ``ttl_hours`` ago (0 keeps all).
+
+    Each project's stable lines and hit lines carry their own write time, so a
+    write for one project never renews another's.
+    """
+    fresh = dict(entry)
+    if ttl_hours <= 0:
+        return fresh
+    now = datetime.now(timezone.utc)
+    for key in ("stable", "hits"):
+        written = str(entry.get(f"{key}_at") or entry.get("updated_at") or "")
+        try:
+            age_h = (now - datetime.fromisoformat(written)).total_seconds() / 3600.0
+        except ValueError:
+            age_h = float("inf")
+        if age_h > ttl_hours:
+            fresh[key] = []
+    return fresh
 
 
 def _bound_project_id(cwd: str) -> str:
@@ -795,6 +818,8 @@ def _offline_turn(
             "assistant_text": turn.assistant_text,
         })
     entry = (cache.get("projects") or {}).get(project_id) if project_id else None
+    if isinstance(entry, dict):
+        entry = _fresh_sections(entry, float(settings.get("hook_cache_ttl_hours", _CACHE_TTL_HOURS)))
     if turn.can_inject and isinstance(entry, dict):
         session = turn.event == EVENT_SESSION
         context, stable, hits = render_cached_pack(

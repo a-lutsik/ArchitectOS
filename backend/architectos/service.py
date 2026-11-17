@@ -66,6 +66,8 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         self._embedding_index_queue: queue.Queue[str] = queue.Queue()
         self._embedding_worker_started = False
         self.repository.register_node_upsert_listener(self._enqueue_embedding_index)
+        # A cached memory that changes where it may be shown leaves the offline hook cache.
+        self.repository.register_node_upsert_listener(self._forget_changed_hook_node)
         # Refreshing duplicate flags rescans every active node in the project, so
         # a single Accept must not pay for it inline. Same opt-in as above: stay
         # synchronous until start_background_maintenance() flips it, so tests and

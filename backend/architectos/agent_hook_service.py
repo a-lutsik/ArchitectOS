@@ -13,14 +13,21 @@ search, the stable layer and the repository are reached through ``self``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator, Mapping
+
+try:
+    import fcntl
+except ImportError:  # Windows: the cache file is then serialized within one process only
+    fcntl = None  # type: ignore[assignment]
 
 from .agent_hooks import (
     BRIEFING_CACHE,
@@ -31,6 +38,7 @@ from .agent_hooks import (
     spool_turn,
     write_private,
 )
+from .models import MemoryNode
 from .search import DEFAULT_CONTEXT_CHAR_BUDGET, MIN_CONTEXT_CHAR_BUDGET, pack_memory_context
 
 _LOG = logging.getLogger("architectos.service")
@@ -51,9 +59,39 @@ HOOK_MIN_SCORE = 120.0
 HOOK_SPOOL_MAX_ATTEMPTS = 3
 # capture_memory_turn's project for a folder no project claims; the offline hook mirrors it.
 HOOK_DEFAULT_PROJECT = "architectos"
+# The offline hook ignores a project's cached lines older than this (0 = no limit). The
+# app drops changed memories from the cache itself; the age bounds what it cannot see.
+HOOK_CACHE_TTL_HOURS = 24
 
 _CACHE_LOCK = threading.Lock()
 _SPOOL_LOCK = threading.Lock()
+
+
+def _cache_signature(node: Mapping[str, Any]) -> str:
+    """What decides whether, and how, a cached memory line may still be shown.
+
+    Lifecycle telemetry (access counts, scores) is left out, so a search's access
+    bump never evicts the lines it was just cached with.
+    """
+    meta = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    fields = [node.get(key) for key in ("status", "scope", "project_id", "author_project_id", "label", "text")]
+    raw = json.dumps([*fields, (meta or {}).get("invalid_at")], sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on ``path`` across processes (the app and every MCP server write the cache)."""
+    if fcntl is None:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
 
 
 def _bounded(raw: Any, default: float, low: float, high: float) -> float:
@@ -76,6 +114,7 @@ class AgentHookServiceMixin:
             )),
             "hook_min_score": _bounded(config.get("hook_min_score"), HOOK_MIN_SCORE, 0.0, 1000.0),
             "hook_stable_every_turns": int(_bounded(config.get("hook_stable_every_turns"), HOOK_STABLE_EVERY_TURNS, 0, 1000)),
+            "hook_cache_ttl_hours": _bounded(config.get("hook_cache_ttl_hours"), HOOK_CACHE_TTL_HOURS, 0.0, 24.0 * 30),
         }
 
     def hook_context(
@@ -135,7 +174,7 @@ class AgentHookServiceMixin:
             )
         pack_done = time.perf_counter()
         if context and project_id:
-            self.remember_hook_pack(project_id, pack=context)
+            self.remember_hook_pack(project_id, pack=context, nodes=[hit["node"] for hit in hits + stable])
         finished = time.perf_counter()
         retrieval = search.get("retrieval") or {}
         _LOG.debug(
@@ -161,56 +200,166 @@ class AgentHookServiceMixin:
     def hook_briefing(self, *, project_id: str | None = None, cwd: str | None = None, limit: int = 6) -> dict[str, Any]:
         """Session-start briefing; also refreshes the project's stable layer in the offline cache."""
         briefing = self.memory_briefing(project_id=project_id, cwd=cwd, limit=limit)
-        self.remember_hook_pack(str(briefing.get("project_id") or ""), briefing=str(briefing.get("context") or ""))
+        self.remember_hook_pack(
+            str(briefing.get("project_id") or ""),
+            briefing=str(briefing.get("context") or ""),
+            nodes=[hit["node"] for hit in briefing.get("stable") or [] if isinstance(hit, dict) and isinstance(hit.get("node"), dict)],
+        )
         return briefing
 
-    def remember_hook_pack(self, project_id: str, *, briefing: str = "", pack: str = "") -> None:
+    def remember_hook_pack(
+        self, project_id: str, *, briefing: str = "", pack: str = "", nodes: Iterable[Mapping[str, Any]] = ()
+    ) -> None:
         """Keep a project's latest briefing (stable lines) and hook pack (hit lines) for the offline hook.
 
-        Every write also refreshes the folder -> project roots and the hook
-        settings, so the hook can resolve a project and size a pack without the
-        store. With nothing new the file is only rewritten when those changed.
-        Never raises: the cache is a convenience, the turn must not fail on it.
+        Each line keeps the signature of its node (``nodes``), so a later change
+        that matters evicts it. Every write also refreshes the folder -> project
+        roots and the hook settings, so the hook can resolve a project and size a
+        pack without the store; with nothing new the file is only rewritten when
+        those changed. Never raises: the turn must not fail on the cache.
         """
-        path = Path(self.project_root) / "data" / BRIEFING_CACHE
         try:
-            with _CACHE_LOCK:
-                try:
-                    cache = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    cache = {}
-                cache = cache if isinstance(cache, dict) else {}
-                settings = self.agent_hook_settings()
-                roots = self._hook_project_roots()
-                shared = {"roots": roots, "default_project": HOOK_DEFAULT_PROJECT, "settings": {
-                    "hook_char_budget": settings["hook_char_budget"],
-                    "hook_stable_every_turns": settings["hook_stable_every_turns"],
-                }}
+            settings = self.agent_hook_settings()
+            roots = self._hook_project_roots()
+            shared = {"roots": roots, "default_project": HOOK_DEFAULT_PROJECT, "settings": {
+                "hook_char_budget": settings["hook_char_budget"],
+                "hook_stable_every_turns": settings["hook_stable_every_turns"],
+                "hook_cache_ttl_hours": settings["hook_cache_ttl_hours"],
+            }}
+            signatures = {str(node.get("id") or ""): _cache_signature(node) for node in nodes}
+
+            def change(cache: dict[str, Any]) -> bool:
                 if not (project_id and (briefing or pack)) and all(cache.get(key) == value for key, value in shared.items()):
-                    return
+                    return False
                 raw_projects = cache.get("projects")
                 projects: dict[str, Any] = raw_projects if isinstance(raw_projects, dict) else {}
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 if project_id and (briefing or pack):
                     raw_entry = projects.get(project_id)
                     entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
                     for text, key in ((briefing, "stable"), (pack, "hits")):
                         if text:
                             parsed = split_pack(text)
-                            entry["header"], entry[key] = parsed["header"], parsed[key]
-                    entry["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                            entry["header"] = parsed["header"]
+                            entry[key] = [[node_id, line, signatures.get(node_id, "")] for node_id, line in parsed[key]]
+                            entry[f"{key}_at"] = now
+                    entry["updated_at"] = now
                     projects[project_id] = entry
-                cache.update(shared, version=1, projects=projects,
-                             updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                scratch = path.with_suffix(".tmp")
-                write_private(scratch, json.dumps(cache, ensure_ascii=False))
-                os.replace(scratch, path)
+                cache.update(shared, version=2, projects=projects, updated_at=now)
+                return True
+
+            self._update_briefing_cache(change)
             _LOG.debug(
-                "briefing cache updated project=%s briefing=%s pack=%s projects=%s roots=%s",
-                project_id or "-", bool(briefing), bool(pack), len(projects), len(roots),
+                "briefing cache updated project=%s briefing=%s pack=%s roots=%s",
+                project_id or "-", bool(briefing), bool(pack), len(roots),
             )
         except Exception as exc:  # noqa: BLE001 - the offline cache must never break a turn
             _LOG.warning("briefing cache not updated for project %s: %s", project_id or "-", exc)
+
+    def forget_hook_memories(self, node_ids: Iterable[str] = (), *, projects: Iterable[str] = ()) -> None:
+        """Drop deleted memories, and whole projects, from the offline cache. Never raises."""
+        gone, dropped = set(node_ids), set(projects)
+        if not (gone or dropped):
+            return
+        try:
+            self._evict_hook_cache(lambda node_id, signature: node_id in gone, dropped)
+        except Exception as exc:  # noqa: BLE001 - the offline cache must never break a write
+            _LOG.warning("briefing cache not pruned: %s", exc)
+
+    def _forget_changed_hook_node(self, node: MemoryNode) -> None:
+        """Upsert listener: a cached memory whose status, scope, project or text changed leaves the cache.
+
+        Runs in every process that writes memory (the app, each MCP server). The
+        ids the cache holds are re-read only when the file changed, so a write that
+        touches no cached memory costs one stat.
+        """
+        try:
+            cached = self._hook_cache_index().get(node.id)
+            if cached is None:
+                return
+            signature = _cache_signature(node.to_dict())
+            if cached == {signature}:
+                return
+            self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set())
+        except Exception as exc:  # noqa: BLE001 - a listener must never break the write
+            _LOG.warning("briefing cache not pruned for node %s: %s", node.id, exc)
+
+    def _hook_cache_projects(self) -> set[str]:
+        try:
+            cache = json.loads((Path(self.project_root) / "data" / BRIEFING_CACHE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        projects = cache.get("projects") if isinstance(cache, dict) else None
+        return set(projects) if isinstance(projects, dict) else set()
+
+    def _hook_cache_index(self) -> dict[str, set[str]]:
+        """Cached memory id -> the signatures its lines were cached with, re-read when the file changes."""
+        path = Path(self.project_root) / "data" / BRIEFING_CACHE
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+        memo = getattr(self, "_hook_cache_memo", None)
+        if memo is not None and memo[0] == stamp:
+            return memo[1]
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        index: dict[str, set[str]] = {}
+        for entry in ((cache.get("projects") or {}) if isinstance(cache, dict) else {}).values():
+            for key in ("stable", "hits"):
+                for item in (entry.get(key) or []) if isinstance(entry, dict) else []:
+                    if isinstance(item, list) and len(item) >= 2:
+                        index.setdefault(str(item[0]), set()).add(str(item[2]) if len(item) > 2 else "")
+        self._hook_cache_memo = (stamp, index)
+        return index
+
+    def _evict_hook_cache(self, evict: Callable[[str, str], bool], projects: set[str]) -> None:
+        """Remove the cached lines ``evict(node_id, signature)`` picks, and the entries of ``projects``."""
+        removed = {"lines": 0, "projects": 0}
+
+        def change(cache: dict[str, Any]) -> bool:
+            entries = cache.get("projects")
+            if not isinstance(entries, dict):
+                return False
+            for project_id in projects & set(entries):
+                del entries[project_id]
+                removed["projects"] += 1
+            for entry in entries.values():
+                for key in ("stable", "hits"):
+                    items = entry.get(key) if isinstance(entry, dict) else None
+                    if not isinstance(items, list):
+                        continue
+                    kept = [item for item in items if not (
+                        isinstance(item, list) and len(item) >= 2 and evict(str(item[0]), str(item[2]) if len(item) > 2 else "")
+                    )]
+                    removed["lines"] += len(items) - len(kept)
+                    entry[key] = kept
+            return bool(removed["lines"] or removed["projects"])
+
+        self._update_briefing_cache(change)
+        if removed["lines"] or removed["projects"]:
+            _LOG.info("briefing cache pruned: lines=%s projects=%s", removed["lines"], removed["projects"])
+
+    def _update_briefing_cache(self, change: Callable[[dict[str, Any]], bool]) -> None:
+        """Read, ``change`` and rewrite data/briefing_cache.json; ``change`` returns False to skip the write.
+
+        Serialized across threads and, through a lock file, across processes.
+        """
+        path = Path(self.project_root) / "data" / BRIEFING_CACHE
+        with _CACHE_LOCK, _file_lock(path.with_name(f"{BRIEFING_CACHE}.lock")):
+            try:
+                cache = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cache = {}
+            cache = cache if isinstance(cache, dict) else {}
+            if not change(cache):
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            scratch = path.with_name(f"{BRIEFING_CACHE}.{os.getpid()}.tmp")
+            write_private(scratch, json.dumps(cache, ensure_ascii=False))
+            os.replace(scratch, path)
 
     def _hook_project_roots(self) -> dict[str, str]:
         roots: dict[str, str] = {}
@@ -296,10 +445,17 @@ class AgentHookServiceMixin:
             return "failed"
 
     def hook_maintenance(self) -> None:
-        """App start and once a minute: replay spooled captures, prune old sessions, refresh cached roots."""
+        """App start and once a minute: replay spooled captures, prune old sessions, refresh cached roots.
+
+        Also drops cache entries of projects that no longer exist (deleted, or
+        removed by a migration).
+        """
         try:
             self.drain_hook_spool()
             prune_hook_sessions(Path(self.project_root))
             self.remember_hook_pack("")
+            known = {str(project.id) for project in self.repository.list_projects()} | {HOOK_DEFAULT_PROJECT}
+            cached = self._hook_cache_projects()
+            self.forget_hook_memories(projects=cached - known)
         except Exception as exc:  # noqa: BLE001 - background maintenance must not crash the app
             _LOG.error("hook maintenance failed: %s", exc, exc_info=True)
