@@ -1075,6 +1075,66 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertNotIn(stable_id, _injected_ids(later))
         self.assertFalse(marker_left)
 
+    def _write_while_the_cache_lock_is_held(self, root: Path, write: Any) -> tuple[float | None, bool]:
+        """Run ``write`` while another process holds the cache lock: (seconds it took or None, marker left)."""
+        lock = root / "data" / f"{agent_hooks.BRIEFING_CACHE}.lock"
+        finished: list[float] = []
+
+        def run() -> None:
+            started = time.monotonic()
+            write()
+            finished.append(time.monotonic() - started)
+
+        with agent_hooks.file_lock(lock):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(1.5)
+            took = finished[0] if finished else None
+            marked = (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").exists()
+        thread.join(10)
+        return took, marked
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_stuck_cache_lock_does_not_stall_writing_an_uncached_memory(self) -> None:
+        # The listener used to wait for the cache lock on every write, after commit:
+        # a holder stuck for 3 s cost every upsert in every process 3 s.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            took, _ = self._write_while_the_cache_lock_is_held(root, lambda: service.repository.add_node(
+                "Lesson", "unrelated", "project", "Deploys run on Tuesdays.", "architectos"
+            ))
+        self.assertIsNotNone(took)
+        self.assertLess(took, 0.2)
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_cached_memory_changed_under_a_stuck_lock_stays_out_of_the_offline_pack(self) -> None:
+        # The eviction gives up on the lock after a short wait, and the change is not lost:
+        # the offline hook stays off the cached lines until a locked write re-checks them.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            took, marked = self._write_while_the_cache_lock_is_held(root, lambda: self._archive(service, stable_id))
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+            later = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 1.0)
+        self.assertTrue(marked)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
+        self.assertTrue(_injected_ids(later))
+
+    def test_writing_an_uncached_memory_does_not_sign_it(self) -> None:
+        # Signing costs ~200 us per node; only a memory the cache holds needs it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            with mock.patch.object(agent_hook_service, "_cache_signature", wraps=agent_hook_service._cache_signature) as sign:  # noqa: SLF001
+                service.repository.add_node("Lesson", "unrelated", "project", "Deploys run on Tuesdays.", "architectos")
+        sign.assert_not_called()
+
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
         # from the store re-checks the cached lines and renews their age.
