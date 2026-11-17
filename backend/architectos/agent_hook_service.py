@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-
 from .agent_hooks import (
     BRIEFING_CACHE,
     HOOK_SPOOL,
@@ -155,7 +154,9 @@ class AgentHookServiceMixin:
             )
         pack_done = time.perf_counter()
         if context and project_id:
-            self.remember_hook_pack(project_id, pack=context, nodes=[hit["node"] for hit in hits + stable])
+            self.remember_hook_pack(
+                project_id, pack=context, nodes=[hit["node"] for hit in hits + stable], revalidate_stable=bool(stable)
+            )
         finished = time.perf_counter()
         retrieval = search.get("retrieval") or {}
         _LOG.debug(
@@ -189,7 +190,13 @@ class AgentHookServiceMixin:
         return briefing
 
     def remember_hook_pack(
-        self, project_id: str, *, briefing: str = "", pack: str = "", nodes: Iterable[Mapping[str, Any]] = ()
+        self,
+        project_id: str,
+        *,
+        briefing: str = "",
+        pack: str = "",
+        nodes: Iterable[Mapping[str, Any]] = (),
+        revalidate_stable: bool = False,
     ) -> None:
         """Keep a project's latest briefing (stable lines) and hook pack (hit lines) for the offline hook.
 
@@ -197,7 +204,10 @@ class AgentHookServiceMixin:
         that matters evicts it. Every write also refreshes the folder -> project
         roots and the hook settings, so the hook can resolve a project and size a
         pack without the store; with nothing new the file is only rewritten when
-        those changed. Never raises: the turn must not fail on the cache.
+        those changed. ``revalidate_stable`` (a prompt that got the stable layer)
+        re-checks the cached stable lines against the store and renews their age,
+        which otherwise only a briefing does. Never raises: the turn must not fail
+        on the cache.
         """
         try:
             settings = self.agent_hook_settings()
@@ -214,16 +224,21 @@ class AgentHookServiceMixin:
             def change(cache: dict[str, Any]) -> bool:
                 if not (project_id and (briefing or pack)) and all(cache.get(key) == value for key, value in shared.items()):
                     return False
-                # Under the cache lock, against the store: a memory another process archived
-                # or moved since this pack was built (and evicted meanwhile) stays out.
-                current = {node.id: _cache_signature(node.to_dict()) for node in self.repository.list_nodes_by_ids(list(signatures))}
-                fresh = {node_id for node_id, signature in signatures.items() if current.get(node_id) == signature}
                 raw_projects = cache.get("projects")
                 projects: dict[str, Any] = raw_projects if isinstance(raw_projects, dict) else {}
+                raw_entry = projects.get(project_id) if project_id else None
+                entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
+                held = [item for item in entry.get("stable") or [] if isinstance(item, list) and len(item) >= 2] if revalidate_stable else []
+                # Under the cache lock, against the store: a memory another process archived
+                # or moved since this pack was built (and evicted meanwhile) stays out.
+                checked = list({*signatures, *(str(item[0]) for item in held)})
+                current = {node.id: _cache_signature(node.to_dict()) for node in self.repository.list_nodes_by_ids(checked)}
+                fresh = {node_id for node_id, signature in signatures.items() if current.get(node_id) == signature}
                 now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 if project_id and (briefing or pack):
-                    raw_entry = projects.get(project_id)
-                    entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
+                    if held:
+                        entry["stable"] = [item for item in held if len(item) > 2 and current.get(str(item[0])) == item[2]]
+                        entry["stable_at"] = now
                     for text, key in ((briefing, "stable"), (pack, "hits")):
                         if text:
                             parsed = split_pack(text, set(signatures))

@@ -900,6 +900,20 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertFalse(written_while_held)
         self.assertTrue(written)
 
+    def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
+        # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
+        # from the store re-checks the cached lines and renews their age.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            path = root / "data" / "briefing_cache.json"
+            cache = json.loads(path.read_text(encoding="utf-8"))
+            cache["projects"]["architectos"]["stable_at"] = "2000-01-01T00:00:00+00:00"
+            path.write_text(json.dumps(cache), encoding="utf-8")
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=True)
+            start = _hook(root, "SessionStart", cwd=root, session="s1")
+        self.assertIn(stable_id, _injected_ids(start))
+
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

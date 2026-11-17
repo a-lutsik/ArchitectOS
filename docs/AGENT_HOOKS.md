@@ -186,8 +186,12 @@ store, so an event costs a few milliseconds instead of a service cold start:
   already holds. A cached memory leaves the cache as soon as its status, scope,
   project, author project, validity (`invalid_at`), label or text changes (in the
   app or in any MCP server process; access telemetry does not count), when it is
-  wiped, and a project's entry goes with a project wipe or once the project no
-  longer exists. Lines older than `agent.hook_cache_ttl_hours` are not injected.
+  wiped, and a project's entry goes with a project wipe or once the registered
+  project no longer exists. Lines older than `agent.hook_cache_ttl_hours` are not
+  injected; a prompt that gets the stable layer from the app re-checks and renews
+  the cached stable lines. Writers of the cache (the app, MCP servers) and the
+  hooks of one session take a lock file first; on Windows, which has no `fcntl`,
+  that lock holds within one process only.
 - **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
   the project resolved for the folder. The app replays the spool through
   `capture_memory_turn` into each record's own project when it starts and once a
