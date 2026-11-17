@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import re
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from backend.architectos import memory_dedup
 from backend.architectos.candidate_identity import origin_key_from_memory_node
 from backend.architectos.mcp_server import MemoryMCPServer
 from backend.architectos.memory_dedup import MemoryDedupGate, content_salt, fact_features, stem
@@ -21,6 +23,47 @@ from backend.architectos.models import MemoryNode, owned_by, stable_id
 from backend.architectos.sdk import ArchitectOS
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
+
+
+# Pairs of atoms with the verdict and the auto-capture outcome the design requires
+# (docs/notes/auto-capture-architect.md, Q1). ``a`` is stored, ``b`` is incoming.
+DEDUP_PAIRS: list[dict[str, Any]] = [
+    json.loads(line)
+    for line in (Path(__file__).parent / "data" / "dedup_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+ATOM_TEMPLATES = ("chat_session_atom", "mcp_turn_atom")
+_PAIR_PROJECTS = itertools.count()
+_FILLER_WORD = {"en": "zebra", "ru": "зебра"}
+_ADDED_WORDS = {
+    "en": " and the same holds for every other deployment environment",
+    "ru": " и то же самое верно для каждого другого окружения развертывания",
+}
+_NEGATION_INSERT = {"en": "do not", "ru": "не"}
+
+
+def with_single_number(text: str, number: int) -> str:
+    """``text`` with exactly one number: its own one replaced, or ``(number)`` appended."""
+    if len(re.findall(r"\d+", text)) == 1:
+        return re.sub(r"\d+", str(number), text, count=1)
+    return f"{text.rstrip('.')} ({number})"
+
+
+def with_replaced_word(text: str, lang: str) -> str:
+    """``text`` with its longest plain word (not the first) swapped for a filler word."""
+    words = text.split()
+    index = max((i for i in range(1, len(words)) if words[i].isalpha()), key=lambda i: len(words[i]))
+    words[index] = _FILLER_WORD[lang]
+    return " ".join(words)
+
+
+def with_negation(text: str, lang: str) -> str:
+    first, rest = text.split(" ", 1)
+    return f"{first} {_NEGATION_INSERT[lang]} {rest}"
+
+
+def with_added_words(text: str, lang: str) -> str:
+    return text.rstrip(".") + _ADDED_WORDS[lang]
 
 
 class GateClassifierTests(unittest.TestCase):
@@ -254,6 +297,128 @@ class GateWritePathTests(unittest.TestCase):
         fresh = dict(update, label="Шрифт", text="Интерфейс использует шрифт Inter")
         self.assertTrue(self.service._auto_accept_near_duplicate(update))
         self.assertFalse(self.service._auto_accept_near_duplicate(fresh))
+
+    def _atom(self, template: str, fact_text: str) -> tuple[str, str, str]:
+        """Label, body and type of the atom ``_enqueue_session_fact_atoms`` builds for one fact."""
+        built: list[dict[str, Any]] = []
+
+        def capture(project_id: str, candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+            built.extend(candidates)
+            return []
+
+        from_mcp = {"source_type": "mcp", "template": template, "id_kind": template} if template == "mcp_turn_atom" else {}
+        with mock.patch.object(self.service.ingestion_engine, "prepare_candidates", side_effect=capture):
+            self.service._enqueue_session_fact_atoms(
+                "architectos", "chat-atoms", 1, [{"type": "Decision", "text": fact_text}],
+                mode="review", trigger="test", **from_mcp,
+            )
+        self.assertEqual(len(built), 1, fact_text)
+        self.assertEqual(built[0]["metadata"]["template"], template)
+        return str(built[0]["label"]), str(built[0]["text"]), str(built[0]["type"])
+
+    def _gate_outcome(
+        self, stored: tuple[str, str], incoming: tuple[str, str], *, same_turn: bool = False
+    ) -> tuple[str, str]:
+        """``(gate verdict, auto outcome)`` of an incoming atom against a stored one.
+
+        Both are ``(template, fact text)``. The verdict is what ``classify`` answers
+        over the dedup index; ``update`` is a replacement only if
+        ``replacement_allowed`` says so, otherwise both facts stay.
+        """
+        stored_label, stored_body, stored_type = self._atom(*stored)
+        label, body, node_type = self._atom(*incoming)
+        project_id = f"pair-{next(_PAIR_PROJECTS)}"
+        self.repo.add_node(stored_type, stored_label, "project", stored_body, project_id, metadata={"template": stored[0]})
+        action = self.service.memory_dedup.classify(label, body, node_type, "project", project_id).action
+        if action == "update":
+            allowed = memory_dedup.replacement_allowed(body, stored_body, same_turn=same_turn)
+            return action, "replace" if allowed else "keep_both"
+        return action, {"duplicate": "reject", "conflict": "reject", "enrich": "fold"}.get(action, "write")
+
+    def _assert_pair(self, row: dict[str, Any]) -> None:
+        template_pairs = [tuple(row["templates"])] if row.get("templates") else [(name, name) for name in ATOM_TEMPLATES]
+        for stored_template, incoming_template in template_pairs:
+            with self.subTest(pair=row["id"], stored=stored_template, incoming=incoming_template):
+                got = self._gate_outcome((stored_template, row["a"]), (incoming_template, row["b"]))
+                self.assertEqual(got, (row["verdict"], row["outcome"]))
+
+    def test_pairs_that_must_fire_are_decided_from_the_whole_statement(self) -> None:
+        rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"reject", "fold", "replace"}]
+        self.assertEqual(len(rows), 9)
+        for row in rows:
+            self._assert_pair(row)
+
+    def test_pairs_that_must_stay_alive_never_fold_or_replace(self) -> None:
+        rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"keep_both", "write"}]
+        self.assertEqual(len(rows), 12)
+        for row in rows:
+            self._assert_pair(row)
+
+    def test_metamorphic_variants_of_every_must_fire_base_fact(self) -> None:
+        bases = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"reject", "fold", "replace"}]
+        for row in bases:
+            base, lang = row["a"], row["lang"]
+            chat, mcp = "chat_session_atom", "mcp_turn_atom"
+            number_10, number_20 = with_single_number(base, 10), with_single_number(base, 20)
+            cases = {
+                "word and number replaced is not an update": (
+                    (chat, number_10), (chat, with_single_number(with_replaced_word(base, lang), 20)), None,
+                ),
+                "only number changed is a replacement": ((chat, number_10), (chat, number_20), ("update", "replace")),
+                "inserted negation is a conflict": ((chat, base), (chat, with_negation(base, lang)), ("conflict", "reject")),
+                "appended words enrich": ((chat, base), (chat, with_added_words(base, lang)), ("enrich", "fold")),
+                "Ask against MCP is a duplicate": ((chat, base), (mcp, base), ("duplicate", "reject")),
+                "MCP against Ask is a duplicate": ((mcp, base), (chat, base), ("duplicate", "reject")),
+            }
+            for name, (stored, incoming, expected) in cases.items():
+                with self.subTest(base=row["id"], variant=name):
+                    got = self._gate_outcome(stored, incoming)
+                    if expected is None:
+                        self.assertNotEqual(got[0], "update")
+                        self.assertNotEqual(got[1], "replace")
+                    else:
+                        self.assertEqual(got, expected)
+
+    def test_replacement_needs_equal_templates_one_changed_number_and_another_turn(self) -> None:
+        def allowed(old: str, new: str, *, same_turn: bool = False) -> bool:
+            return memory_dedup.replacement_allowed(
+                self._atom("chat_session_atom", new)[1], self._atom("chat_session_atom", old)[1], same_turn=same_turn,
+            )
+
+        old = "The Azure Boards sync job fetches at most 200 work items per WIQL window"
+        new = "The Azure Boards sync job fetches at most 1000 work items per WIQL window"
+        self.assertTrue(allowed(old, new))
+        self.assertFalse(allowed(old, new, same_turn=True), "facts of one turn never replace each other")
+        self.assertFalse(allowed(old, old), "an unchanged number is no replacement")
+        self.assertFalse(allowed(old, new.replace("sync job", "export job")), "templates differ")
+        self.assertFalse(
+            allowed("Service A calls service B with a 30 second timeout", "Service B calls service A with a 60 second timeout"),
+            "same number count but another word order",
+        )
+        self.assertFalse(
+            allowed("The rate limit is 100 requests per 60 seconds", "The rate limit is 200 requests per 30 seconds"),
+            "several numbers are never a replacement",
+        )
+        self.assertFalse(
+            allowed("Stage 1 of the release pipeline runs on Linux", "Stage 2 of the release pipeline runs on Linux"),
+            "a number right after the first word names the item, it is not a value",
+        )
+        self.assertFalse(allowed("Спринт 14 закрывается в пятницу", "Спринт 15 закрывается в пятницу"))
+        self.assertFalse(allowed("Limit is 5 requests", "Limit is 5 requests and 7 retries"), "number count differs")
+
+
+def _residual_pair_test(row: dict[str, Any]) -> Any:
+    @unittest.expectedFailure
+    def test(self: GateWritePathTests) -> None:
+        self._assert_pair(row)
+
+    test.__doc__ = f"Accepted risk, kept visible: {row['id']}"
+    return test
+
+
+for _row in DEDUP_PAIRS:
+    if _row["residual"]:
+        setattr(GateWritePathTests, f"test_residual_{_row['id']}", _residual_pair_test(_row))
 
 
 def caller_salt(caller: str, text: str) -> str:
