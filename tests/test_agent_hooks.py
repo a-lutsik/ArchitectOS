@@ -332,6 +332,35 @@ class HookSessionTests(unittest.TestCase):
         "Which ledger rule covers batching?",
     )
 
+    def test_stable_layer_stays_due_until_a_prompt_actually_shows_it(self) -> None:
+        # The app timed out and the offline cache had no stable lines: nothing was
+        # shown, so the next prompt must ask for the stable layer again.
+        sent: list[dict[str, object]] = []
+
+        def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+            if not sent:
+                sent.append({})
+                raise TimeoutError("timed out")
+            sent.append(json.loads(body or b"{}"))
+            return 200, json.dumps({"project_id": "architectos", "context": "", "hits": [], "stable": []}).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 8)
+            # The app cached a hits-only pack: the offline answer has hits but no stable lines.
+            service.capture_memory_turn(self.QUESTIONS[0], hook=True, capture=False, include_stable=False)
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            with mock.patch.object(agent_hooks, "_exchange", side_effect=exchange):
+                first = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0])
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[1])
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[2])
+        self.assertTrue(_injected_ids(first))
+        self.assertFalse(_stable_section(first))
+        self.assertEqual([item.get("include_stable") for item in sent[1:]], [True, False])
+
     def test_a_session_never_gets_the_same_id_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -325,8 +325,15 @@ class HookSession:
         due = stable_turn is None or (every > 0 and int(entry.get("turn") or 0) + 1 - int(stable_turn) >= every)
         return due, list(entry.get("seen") or {})
 
-    def record(self, turn: HookTurn, result: dict[str, Any] | None, injected: str, *, include_stable: bool) -> None:
-        """Remember what this event injected, under the project the app resolved."""
+    def record(
+        self, turn: HookTurn, result: dict[str, Any] | None, injected: str, *, include_stable: bool, transport: str
+    ) -> None:
+        """Remember what this event injected, under the project the app resolved.
+
+        The stable layer counts as shown only when it reached the agent, or when the
+        app itself answered that the project has none; an offline or empty pack
+        leaves it due for the next prompt.
+        """
         if result is None:
             return
         project_id = str(result.get("project_id") or self.project_for(turn.cwd))
@@ -337,13 +344,15 @@ class HookSession:
         if "stable_every_turns" in result:
             self.state["stable_every"] = int(result["stable_every_turns"])
         entry = self.project(project_id)
+        shown = STABLE_TITLE in injected or (transport == "http" and not result.get("stable"))
         if turn.event == EVENT_SESSION:
             if turn.source in _RESET_SOURCES:
                 entry["seen"] = {}
-            entry["stable_turn"] = int(entry["turn"])
+            if shown:
+                entry["stable_turn"] = int(entry["turn"])
         elif turn.event == EVENT_PROMPT:
             entry["turn"] = int(entry["turn"]) + 1
-            if include_stable:
+            if include_stable and shown:
                 entry["stable_turn"] = entry["turn"]
         for node_id in _INJECTED_ID.findall(injected):
             entry["seen"][node_id] = entry["turn"]
@@ -819,7 +828,7 @@ def handle_capture(
         _log().info("injection skipped: kind=%s transport=%s reason=%s", turn.event, transport,
                   "no reply" if result is None else "empty pack")
     if session is not None:
-        session.record(turn, result, injected, include_stable=include_stable)
+        session.record(turn, result, injected, include_stable=include_stable, transport=transport)
         if turn.event == EVENT_PROMPT:
             session.keep_prompt(turn.cwd, turn.user_text)
         session.save()
