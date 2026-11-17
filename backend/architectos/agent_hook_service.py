@@ -201,7 +201,9 @@ class AgentHookServiceMixin:
         """
         try:
             settings = self.agent_hook_settings()
-            roots = self._hook_project_roots()
+            registered = self.repository.list_projects()
+            roots = self._hook_project_roots(registered)
+            registered_ids = {str(project.id) for project in registered}
             shared = {"roots": roots, "default_project": HOOK_DEFAULT_PROJECT, "settings": {
                 "hook_char_budget": settings["hook_char_budget"],
                 "hook_stable_every_turns": settings["hook_stable_every_turns"],
@@ -229,6 +231,9 @@ class AgentHookServiceMixin:
                             entry[key] = [[node_id, line, signatures[node_id]] for node_id, line in parsed[key] if node_id in fresh]
                             entry[f"{key}_at"] = now
                     entry["updated_at"] = now
+                    # Maintenance drops the entry once a registered project is deleted; an id
+                    # from a bind file or an explicit project_id may never have had a row.
+                    entry["registered"] = project_id in registered_ids
                     projects[project_id] = entry
                 cache.update(shared, version=2, projects=projects, updated_at=now)
                 return True
@@ -269,13 +274,16 @@ class AgentHookServiceMixin:
         except Exception as exc:  # noqa: BLE001 - a listener must never break the write
             _LOG.warning("briefing cache not pruned for node %s: %s", node.id, exc)
 
-    def _hook_cache_projects(self) -> set[str]:
+    def _registered_hook_cache_projects(self) -> set[str]:
+        """Cached projects that had a projects row when they were cached."""
         try:
             cache = json.loads((Path(self.project_root) / "data" / BRIEFING_CACHE).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return set()
         projects = cache.get("projects") if isinstance(cache, dict) else None
-        return set(projects) if isinstance(projects, dict) else set()
+        if not isinstance(projects, dict):
+            return set()
+        return {str(project_id) for project_id, entry in projects.items() if isinstance(entry, dict) and entry.get("registered")}
 
     def _hook_cache_index(self) -> dict[str, set[str]]:
         """Cached memory id -> the signatures its lines were cached with, re-read when the file changes."""
@@ -346,9 +354,10 @@ class AgentHookServiceMixin:
             write_private(scratch, json.dumps(cache, ensure_ascii=False))
             os.replace(scratch, path)
 
-    def _hook_project_roots(self) -> dict[str, str]:
+    @staticmethod
+    def _hook_project_roots(projects: Iterable[Any]) -> dict[str, str]:
         roots: dict[str, str] = {}
-        for project in self.repository.list_projects():
+        for project in projects:
             raw = str(getattr(project, "root_path", "") or "").strip()
             if not raw:
                 continue
@@ -432,15 +441,15 @@ class AgentHookServiceMixin:
     def hook_maintenance(self) -> None:
         """App start and once a minute: replay spooled captures, prune old sessions, refresh cached roots.
 
-        Also drops cache entries of projects that no longer exist (deleted, or
-        removed by a migration).
+        Also drops cache entries of registered projects that no longer exist
+        (deleted, or removed by a migration); an id that never had a projects row
+        (a bind file, an explicit project_id) keeps its entry until the TTL.
         """
         try:
             self.drain_hook_spool()
             prune_hook_sessions(Path(self.project_root))
             self.remember_hook_pack("")
             known = {str(project.id) for project in self.repository.list_projects()} | {HOOK_DEFAULT_PROJECT}
-            cached = self._hook_cache_projects()
-            self.forget_hook_memories(projects=cached - known)
+            self.forget_hook_memories(projects=self._registered_hook_cache_projects() - known)
         except Exception as exc:  # noqa: BLE001 - background maintenance must not crash the app
             _LOG.error("hook maintenance failed: %s", exc, exc_info=True)

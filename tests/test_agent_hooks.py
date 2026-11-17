@@ -812,6 +812,25 @@ class HookCacheInvalidationTests(unittest.TestCase):
             cached = self._cache_ids(root)
         self.assertEqual(cached, {kept.id})
 
+    def test_maintenance_drops_deleted_projects_and_keeps_unregistered_ones(self) -> None:
+        # A project id may come from a bind file or an explicit project_id without a
+        # projects row; only a project that was registered and is gone is dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            alpha, _ = _two_projects(root, service)
+            _seed(service, "alpha", 6)
+            _seed(service, "ghost", 6)
+            service.capture_memory_turn(self.QUESTION, cwd=str(alpha), hook=True, capture=False, include_stable=False)
+            service.capture_memory_turn(self.QUESTION, project_id="ghost", hook=True, capture=False, include_stable=False)
+            before = set(json.loads((root / "data" / "briefing_cache.json").read_text(encoding="utf-8"))["projects"])
+            with service.repository._connect() as conn:  # noqa: SLF001 - a project removed outside the app's API
+                conn.execute("DELETE FROM projects WHERE id = 'alpha'")
+            service.hook_maintenance()
+            after = set(json.loads((root / "data" / "briefing_cache.json").read_text(encoding="utf-8"))["projects"])
+        self.assertEqual(before, {"alpha", "ghost"})
+        self.assertEqual(after, {"ghost"})
+
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
