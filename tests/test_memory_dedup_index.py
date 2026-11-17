@@ -1,6 +1,7 @@
 """Stage 2: the dedup gate reads an index instead of scanning every node."""
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import random
@@ -21,6 +22,8 @@ from backend.architectos.memory_dedup import (
     fact_features,
     features_to_json,
     incoming_features,
+    normalize_fact_text,
+    subject_key,
 )
 from backend.architectos.memory_ingestion import CHAT_FACT_BOILERPLATE_PREFIXES
 from backend.architectos.service import ArchitectOSService
@@ -38,8 +41,8 @@ _WORDS = (
 OUTDATED_VERSION = DEDUP_INDEX_VERSION - 1
 ASK_HEADER = CHAT_FACT_BOILERPLATE_PREFIXES[1]
 MCP_HEADER = CHAT_FACT_BOILERPLATE_PREFIXES[2]
-# Features an older release could have stored for any text: parseable, but not this text's.
-STALE_FEATURES = features_to_json(fact_features("stale", "stale"))
+# Features release v1 stored for an atom (label and header included), but of another text than the row's.
+STALE_FEATURES = features_to_json(memory_dedup._text_features("MCP fact: stale atom", f"{MCP_HEADER}\n\nstale atom"))
 # Statement of an atom, the stored one, the incoming one, and the gate verdict the v1 features already give.
 STALE_ROW_CASES = (
     ("repeat", "Review candidates expire after 7 days unless a person accepts them",
@@ -156,14 +159,23 @@ class DedupIndexTests(unittest.TestCase):
                 best_action, best_rank, best_score, best_target = verdict.action, r, verdict.score, node.id
         return best_action, best_target, best_near
 
-    def test_index_matches_full_scan_on_random_corpus(self) -> None:
-        rng = random.Random(20261012)
+    def _random_fact_or_atom(self, rng: random.Random, *, atoms: bool) -> tuple[str, str, str]:
+        label, text, node_type = _random_fact(rng)
+        if atoms and rng.random() < 0.7:
+            # Few words in few slots, so atoms often share a template or frame.
+            words = " ".join(rng.choice(_WORDS[:4]) for _ in range(3))
+            negation = "не " if rng.random() < 0.2 else ""
+            number = f" {rng.choice([10, 20])}" if rng.random() < 0.5 else ""
+            text = f"{rng.choice((ASK_HEADER, MCP_HEADER))}\n\n{negation}{words}{number}"
+        return label, text, node_type
+
+    def _assert_index_matches_full_scan(self, rng: random.Random, *, atoms: bool) -> None:
         for i in range(250):
-            label, text, node_type = _random_fact(rng)
+            label, text, node_type = self._random_fact_or_atom(rng, atoms=atoms)
             # Distinct ids even under equal labels; same as the gate's salting.
             self.repo.add_node(node_type, label, "project", text, "architectos", id_salt=str(i))
         for _ in range(120):
-            label, text, node_type = _random_fact(rng)
+            label, text, node_type = self._random_fact_or_atom(rng, atoms=atoms)
             decision = self.gate.classify(label, text, node_type, "project", "architectos")
             action, target, near = self._brute_force(label, text, node_type)
             self.assertEqual(decision.action, action, (label, text))
@@ -174,6 +186,12 @@ class DedupIndexTests(unittest.TestCase):
             else:
                 # Below the flag threshold the index may skip weak neighbours.
                 self.assertLess(decision.near_score, self.gate.NEAR_DUPLICATE_SIMILARITY, (label, text))
+
+    def test_index_matches_full_scan_on_random_corpus(self) -> None:
+        self._assert_index_matches_full_scan(random.Random(20261012), atoms=False)
+
+    def test_index_matches_full_scan_on_random_corpus_with_atoms(self) -> None:
+        self._assert_index_matches_full_scan(random.Random(20261118), atoms=True)
 
     def test_near_min_shared_never_drops_a_flagged_neighbour(self) -> None:
         rng = random.Random(7)
@@ -403,6 +421,50 @@ class DedupIndexTests(unittest.TestCase):
         for entry in reference:
             with self.subTest(label=entry["label"][:40], text=entry["text"][:40]):
                 self.assertEqual(features_to_json(fact_features(entry["label"], entry["text"])), entry["features"])
+
+    def test_v1_rows_of_texts_without_a_header_are_read_as_stored(self) -> None:
+        with self._written_by_v1():
+            ids = [
+                self.repo.add_node("Decision", "Лимит API", "project", f"Лимит запросов {100 + i} в час", "architectos", id_salt=str(i))
+                .id
+                for i in range(60)
+            ]
+        self.assertEqual(self._row_versions(), {1})
+        for i, node_id in enumerate(ids):
+            with self.subTest(i=i):
+                decision = self.gate.classify("Лимит API", f"Лимит запросов {100 + i} в час", "Decision", "project", "architectos")
+                self.assertEqual((decision.action, decision.target_id), ("duplicate", node_id))
+
+    def test_v1_atom_row_is_read_like_a_fresh_one(self) -> None:
+        fact = "Review candidates expire after 7 days unless a person accepts them"
+        with self._written_by_v1():
+            node_id = self._add_atom(fact)
+        self.assertEqual(self._row_versions(), {1})
+        label, body = self._atom(fact + ".")
+        decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
+        self.assertEqual((decision.action, decision.target_id), ("duplicate", node_id))
+
+    def test_outdated_atom_rows_past_the_recompute_limit_only_count_for_the_near_flag(self) -> None:
+        rng = random.Random(5)
+        fact = "Session store keeps entry zebra alive for the configured window"
+        label, body = self._atom(fact)
+        features = fact_features(label, body)
+        # An atom row of an older release (its key holds the header) whose features would fold the incoming fact.
+        misleading = features_to_json(dataclasses.replace(features, key=("", normalize_fact_text(body))))
+        ids = [
+            self._add_atom(f"Session store keeps entry {''.join(rng.choices(string.ascii_lowercase, k=7))} alive for the configured window")
+            for _ in range(60)
+        ]
+        self._age(ids, features=misleading, subject=subject_key(features))
+        subject_rows = self.repo.dedup_subject_rows("project", "architectos", subject_key(features))
+        self.assertEqual(len(subject_rows), 50)
+        self.assertNotIn(misleading, [row["features"] for row in subject_rows])
+        neighbours = self.repo.dedup_stem_neighbours("project", "architectos", sorted(features.stems), 1)
+        self.assertEqual(len(neighbours), 60)
+        self.assertEqual([row["features"] for row in neighbours if not row["current"]], [misleading] * 10)
+        decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
+        self.assertEqual(decision.action, "new")
+        self.assertIn(decision.near_id, ids)
 
     def test_compaction_after_the_pass_keeps_atoms_that_differ_in_tokens_with_digits(self) -> None:
         pairs = [("p95", "p99"), ("AES128", "AES256"), ("k8s", "k3s"), ("x86", "x64"), ("ipv4", "ipv6")]

@@ -241,17 +241,28 @@ class StorageDedupMixin:
     def _read_current_features(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         """Index rows as dicts; ``current`` tells whether ``features`` match this release.
 
-        An outdated row (written by an older feature version, not yet refreshed)
-        gets features computed from its node here, in memory and without a write,
-        for the first ``MAX_STALE_RECOMPUTE`` of them; the rest keep their stored
-        features with ``current`` False and only count for the near flag.
+        Only an atom row of an older version is outdated: the features of other
+        texts do not depend on the version (the background pass only stamps
+        them), and the stored features show which rows are atoms. An outdated
+        row gets features computed from its node here, in memory and without a
+        write, for the first ``MAX_STALE_RECOMPUTE`` of them; the rest keep their
+        stored features with ``current`` False and only count for the near flag.
         """
-        from .memory_dedup import DEDUP_INDEX_VERSION, fact_features, features_to_json
+        from .memory_dedup import (
+            DEDUP_INDEX_VERSION,
+            fact_features,
+            features_from_json,
+            features_to_json,
+            is_atom_features,
+        )
 
         result = [dict(row) for row in rows]
         outdated: dict[str, dict[str, Any]] = {}
         for row in result:
-            row["current"] = int(row.pop("version")) >= DEDUP_INDEX_VERSION
+            row["current"] = (
+                int(row.pop("version")) >= DEDUP_INDEX_VERSION
+                or not is_atom_features(features_from_json(str(row["features"])))
+            )
             if not row["current"] and len(outdated) < MAX_STALE_RECOMPUTE:
                 outdated[str(row["node_id"])] = row
         if not outdated:

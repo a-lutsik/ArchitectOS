@@ -320,6 +320,15 @@ def subject_key(features: FactFeatures) -> str:
     return hashlib.sha1("\x1f".join(sorted(features.label_core)).encode("utf-8")).hexdigest()[:20]
 
 
+# An atom row written while features still included the header has a key that starts with it.
+_ATOM_KEY_PREFIXES = tuple(normalize_fact_text(prefix) for prefix in CHAT_FACT_BOILERPLATE_PREFIXES)
+
+
+def is_atom_features(features: FactFeatures) -> bool:
+    """Whether stored features belong to a chat/MCP fact atom, of this or an older version."""
+    return bool(features.template) or features.key[1].startswith(_ATOM_KEY_PREFIXES)
+
+
 def features_to_json(features: FactFeatures) -> str:
     data: dict[str, Any] = {
         "key": list(features.key),
