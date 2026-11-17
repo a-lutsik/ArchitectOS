@@ -906,6 +906,7 @@ class ChatSessionServiceMixin:
         return {
             "project_id": actual_project_id,
             "context": context,
+            **({"shown": packed["shown"]} if "shown" in packed else {}),
             "hits": hits,
             "stable": packed.get("stable") or [],
             **({"stable_every_turns": packed["stable_every_turns"]} if "stable_every_turns" in packed else {}),

@@ -20,14 +20,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import socket
 import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, NamedTuple
 
 try:
     import fcntl
@@ -155,7 +154,6 @@ _CAPTURE_TIMEOUT = 5.0
 _SESSION_DIR = "hook_sessions"
 _SESSION_TTL_S = 3 * 24 * 3600.0
 _STABLE_EVERY_TURNS = 20
-_INJECTED_ID = re.compile(r"^- id=(\S+)", re.MULTILINE)
 # The question waits in the session file until turn end captures it with the answer.
 _PENDING_PROMPT_MAX_CHARS = 20000
 
@@ -492,13 +490,15 @@ class HookSession:
         return due, list(entry.get("seen") or {})
 
     def record(
-        self, turn: HookTurn, result: dict[str, Any] | None, injected: str, *, include_stable: bool, transport: str
+        self, turn: HookTurn, result: dict[str, Any] | None, shown: list[tuple[str, str]], *,
+        include_stable: bool, transport: str,
     ) -> None:
         """Remember what this event injected, under the project the app resolved.
 
-        The stable layer counts as shown only when it reached the agent, or when the
-        app itself answered that the project has none; an offline or empty pack
-        leaves it due for the next prompt.
+        ``shown`` is (id, section) of each memory line that reached the agent (see
+        shown_memories). The stable layer counts as shown only when one of its lines
+        did, or when the app itself answered that the project has none; an offline
+        or empty pack leaves it due for the next prompt.
         """
         if result is None:
             return
@@ -510,17 +510,17 @@ class HookSession:
         if "stable_every_turns" in result:
             self.state["stable_every"] = int(result["stable_every_turns"])
         entry = self.project(project_id)
-        shown = STABLE_TITLE in injected or (transport == "http" and not result.get("stable"))
+        stable_shown = any(section == "stable" for _, section in shown) or (transport == "http" and not result.get("stable"))
         if turn.event == EVENT_SESSION:
             if turn.source in _RESET_SOURCES:
                 entry["seen"] = {}
-            if shown:
+            if stable_shown:
                 entry["stable_turn"] = int(entry["turn"])
         elif turn.event == EVENT_PROMPT:
             entry["turn"] = int(entry["turn"]) + 1
-            if include_stable and shown:
+            if include_stable and stable_shown:
                 entry["stable_turn"] = entry["turn"]
-        for node_id in _INJECTED_ID.findall(injected):
+        for node_id, _ in shown:
             entry["seen"][node_id] = entry["turn"]
 
     def keep_prompt(self, cwd: str, text: str) -> str:
@@ -747,6 +747,39 @@ _BIND_FILENAME = ".architectos.json"
 # Section titles of search.pack_memory_context: the cache keeps a pack's lines per section.
 STABLE_TITLE = "Stable memory (pinned / constraints / long-term):"
 HITS_TITLE = "Retrieved for this query:"
+def pack_lines_shown(context: str, lines: Iterable[tuple[str, str, str]]) -> list[list[Any]]:
+    """[id, section, end] for each (id, section, line) of a rendered pack, in pack order.
+
+    ``end`` is where the line stops in ``context``, so the hook can tell which lines
+    a cut injection still carries whole. The ids come from the pack's own line list,
+    never read back out of its text: a memory's text may hold a line that looks
+    like another memory's.
+    """
+    shown: list[list[Any]] = []
+    position = 0
+    for node_id, section, line in lines:
+        at = context.find(line, position)
+        if at < 0:
+            continue
+        position = at + len(line)
+        shown.append([node_id, section, position])
+    return shown
+
+
+def shown_memories(result: Mapping[str, Any] | None, injected: str) -> list[tuple[str, str]]:
+    """(id, section) of each memory line that reached the agent whole in ``injected``."""
+    if not (result and injected):
+        return []
+    context = str(result.get("context") or "")
+    # render_stdout injects the stripped context after the prefix and cuts it at _INJECT_MAX_CHARS.
+    kept = len(context) - len(context.lstrip()) + _INJECT_MAX_CHARS - len(_INJECT_PREFIX) - 2
+    return [
+        (str(item[0]), str(item[1]))
+        for item in result.get("shown") or []
+        if isinstance(item, list) and len(item) >= 3 and isinstance(item[2], int) and item[2] <= kept
+    ]
+
+
 def pack_header(context: str) -> str:
     """The lines of a rendered pack before its first memory section."""
     header: list[str] = []
@@ -757,14 +790,14 @@ def pack_header(context: str) -> str:
     return "\n".join(header).strip()
 
 
-def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclude: set[str], budget: int) -> tuple[str, list[str], list[str]]:
-    """Rebuild a pack from cached lines: (context, stable ids, hit ids); "" when nothing is new.
+def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclude: set[str], budget: int) -> tuple[str, list[list[Any]]]:
+    """Rebuild a pack from cached lines: (context, shown as pack_lines_shown); "" when nothing is new.
 
     Like the app's hook pack, a requested stable layer ignores ``exclude``.
     """
     header = str(entry.get("header") or "")
     lines, used, taken = [header], len(header), set()
-    picked: dict[str, list[str]] = {"stable": [], "hits": []}
+    picked: list[tuple[str, str, str]] = []
     for key, title in (("stable", STABLE_TITLE), ("hits", HITS_TITLE)):
         if key == "stable" and not include_stable:
             continue
@@ -777,15 +810,16 @@ def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclud
             if node_id in taken or (key == "hits" and node_id in exclude) or cost + len(line) + 1 > budget:
                 continue
             section.append(line)
-            picked[key].append(node_id)
+            picked.append((node_id, key, line))
             taken.add(node_id)
             cost += len(line) + 1
         if section:
             lines.extend(["", title, *section])
             used = cost
     if not taken:
-        return "", [], []
-    return "\n".join(lines).strip(), picked["stable"], picked["hits"]
+        return "", []
+    context = "\n".join(lines).strip()
+    return context, pack_lines_shown(context, picked)
 
 
 def _fresh_sections(entry: Mapping[str, Any], ttl_hours: float) -> dict[str, Any]:
@@ -938,13 +972,16 @@ def _offline_turn(
     dirty = (root / "data" / BRIEFING_CACHE_DIRTY).exists()
     if turn.can_inject and isinstance(entry, dict) and not dirty:
         session = turn.event == EVENT_SESSION
-        context, stable, hits = render_cached_pack(
+        context, shown = render_cached_pack(
             {**entry, "hits": []} if session else entry,  # session start is the briefing: stable layer only
             include_stable=include_stable or session,
             exclude=set() if session else set(exclude_ids),
             budget=_BRIEFING_CHAR_BUDGET if session else hook_pack_budget(int(settings.get("hook_char_budget") or _HOOK_CHAR_BUDGET)),
         )
-        result.update(context=context, stable=stable, hits=hits)
+        result.update(
+            context=context, shown=shown,
+            stable=[item[0] for item in shown if item[1] == "stable"], hits=[item[0] for item in shown if item[1] == "hits"],
+        )
     _log().info(
         "offline hook: kind=%s project=%s cached=%s dirty=%s injected_ids=%s spooled=%s",
         turn.event, project_id or "-", isinstance(entry, dict), dirty, len(result["hits"]) + len(result["stable"]),
@@ -1036,7 +1073,7 @@ def handle_capture(
     if turn.session_id:
         # Re-read under the lock: another hook of this session may have saved meanwhile.
         with HookSession.edit(session_root, turn.session_id) as session:
-            session.record(turn, result, injected, include_stable=include_stable, transport=transport)
+            session.record(turn, result, shown_memories(result, injected), include_stable=include_stable, transport=transport)
             if turn.event == EVENT_PROMPT:
                 orphan = session.keep_prompt(turn.cwd, turn.user_text)
                 if orphan and _offline_allowed():

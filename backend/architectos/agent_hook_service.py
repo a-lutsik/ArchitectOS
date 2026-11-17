@@ -30,6 +30,7 @@ from .agent_hooks import (
     file_lock,
     hook_pack_budget,
     pack_header,
+    pack_lines_shown,
     prune_hook_sessions,
     replace_file,
     spool_turn,
@@ -210,6 +211,7 @@ class AgentHookServiceMixin:
         return {
             "project_id": project_id,
             "context": context,
+            "shown": pack_lines_shown(context, [(node_id, section, line) for node_id, (section, line) in rendered.items()]),
             "hits": hits,
             "stable": stable,
             "stable_every_turns": settings["hook_stable_every_turns"],
@@ -232,7 +234,8 @@ class AgentHookServiceMixin:
             lines=rendered,
             nodes=[hit["node"] for hit in briefing.get("stable") or [] if isinstance(hit, dict) and isinstance(hit.get("node"), dict)],
         )
-        return briefing
+        context = str(briefing.get("context") or "")
+        return {**briefing, "shown": pack_lines_shown(context, [(node_id, section, line) for node_id, (section, line) in rendered.items()])}
 
     def remember_hook_pack(
         self,

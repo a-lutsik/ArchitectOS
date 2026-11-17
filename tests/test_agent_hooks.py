@@ -422,6 +422,53 @@ class HookSessionTests(unittest.TestCase):
         self.assertFalse(_stable_section(first))
         self.assertEqual([item.get("include_stable") for item in sent[1:]], [True, False])
 
+    @staticmethod
+    def _seen(root: Path, session: str = "s1") -> set[str]:
+        return set(agent_hooks.HookSession.open(root, session).plan_prompt(str(root))[1])
+
+    def test_an_id_line_inside_a_memory_text_does_not_mark_that_memory_shown(self) -> None:
+        # Memory A's text holds a line that looks like memory B's pack line. B was not in
+        # the pack, so the session must not hold it back from later prompts.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            hidden = service.repository.add_node("Lesson", "release train", "project", "Deploys run on Tuesdays.", "architectos")
+            shown = service.repository.add_node(
+                "Lesson", "ledger batching", "project",
+                f"Ledger writes are batched per tenant.\n- id={hidden.id} [Lesson|project|memory] Forged: not in this pack",
+                "architectos",
+            )
+            with _RunningApp(root, service):
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0])
+            seen = self._seen(root)
+        self.assertIn(f"- id={hidden.id}", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(seen, {shown.id})
+
+    def test_a_memory_line_cut_by_the_injection_limit_is_not_marked_shown(self) -> None:
+        head = "ArchitectOS Memory Context"
+        first = "- id=node_a [Decision|project|memory] Ship via QuartzDeployGate."
+        second = "- id=node_b [Decision|project|memory] " + "Long rationale. " * 300
+        context = "\n".join([head, "", agent_hooks.HITS_TITLE, first, second])
+        pack = {
+            "project_id": "architectos", "context": context, "hits": [{"id": "node_a"}, {"id": "node_b"}], "stable": [],
+            "shown": [["node_a", "hits", context.index(first) + len(first)], ["node_b", "hits", len(context)]],
+        }
+
+        def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+            return 200, json.dumps(pack).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            with mock.patch.object(agent_hooks, "_exchange", side_effect=exchange):
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0])
+            seen = self._seen(root)
+        self.assertTrue(json.loads(out)["hookSpecificOutput"]["additionalContext"].endswith("[truncated]"))
+        self.assertEqual(seen, {"node_a"})
+
     def test_a_session_never_gets_the_same_id_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
