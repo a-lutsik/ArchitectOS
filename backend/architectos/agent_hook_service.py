@@ -337,7 +337,8 @@ class AgentHookServiceMixin:
         once the file is replaced (see _rewrite_briefing_cache). A cached memory
         whose signature changed is evicted under the lock, waited for at most
         HOOK_CACHE_LOCK_WAIT_S; when the lock stays held, the cache is marked dirty
-        instead (see BRIEFING_CACHE_DIRTY) and the next locked write re-checks it.
+        instead (see BRIEFING_CACHE_DIRTY) and the next locked write re-checks it;
+        while that marker waits, later changes leave themselves to it.
         """
         try:
             cached = self._hook_cache_index().get(node.id)
@@ -345,6 +346,11 @@ class AgentHookServiceMixin:
                 return
             signature = _cache_signature(node.to_dict())
             if cached == {signature}:
+                return
+            if (Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY).exists():
+                # Already marked and not yet claimed: the write that claims it reads the
+                # store after this change, so waiting for a stuck lock again buys nothing.
+                _LOG.debug("briefing cache already marked for revalidation, node %s left to it", node.id)
                 return
             started = time.monotonic()
             if not _CACHE_LOCK.acquire(timeout=HOOK_CACHE_LOCK_WAIT_S):

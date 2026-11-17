@@ -1240,6 +1240,28 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertEqual(marks.call_count, 0)
         self.assertFalse(dirty)
 
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_stuck_cache_lock_costs_one_wait_not_one_per_changed_memory(self) -> None:
+        # Once the cache is marked dirty, further changes to cached memories need not
+        # wait for the stuck lock nor warn again: the next write re-checks them all.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            cached = sorted(self._cache_ids(root))
+            with self.assertLogs("architectos.service", level="WARNING") as logs:
+                took, marked = self._write_while_the_cache_lock_is_held(
+                    root, lambda: [self._archive(service, node_id) for node_id in cached[:3]]
+                )
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+        self.assertEqual(len(cached[:3]), 3)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 0.45)
+        self.assertTrue(marked and dirty)
+        self.assertEqual(len([line for line in logs.output if "deferred" in line]), 1)
+        self.assertFalse(set(cached[:3]) & after)
+
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
         # from the store re-checks the cached lines and renews their age.
