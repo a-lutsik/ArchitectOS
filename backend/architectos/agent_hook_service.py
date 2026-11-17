@@ -231,6 +231,10 @@ class AgentHookServiceMixin:
             def change(cache: dict[str, Any]) -> bool:
                 if not (project_id and (briefing or pack)) and all(cache.get(key) == value for key, value in shared.items()):
                     return False
+                # Under the cache lock, against the store: a memory another process archived
+                # or moved since this pack was built (and evicted meanwhile) stays out.
+                current = {node.id: _cache_signature(node.to_dict()) for node in self.repository.list_nodes_by_ids(list(signatures))}
+                fresh = {node_id for node_id, signature in signatures.items() if current.get(node_id) == signature}
                 raw_projects = cache.get("projects")
                 projects: dict[str, Any] = raw_projects if isinstance(raw_projects, dict) else {}
                 now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -241,7 +245,7 @@ class AgentHookServiceMixin:
                         if text:
                             parsed = split_pack(text, set(signatures))
                             entry["header"] = parsed["header"]
-                            entry[key] = [[node_id, line, signatures.get(node_id, "")] for node_id, line in parsed[key]]
+                            entry[key] = [[node_id, line, signatures[node_id]] for node_id, line in parsed[key] if node_id in fresh]
                             entry[f"{key}_at"] = now
                     entry["updated_at"] = now
                     projects[project_id] = entry

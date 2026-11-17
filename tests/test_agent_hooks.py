@@ -13,9 +13,10 @@ import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
-from backend.architectos import agent_hooks
+from backend.architectos import agent_hook_service, agent_hooks
 from backend.architectos.agent_hook_service import HOOK_CHAR_BUDGET_MIN
 from backend.architectos.mcp_server import MemoryMCPServer, write_mcp_bind_file
 from backend.architectos.models import Project
@@ -733,6 +734,55 @@ class HookCacheInvalidationTests(unittest.TestCase):
             after = self._cache_ids(root)
         self.assertEqual(cached, {node.id})
         self.assertEqual(after, set())
+
+    def test_a_memory_archived_while_the_turn_packs_does_not_return_to_the_cache(self) -> None:
+        # Another process archives a hit after this turn found it and evicts it from the
+        # cache before this turn writes its pack: the pack must not bring it back.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            ids = _seed(service, "architectos", 6)
+            other = ArchitectOSService(root)  # e.g. an MCP server process
+            archived: list[str] = []
+            real_pack = agent_hook_service.pack_memory_context
+
+            def pack_then_archive(hits: list[dict[str, Any]], **kwargs: Any) -> str:
+                context = real_pack(hits, **kwargs)
+                node = other.repository.get_node(str(hits[0]["node"]["id"]))
+                assert node is not None
+                node.status = "archived"
+                other.repository.upsert_node(node)
+                archived.append(node.id)
+                return context
+
+            with mock.patch.object(agent_hook_service, "pack_memory_context", side_effect=pack_then_archive):
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            cached = self._cache_ids(root)
+        self.assertTrue(archived and archived[0] in ids)
+        self.assertTrue(cached)
+        self.assertNotIn(archived[0], cached)
+
+    def test_a_stable_memory_archived_during_the_briefing_does_not_enter_the_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            kept = service.repository.add_node("Constraint", "ledger constraint", "project", "Ledger writes must stay idempotent.", "architectos")
+            gone = service.repository.add_node("Constraint", "invoice constraint", "project", "Invoices close at midnight UTC.", "architectos")
+            other = ArchitectOSService(root)
+            real_briefing = service.memory_briefing
+
+            def briefing_then_archive(**kwargs: Any) -> dict[str, Any]:
+                result = real_briefing(**kwargs)
+                node = other.repository.get_node(gone.id)
+                assert node is not None
+                node.status = "archived"
+                other.repository.upsert_node(node)
+                return result
+
+            with mock.patch.object(service, "memory_briefing", side_effect=briefing_then_archive):
+                service.hook_briefing(cwd=str(root))
+            cached = self._cache_ids(root)
+        self.assertEqual(cached, {kept.id})
 
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
