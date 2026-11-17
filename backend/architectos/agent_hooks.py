@@ -198,6 +198,21 @@ def _debug(message: str, root: Path | None = None) -> None:
         pass
 
 
+def write_private(path: Path, text: str, *, append: bool = False) -> None:
+    """Write ``text`` to a file only its owner can read, like the database and runtime.json.
+
+    Session files hold the pending question, the spool the question and answer, the
+    briefing cache memory lines. A file left from an older version is tightened too.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    with open(os.open(path, flags, 0o600), "a" if append else "w", encoding="utf-8") as handle:
+        handle.write(text)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # Windows may ignore or reject POSIX modes
+
+
 def _clean(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
@@ -371,7 +386,7 @@ class HookSession:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             scratch = self.path.with_suffix(".tmp")
-            scratch.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
+            write_private(scratch, json.dumps(self.state, ensure_ascii=False))
             os.replace(scratch, self.path)
         except OSError as exc:
             _log().warning("hook session file not saved: %s (%s)", self.path.name, exc)
@@ -673,8 +688,7 @@ def spool_turn(root: Path, record: dict[str, Any]) -> bool:
             _log().warning("hook spool full, capture dropped: bytes=%s limit=%s", size, _SPOOL_MAX_BYTES)
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
+        write_private(path, line, append=True)
     except OSError as exc:
         _log().warning("hook spool not written: %s", exc)
         return False

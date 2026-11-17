@@ -186,7 +186,9 @@ store, so an event costs a few milliseconds instead of a service cold start:
   three times and then dropped. The spool stops growing at 5 MB. A capture whose
   HTTP request timed out is *not* spooled: the app already has it. One the app
   answered with an error (HTTP 4xx/5xx, a cut reply) is spooled, since the app did
-  not store it.
+  not store it. The spool keeps the raw question and answer until the app replays
+  them through `capture_memory_turn`, which redacts secrets as for a live turn; like
+  the session files and the briefing cache it is readable by its owner only (0600).
 - Until the app runs again, spooled facts are not in memory. `doctor` shows how
   many records wait and how old the oldest one is.
 

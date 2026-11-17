@@ -613,6 +613,28 @@ class HookOfflineTests(unittest.TestCase):
         for fact in facts:
             self.assertIn(fact, context)
 
+    @unittest.skipIf(os.name == "nt", "POSIX file modes")
+    def test_hook_files_are_private_to_the_owner(self) -> None:
+        # Session files hold the pending question, the spool holds question and answer,
+        # the briefing cache holds memory lines: owner-only, like the database.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 4)
+            service.hook_briefing(cwd=str(root))
+            previous = os.umask(0o022)
+            try:
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+                _hook(root, "Stop", cwd=root, session="s1", last_assistant_message="Batch them per tenant.")
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            finally:
+                os.umask(previous)
+            data = root / "data"
+            files = [data / "briefing_cache.json", data / "hook_spool.jsonl", *(data / "hook_sessions").glob("*.json")]
+            modes = {path.name: oct(path.stat().st_mode & 0o777) for path in files}
+        self.assertEqual(len(modes), 3)
+        self.assertEqual(set(modes.values()), {"0o600"}, modes)
+
     def test_spool_keeps_records_with_unicode_line_separators(self) -> None:
         # json.dumps(ensure_ascii=False) leaves U+2028, U+2029 and U+0085 raw, and
         # str.splitlines() breaks on them; only "\n" ends a spool record.

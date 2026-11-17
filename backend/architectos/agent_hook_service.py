@@ -22,7 +22,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .agent_hooks import BRIEFING_CACHE, HOOK_SPOOL, hook_pack_budget, prune_hook_sessions, split_pack, spool_turn
+from .agent_hooks import (
+    BRIEFING_CACHE,
+    HOOK_SPOOL,
+    hook_pack_budget,
+    prune_hook_sessions,
+    split_pack,
+    spool_turn,
+    write_private,
+)
 from .search import DEFAULT_CONTEXT_CHAR_BUDGET, pack_memory_context
 
 _LOG = logging.getLogger("architectos.service")
@@ -194,7 +202,7 @@ class AgentHookServiceMixin:
                              updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
                 path.parent.mkdir(parents=True, exist_ok=True)
                 scratch = path.with_suffix(".tmp")
-                scratch.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+                write_private(scratch, json.dumps(cache, ensure_ascii=False))
                 os.replace(scratch, path)
             _LOG.debug(
                 "briefing cache updated project=%s briefing=%s pack=%s projects=%s roots=%s",
