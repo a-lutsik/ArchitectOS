@@ -1196,12 +1196,12 @@ class HookCacheInvalidationTests(unittest.TestCase):
             real = service._revalidate_hook_cache  # noqa: SLF001
             during: list[str] = []
 
-            def offline_hook_meanwhile(cache: dict[str, Any]) -> int:
+            def offline_hook_meanwhile(cache: dict[str, Any], only: set[str] | None = None) -> int:
                 if not during:
                     during.append(_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION))
                     raise RuntimeError("writer killed while re-checking")
                 service._mark_hook_cache_dirty()  # noqa: SLF001 - another change missed the lock meanwhile
-                return real(cache)
+                return real(cache, only)
 
             with mock.patch.object(service, "_revalidate_hook_cache", side_effect=offline_hook_meanwhile):
                 service.hook_maintenance()
@@ -1213,6 +1213,32 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertNotIn(stable_id, _injected_ids(after_kill))
         self.assertNotIn(stable_id, cached)
         self.assertEqual(left, [f"{agent_hooks.BRIEFING_CACHE}.dirty"])
+
+    def test_concurrent_writes_of_uncached_memories_neither_lock_nor_dirty_the_cache(self) -> None:
+        # Two writers of unrelated memories used to take each other for a cache writer:
+        # most writes marked the cache dirty, and the offline hook went silent.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            nodes = [service.repository.add_node("Lesson", f"unrelated {index}", "project", f"Deploys run on day {index}.", "architectos")
+                     for index in range(2)]
+
+            def rewrite(node: Any) -> None:
+                for step in range(150):
+                    node.metadata = {**node.metadata, "step": step}
+                    service.repository.upsert_node(node)
+
+            with mock.patch.object(agent_hook_service, "file_lock", wraps=agent_hook_service.file_lock) as locks, \
+                    mock.patch.object(service, "_mark_hook_cache_dirty", wraps=service._mark_hook_cache_dirty) as marks:  # noqa: SLF001
+                threads = [threading.Thread(target=rewrite, args=(node,)) for node in nodes]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(60)
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+        self.assertEqual(locks.call_count, 0)
+        self.assertEqual(marks.call_count, 0)
+        self.assertFalse(dirty)
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer

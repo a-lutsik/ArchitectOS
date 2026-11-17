@@ -1323,6 +1323,7 @@ def status(*, project_root: Path | None = None) -> dict[str, Any]:
                 "path": str(data_root / "data" / BRIEFING_CACHE),
                 "projects": len(cache.get("projects") or {}),
                 "updated_at": cache.get("updated_at"),
+                "dirty": briefing_cache_dirty(data_root),
             },
             "sessions": sessions,
         },
