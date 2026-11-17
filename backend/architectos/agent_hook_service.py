@@ -19,19 +19,15 @@ import logging
 import os
 import threading
 import time
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
-try:
-    import fcntl
-except ImportError:  # Windows: the cache file is then serialized within one process only
-    fcntl = None  # type: ignore[assignment]
 
 from .agent_hooks import (
     BRIEFING_CACHE,
     HOOK_SPOOL,
+    file_lock,
     hook_pack_budget,
     prune_hook_sessions,
     split_pack,
@@ -77,21 +73,6 @@ def _cache_signature(node: Mapping[str, Any]) -> str:
     fields = [node.get(key) for key in ("status", "scope", "project_id", "author_project_id", "label", "text")]
     raw = json.dumps([*fields, (meta or {}).get("invalid_at")], sort_keys=True, default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-
-@contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive lock on ``path`` across processes (the app and every MCP server write the cache)."""
-    if fcntl is None:
-        yield
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)  # closing releases the lock
 
 
 def _bounded(raw: Any, default: float, low: float, high: float) -> float:
@@ -352,7 +333,7 @@ class AgentHookServiceMixin:
         Serialized across threads and, through a lock file, across processes.
         """
         path = Path(self.project_root) / "data" / BRIEFING_CACHE
-        with _CACHE_LOCK, _file_lock(path.with_name(f"{BRIEFING_CACHE}.lock")):
+        with _CACHE_LOCK, file_lock(path.with_name(f"{BRIEFING_CACHE}.lock")):
             try:
                 cache = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):

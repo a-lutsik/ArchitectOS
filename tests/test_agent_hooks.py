@@ -570,6 +570,34 @@ class HookCaptureOnStopTests(unittest.TestCase):
         lines = spool.read_text(encoding="utf-8").splitlines() if spool.exists() else []
         return [(json.loads(line)["user_text"], json.loads(line)["assistant_text"]) for line in lines]
 
+    def test_next_prompt_during_a_slow_turn_end_neither_doubles_nor_loses_a_question(self) -> None:
+        # The next prompt's hook runs while turn end still waits for the app: the first
+        # question is captured once (by turn end), and the second stays held.
+        first, second = self.PROMPT, "Which team owns QuartzDeployGate?"
+        sent: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+
+            def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+                request = json.loads(body or b"{}")
+                sent.append(request)
+                if request.get("capture") and request.get("assistant_text") == self.ANSWER:
+                    _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=second)  # arrives meanwhile
+                return 200, json.dumps({"project_id": "architectos", "context": "", "hits": [], "stable": []}).encode("utf-8")
+
+            with mock.patch.object(agent_hooks, "_exchange", side_effect=exchange):
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=first)
+                _hook(root, "Stop", cwd=root, session="s1", last_assistant_message=self.ANSWER)
+                _hook(root, "Stop", cwd=root, session="s1", last_assistant_message="Team Quartz owns it.")
+            spooled = self._spooled(root)
+        captures = [(item["user_text"], item["assistant_text"]) for item in sent if item.get("capture")]
+        self.assertEqual(captures, [(first, self.ANSWER), (second, "Team Quartz owns it.")])
+        self.assertEqual(spooled, [])
+
     def test_turn_end_pairs_the_question_after_the_agent_changed_folders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

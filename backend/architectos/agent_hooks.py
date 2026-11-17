@@ -24,9 +24,15 @@ import re
 import socket
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, NamedTuple
+
+try:
+    import fcntl
+except ImportError:  # Windows: files are then serialized within one process only
+    fcntl = None  # type: ignore[assignment]
 
 from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
@@ -213,6 +219,21 @@ def write_private(path: Path, text: str, *, append: bool = False) -> None:
         pass  # Windows may ignore or reject POSIX modes
 
 
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on ``path`` across processes (hooks of one session, app and MCP servers)."""
+    if fcntl is None:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
+
+
 def _clean(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
@@ -297,10 +318,28 @@ class HookSession:
         self.path = path
         self.state = state
 
+    @staticmethod
+    def _path(root: Path, session_id: str) -> Path:
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        return root / "data" / _SESSION_DIR / f"{digest}.json"
+
+    @classmethod
+    @contextmanager
+    def edit(cls, root: Path, session_id: str) -> Iterator["HookSession"]:
+        """The session read, changed and saved under its lock file.
+
+        Two hooks of one session can overlap (the next prompt arrives while turn end
+        still waits for the app), so every change re-reads the file under the lock;
+        keep the block short, never across an HTTP call.
+        """
+        with file_lock(cls._path(root, session_id).with_suffix(".lock")):
+            session = cls.open(root, session_id)
+            yield session
+            session.save()
+
     @classmethod
     def open(cls, root: Path, session_id: str) -> "HookSession":
-        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
-        path = root / "data" / _SESSION_DIR / f"{digest}.json"
+        path = cls._path(root, session_id)
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -893,21 +932,24 @@ def handle_capture(
     if turn.event == EVENT_RESPONSE and not turn.assistant_text and not turn.session_id:
         return _silent(turn.client, turn.event)
     started = time.perf_counter()
-    session = HookSession.open(root or resolve_project_root(), turn.session_id) if turn.session_id else None
+    session_root = root or resolve_project_root()
     # Turn end never injects, so it skips the stable layer. With a session the
     # prompt only injects and turn end captures question + answer in one call;
     # without one, each event captures its own text as before.
     include_stable, capture = turn.event != EVENT_RESPONSE, True
     exclude_ids: list[str] = []
-    if session is not None and turn.event == EVENT_PROMPT:
-        include_stable, exclude_ids = session.plan_prompt(turn.cwd)
+    if turn.session_id and turn.event == EVENT_PROMPT:
+        include_stable, exclude_ids = HookSession.open(session_root, turn.session_id).plan_prompt(turn.cwd)
         capture = False
-    elif session is not None and turn.event == EVENT_RESPONSE:
+    elif turn.session_id and turn.event == EVENT_RESPONSE:
+        # Taken and saved before the send: a prompt hook running meanwhile must not
+        # find the question still held (and spool it a second time).
+        with HookSession.edit(session_root, turn.session_id) as session:
+            turn = turn._replace(user_text=session.take_prompt(turn.cwd))
         # Turn end with no answer text (the agent was interrupted) still captures the question.
-        turn = turn._replace(user_text=session.take_prompt(turn.cwd))
         if not (turn.user_text or turn.assistant_text):
             return _silent(turn.client, turn.event)
-    if session is not None and turn.event == EVENT_PROMPT and not turn.can_inject:
+    if turn.session_id and turn.event == EVENT_PROMPT and not turn.can_inject:
         result, transport = None, "deferred"  # nothing to inject; the question waits for turn end
     else:
         result, transport = _send_turn(
@@ -918,20 +960,21 @@ def handle_capture(
     if turn.can_inject and not injected:
         _log().info("injection skipped: kind=%s transport=%s reason=%s", turn.event, transport,
                   "no reply" if result is None else "empty pack")
-    if session is not None:
-        session.record(turn, result, injected, include_stable=include_stable, transport=transport)
-        if turn.event == EVENT_PROMPT:
-            orphan = session.keep_prompt(turn.cwd, turn.user_text)
-            if orphan and _offline_allowed():
-                spool_turn(root or resolve_project_root(), {
-                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "project_id": session.project_for(turn.cwd),
-                    "cwd": turn.cwd,
-                    "client": turn.client,
-                    "user_text": orphan,
-                    "assistant_text": "",
-                })
-        session.save()
+    if turn.session_id:
+        # Re-read under the lock: another hook of this session may have saved meanwhile.
+        with HookSession.edit(session_root, turn.session_id) as session:
+            session.record(turn, result, injected, include_stable=include_stable, transport=transport)
+            if turn.event == EVENT_PROMPT:
+                orphan = session.keep_prompt(turn.cwd, turn.user_text)
+                if orphan and _offline_allowed():
+                    spool_turn(session_root, {
+                        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "project_id": session.project_for(turn.cwd),
+                        "cwd": turn.cwd,
+                        "client": turn.client,
+                        "user_text": orphan,
+                        "assistant_text": "",
+                    })
     if _debug_enabled():
         _debug(_timing_line(turn, transport, (time.perf_counter() - started) * 1000.0, out, result), root)
     return out
