@@ -69,6 +69,9 @@ class _HookLog:
     def warning(self, message: str, *args: object) -> None:
         _debug(f"WARNING {message % args}")
 
+    def debug(self, message: str, *args: object) -> None:
+        _debug(f"DEBUG {message % args}")
+
 
 def _log() -> logging.Logger | _HookLog:
     """The hook's logger: the module logger inside the app, a plain hooks.log writer in the hook command."""
@@ -234,6 +237,9 @@ _LOCK_POLL_S = 0.01
 # app reading the cache or a session file); such a reader lets go within milliseconds.
 _RETRY_REPLACE = os.name == "nt"
 _REPLACE_WAIT_S = 1.0
+# Lock files this process already warned about: in the app every memory write takes the
+# cache lock, and an unusable one would otherwise log a warning per write.
+_LOCK_WARNED: set[str] = set()
 
 
 def replace_file(source: Path, target: Path) -> None:
@@ -304,7 +310,11 @@ def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         held = _acquire(fd, wait)
     except OSError as exc:
-        _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
+        if str(path) in _LOCK_WARNED:
+            _log().debug("lock file still unusable, going on without it: %s (%s)", path.name, exc)
+        else:
+            _LOCK_WARNED.add(str(path))
+            _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
         if fd is not None:
             os.close(fd)
             fd = None

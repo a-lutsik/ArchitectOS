@@ -820,6 +820,21 @@ class HookFileLockTests(unittest.TestCase):
         self.assertTrue(acquired)
         self.assertIn(fake.LK_UNLCK, fake.calls)
 
+    def test_an_unusable_lock_file_warns_once_per_path(self) -> None:
+        # In the app every memory write takes the cache lock: one warning per lock
+        # file, not one per write.
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "data"
+            blocker.write_text("a file where the folder should be", encoding="utf-8")
+            with self.assertLogs(agent_hooks.__name__, level="DEBUG") as logs:
+                for _ in range(3):
+                    with agent_hooks.file_lock(blocker / "x.lock") as held:
+                        self.assertTrue(held)  # runs unlocked, as before
+                with agent_hooks.file_lock(blocker / "y.lock"):
+                    pass
+        levels = [record.levelname for record in logs.records]
+        self.assertEqual(levels, ["WARNING", "DEBUG", "DEBUG", "WARNING"])
+
     @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
     def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
