@@ -17,7 +17,6 @@ from typing import Any
 from unittest import mock
 
 from backend.architectos import agent_hook_service, agent_hooks
-from backend.architectos.agent_hook_service import HOOK_CHAR_BUDGET_MIN
 from backend.architectos.mcp_server import MemoryMCPServer, write_mcp_bind_file
 from backend.architectos.models import Project
 from backend.architectos.server import ArchitectOSHandler
@@ -232,7 +231,7 @@ class HookBudgetTests(unittest.TestCase):
             settings = service.agent_hook_settings()
         self.assertGreater(len(wide), 1600)
         self.assertLessEqual(len(wide), 2600)
-        self.assertEqual(settings["hook_char_budget"], HOOK_CHAR_BUDGET_MIN)
+        self.assertEqual(settings["hook_char_budget"], 1301)  # the pack's 1200 floor + the hook prefix
 
     def test_injection_stays_within_the_smallest_hook_char_budget(self) -> None:
         # pack_memory_context never packs below its 1 200-character floor, so the
@@ -570,6 +569,27 @@ class HookCaptureOnStopTests(unittest.TestCase):
         lines = spool.read_text(encoding="utf-8").splitlines() if spool.exists() else []
         return [(json.loads(line)["user_text"], json.loads(line)["assistant_text"]) for line in lines]
 
+    def test_session_changes_wait_for_the_session_lock(self) -> None:
+        # Another hook of the same session holding its lock blocks this one's change.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            lock = agent_hooks.HookSession._path(root, "s1").with_suffix(".lock")  # noqa: SLF001
+            done = threading.Event()
+
+            def prompt() -> None:
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.PROMPT)
+                done.set()
+
+            with mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_OFFLINE": "0"}), agent_hooks.file_lock(lock):
+                thread = threading.Thread(target=prompt, daemon=True)
+                thread.start()
+                blocked = not done.wait(0.5)
+            thread.join(timeout=10)
+            saved = bool(list((root / "data" / "hook_sessions").glob("*.json")))
+        self.assertTrue(blocked)
+        self.assertTrue(saved)
+
     def test_next_prompt_during_a_slow_turn_end_neither_doubles_nor_loses_a_question(self) -> None:
         # The next prompt's hook runs while turn end still waits for the app: the first
         # question is captured once (by turn end), and the second stays held.
@@ -830,6 +850,55 @@ class HookCacheInvalidationTests(unittest.TestCase):
             after = set(json.loads((root / "data" / "briefing_cache.json").read_text(encoding="utf-8"))["projects"])
         self.assertEqual(before, {"alpha", "ghost"})
         self.assertEqual(after, {"ghost"})
+
+    def test_clearing_a_source_drops_only_its_memories_from_the_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            project_id = service.create_project({"id": "wipe-docs", "name": "Wipe Docs", "root_path": str(root)})["id"]
+            sources = {item["kind"]: item["id"] for item in service.list_project_sources(project_id)}
+            texts = {
+                "docs": "Ledger writes are batched per tenant before replication.",
+                "adr": "How we batch ledger writes: the nightly job flushes invoices in groups of 500.",
+            }
+            added = {
+                kind: service.add_memory({
+                    "project_id": project_id, "label": f"Ledger rule from {kind}", "type": "Lesson", "scope": "project",
+                    "text": text, "source_id": sources[kind],
+                })["id"]
+                for kind, text in texts.items()
+            }
+            service.repository.set_setting("agent", {"hook_min_score": 0})  # both memories in the pack
+            service.capture_memory_turn(self.QUESTION, project_id=project_id, hook=True, capture=False, include_stable=False)
+            before = self._cache_ids(root, project_id)
+            service.clear_source_memory(sources["docs"], confirm=True)
+            after = self._cache_ids(root, project_id)
+        self.assertEqual(before, set(added.values()))
+        self.assertEqual(after, {added["adr"]})
+
+    def test_cache_writes_wait_for_the_cross_process_lock(self) -> None:
+        # Another process (an MCP server) holding the cache lock blocks this writer.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 4)
+            path = root / "data" / agent_hooks.BRIEFING_CACHE
+            done = threading.Event()
+
+            def write() -> None:
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+                done.set()
+
+            with agent_hooks.file_lock(path.with_name(f"{agent_hooks.BRIEFING_CACHE}.lock")):
+                thread = threading.Thread(target=write, daemon=True)
+                thread.start()
+                blocked = not done.wait(0.5)
+                written_while_held = path.exists()
+            thread.join(timeout=10)
+            written = path.exists()
+        self.assertTrue(blocked)
+        self.assertFalse(written_while_held)
+        self.assertTrue(written)
 
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
