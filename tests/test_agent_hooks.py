@@ -14,7 +14,7 @@ import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from unittest import mock
 
 from backend.architectos import agent_hook_service, agent_hooks
@@ -1453,6 +1453,60 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertNotIn(archived, _injected_ids(during))
         self.assertNotIn(archived, after)
         self.assertEqual(left, [])
+
+    def _deferred_eviction(self, root: Path) -> tuple[ArchitectOSService, str]:
+        """A cache that still holds an archived stable memory, marked dirty."""
+        service, stable_id, _ = self._cached(root)
+        node = service.repository.get_node(stable_id)
+        assert node is not None
+        node.status = "archived"
+        service.repository.upsert_node(node, notify=False)
+        service._mark_hook_cache_dirty()  # noqa: SLF001
+        return service, stable_id
+
+    def test_the_offline_hook_judges_the_cache_it_read_not_a_later_one(self) -> None:
+        # The app finishes a whole re-check (claim, write, remove the marker) while the
+        # hook works on the cache it read before: that copy was dirty.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id = self._deferred_eviction(root)
+            real = agent_hooks.cached_project_for
+            ran: list[int] = []
+
+            def recheck_meanwhile(cwd: str, cache: Mapping[str, Any]) -> str:
+                if not ran:
+                    ran.append(1)
+                    service.hook_maintenance()
+                return real(cwd, cache)
+
+            with mock.patch.object(agent_hooks, "cached_project_for", side_effect=recheck_meanwhile):
+                out = _hook(root, "SessionStart", cwd=root, session="s1")
+        self.assertTrue(ran)
+        self.assertNotIn(stable_id, _injected_ids(out))
+
+    def test_the_offline_hook_rereads_a_cache_replaced_while_it_read(self) -> None:
+        # The re-check ends between the hook's read and its second look at the marker:
+        # the marker is gone, but the file the hook read is not the file there now.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id = self._deferred_eviction(root)
+            (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").unlink()  # the archive is not marked yet
+            real = agent_hooks.briefing_cache_dirty
+            looks: list[bool] = []
+
+            def look(where: Path) -> bool:
+                if len(looks) == 1:  # the hook has read the stale file; now its listener marks it
+                    service._mark_hook_cache_dirty()  # noqa: SLF001
+                    service.hook_maintenance()  # and the app claims, re-checks, writes, unmarks
+                looks.append(real(where))
+                return looks[-1]
+
+            with mock.patch.object(agent_hooks, "briefing_cache_dirty", side_effect=look), \
+                    mock.patch.object(agent_hooks, "_read_briefing_cache", wraps=agent_hooks._read_briefing_cache) as reads:  # noqa: SLF001
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+        self.assertGreaterEqual(reads.call_count, 2)  # the replaced file was read again, and was clean
+        self.assertTrue(_injected_ids(out))
+        self.assertNotIn(stable_id, _injected_ids(out))
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer

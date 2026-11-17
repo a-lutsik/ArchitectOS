@@ -926,16 +926,48 @@ def cached_project_for(cwd: str, cache: Mapping[str, Any]) -> str:
     return best or str(cache.get("default_project") or "")
 
 
-def load_briefing_cache(root: Path) -> dict[str, Any]:
+def _read_briefing_cache(root: Path) -> tuple[dict[str, Any], tuple[int, int, int] | None]:
+    """The cache and the (inode, size, mtime) of the very file read; ({}, None) without one."""
     path = root / "data" / BRIEFING_CACHE
     try:
-        cache = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8") as handle:
+            stat = os.fstat(handle.fileno())
+            cache = json.loads(handle.read())
     except FileNotFoundError:
-        return {}
+        return {}, None
     except (OSError, ValueError) as exc:
         _log().warning("briefing cache unreadable, offline hook stays silent: %s", exc)
-        return {}
-    return cache if isinstance(cache, dict) else {}
+        return {}, None
+    return (cache if isinstance(cache, dict) else {}), (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def load_briefing_cache(root: Path) -> dict[str, Any]:
+    return _read_briefing_cache(root)[0]
+
+
+def load_clean_briefing_cache(root: Path) -> tuple[dict[str, Any], bool]:
+    """(cache, dirty) for the offline hook: is the copy it read one it may inject from?
+
+    The marker is looked at before and after the read, and the file read must still
+    be the file there: a writer can claim, re-check, write and unmark it all while
+    the hook reads, and the copy read before is the stale one. A file replaced
+    meanwhile is read once more.
+    """
+    cache: dict[str, Any] = {}
+    for _ in range(2):
+        if briefing_cache_dirty(root):
+            return load_briefing_cache(root), True
+        cache, stamp = _read_briefing_cache(root)
+        if briefing_cache_dirty(root):
+            return cache, True
+        try:
+            stat = (root / "data" / BRIEFING_CACHE).stat()
+            current: tuple[int, int, int] | None = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            current = None
+        if current == stamp:
+            return cache, False
+    return cache, True
 
 
 def spool_turn(root: Path, record: dict[str, Any]) -> bool:
@@ -993,7 +1025,7 @@ def _offline_turn(
     spool: bool,
 ) -> dict[str, Any]:
     """The app is closed: inject from the briefing cache, spool the capture. Never opens the store."""
-    cache = load_briefing_cache(root)
+    cache, dirty = load_clean_briefing_cache(root)
     project_id = cached_project_for(turn.cwd, cache) if turn.cwd else ""
     result: dict[str, Any] = {"project_id": project_id, "context": "", "hits": [], "stable": []}
     raw_settings = cache.get("settings")
@@ -1012,7 +1044,6 @@ def _offline_turn(
     entry = (cache.get("projects") or {}).get(project_id) if project_id else None
     if isinstance(entry, dict):
         entry = _fresh_sections(entry, float(settings.get("hook_cache_ttl_hours", _CACHE_TTL_HOURS)))
-    dirty = briefing_cache_dirty(root)
     if turn.can_inject and isinstance(entry, dict) and not dirty:
         session = turn.event == EVENT_SESSION
         context, shown = render_cached_pack(
