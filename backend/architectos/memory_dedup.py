@@ -648,9 +648,11 @@ class MemoryDedupGate:
 
         Equal templates: the same values are a duplicate (a conflict if the
         polarity flipped), changed values an update. Equal frames without
-        numbers and negation are the same words in another order. A frame
-        strictly inside the other, with numbers nested the same way and the
-        same polarity, is an enrich (or already covered). Anything else is new.
+        numbers and negation are the same words in another order. Anything
+        else is new, a statement nested in the other too: the extra words may
+        narrow or reverse it ("members can delete projects" inside "admins can
+        delete projects but members can only archive them"), so it is left to
+        the near flag and the judge.
         """
         near = self.near_score(incoming, existing)
         verdict = DedupDecision(near_score=near)
@@ -672,23 +674,12 @@ class MemoryDedupGate:
                 near_score=near,
                 details={"values_from": [old for old, _ in changed], "values_to": [new for _, new in changed]},
             )
-        frame, existing_frame = incoming.label_core, existing.label_core
         if (
-            frame == existing_frame
+            incoming.label_core == existing.label_core
             and not (incoming.numbers or existing.numbers)
             and not (incoming.negated or existing.negated)
         ):
             return DedupDecision("duplicate", score=1.0, reason="same words in another order", near_score=near)
-        if not same_polarity or min(len(frame), len(existing_frame)) < self.MIN_STEMS:
-            return verdict
-        score = len(frame & existing_frame) / len(frame | existing_frame)
-        if frame > existing_frame and incoming.numbers >= existing.numbers:
-            return DedupDecision(
-                "enrich", score=score, reason="same fact with added detail", near_score=near,
-                details={"added": sorted(frame - existing_frame)[:20]},
-            )
-        if frame < existing_frame and incoming.numbers <= existing.numbers:
-            return DedupDecision("duplicate", score=score, reason="already covered by a fuller fact", near_score=near)
         return verdict
 
     def gray_candidates(

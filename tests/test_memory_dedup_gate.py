@@ -142,6 +142,26 @@ class GateClassifierTests(unittest.TestCase):
             same_turn=False,
         ))
 
+    def test_atom_inside_another_is_a_new_fact(self) -> None:
+        pairs = [
+            ("Admins can delete projects in the workspace but members can only archive them",
+             "Members can delete projects in the workspace"),
+            ("The cache is enabled in production for the billing service",
+             "The cache is enabled in staging and disabled in production for the billing service"),
+            ("Search uses the dedup index", "Search uses the dedup index only when the feature flag is on"),
+            ("We use plan a for the rollout of the billing service", "We use plan b for the rollout of the billing service"),
+        ]
+        for old, new in pairs:
+            for stored, incoming in ((old, new), (new, old)):
+                with self.subTest(stored=stored, incoming=incoming):
+                    self.assertEqual(self._compare_atoms(stored, incoming).action, "new")
+
+    def test_changed_number_with_flipped_polarity_is_no_update(self) -> None:
+        verdict = self._compare_atoms(
+            "We use 5 workers for the export queue", "We do not use 6 workers for the export queue",
+        )
+        self.assertEqual(verdict.action, "new")
+
     def test_atom_with_a_second_not_keeps_every_word(self) -> None:
         verdict = self._compare_atoms(
             "The app does not cache not-found responses", "The app does not log not-found responses",
@@ -225,6 +245,18 @@ class GateWritePathTests(unittest.TestCase):
             with self.subTest(fact=fact):
                 node = self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson")
                 self.assertEqual(node["dedup"]["action"], "new")
+
+    def test_atom_inside_a_stored_one_is_written_and_flagged(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
+        written = []
+        for fact in (
+            "Search uses the dedup index only when the feature flag is on",
+            "Search uses the dedup index",
+        ):
+            written.append(self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson"))
+        self.assertEqual(written[1]["dedup"]["action"], "new")
+        self.assertNotEqual(written[1]["id"], written[0]["id"])
+        self.assertEqual(written[1]["metadata"].get("possible_duplicate_of"), written[0]["id"])
 
     def test_atoms_that_differ_in_a_token_with_digits_are_both_written(self) -> None:
         header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
@@ -436,13 +468,13 @@ class GateWritePathTests(unittest.TestCase):
 
     def test_pairs_that_must_fire_are_decided_from_the_whole_statement(self) -> None:
         rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"reject", "fold", "replace"}]
-        self.assertEqual(len(rows), 9)
+        self.assertEqual(len(rows), 8)
         for row in rows:
             self._assert_pair(row)
 
     def test_pairs_that_must_stay_alive_never_fold_or_replace(self) -> None:
         rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"keep_both", "write"}]
-        self.assertEqual(len(rows), 12)
+        self.assertEqual(len(rows), 13)
         for row in rows:
             self._assert_pair(row)
 
@@ -458,7 +490,8 @@ class GateWritePathTests(unittest.TestCase):
                 ),
                 "only number changed is a replacement": ((chat, number_10), (chat, number_20), ("update", "replace")),
                 "inserted negation is a conflict": ((chat, base), (chat, with_negation(base, lang)), ("conflict", "reject")),
-                "appended words enrich": ((chat, base), (chat, with_added_words(base, lang)), ("enrich", "fold")),
+                # A nested statement may say less than it seems: left to the near flag, not folded.
+                "appended words are a new fact": ((chat, base), (chat, with_added_words(base, lang)), ("new", "write")),
                 "Ask against MCP is a duplicate": ((chat, base), (mcp, base), ("duplicate", "reject")),
                 "MCP against Ask is a duplicate": ((mcp, base), (chat, base), ("duplicate", "reject")),
             }
