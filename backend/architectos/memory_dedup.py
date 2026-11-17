@@ -187,16 +187,19 @@ def statement_shape(statement: str) -> tuple[frozenset[str], tuple[str, ...], tu
     """
     tokens: list[str] = []
     values: list[str] = []
-    do_at = -1
+    # Whether the last token is a do-word: "not" right after it drops both.
+    after_do = False
     for raw in statement.split():
         ident = _identifier(raw)
         if ident:
             tokens.append(ident)
+            after_do = False
             continue
         token = normalize_fact_text(raw)
         if token and _is_number(token):
             tokens.append("#")
             values.append(_number_value(token))
+            after_do = False
             continue
         for word in _WORD_RE.findall(raw):
             # Lower-case "a" only: "Service A" names a service.
@@ -208,13 +211,14 @@ def statement_shape(statement: str) -> tuple[frozenset[str], tuple[str, ...], tu
             elif word.endswith("n't"):
                 word = word[:-3]
                 if word in _DO_WORDS:
+                    after_do = False
                     continue
             elif word in NEGATION_WORDS:
-                if word == "not" and do_at == len(tokens) - 1:
+                if word == "not" and after_do:
                     tokens.pop()
+                after_do = False
                 continue
-            if word in _DO_WORDS:
-                do_at = len(tokens)
+            after_do = word in _DO_WORDS
             tokens.append(stem(word))
     return frozenset(tokens) - {"#"}, tuple(tokens), tuple(values)
 

@@ -19,6 +19,7 @@ from backend.architectos import memory_dedup
 from backend.architectos.candidate_identity import origin_key_from_memory_node
 from backend.architectos.mcp_server import MemoryMCPServer
 from backend.architectos.memory_dedup import MemoryDedupGate, content_salt, fact_features, stem
+from backend.architectos.memory_ingestion import CHAT_FACT_BOILERPLATE_PREFIXES
 from backend.architectos.models import MemoryNode, owned_by, stable_id
 from backend.architectos.sdk import ArchitectOS
 from backend.architectos.server import ArchitectOSHandler
@@ -72,6 +73,29 @@ class GateClassifierTests(unittest.TestCase):
 
     def _compare(self, old: tuple[str, str], new: tuple[str, str]) -> Any:
         return self.gate.compare(fact_features(*new), fact_features(*old))
+
+    def _compare_atoms(self, old_fact: str, new_fact: str) -> Any:
+        """Verdict for two Ask atoms, built like ``_enqueue_session_fact_atoms`` builds them."""
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        return self.gate.compare(
+            fact_features(f"Chat fact: {new_fact[:72]}", f"{header}\n\n{new_fact}"),
+            fact_features(f"Chat fact: {old_fact[:72]}", f"{header}\n\n{old_fact}"),
+        )
+
+    def test_atom_that_starts_with_not_or_holds_a_negated_compound_is_read(self) -> None:
+        self.assertEqual(
+            self._compare_atoms("Every hook process opens the store", "Not every hook process opens the store").action,
+            "conflict",
+        )
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        features = fact_features("Chat fact: not-null", f"{header}\n\nThe not-null constraint is enforced")
+        self.assertIn("constraint", features.template)
+
+    def test_atom_with_a_second_not_keeps_every_word(self) -> None:
+        verdict = self._compare_atoms(
+            "The app does not cache not-found responses", "The app does not log not-found responses",
+        )
+        self.assertEqual(verdict.action, "new")
 
     def test_light_stemming_folds_inflections(self) -> None:
         self.assertEqual({stem(w) for w in ("хранит", "хранится", "хранят")}, {"хран"})
@@ -143,6 +167,13 @@ class GateWritePathTests(unittest.TestCase):
 
     def _add(self, label: str, text: str, node_type: str = "Decision", **extra: Any) -> dict[str, Any]:
         return self.service.add_memory({"label": label, "text": text, "type": node_type, **extra})
+
+    def test_atom_that_starts_with_not_is_written(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
+        for fact in ("Not every hook process opens the store directly", "The not-null constraint is enforced on every table"):
+            with self.subTest(fact=fact):
+                node = self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson")
+                self.assertEqual(node["dedup"]["action"], "new")
 
     def _edges(self, source: str, target: str, edge_type: str) -> list[Any]:
         return [
