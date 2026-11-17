@@ -569,6 +569,7 @@ class HookCaptureOnStopTests(unittest.TestCase):
         lines = spool.read_text(encoding="utf-8").splitlines() if spool.exists() else []
         return [(json.loads(line)["user_text"], json.loads(line)["assistant_text"]) for line in lines]
 
+    @unittest.skipIf(agent_hooks.fcntl is None, "no cross-process file lock without fcntl (Windows)")
     def test_session_changes_wait_for_the_session_lock(self) -> None:
         # Another hook of the same session holding its lock blocks this one's change.
         with tempfile.TemporaryDirectory() as tmp:
@@ -876,6 +877,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertEqual(before, set(added.values()))
         self.assertEqual(after, {added["adr"]})
 
+    @unittest.skipIf(agent_hooks.fcntl is None, "no cross-process file lock without fcntl (Windows)")
     def test_cache_writes_wait_for_the_cross_process_lock(self) -> None:
         # Another process (an MCP server) holding the cache lock blocks this writer.
         with tempfile.TemporaryDirectory() as tmp:
