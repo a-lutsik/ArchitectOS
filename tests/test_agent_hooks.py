@@ -460,6 +460,23 @@ class HookCaptureOnStopTests(unittest.TestCase):
     def _captures(spy: mock.MagicMock) -> list[tuple[str, str]]:
         return [(call.args[0], call.args[1]) for call in spy.call_args_list if call.kwargs.get("capture", True)]
 
+    def test_turn_end_spools_the_turn_when_the_app_answers_with_an_error(self) -> None:
+        # The question leaves the session file before the send; an app error (500 from
+        # "database is locked", a cut reply) must not lose the turn.
+        for status, body in ((500, b'{"error": "database is locked"}'), (200, b"")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "data").mkdir()
+                (root / "data" / "architectos.runtime.json").write_text(
+                    json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+                )
+                with mock.patch.object(agent_hooks, "_exchange", return_value=(status, body)):
+                    _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.PROMPT)
+                    _hook(root, "Stop", cwd=root, session="s1", last_assistant_message=self.ANSWER)
+                spool = root / "data" / "hook_spool.jsonl"
+                spooled = [json.loads(line) for line in spool.read_text(encoding="utf-8").splitlines()] if spool.exists() else []
+                self.assertEqual([(item["user_text"], item["assistant_text"]) for item in spooled], [(self.PROMPT, self.ANSWER)])
+
     def test_prompt_only_injects_and_turn_end_captures_question_with_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -516,8 +516,11 @@ def _send_turn(
             return result, "http"
     if not _offline_allowed():
         return None, "none"
-    # A timed-out capture already reached the app; spooling it too would capture it twice.
-    spool = capture and turn.event != EVENT_SESSION and failure == "unreachable"
+    # A timed-out capture already reached the app and is likely still running; spooling
+    # it too would capture it twice. An app that answered with an error (500 from a
+    # locked store, a cut reply) did not capture it, and the question has already left
+    # the session file: spool it. A replay of a turn the app did store is deduplicated.
+    spool = capture and turn.event != EVENT_SESSION and failure in ("unreachable", "error")
     return _offline_turn(turn, root or resolve_project_root(), include_stable=include_stable,
                          exclude_ids=exclude_ids or [], spool=spool), "offline"
 

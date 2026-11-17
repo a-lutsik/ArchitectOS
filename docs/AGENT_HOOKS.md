@@ -184,7 +184,9 @@ store, so an event costs a few milliseconds instead of a service cold start:
   `capture_memory_turn` into each record's own project when it starts and once a
   minute (the `chat-session-idle` loop); a record that keeps failing is retried
   three times and then dropped. The spool stops growing at 5 MB. A capture whose
-  HTTP request timed out is *not* spooled: the app already has it.
+  HTTP request timed out is *not* spooled: the app already has it. One the app
+  answered with an error (HTTP 4xx/5xx, a cut reply) is spooled, since the app did
+  not store it.
 - Until the app runs again, spooled facts are not in memory. `doctor` shows how
   many records wait and how old the oldest one is.
 
