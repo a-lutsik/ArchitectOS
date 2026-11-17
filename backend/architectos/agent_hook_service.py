@@ -179,9 +179,11 @@ class AgentHookServiceMixin:
                 }}
                 if not (project_id and (briefing or pack)) and all(cache.get(key) == value for key, value in shared.items()):
                     return
-                projects = cache.get("projects") if isinstance(cache.get("projects"), dict) else {}
+                raw_projects = cache.get("projects")
+                projects: dict[str, Any] = raw_projects if isinstance(raw_projects, dict) else {}
                 if project_id and (briefing or pack):
-                    entry = projects.get(project_id) if isinstance(projects.get(project_id), dict) else {}
+                    raw_entry = projects.get(project_id)
+                    entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
                     for text, key in ((briefing, "stable"), (pack, "hits")):
                         if text:
                             parsed = split_pack(text)

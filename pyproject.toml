@@ -70,6 +70,7 @@ ignore_missing_imports = true
 # with no signal. Disabled per-module; everything else stays on.
 [[tool.mypy.overrides]]
 module = [
+    "architectos.agent_hook_service",
     "architectos.ai_runtime_service",
     "architectos.azure_boards_parse",
     "architectos.azure_boards_sync",
