@@ -576,6 +576,23 @@ class DedupIndexTests(unittest.TestCase):
         self._assert_equals_a_build_from_scratch()
         self.assertEqual(self.service.rebuild_memory_dedup_index()["added"], 0)
 
+    def test_compaction_merges_atoms_only_on_an_equal_template(self) -> None:
+        swapped = [
+            self._add_atom("The ingestion service calls the dedup gate before the candidate store is updated"),
+            self._add_atom("The dedup gate calls the ingestion service before the candidate store is updated"),
+        ]
+        repeated = "Review candidates expire after 7 days unless a person accepts them"
+        # Once from Ask and once from MCP: two nodes under different labels.
+        verbatim = [
+            self.repo.add_node("Lesson", f"Chat fact: {repeated}", "project", f"{ASK_HEADER}\n\n{repeated}", "architectos").id,
+            self._add_atom(repeated),
+        ]
+        report = self.service.compact_memory({"project_id": "architectos", "dry_run": True})
+        self.assertEqual(report["would_merge"], 1)
+        self.service.run_scheduled_compaction()
+        self.assertEqual([self.repo.get_node(node_id).status for node_id in swapped], ["active", "active"])
+        self.assertEqual(sorted(self.repo.get_node(node_id).status == "active" for node_id in verbatim), [False, True])
+
     def test_manual_reindex_reports_indexed_nodes(self) -> None:
         node = self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})
         result = self.service.rebuild_memory_dedup_index()
