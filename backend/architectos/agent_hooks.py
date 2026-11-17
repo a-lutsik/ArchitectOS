@@ -20,19 +20,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import socket
 import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, NamedTuple
 
 try:
     import fcntl
-except ImportError:  # Windows: files are then serialized within one process only
+except ImportError:  # Windows: msvcrt byte locks instead
     fcntl = None  # type: ignore[assignment]
+msvcrt: Any = None
+if fcntl is None:
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:
+        pass
+    else:
+        msvcrt = _msvcrt
 
 from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
@@ -60,6 +67,9 @@ class _HookLog:
 
     def warning(self, message: str, *args: object) -> None:
         _debug(f"WARNING {message % args}")
+
+    def debug(self, message: str, *args: object) -> None:
+        _debug(f"DEBUG {message % args}")
 
 
 def _log() -> logging.Logger | _HookLog:
@@ -144,7 +154,6 @@ _CAPTURE_TIMEOUT = 5.0
 _SESSION_DIR = "hook_sessions"
 _SESSION_TTL_S = 3 * 24 * 3600.0
 _STABLE_EVERY_TURNS = 20
-_INJECTED_ID = re.compile(r"^- id=(\S+)", re.MULTILINE)
 # The question waits in the session file until turn end captures it with the answer.
 _PENDING_PROMPT_MAX_CHARS = 20000
 
@@ -219,32 +228,102 @@ def write_private(path: Path, text: str, *, append: bool = False) -> None:
         pass  # Windows may ignore or reject POSIX modes
 
 
+# msvcrt has no blocking lock without a 10 s cap, so a Windows wait polls at this pace;
+# a Windows replace refused by a reader is retried at the same pace.
+_LOCK_POLL_S = 0.01
+# Windows refuses os.replace while another process has the target open (a hook or the
+# app reading the cache or a session file); such a reader lets go within milliseconds.
+_RETRY_REPLACE = os.name == "nt"
+_REPLACE_WAIT_S = 1.0
+# Lock files this process already warned about: in the app every memory write takes the
+# cache lock, and an unusable one would otherwise log a warning per write.
+_LOCK_WARNED: set[str] = set()
+
+
+def replace_file(source: Path, target: Path) -> None:
+    """os.replace that waits up to a second for a Windows reader of ``target`` to let go."""
+    deadline = time.monotonic() + _REPLACE_WAIT_S
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if not _RETRY_REPLACE or time.monotonic() >= deadline:
+                raise
+            time.sleep(_LOCK_POLL_S)
+
+
+def _acquire(fd: int, wait: float | None) -> bool:
+    """Take the exclusive lock on ``fd``: block (``wait`` None) or give up after ``wait`` seconds."""
+    if fcntl is not None and wait is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return True
+    # A held lock: flock says EWOULDBLOCK, msvcrt EACCES.
+    busy: type[OSError] = BlockingIOError if fcntl is not None else PermissionError
+    deadline = None if wait is None else time.monotonic() + wait
+    while True:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except busy:
+            pass
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(_LOCK_POLL_S if deadline is None else max(0.0, min(_LOCK_POLL_S, deadline - time.monotonic())))
+
+
+def _release(fd: int) -> None:
+    try:
+        if fcntl is None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass  # closing the handle releases it too
+    finally:
+        os.close(fd)  # with flock, closing is the release
+
+
 @contextmanager
-def file_lock(path: Path) -> Iterator[None]:
+def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
     """Hold an exclusive lock on ``path`` across processes (hooks of one session, app and MCP servers).
 
-    A lock file that cannot be made or locked (read-only folder, full disk, a file
-    system without flock) must not cost the turn its pack or its capture: the
-    block then runs unlocked, with a warning.
+    flock on POSIX, a one-byte msvcrt lock on Windows. Yields True while the lock
+    is held. With ``wait`` (seconds) it gives up on a lock held elsewhere for
+    longer and yields False: the block then runs without it and must say so. A
+    lock file that cannot be made or locked (read-only folder, full disk, a file
+    system without locks) must not cost the turn its pack or its capture: the
+    block then runs unlocked (True), with a warning.
     """
-    if fcntl is None:
-        yield
+    if fcntl is None and msvcrt is None:
+        yield True
         return
     fd: int | None = None
+    held = True
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        held = _acquire(fd, wait)
     except OSError as exc:
-        _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
+        if str(path) in _LOCK_WARNED:
+            _log().debug("lock file still unusable, going on without it: %s (%s)", path.name, exc)
+        else:
+            _LOCK_WARNED.add(str(path))
+            _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
         if fd is not None:
             os.close(fd)
             fd = None
+    if not held and fd is not None:
+        os.close(fd)
+        fd = None
     try:
-        yield
+        yield held
     finally:
         if fd is not None:
-            os.close(fd)  # closing releases the lock
+            _release(fd)
 
 
 def _clean(value: Any) -> str:
@@ -411,13 +490,15 @@ class HookSession:
         return due, list(entry.get("seen") or {})
 
     def record(
-        self, turn: HookTurn, result: dict[str, Any] | None, injected: str, *, include_stable: bool, transport: str
+        self, turn: HookTurn, result: dict[str, Any] | None, shown: list[tuple[str, str]], *,
+        include_stable: bool, transport: str,
     ) -> None:
         """Remember what this event injected, under the project the app resolved.
 
-        The stable layer counts as shown only when it reached the agent, or when the
-        app itself answered that the project has none; an offline or empty pack
-        leaves it due for the next prompt.
+        ``shown`` is (id, section) of each memory line that reached the agent (see
+        shown_memories). The stable layer counts as shown only when one of its lines
+        did, or when the app itself answered that the project has none; an offline
+        or empty pack leaves it due for the next prompt.
         """
         if result is None:
             return
@@ -429,17 +510,17 @@ class HookSession:
         if "stable_every_turns" in result:
             self.state["stable_every"] = int(result["stable_every_turns"])
         entry = self.project(project_id)
-        shown = STABLE_TITLE in injected or (transport == "http" and not result.get("stable"))
+        stable_shown = any(section == "stable" for _, section in shown) or (transport == "http" and not result.get("stable"))
         if turn.event == EVENT_SESSION:
             if turn.source in _RESET_SOURCES:
                 entry["seen"] = {}
-            if shown:
+            if stable_shown:
                 entry["stable_turn"] = int(entry["turn"])
         elif turn.event == EVENT_PROMPT:
             entry["turn"] = int(entry["turn"]) + 1
-            if include_stable and shown:
+            if include_stable and stable_shown:
                 entry["stable_turn"] = entry["turn"]
-        for node_id in _INJECTED_ID.findall(injected):
+        for node_id, _ in shown:
             entry["seen"][node_id] = entry["turn"]
 
     def keep_prompt(self, cwd: str, text: str) -> str:
@@ -465,7 +546,7 @@ class HookSession:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             scratch = self.path.with_suffix(".tmp")
             write_private(scratch, json.dumps(self.state, ensure_ascii=False))
-            os.replace(scratch, self.path)
+            replace_file(scratch, self.path)
         except OSError as exc:
             _log().warning("hook session file not saved: %s (%s)", self.path.name, exc)
 
@@ -651,6 +732,10 @@ def _send_turn(
 # last cached in data/briefing_cache.json and appends captures to
 # data/hook_spool.jsonl, which the app drains on start and every minute.
 BRIEFING_CACHE = "briefing_cache.json"
+# Left by a process that could not evict a changed memory from the cache (the file
+# would not be replaced, or its lock stayed held): until the next locked write
+# re-checks every cached line against the store, the offline hook injects no lines.
+BRIEFING_CACHE_DIRTY = f"{BRIEFING_CACHE}.dirty"
 HOOK_SPOOL = "hook_spool.jsonl"
 _SPOOL_MAX_BYTES = 5 * 1024 * 1024
 _BRIEFING_CHAR_BUDGET = 2000
@@ -662,6 +747,39 @@ _BIND_FILENAME = ".architectos.json"
 # Section titles of search.pack_memory_context: the cache keeps a pack's lines per section.
 STABLE_TITLE = "Stable memory (pinned / constraints / long-term):"
 HITS_TITLE = "Retrieved for this query:"
+def pack_lines_shown(context: str, lines: Iterable[tuple[str, str, str]]) -> list[list[Any]]:
+    """[id, section, end] for each (id, section, line) of a rendered pack, in pack order.
+
+    ``end`` is where the line stops in ``context``, so the hook can tell which lines
+    a cut injection still carries whole. The ids come from the pack's own line list,
+    never read back out of its text: a memory's text may hold a line that looks
+    like another memory's.
+    """
+    shown: list[list[Any]] = []
+    position = 0
+    for node_id, section, line in lines:
+        at = context.find(line, position)
+        if at < 0:
+            continue
+        position = at + len(line)
+        shown.append([node_id, section, position])
+    return shown
+
+
+def shown_memories(result: Mapping[str, Any] | None, injected: str) -> list[tuple[str, str]]:
+    """(id, section) of each memory line that reached the agent whole in ``injected``."""
+    if not (result and injected):
+        return []
+    context = str(result.get("context") or "")
+    # render_stdout injects the stripped context after the prefix and cuts it at _INJECT_MAX_CHARS.
+    kept = len(context) - len(context.lstrip()) + _INJECT_MAX_CHARS - len(_INJECT_PREFIX) - 2
+    return [
+        (str(item[0]), str(item[1]))
+        for item in result.get("shown") or []
+        if isinstance(item, list) and len(item) >= 3 and isinstance(item[2], int) and item[2] <= kept
+    ]
+
+
 def pack_header(context: str) -> str:
     """The lines of a rendered pack before its first memory section."""
     header: list[str] = []
@@ -672,14 +790,14 @@ def pack_header(context: str) -> str:
     return "\n".join(header).strip()
 
 
-def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclude: set[str], budget: int) -> tuple[str, list[str], list[str]]:
-    """Rebuild a pack from cached lines: (context, stable ids, hit ids); "" when nothing is new.
+def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclude: set[str], budget: int) -> tuple[str, list[list[Any]]]:
+    """Rebuild a pack from cached lines: (context, shown as pack_lines_shown); "" when nothing is new.
 
     Like the app's hook pack, a requested stable layer ignores ``exclude``.
     """
     header = str(entry.get("header") or "")
     lines, used, taken = [header], len(header), set()
-    picked: dict[str, list[str]] = {"stable": [], "hits": []}
+    picked: list[tuple[str, str, str]] = []
     for key, title in (("stable", STABLE_TITLE), ("hits", HITS_TITLE)):
         if key == "stable" and not include_stable:
             continue
@@ -692,15 +810,16 @@ def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclud
             if node_id in taken or (key == "hits" and node_id in exclude) or cost + len(line) + 1 > budget:
                 continue
             section.append(line)
-            picked[key].append(node_id)
+            picked.append((node_id, key, line))
             taken.add(node_id)
             cost += len(line) + 1
         if section:
             lines.extend(["", title, *section])
             used = cost
     if not taken:
-        return "", [], []
-    return "\n".join(lines).strip(), picked["stable"], picked["hits"]
+        return "", []
+    context = "\n".join(lines).strip()
+    return context, pack_lines_shown(context, picked)
 
 
 def _fresh_sections(entry: Mapping[str, Any], ttl_hours: float) -> dict[str, Any]:
@@ -850,18 +969,22 @@ def _offline_turn(
     entry = (cache.get("projects") or {}).get(project_id) if project_id else None
     if isinstance(entry, dict):
         entry = _fresh_sections(entry, float(settings.get("hook_cache_ttl_hours", _CACHE_TTL_HOURS)))
-    if turn.can_inject and isinstance(entry, dict):
+    dirty = (root / "data" / BRIEFING_CACHE_DIRTY).exists()
+    if turn.can_inject and isinstance(entry, dict) and not dirty:
         session = turn.event == EVENT_SESSION
-        context, stable, hits = render_cached_pack(
+        context, shown = render_cached_pack(
             {**entry, "hits": []} if session else entry,  # session start is the briefing: stable layer only
             include_stable=include_stable or session,
             exclude=set() if session else set(exclude_ids),
             budget=_BRIEFING_CHAR_BUDGET if session else hook_pack_budget(int(settings.get("hook_char_budget") or _HOOK_CHAR_BUDGET)),
         )
-        result.update(context=context, stable=stable, hits=hits)
+        result.update(
+            context=context, shown=shown,
+            stable=[item[0] for item in shown if item[1] == "stable"], hits=[item[0] for item in shown if item[1] == "hits"],
+        )
     _log().info(
-        "offline hook: kind=%s project=%s cached=%s injected_ids=%s spooled=%s",
-        turn.event, project_id or "-", isinstance(entry, dict), len(result["hits"]) + len(result["stable"]),
+        "offline hook: kind=%s project=%s cached=%s dirty=%s injected_ids=%s spooled=%s",
+        turn.event, project_id or "-", isinstance(entry, dict), dirty, len(result["hits"]) + len(result["stable"]),
         result.get("spooled", False),
     )
     return result
@@ -950,7 +1073,7 @@ def handle_capture(
     if turn.session_id:
         # Re-read under the lock: another hook of this session may have saved meanwhile.
         with HookSession.edit(session_root, turn.session_id) as session:
-            session.record(turn, result, injected, include_stable=include_stable, transport=transport)
+            session.record(turn, result, shown_memories(result, injected), include_stable=include_stable, transport=transport)
             if turn.event == EVENT_PROMPT:
                 orphan = session.keep_prompt(turn.cwd, turn.user_text)
                 if orphan and _offline_allowed():

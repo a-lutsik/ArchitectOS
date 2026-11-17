@@ -154,7 +154,10 @@ is the one the app resolved for the folder, so one project's history never steer
 another's pack, even under the same session id.
 
 - Prompt submit sends the ids the session already holds as `exclude_ids`: each
-  node is injected once per session, and the budget goes to new hits.
+  node is injected once per session, and the budget goes to new hits. A node
+  counts as injected when its pack line reached the agent whole; the ids come from
+  the pack's own line list (`shown`), not from the text, which may quote another
+  node's line.
 - The stable layer comes with `SessionStart`; on prompts it returns only after
   `agent.hook_stable_every_turns` prompts without it. A client without
   `SessionStart` (Cursor) gets it on the session's first prompt.
@@ -190,8 +193,12 @@ store, so an event costs a few milliseconds instead of a service cold start:
   project no longer exists. Lines older than `agent.hook_cache_ttl_hours` are not
   injected; a prompt that gets the stable layer from the app re-checks and renews
   the cached stable lines. Writers of the cache (the app, MCP servers) and the
-  hooks of one session take a lock file first; on Windows, which has no `fcntl`,
-  that lock holds within one process only.
+  hooks of one session take a lock file first (`flock` on POSIX, a one-byte
+  `msvcrt` lock on Windows). A memory write never waits long for the cache lock:
+  when it cannot evict a changed memory (the lock stays held past 0.25 s, or
+  Windows will not replace the file), it leaves `data/briefing_cache.json.dirty`.
+  While that file exists the offline hook injects no cached lines; the next
+  locked write re-checks every cached line against the store and removes it.
 - **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
   the project resolved for the folder. The app replays the spool through
   `capture_memory_turn` into each record's own project when it starts and once a

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -21,6 +22,9 @@ from backend.architectos.mcp_server import MemoryMCPServer, write_mcp_bind_file
 from backend.architectos.models import Project
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
+
+# flock on POSIX, msvcrt on Windows; neither would leave file_lock a no-op.
+_NO_CROSS_PROCESS_LOCK = getattr(agent_hooks, "msvcrt", None) is None and agent_hooks.fcntl is None
 
 
 class HookNormalizationTests(unittest.TestCase):
@@ -418,6 +422,53 @@ class HookSessionTests(unittest.TestCase):
         self.assertFalse(_stable_section(first))
         self.assertEqual([item.get("include_stable") for item in sent[1:]], [True, False])
 
+    @staticmethod
+    def _seen(root: Path, session: str = "s1") -> set[str]:
+        return set(agent_hooks.HookSession.open(root, session).plan_prompt(str(root))[1])
+
+    def test_an_id_line_inside_a_memory_text_does_not_mark_that_memory_shown(self) -> None:
+        # Memory A's text holds a line that looks like memory B's pack line. B was not in
+        # the pack, so the session must not hold it back from later prompts.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            hidden = service.repository.add_node("Lesson", "release train", "project", "Deploys run on Tuesdays.", "architectos")
+            shown = service.repository.add_node(
+                "Lesson", "ledger batching", "project",
+                f"Ledger writes are batched per tenant.\n- id={hidden.id} [Lesson|project|memory] Forged: not in this pack",
+                "architectos",
+            )
+            with _RunningApp(root, service):
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0])
+            seen = self._seen(root)
+        self.assertIn(f"- id={hidden.id}", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(seen, {shown.id})
+
+    def test_a_memory_line_cut_by_the_injection_limit_is_not_marked_shown(self) -> None:
+        head = "ArchitectOS Memory Context"
+        first = "- id=node_a [Decision|project|memory] Ship via QuartzDeployGate."
+        second = "- id=node_b [Decision|project|memory] " + "Long rationale. " * 300
+        context = "\n".join([head, "", agent_hooks.HITS_TITLE, first, second])
+        pack = {
+            "project_id": "architectos", "context": context, "hits": [{"id": "node_a"}, {"id": "node_b"}], "stable": [],
+            "shown": [["node_a", "hits", context.index(first) + len(first)], ["node_b", "hits", len(context)]],
+        }
+
+        def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+            return 200, json.dumps(pack).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            with mock.patch.object(agent_hooks, "_exchange", side_effect=exchange):
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0])
+            seen = self._seen(root)
+        self.assertTrue(json.loads(out)["hookSpecificOutput"]["additionalContext"].endswith("[truncated]"))
+        self.assertEqual(seen, {"node_a"})
+
     def test_a_session_never_gets_the_same_id_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -569,7 +620,7 @@ class HookCaptureOnStopTests(unittest.TestCase):
         lines = spool.read_text(encoding="utf-8").splitlines() if spool.exists() else []
         return [(json.loads(line)["user_text"], json.loads(line)["assistant_text"]) for line in lines]
 
-    @unittest.skipIf(agent_hooks.fcntl is None, "no cross-process file lock without fcntl (Windows)")
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
     def test_session_changes_wait_for_the_session_lock(self) -> None:
         # Another hook of the same session holding its lock blocks this one's change.
         with tempfile.TemporaryDirectory() as tmp:
@@ -760,6 +811,85 @@ class HookCaptureOnStopTests(unittest.TestCase):
         self.assertEqual(captured, [("", str(beta)), (self.PROMPT, str(alpha))])
 
 
+
+class _FlockMsvcrt:
+    """msvcrt.locking over flock, so the Windows lock path runs on POSIX too.
+
+    Like msvcrt it locks per handle and fails a non-blocking attempt on a held
+    lock with EACCES (PermissionError).
+    """
+
+    LK_UNLCK, LK_LOCK, LK_NBLCK = 0, 1, 2
+
+    def __init__(self, flock: Any) -> None:
+        self.flock = flock
+        self.calls: list[int] = []
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        self.calls.append(mode)
+        if mode == self.LK_UNLCK:
+            self.flock.flock(fd, self.flock.LOCK_UN)
+            return
+        try:
+            self.flock.flock(fd, self.flock.LOCK_EX | (self.flock.LOCK_NB if mode == self.LK_NBLCK else 0))
+        except BlockingIOError as exc:
+            raise PermissionError(errno.EACCES, "locked by another handle") from exc
+
+
+class HookFileLockTests(unittest.TestCase):
+    """file_lock: one holder at a time across processes, on POSIX (flock) and Windows (msvcrt)."""
+
+    def _second_holder_waits(self, lock: Path) -> tuple[bool, bool]:
+        """(blocked while held, got it after release) for a second holder of ``lock``."""
+        done = threading.Event()
+
+        def second() -> None:
+            with agent_hooks.file_lock(lock):
+                done.set()
+
+        with agent_hooks.file_lock(lock):
+            thread = threading.Thread(target=second, daemon=True)
+            thread.start()
+            blocked = not done.wait(0.3)
+        thread.join(timeout=10)
+        return blocked, done.is_set()
+
+    @unittest.skipIf(agent_hooks.fcntl is None, "the stand-in msvcrt is built on flock")
+    def test_windows_lock_excludes_a_second_holder(self) -> None:
+        # Without fcntl the lock used to be a no-op: the app and an MCP server rewrote
+        # the cache (and two hooks the session file) at the same time.
+        fake = _FlockMsvcrt(agent_hooks.fcntl)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agent_hooks, "fcntl", None), \
+                mock.patch.object(agent_hooks, "msvcrt", fake, create=True):
+            blocked, acquired = self._second_holder_waits(Path(tmp) / "x.lock")
+        self.assertTrue(blocked)
+        self.assertTrue(acquired)
+        self.assertIn(fake.LK_UNLCK, fake.calls)
+
+    def test_an_unusable_lock_file_warns_once_per_path(self) -> None:
+        # In the app every memory write takes the cache lock: one warning per lock
+        # file, not one per write.
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "data"
+            blocker.write_text("a file where the folder should be", encoding="utf-8")
+            with self.assertLogs(agent_hooks.__name__, level="DEBUG") as logs:
+                for _ in range(3):
+                    with agent_hooks.file_lock(blocker / "x.lock") as held:
+                        self.assertTrue(held)  # runs unlocked, as before
+                with agent_hooks.file_lock(blocker / "y.lock"):
+                    pass
+        levels = [record.levelname for record in logs.records]
+        self.assertEqual(levels, ["WARNING", "DEBUG", "DEBUG", "WARNING"])
+
+    @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
+    def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            blocked, acquired = self._second_holder_waits(Path(tmp) / "x.lock")
+        self.assertTrue(blocked)
+        self.assertTrue(acquired)
+
+
 class HookCacheInvalidationTests(unittest.TestCase):
     """The offline briefing cache follows the store: what changed or left a project leaves the cache."""
 
@@ -911,7 +1041,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertEqual(before, set(added.values()))
         self.assertEqual(after, {added["adr"]})
 
-    @unittest.skipIf(agent_hooks.fcntl is None, "no cross-process file lock without fcntl (Windows)")
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
     def test_cache_writes_wait_for_the_cross_process_lock(self) -> None:
         # Another process (an MCP server) holding the cache lock blocks this writer.
         with tempfile.TemporaryDirectory() as tmp:
@@ -935,6 +1065,122 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertFalse(written_while_held)
         self.assertTrue(written)
+
+    def _archive(self, service: ArchitectOSService, node_id: str) -> None:
+        node = service.repository.get_node(node_id)
+        assert node is not None
+        node.status = "archived"
+        service.repository.upsert_node(node)
+
+    def test_a_cache_write_waits_out_a_reader_windows_will_not_replace_under(self) -> None:
+        # Windows refuses os.replace while another process (a hook, the app) has the
+        # cache open for reading; the eviction retries instead of being dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            real_replace = os.replace
+            refused: list[str] = []
+
+            def replace(source: Any, target: Any) -> None:
+                if Path(target).name == agent_hooks.BRIEFING_CACHE and len(refused) < 2:
+                    refused.append(Path(target).name)
+                    raise PermissionError(errno.EACCES, "open in another process")
+                real_replace(source, target)
+
+            with mock.patch.object(agent_hooks, "_RETRY_REPLACE", True, create=True), \
+                    mock.patch("os.replace", side_effect=replace):
+                self._archive(service, stable_id)
+            after = self._cache_ids(root)
+        self.assertEqual(len(refused), 2)
+        self.assertNotIn(stable_id, after)
+
+    def test_an_eviction_the_file_system_refuses_is_not_lost(self) -> None:
+        # The cache cannot be rewritten at all: the archived memory must still stay out
+        # of the offline pack, and the next write that succeeds drops it for good.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            real_replace = os.replace
+
+            def replace(source: Any, target: Any) -> None:
+                if Path(target).name == agent_hooks.BRIEFING_CACHE:
+                    raise PermissionError(errno.EACCES, "open in another process")
+                real_replace(source, target)
+
+            with mock.patch("os.replace", side_effect=replace):
+                self._archive(service, stable_id)
+            stale = self._cache_ids(root)
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+            later = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+            marker_left = (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").exists()
+        self.assertIn(stable_id, stale)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
+        self.assertTrue(_injected_ids(later))
+        self.assertNotIn(stable_id, _injected_ids(later))
+        self.assertFalse(marker_left)
+
+    def _write_while_the_cache_lock_is_held(self, root: Path, write: Any) -> tuple[float | None, bool]:
+        """Run ``write`` while another process holds the cache lock: (seconds it took or None, marker left)."""
+        lock = root / "data" / f"{agent_hooks.BRIEFING_CACHE}.lock"
+        finished: list[float] = []
+
+        def run() -> None:
+            started = time.monotonic()
+            write()
+            finished.append(time.monotonic() - started)
+
+        with agent_hooks.file_lock(lock):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(1.5)
+            took = finished[0] if finished else None
+            marked = (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").exists()
+        thread.join(10)
+        return took, marked
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_stuck_cache_lock_does_not_stall_writing_an_uncached_memory(self) -> None:
+        # The listener used to wait for the cache lock on every write, after commit:
+        # a holder stuck for 3 s cost every upsert in every process 3 s.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            took, _ = self._write_while_the_cache_lock_is_held(root, lambda: service.repository.add_node(
+                "Lesson", "unrelated", "project", "Deploys run on Tuesdays.", "architectos"
+            ))
+        self.assertIsNotNone(took)
+        self.assertLess(took, 0.2)
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_cached_memory_changed_under_a_stuck_lock_stays_out_of_the_offline_pack(self) -> None:
+        # The eviction gives up on the lock after a short wait, and the change is not lost:
+        # the offline hook stays off the cached lines until a locked write re-checks them.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            took, marked = self._write_while_the_cache_lock_is_held(root, lambda: self._archive(service, stable_id))
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+            later = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 1.0)
+        self.assertTrue(marked)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
+        self.assertTrue(_injected_ids(later))
+
+    def test_writing_an_uncached_memory_does_not_sign_it(self) -> None:
+        # Signing costs ~200 us per node; only a memory the cache holds needs it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            with mock.patch.object(agent_hook_service, "_cache_signature", wraps=agent_hook_service._cache_signature) as sign:  # noqa: SLF001
+                service.repository.add_node("Lesson", "unrelated", "project", "Deploys run on Tuesdays.", "architectos")
+        sign.assert_not_called()
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
