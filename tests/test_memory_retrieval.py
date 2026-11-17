@@ -950,6 +950,30 @@ class MemorySearchQualityTests(unittest.TestCase):
         for (_, score), (_, want) in zip(found, expected):
             self.assertAlmostEqual(score, want, places=9)
 
+    def test_vector_search_sees_rows_added_or_moved_after_the_first_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+
+            def add(label: str) -> str:
+                return service.add_memory({
+                    "project_id": "proj_a", "label": label, "type": "Lesson", "scope": "project",
+                    "text": f"{label}: the session token rotation job must retry on timeout.",
+                })["id"]
+
+            moved = add("Rotation rule one")
+            engine = service.memory_embeddings
+            query = "session token rotation retry"
+            first = [node_id for node_id, _ in engine.search_scored(query, project_id="proj_a", limit=20, min_score=-1.0)]
+            added = add("Rotation rule two")
+            node = service.repository.get_node(moved)
+            assert node is not None
+            node.project_id = "proj_b"
+            service.repository.upsert_node(node)
+            after = [node_id for node_id, _ in engine.search_scored(query, project_id="proj_a", limit=20, min_score=-1.0)]
+        self.assertIn(moved, first)
+        self.assertIn(added, after)
+        self.assertNotIn(moved, after)
+
 
 class MemoryAsyncIndexingTests(unittest.TestCase):
     def test_queued_indexing_drains_and_covers_node(self) -> None:

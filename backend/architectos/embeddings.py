@@ -196,8 +196,8 @@ class _VectorIndex:
         self.dims = dims
         self.matrix = matrix
         self.vectors = vectors or []
-        # (project_id, scope) -> positions a search with that filter may see; rows never
-        # change scope or project inside one index, so each filter is evaluated once.
+        # (project_id, scope) -> positions a search with that filter may see. Built under
+        # the engine's cache lock and cleared there whenever a row is added or re-scoped.
         self.visible: dict[tuple[str | None, str | None], list[int]] = {}
 
     def __len__(self) -> int:
@@ -310,6 +310,7 @@ class MemoryEmbeddingEngine:
             index = self._vector_cache
             if index is None or index.dims != len(vector):
                 return False
+            index.visible.clear()
             if node_id in index.node_ids:
                 position = index.node_ids.index(node_id)
                 index.scopes[position] = scope
@@ -536,13 +537,14 @@ class MemoryEmbeddingEngine:
         # beside it, so it stays a tight comprehension over the cached visible rows;
         # math.sumprod does each dot product in C.
         q_norm = math.sqrt(sum(v * v for v in query_vector)) or 1.0
-        visible = index.visible.get((project_id, scope))
-        if visible is None:
-            visible = index.visible[(project_id, scope)] = [
-                position
-                for position, (node_scope, node_project) in enumerate(zip(index.scopes, index.projects, strict=True))
-                if self._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope)
-            ]
+        with self._cache_lock:
+            visible = index.visible.get((project_id, scope))
+            if visible is None:
+                visible = index.visible[(project_id, scope)] = [
+                    position
+                    for position, (node_scope, node_project) in enumerate(zip(index.scopes, index.projects, strict=True))
+                    if self._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope)
+                ]
         vectors = index.vectors
         nonzero = [dim for dim, weight in enumerate(query_vector) if weight]
         if 2 <= len(nonzero) * 4 <= dims:
