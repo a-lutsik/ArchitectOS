@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import logging
 import os
 import re
 import socket
@@ -28,14 +27,32 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
 
 from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
 
-_LOG = logging.getLogger(__name__)
-# The hook runs inside the agent's process tree: stay off stderr unless a handler is configured.
-_LOG.addHandler(logging.NullHandler())
+if TYPE_CHECKING:
+    import logging
+
+_LOGGER: logging.Logger | None = None
+
+
+def _log() -> logging.Logger:
+    """The hook's logger, created on first use.
+
+    Every agent turn starts a new interpreter and a turn that injects normally
+    logs nothing, so importing logging up front would cost each turn ~10 ms.
+    The hook runs inside the agent's process tree: it stays off stderr unless a
+    handler is configured.
+    """
+    global _LOGGER
+    if _LOGGER is None:
+        import logging
+
+        _LOGGER = logging.getLogger(__name__)
+        _LOGGER.addHandler(logging.NullHandler())
+    return _LOGGER
 
 CLIENTS: tuple[str, ...] = ("cursor", "claude", "codex")
 
@@ -232,7 +249,7 @@ def prune_hook_sessions(root: Path, *, max_age_s: float = _SESSION_TTL_S) -> int
         except OSError:
             continue
     if removed:
-        _LOG.info("hook sessions pruned: removed=%s max_age_h=%.0f", removed, max_age_s / 3600.0)
+        _log().info("hook sessions pruned: removed=%s max_age_h=%.0f", removed, max_age_s / 3600.0)
     return removed
 
 
@@ -260,10 +277,10 @@ class HookSession:
             prune_hook_sessions(root)
             state = {}
         except (OSError, ValueError) as exc:
-            _LOG.warning("hook session file unreadable, starting fresh: %s (%s)", path.name, exc)
+            _log().warning("hook session file unreadable, starting fresh: %s (%s)", path.name, exc)
             state = {}
         if not isinstance(state, dict):
-            _LOG.warning("hook session file is not an object, starting fresh: %s", path.name)
+            _log().warning("hook session file is not an object, starting fresh: %s", path.name)
             state = {}
         return cls(path, state)
 
@@ -333,7 +350,7 @@ class HookSession:
             scratch.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
             os.replace(scratch, self.path)
         except OSError as exc:
-            _LOG.warning("hook session file not saved: %s (%s)", self.path.name, exc)
+            _log().warning("hook session file not saved: %s (%s)", self.path.name, exc)
 
 
 # -- Transport ---------------------------------------------------------------
@@ -404,7 +421,7 @@ def _request_json(
         status, body = _exchange(url, token, data, timeout)
     except TimeoutError as exc:
         _debug(f"http failed: {exc}", root)
-        _LOG.warning("hook request timed out after %.1fs: %s", timeout, url.split("?", 1)[0])
+        _log().warning("hook request timed out after %.1fs: %s", timeout, url.split("?", 1)[0])
         return None, "timeout"
     except OSError as exc:
         _debug(f"http failed: {exc}", root)
@@ -599,7 +616,7 @@ def load_briefing_cache(root: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
-        _LOG.warning("briefing cache unreadable, offline hook stays silent: %s", exc)
+        _log().warning("briefing cache unreadable, offline hook stays silent: %s", exc)
         return {}
     return cache if isinstance(cache, dict) else {}
 
@@ -611,13 +628,13 @@ def spool_turn(root: Path, record: dict[str, Any]) -> bool:
     try:
         size = path.stat().st_size if path.exists() else 0
         if size + len(line) > _SPOOL_MAX_BYTES:
-            _LOG.warning("hook spool full, capture dropped: bytes=%s limit=%s", size, _SPOOL_MAX_BYTES)
+            _log().warning("hook spool full, capture dropped: bytes=%s limit=%s", size, _SPOOL_MAX_BYTES)
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
     except OSError as exc:
-        _LOG.warning("hook spool not written: %s", exc)
+        _log().warning("hook spool not written: %s", exc)
         return False
     return True
 
@@ -663,7 +680,8 @@ def _offline_turn(
     cache = load_briefing_cache(root)
     project_id = cached_project_for(turn.cwd, cache) if turn.cwd else ""
     result: dict[str, Any] = {"project_id": project_id, "context": "", "hits": [], "stable": []}
-    settings = cache.get("settings") if isinstance(cache.get("settings"), dict) else {}
+    raw_settings = cache.get("settings")
+    settings: dict[str, Any] = raw_settings if isinstance(raw_settings, dict) else {}
     if "hook_stable_every_turns" in settings:
         result["stable_every_turns"] = int(settings["hook_stable_every_turns"])
     if spool:
@@ -685,7 +703,7 @@ def _offline_turn(
             budget=_BRIEFING_CHAR_BUDGET if session else hook_pack_budget(int(settings.get("hook_char_budget") or _HOOK_CHAR_BUDGET)),
         )
         result.update(context=context, stable=stable, hits=hits)
-    _LOG.info(
+    _log().info(
         "offline hook: kind=%s project=%s cached=%s injected_ids=%s spooled=%s",
         turn.event, project_id or "-", isinstance(entry, dict), len(result["hits"]) + len(result["stable"]),
         result.get("spooled", False),
@@ -749,7 +767,8 @@ def handle_capture(
     # Turn end never injects, so it skips the stable layer. With a session the
     # prompt only injects and turn end captures question + answer in one call;
     # without one, each event captures its own text as before.
-    include_stable, exclude_ids, capture = turn.event != EVENT_RESPONSE, [], True
+    include_stable, capture = turn.event != EVENT_RESPONSE, True
+    exclude_ids: list[str] = []
     if session is not None and turn.event == EVENT_PROMPT:
         include_stable, exclude_ids = session.plan_prompt(turn.cwd)
         capture = False
@@ -764,7 +783,7 @@ def handle_capture(
     out = render_stdout(turn, result)
     injected = _injected_text(out)
     if turn.can_inject and not injected:
-        _LOG.info("injection skipped: kind=%s transport=%s reason=%s", turn.event, transport,
+        _log().info("injection skipped: kind=%s transport=%s reason=%s", turn.event, transport,
                   "no reply" if result is None else "empty pack")
     if session is not None:
         session.record(turn, result, injected, include_stable=include_stable)
@@ -1054,6 +1073,8 @@ def build_parser(command: str | None = None) -> argparse.ArgumentParser:
 
 def _log_to_hooks_file() -> None:
     """With ARCHITECTOS_HOOK_DEBUG the hook's own log lines (counts only) join data/hooks.log."""
+    import logging
+
     try:
         path = resolve_project_root() / "data" / "hooks.log"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1061,8 +1082,8 @@ def _log_to_hooks_file() -> None:
     except OSError:
         return
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    _LOG.addHandler(handler)
-    _LOG.setLevel(logging.INFO)
+    _log().addHandler(handler)
+    _log().setLevel(logging.INFO)
 
 
 def main(argv: list[str] | None = None) -> int:
