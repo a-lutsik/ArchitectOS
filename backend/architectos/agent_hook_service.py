@@ -365,10 +365,8 @@ class AgentHookServiceMixin:
                     if not held:
                         self._hook_cache_lock_busy(node.id, dirty)
                         return
-                    if self._hook_cache_index().get(node.id, {signature}) != {signature}:
-                        self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set(), locked=True)
-                    elif dirty:
-                        self._rewrite_briefing_cache(lambda cache: False)  # claims the marker, re-checks all
+                    # Also claims a waiting marker and re-checks the whole cache.
+                    self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set(), locked=True)
             finally:
                 _CACHE_LOCK.release()
         except Exception as exc:  # noqa: BLE001 - a listener must never break the write
