@@ -477,7 +477,7 @@ class HookSessionTests(unittest.TestCase):
         context = "\n".join(["ArchitectOS Memory Context", "", agent_hooks.STABLE_TITLE, stable_line, "",
                              agent_hooks.HITS_TITLE, hit_line])
         pack = {"project_id": "architectos", "context": context,
-                "stable": [{"node": {"id": "node_s"}, "score": 1.0}], "hits": [{"node": {"id": "node_a"}, "score": 300.0}]}
+                "stable": [{"node": {"id": "node_s"}, "score": 1.0}], "hits": [{"node": {"id": "node_a"}, "score": 300.0}, {"node": {"id": "node_y"}, "score": 200.0}]}  # node_y: past the budget
         sent: list[dict[str, Any]] = []
 
         def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
@@ -1357,6 +1357,27 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertTrue(marked)
         self.assertNotIn(stable_id, _injected_ids(during))
         self.assertNotIn(stable_id, after)
+
+    def test_a_failed_recheck_of_freshly_cached_lines_dirties_the_cache(self) -> None:
+        # The lines are already written when their re-check fails: without it they may
+        # hold a memory archived meanwhile, so the cache must read as dirty.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 4)
+            real = service._revalidate_hook_cache  # noqa: SLF001
+
+            def store_gone(cache: dict[str, Any], only: set[str] | None = None) -> int:
+                if only is not None:
+                    raise RuntimeError("store unavailable")
+                return real(cache, only)
+
+            with mock.patch.object(service, "_revalidate_hook_cache", side_effect=store_gone):
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            written = bool(self._cache_ids(root))
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+        self.assertTrue(written)
+        self.assertTrue(dirty)
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
