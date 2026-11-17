@@ -940,14 +940,14 @@ class MemorySearchQualityTests(unittest.TestCase):
             index = engine._vector_cache  # noqa: SLF001
             norm = math.sqrt(sum(value * value for value in vector))
             expected = sorted(
-                ((node_id, cosine(vector, list(row)) / norm) for node_id, row in zip(index.node_ids, index.vectors)),
+                ((node_id, cosine(vector, list(row)) / norm) for node_id, row in zip(index.node_ids, index.vectors, strict=True)),
                 key=lambda item: item[1],
                 reverse=True,
             )
         self.assertLessEqual(sum(1 for value in vector if value) * 4, len(vector), "hash query exercises the sparse path")
         self.assertGreaterEqual(len(found), 12)
         self.assertEqual([node_id for node_id, _ in found], [node_id for node_id, _ in expected])
-        for (_, score), (_, want) in zip(found, expected):
+        for (_, score), (_, want) in zip(found, expected, strict=True):
             self.assertAlmostEqual(score, want, places=9)
 
     def test_vector_search_sees_rows_added_or_moved_after_the_first_search(self) -> None:
