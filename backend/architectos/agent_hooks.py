@@ -31,8 +31,16 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, NamedTuple
 
 try:
     import fcntl
-except ImportError:  # Windows: files are then serialized within one process only
+except ImportError:  # Windows: msvcrt byte locks instead
     fcntl = None  # type: ignore[assignment]
+msvcrt: Any = None
+if fcntl is None:
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:
+        pass
+    else:
+        msvcrt = _msvcrt
 
 from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
@@ -219,32 +227,95 @@ def write_private(path: Path, text: str, *, append: bool = False) -> None:
         pass  # Windows may ignore or reject POSIX modes
 
 
+# msvcrt has no blocking lock without a 10 s cap, so a Windows wait polls at this pace;
+# a Windows replace refused by a reader is retried at the same pace.
+_LOCK_POLL_S = 0.01
+# Windows refuses os.replace while another process has the target open (a hook or the
+# app reading the cache or a session file); such a reader lets go within milliseconds.
+_RETRY_REPLACE = os.name == "nt"
+_REPLACE_WAIT_S = 1.0
+
+
+def replace_file(source: Path, target: Path) -> None:
+    """os.replace that waits up to a second for a Windows reader of ``target`` to let go."""
+    deadline = time.monotonic() + _REPLACE_WAIT_S
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if not _RETRY_REPLACE or time.monotonic() >= deadline:
+                raise
+            time.sleep(_LOCK_POLL_S)
+
+
+def _acquire(fd: int, wait: float | None) -> bool:
+    """Take the exclusive lock on ``fd``: block (``wait`` None) or give up after ``wait`` seconds."""
+    if fcntl is not None and wait is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return True
+    # A held lock: flock says EWOULDBLOCK, msvcrt EACCES.
+    busy: type[OSError] = BlockingIOError if fcntl is not None else PermissionError
+    deadline = None if wait is None else time.monotonic() + wait
+    while True:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except busy:
+            pass
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(_LOCK_POLL_S if deadline is None else max(0.0, min(_LOCK_POLL_S, deadline - time.monotonic())))
+
+
+def _release(fd: int) -> None:
+    try:
+        if fcntl is None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass  # closing the handle releases it too
+    finally:
+        os.close(fd)  # with flock, closing is the release
+
+
 @contextmanager
-def file_lock(path: Path) -> Iterator[None]:
+def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
     """Hold an exclusive lock on ``path`` across processes (hooks of one session, app and MCP servers).
 
-    A lock file that cannot be made or locked (read-only folder, full disk, a file
-    system without flock) must not cost the turn its pack or its capture: the
-    block then runs unlocked, with a warning.
+    flock on POSIX, a one-byte msvcrt lock on Windows. Yields True while the lock
+    is held. With ``wait`` (seconds) it gives up on a lock held elsewhere for
+    longer and yields False: the block then runs without it and must say so. A
+    lock file that cannot be made or locked (read-only folder, full disk, a file
+    system without locks) must not cost the turn its pack or its capture: the
+    block then runs unlocked (True), with a warning.
     """
-    if fcntl is None:
-        yield
+    if fcntl is None and msvcrt is None:
+        yield True
         return
     fd: int | None = None
+    held = True
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        held = _acquire(fd, wait)
     except OSError as exc:
         _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
         if fd is not None:
             os.close(fd)
             fd = None
+    if not held and fd is not None:
+        os.close(fd)
+        fd = None
     try:
-        yield
+        yield held
     finally:
         if fd is not None:
-            os.close(fd)  # closing releases the lock
+            _release(fd)
 
 
 def _clean(value: Any) -> str:
@@ -465,7 +536,7 @@ class HookSession:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             scratch = self.path.with_suffix(".tmp")
             write_private(scratch, json.dumps(self.state, ensure_ascii=False))
-            os.replace(scratch, self.path)
+            replace_file(scratch, self.path)
         except OSError as exc:
             _log().warning("hook session file not saved: %s (%s)", self.path.name, exc)
 
@@ -651,6 +722,10 @@ def _send_turn(
 # last cached in data/briefing_cache.json and appends captures to
 # data/hook_spool.jsonl, which the app drains on start and every minute.
 BRIEFING_CACHE = "briefing_cache.json"
+# Left by a process that could not evict a changed memory from the cache (the file
+# would not be replaced, or its lock stayed held): until the next locked write
+# re-checks every cached line against the store, the offline hook injects no lines.
+BRIEFING_CACHE_DIRTY = f"{BRIEFING_CACHE}.dirty"
 HOOK_SPOOL = "hook_spool.jsonl"
 _SPOOL_MAX_BYTES = 5 * 1024 * 1024
 _BRIEFING_CHAR_BUDGET = 2000
@@ -850,7 +925,8 @@ def _offline_turn(
     entry = (cache.get("projects") or {}).get(project_id) if project_id else None
     if isinstance(entry, dict):
         entry = _fresh_sections(entry, float(settings.get("hook_cache_ttl_hours", _CACHE_TTL_HOURS)))
-    if turn.can_inject and isinstance(entry, dict):
+    dirty = (root / "data" / BRIEFING_CACHE_DIRTY).exists()
+    if turn.can_inject and isinstance(entry, dict) and not dirty:
         session = turn.event == EVENT_SESSION
         context, stable, hits = render_cached_pack(
             {**entry, "hits": []} if session else entry,  # session start is the briefing: stable layer only
@@ -860,8 +936,8 @@ def _offline_turn(
         )
         result.update(context=context, stable=stable, hits=hits)
     _log().info(
-        "offline hook: kind=%s project=%s cached=%s injected_ids=%s spooled=%s",
-        turn.event, project_id or "-", isinstance(entry, dict), len(result["hits"]) + len(result["stable"]),
+        "offline hook: kind=%s project=%s cached=%s dirty=%s injected_ids=%s spooled=%s",
+        turn.event, project_id or "-", isinstance(entry, dict), dirty, len(result["hits"]) + len(result["stable"]),
         result.get("spooled", False),
     )
     return result

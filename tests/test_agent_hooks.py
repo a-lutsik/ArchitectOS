@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -21,6 +22,9 @@ from backend.architectos.mcp_server import MemoryMCPServer, write_mcp_bind_file
 from backend.architectos.models import Project
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
+
+# flock on POSIX, msvcrt on Windows; neither would leave file_lock a no-op.
+_NO_CROSS_PROCESS_LOCK = getattr(agent_hooks, "msvcrt", None) is None and agent_hooks.fcntl is None
 
 
 class HookNormalizationTests(unittest.TestCase):
@@ -569,7 +573,7 @@ class HookCaptureOnStopTests(unittest.TestCase):
         lines = spool.read_text(encoding="utf-8").splitlines() if spool.exists() else []
         return [(json.loads(line)["user_text"], json.loads(line)["assistant_text"]) for line in lines]
 
-    @unittest.skipIf(agent_hooks.fcntl is None, "no cross-process file lock without fcntl (Windows)")
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
     def test_session_changes_wait_for_the_session_lock(self) -> None:
         # Another hook of the same session holding its lock blocks this one's change.
         with tempfile.TemporaryDirectory() as tmp:
@@ -760,6 +764,70 @@ class HookCaptureOnStopTests(unittest.TestCase):
         self.assertEqual(captured, [("", str(beta)), (self.PROMPT, str(alpha))])
 
 
+
+class _FlockMsvcrt:
+    """msvcrt.locking over flock, so the Windows lock path runs on POSIX too.
+
+    Like msvcrt it locks per handle and fails a non-blocking attempt on a held
+    lock with EACCES (PermissionError).
+    """
+
+    LK_UNLCK, LK_LOCK, LK_NBLCK = 0, 1, 2
+
+    def __init__(self, flock: Any) -> None:
+        self.flock = flock
+        self.calls: list[int] = []
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        self.calls.append(mode)
+        if mode == self.LK_UNLCK:
+            self.flock.flock(fd, self.flock.LOCK_UN)
+            return
+        try:
+            self.flock.flock(fd, self.flock.LOCK_EX | (self.flock.LOCK_NB if mode == self.LK_NBLCK else 0))
+        except BlockingIOError as exc:
+            raise PermissionError(errno.EACCES, "locked by another handle") from exc
+
+
+class HookFileLockTests(unittest.TestCase):
+    """file_lock: one holder at a time across processes, on POSIX (flock) and Windows (msvcrt)."""
+
+    def _second_holder_waits(self, lock: Path) -> tuple[bool, bool]:
+        """(blocked while held, got it after release) for a second holder of ``lock``."""
+        done = threading.Event()
+
+        def second() -> None:
+            with agent_hooks.file_lock(lock):
+                done.set()
+
+        with agent_hooks.file_lock(lock):
+            thread = threading.Thread(target=second, daemon=True)
+            thread.start()
+            blocked = not done.wait(0.3)
+        thread.join(timeout=10)
+        return blocked, done.is_set()
+
+    @unittest.skipIf(agent_hooks.fcntl is None, "the stand-in msvcrt is built on flock")
+    def test_windows_lock_excludes_a_second_holder(self) -> None:
+        # Without fcntl the lock used to be a no-op: the app and an MCP server rewrote
+        # the cache (and two hooks the session file) at the same time.
+        fake = _FlockMsvcrt(agent_hooks.fcntl)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agent_hooks, "fcntl", None), \
+                mock.patch.object(agent_hooks, "msvcrt", fake, create=True):
+            blocked, acquired = self._second_holder_waits(Path(tmp) / "x.lock")
+        self.assertTrue(blocked)
+        self.assertTrue(acquired)
+        self.assertIn(fake.LK_UNLCK, fake.calls)
+
+    @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
+    def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            blocked, acquired = self._second_holder_waits(Path(tmp) / "x.lock")
+        self.assertTrue(blocked)
+        self.assertTrue(acquired)
+
+
 class HookCacheInvalidationTests(unittest.TestCase):
     """The offline briefing cache follows the store: what changed or left a project leaves the cache."""
 
@@ -911,7 +979,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertEqual(before, set(added.values()))
         self.assertEqual(after, {added["adr"]})
 
-    @unittest.skipIf(agent_hooks.fcntl is None, "no cross-process file lock without fcntl (Windows)")
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
     def test_cache_writes_wait_for_the_cross_process_lock(self) -> None:
         # Another process (an MCP server) holding the cache lock blocks this writer.
         with tempfile.TemporaryDirectory() as tmp:
@@ -935,6 +1003,62 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertFalse(written_while_held)
         self.assertTrue(written)
+
+    def _archive(self, service: ArchitectOSService, node_id: str) -> None:
+        node = service.repository.get_node(node_id)
+        assert node is not None
+        node.status = "archived"
+        service.repository.upsert_node(node)
+
+    def test_a_cache_write_waits_out_a_reader_windows_will_not_replace_under(self) -> None:
+        # Windows refuses os.replace while another process (a hook, the app) has the
+        # cache open for reading; the eviction retries instead of being dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            real_replace = os.replace
+            refused: list[str] = []
+
+            def replace(source: Any, target: Any) -> None:
+                if Path(target).name == agent_hooks.BRIEFING_CACHE and len(refused) < 2:
+                    refused.append(Path(target).name)
+                    raise PermissionError(errno.EACCES, "open in another process")
+                real_replace(source, target)
+
+            with mock.patch.object(agent_hooks, "_RETRY_REPLACE", True, create=True), \
+                    mock.patch("os.replace", side_effect=replace):
+                self._archive(service, stable_id)
+            after = self._cache_ids(root)
+        self.assertEqual(len(refused), 2)
+        self.assertNotIn(stable_id, after)
+
+    def test_an_eviction_the_file_system_refuses_is_not_lost(self) -> None:
+        # The cache cannot be rewritten at all: the archived memory must still stay out
+        # of the offline pack, and the next write that succeeds drops it for good.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            real_replace = os.replace
+
+            def replace(source: Any, target: Any) -> None:
+                if Path(target).name == agent_hooks.BRIEFING_CACHE:
+                    raise PermissionError(errno.EACCES, "open in another process")
+                real_replace(source, target)
+
+            with mock.patch("os.replace", side_effect=replace):
+                self._archive(service, stable_id)
+            stale = self._cache_ids(root)
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+            later = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+            marker_left = (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").exists()
+        self.assertIn(stable_id, stale)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
+        self.assertTrue(_injected_ids(later))
+        self.assertNotIn(stable_id, _injected_ids(later))
+        self.assertFalse(marker_left)
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
