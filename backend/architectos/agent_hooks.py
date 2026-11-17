@@ -390,9 +390,17 @@ class HookSession:
         for node_id in _INJECTED_ID.findall(injected):
             entry["seen"][node_id] = entry["turn"]
 
-    def keep_prompt(self, cwd: str, text: str) -> None:
-        """Hold the question until turn end, under the project resolved for ``cwd``."""
-        self.state.setdefault("pending", {})[self.project_for(cwd)] = text[:_PENDING_PROMPT_MAX_CHARS]
+    def keep_prompt(self, cwd: str, text: str) -> str:
+        """Hold the question until turn end, under the project resolved for ``cwd``.
+
+        Returns the question it replaces: that turn never ended (the agent was
+        stopped before turn end fired), and the caller spools it instead of losing it.
+        """
+        pending = self.state.setdefault("pending", {})
+        project_id = self.project_for(cwd)
+        orphan = str(pending.get(project_id) or "")
+        pending[project_id] = text[:_PENDING_PROMPT_MAX_CHARS]
+        return orphan
 
     def take_prompt(self, cwd: str) -> str:
         """The held question for ``cwd``'s project, removed from the file once taken."""
@@ -853,7 +861,7 @@ def handle_capture(
         return _silent(client, event)
     if turn.event == EVENT_PROMPT and not turn.user_text:
         return _silent(turn.client, turn.event)
-    if turn.event == EVENT_RESPONSE and not turn.assistant_text:
+    if turn.event == EVENT_RESPONSE and not turn.assistant_text and not turn.session_id:
         return _silent(turn.client, turn.event)
     started = time.perf_counter()
     session = HookSession.open(root or resolve_project_root(), turn.session_id) if turn.session_id else None
@@ -866,7 +874,10 @@ def handle_capture(
         include_stable, exclude_ids = session.plan_prompt(turn.cwd)
         capture = False
     elif session is not None and turn.event == EVENT_RESPONSE:
+        # Turn end with no answer text (the agent was interrupted) still captures the question.
         turn = turn._replace(user_text=session.take_prompt(turn.cwd))
+        if not (turn.user_text or turn.assistant_text):
+            return _silent(turn.client, turn.event)
     if session is not None and turn.event == EVENT_PROMPT and not turn.can_inject:
         result, transport = None, "deferred"  # nothing to inject; the question waits for turn end
     else:
@@ -881,7 +892,16 @@ def handle_capture(
     if session is not None:
         session.record(turn, result, injected, include_stable=include_stable, transport=transport)
         if turn.event == EVENT_PROMPT:
-            session.keep_prompt(turn.cwd, turn.user_text)
+            orphan = session.keep_prompt(turn.cwd, turn.user_text)
+            if orphan and _offline_allowed():
+                spool_turn(root or resolve_project_root(), {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "project_id": session.project_for(turn.cwd),
+                    "cwd": turn.cwd,
+                    "client": turn.client,
+                    "user_text": orphan,
+                    "assistant_text": "",
+                })
         session.save()
     if _debug_enabled():
         _debug(_timing_line(turn, transport, (time.perf_counter() - started) * 1000.0, out, result), root)

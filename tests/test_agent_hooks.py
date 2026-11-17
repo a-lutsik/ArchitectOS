@@ -581,6 +581,23 @@ class HookCaptureOnStopTests(unittest.TestCase):
         captures = [(item["user_text"], item["assistant_text"]) for item in sent if item.get("capture")]
         self.assertEqual(captures, [(self.PROMPT, self.ANSWER)])
 
+    def test_interrupted_turn_still_captures_its_question(self) -> None:
+        # Turn end with no answer text (the user stopped the agent) still captures the
+        # question; a prompt whose turn never ended is spooled before the next one
+        # replaces it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sent = self._requests(root, [
+                ("UserPromptSubmit", root, {"prompt": self.PROMPT}),
+                ("Stop", root, {"last_assistant_message": ""}),
+                ("UserPromptSubmit", root, {"prompt": "First unanswered question about QuartzDeployGate?"}),
+                ("UserPromptSubmit", root, {"prompt": "Second question about QuartzDeployGate?"}),
+            ])
+            spooled = self._spooled(root)
+        captures = [(item["user_text"], item["assistant_text"]) for item in sent if item.get("capture")]
+        self.assertEqual(captures, [(self.PROMPT, "")])
+        self.assertEqual(spooled, [("First unanswered question about QuartzDeployGate?", "")])
+
     def test_turn_end_spools_the_turn_when_the_app_answers_with_an_error(self) -> None:
         # The question leaves the session file before the send; an app error (500 from
         # "database is locked", a cut reply) must not lose the turn.
@@ -686,8 +703,9 @@ class HookOfflineTests(unittest.TestCase):
         self.assertFalse(_stable_section(first), "the stable layer came with SessionStart")
         self.assertFalse(set(_injected_ids(first)) & set(_injected_ids(second)))
         self.assertEqual(stop, "")
+        # The first prompt's turn never ended: the second prompt spools its question.
         self.assertEqual([(item["project_id"], item["user_text"], item["assistant_text"]) for item in spooled],
-                         [("architectos", self.QUESTION, "Batch them per tenant.")])
+                         [("architectos", self.QUESTION, ""), ("architectos", self.QUESTION, "Batch them per tenant.")])
 
     def test_offline_briefing_keeps_every_multiline_fact(self) -> None:
         facts = ("Ledger writes must stay idempotent.", "Invoices close at midnight UTC.", "Refunds need two approvals.")

@@ -77,7 +77,11 @@ Two client-specific steps the installer cannot do for you:
    most one extractor call per turn, and the extractor sees both sides. The
    question is removed from the session file as soon as it is taken and is never
    written to `hooks.log`. Cursor pairs `beforeSubmitPrompt` with
-   `afterAgentResponse` the same way.
+   `afterAgentResponse` the same way. A turn end with no answer text (the agent
+   was stopped) still captures the question, and a question whose turn end never
+   came is spooled when the next prompt for that project replaces it. Turn end in
+   a subfolder the session has not seen pairs with the question of the project
+   that folder belongs to.
 
 Capture routes through `capture_memory_turn`, which is the same path MCP's
 `memory_turn` uses, so the governance rules are identical:
