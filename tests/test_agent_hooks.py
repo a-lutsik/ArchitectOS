@@ -1591,6 +1591,66 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertTrue(_injected_ids(out))
         self.assertNotIn(cached[0], _injected_ids(out))
 
+    @staticmethod
+    def _cache_read_fails_once(failed: list[int]) -> Any:
+        """Path.read_text whose first read of the cache file fails as Windows does while another process has it open."""
+        real = Path.read_text
+
+        def read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self.name == agent_hooks.BRIEFING_CACHE and not failed:
+                failed.append(1)
+                raise PermissionError(errno.EACCES, "being used by another process")
+            return real(self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", read_text)
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_cache_the_listener_cannot_read_is_not_taken_for_an_empty_one(self) -> None:
+        # The file is there but cannot be read: whether it holds the memory is unknown,
+        # so the listener must not leave as for an uncached one.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            _, stable_id, _ = self._cached(root)
+            mcp = ArchitectOSService(root)  # its index has never read the file
+            failed: list[int] = []
+            took, marked = self._write_while_the_cache_lock_is_held(root, lambda: self._archive_reading(mcp, stable_id, failed))
+            during = _hook(root, "SessionStart", cwd=root, session="s1")
+            ArchitectOSService(root).hook_maintenance()
+            after = self._cache_ids(root)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertTrue(failed)
+        self.assertIsNotNone(took)
+        self.assertTrue(marked)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
+        self.assertEqual(left, [])
+
+    def _archive_reading(self, service: ArchitectOSService, node_id: str, failed: list[int]) -> None:
+        with self._cache_read_fails_once(failed):
+            self._archive(service, node_id)
+
+    def test_a_writer_that_cannot_read_the_cache_does_not_take_its_marker(self) -> None:
+        # A re-check of a cache it could not read checks nothing: the marker must stay.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            _, stable_id = self._deferred_eviction(root)
+            other = sorted(node_id for node_id in self._cache_ids(root) if node_id != stable_id)[0]
+            mcp = ArchitectOSService(root)
+            index = mcp._hook_cache_index()  # noqa: SLF001 - read before the file becomes unreadable
+            failed: list[int] = []
+            with mock.patch.object(mcp, "_hook_cache_index", return_value=index), self._cache_read_fails_once(failed):
+                self._archive(mcp, other)  # the heal of a dirty cache, lock free
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+            ArchitectOSService(root).hook_maintenance()
+            after = self._cache_ids(root)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertTrue(failed)
+        self.assertTrue(dirty)
+        self.assertFalse({stable_id, other} & set(_injected_ids(during)))
+        self.assertFalse({stable_id, other} & after)
+        self.assertEqual(left, [])
+
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
         # from the store re-checks the cached lines and renews their age.

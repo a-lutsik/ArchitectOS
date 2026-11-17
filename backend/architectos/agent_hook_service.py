@@ -343,9 +343,10 @@ class AgentHookServiceMixin:
         while that marker waits, a later change only tries the lock once.
         """
         try:
-            cached = self._hook_cache_index().get(node.id)
-            if cached is None:
+            index = self._hook_cache_index()
+            if index is not None and node.id not in index:
                 return
+            cached = index.get(node.id) if index is not None else None  # None: unknown, take the lock path
             signature = _cache_signature(node.to_dict())
             if cached == {signature}:
                 return
@@ -390,13 +391,20 @@ class AgentHookServiceMixin:
             return set()
         return {str(project_id) for project_id, entry in projects.items() if isinstance(entry, dict) and entry.get("registered")}
 
-    def _hook_cache_index(self) -> dict[str, set[str]]:
-        """Cached memory id -> the signatures its lines were cached with, re-read when the file changes."""
+    def _hook_cache_index(self) -> dict[str, set[str]] | None:
+        """Cached memory id -> the signatures its lines were cached with, re-read when the file changes.
+
+        {} without a cache file (or with one no reader can parse); None when the file
+        is there but cannot be read now (Windows, while another process has it open):
+        what it holds is unknown.
+        """
         path = Path(self.project_root) / "data" / BRIEFING_CACHE
         try:
             stat = path.stat()
-        except OSError:
+        except FileNotFoundError:
             return {}
+        except OSError:
+            return None
         # A coarse clock gives two writes one mtime; each write replaces the file
         # (a new inode) and its size usually moves too.
         stamp = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
@@ -405,7 +413,11 @@ class AgentHookServiceMixin:
             return memo[1]
         try:
             cache = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            return None
+        except ValueError:
             return {}
         index: dict[str, set[str]] = {}
         for entry in ((cache.get("projects") or {}) if isinstance(cache, dict) else {}).values():
@@ -513,8 +525,10 @@ class AgentHookServiceMixin:
         left = claimed.exists()
         try:
             cache = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (FileNotFoundError, ValueError):  # none yet, or one no reader can use
             cache = {}
+        # Any other OSError raises: a cache that is there but unreadable now must not be
+        # taken for an empty one, whose re-check would clear the marker of a stale file.
         cache = cache if isinstance(cache, dict) else {}
         written = change(cache)
         holds = bool(written and recheck)
