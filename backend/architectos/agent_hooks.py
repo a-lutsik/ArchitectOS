@@ -221,17 +221,30 @@ def write_private(path: Path, text: str, *, append: bool = False) -> None:
 
 @contextmanager
 def file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive lock on ``path`` across processes (hooks of one session, app and MCP servers)."""
+    """Hold an exclusive lock on ``path`` across processes (hooks of one session, app and MCP servers).
+
+    A lock file that cannot be made or locked (read-only folder, full disk, a file
+    system without flock) must not cost the turn its pack or its capture: the
+    block then runs unlocked, with a warning.
+    """
     if fcntl is None:
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fd: int | None = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
+        if fd is not None:
+            os.close(fd)
+            fd = None
+    try:
         yield
     finally:
-        os.close(fd)  # closing releases the lock
+        if fd is not None:
+            os.close(fd)  # closing releases the lock
 
 
 def _clean(value: Any) -> str:

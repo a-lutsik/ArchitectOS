@@ -591,6 +591,40 @@ class HookCaptureOnStopTests(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertTrue(saved)
 
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "POSIX permissions as a non-root user")
+    def test_an_unwritable_session_folder_still_injects_and_captures(self) -> None:
+        # The lock file and the session file cannot be written: the hook goes on
+        # without them instead of losing the pack and the capture.
+        pack = {"project_id": "architectos", "context": "- id=node_a [Decision|project|memory] Ship via QuartzDeployGate.",
+                "hits": [{"id": "node_a"}], "stable": []}
+        sent: list[dict[str, object]] = []
+
+        def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+            request = json.loads(body or b"{}")
+            sent.append(request)
+            if request.get("capture"):
+                raise ConnectionRefusedError("app closed")  # turn end falls back to the spool
+            return 200, json.dumps(pack).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions = root / "data" / "hook_sessions"
+            sessions.mkdir(parents=True)
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            sessions.chmod(0o555)
+            try:
+                with mock.patch.object(agent_hooks, "_exchange", side_effect=exchange):
+                    out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.PROMPT)
+                    _hook(root, "Stop", cwd=root, session="s1", last_assistant_message=self.ANSWER)
+            finally:
+                sessions.chmod(0o755)
+            spooled = self._spooled(root)
+        self.assertIn("QuartzDeployGate", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual([item["assistant_text"] for item in sent if item.get("capture")], [self.ANSWER])
+        self.assertEqual([answer for _, answer in spooled], [self.ANSWER])
+
     def test_next_prompt_during_a_slow_turn_end_neither_doubles_nor_loses_a_question(self) -> None:
         # The next prompt's hook runs while turn end still waits for the app: the first
         # question is captured once (by turn end), and the second stays held.
