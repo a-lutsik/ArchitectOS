@@ -613,6 +613,22 @@ class HookOfflineTests(unittest.TestCase):
         for fact in facts:
             self.assertIn(fact, context)
 
+    def test_spool_keeps_records_with_unicode_line_separators(self) -> None:
+        # json.dumps(ensure_ascii=False) leaves U+2028, U+2029 and U+0085 raw, and
+        # str.splitlines() breaks on them; only "\n" ends a spool record.
+        texts = ("Ledger rule\u2028one", "Ledger rule\u2029two", "Ledger rule\x85three")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            for text in texts:
+                agent_hooks.spool_turn(root, {"project_id": "architectos", "user_text": text, "assistant_text": "Noted."})
+            status = agent_hooks.spool_status(root)
+            with mock.patch.object(service, "capture_memory_turn") as capture:
+                stats = service.drain_hook_spool()
+        self.assertEqual(status["records"], 3)
+        self.assertEqual((stats["records"], stats["captured"], stats["dropped"]), (3, 3, 0))
+        self.assertEqual([call.args[0] for call in capture.call_args_list], list(texts))
+
     def test_app_replays_the_spool_into_each_records_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

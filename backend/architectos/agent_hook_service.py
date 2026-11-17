@@ -239,7 +239,9 @@ class AgentHookServiceMixin:
             started = time.perf_counter()
             for batch in batches:
                 try:
-                    lines = batch.read_text(encoding="utf-8").splitlines()
+                    # The hook writes JSON with raw U+2028/U+2029/U+0085 (ensure_ascii=False),
+                    # which splitlines() would also break on: only "\n" ends a record.
+                    lines = batch.read_text(encoding="utf-8").split("\n")
                 except OSError as exc:
                     _LOG.error("hook spool batch unreadable, kept for the next drain: %s (%s)", batch.name, exc)
                     continue
