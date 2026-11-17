@@ -214,6 +214,42 @@ def _debug(message: str, root: Path | None = None, *, always: bool = False) -> N
         pass
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# data/hooks_warned.json: when the hook process last wrote each such warning to hooks.log.
+_WARNED_FILE = "hooks_warned.json"
+_WARN_EVERY_H = 24.0
+
+
+def _warn_daily(key: str, line: str) -> None:
+    """Write ``line`` to hooks.log unless the hook wrote it for ``key`` in the last day.
+
+    Every agent event is a new hook process and hooks.log has no rotation, so a
+    problem that lasts must not add a line per event.
+    """
+    path = resolve_project_root() / "data" / _WARNED_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    seen: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    now = _now()
+    try:
+        if (now - datetime.fromisoformat(str(seen.get(key)))).total_seconds() < _WARN_EVERY_H * 3600.0:
+            return
+    except (TypeError, ValueError):
+        pass
+    seen[key] = now.isoformat(timespec="seconds")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_private(path, json.dumps(seen))
+    except OSError:
+        pass
+    _debug(line, always=True)
+
+
 def write_private(path: Path, text: str, *, append: bool = False) -> None:
     """Write ``text`` to a file only its owner can read, like the database and runtime.json.
 
@@ -328,7 +364,7 @@ def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
         else:
             _LOCK_WARNED.add(str(path))
             if _STANDALONE:  # nothing else would ever show it: hooks.log takes it even without debug
-                _debug(f"WARNING lock file unusable, going on without it: {path.name} ({exc})", always=True)
+                _warn_daily(str(path), f"WARNING lock file unusable, going on without it: {path.name} ({exc})")
             else:
                 _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
         if fd is not None:

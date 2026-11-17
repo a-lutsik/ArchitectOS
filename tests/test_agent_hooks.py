@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
@@ -984,6 +985,27 @@ class HookFileLockTests(unittest.TestCase):
             _hook(root, "Stop", cwd=root, session="s1", last_assistant_message="We batch per tenant.")  # two edits
             took = time.monotonic() - started
         self.assertLess(took, 0.5 * bound)  # the prompt already found the lock unusable
+
+    def test_the_hook_logs_an_unusable_lock_once_a_day_not_once_per_event(self) -> None:
+        # Every agent event is a new hook process; hooks.log has no rotation.
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp, "ARCHITECTOS_HOOK_DEBUG": ""}), \
+                mock.patch.object(agent_hooks, "_STANDALONE", True):
+            blocker = Path(tmp) / "blocked"
+            blocker.write_text("a file where the folder should be", encoding="utf-8")
+            log = Path(tmp) / "data" / "hooks.log"
+
+            def event() -> int:
+                with mock.patch.object(agent_hooks, "_LOCK_WARNED", set()):  # a fresh process
+                    with agent_hooks.file_lock(blocker / "z.lock"):
+                        pass
+                return len(log.read_text(encoding="utf-8").splitlines()) if log.exists() else 0
+
+            counts = [event(), event(), event()]
+            later = datetime.now(timezone.utc) + timedelta(hours=25)
+            with mock.patch.object(agent_hooks, "_now", return_value=later, create=True):
+                counts.append(event())
+        self.assertEqual(counts, [1, 1, 1, 2])
 
     @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
     def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
