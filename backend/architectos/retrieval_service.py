@@ -24,6 +24,7 @@ from .search import (
     DEFAULT_CONTEXT_CHAR_BUDGET,
     RULE_LAYER_TYPES,
     RULE_TYPE_PRIORITY,
+    SEARCH_HIT_TEXT_CHARS,
     STABLE_PACK_TYPES,
     is_rule_layer_node,
     is_stable_pack_node,
@@ -121,8 +122,10 @@ class RetrievalServiceMixin:
         min_score: float | None = None,
         relevance_floor: float | None = None,
         allowed_scopes: list[str] | set[str] | None = None,
+        vector_timeout_ms: int | None = None,
     ) -> dict[str, Any]:
-        # FTS + vector in parallel; vector is best-effort with a hard timeout.
+        # FTS + vector in parallel; vector is best-effort with a hard timeout
+        # (memory_retrieval.vector_query_timeout_ms unless vector_timeout_ms overrides it).
         # Lifecycle access bump runs inline (cheap: notify=False, no re-embedding);
         # refresh=True additionally reloads fresh lifecycle metadata into hits.
         # as_of (ISO date/datetime) = temporal point-in-time query: only nodes
@@ -152,7 +155,8 @@ class RetrievalServiceMixin:
         retrieval_settings = self.memory_embeddings.settings()
         vector_pool = max(8, min(int(retrieval_settings.get("vector_pool") or 64), 200))
         try:
-            timeout_s = max(0.05, min(int(retrieval_settings.get("vector_query_timeout_ms") or 2500), 5000) / 1000.0)
+            timeout_ms = vector_timeout_ms if vector_timeout_ms is not None else retrieval_settings.get("vector_query_timeout_ms")
+            timeout_s = max(0.05, min(int(timeout_ms or 2500), 5000) / 1000.0)
         except (TypeError, ValueError):
             timeout_s = 2.5
         try:
@@ -629,8 +633,8 @@ class RetrievalServiceMixin:
         ):
             metadata.pop(key, None)
         text = str(node.get("text") or "")
-        if len(text) > 1200:
-            node["text"] = text[:1200]
+        if len(text) > SEARCH_HIT_TEXT_CHARS:
+            node["text"] = text[:SEARCH_HIT_TEXT_CHARS]
         node["metadata"] = metadata
         hit["node"] = node
         return hit
@@ -863,11 +867,13 @@ class RetrievalServiceMixin:
         cwd: str | None = None,
         limit: int = 6,
         char_budget: int = 2000,
+        rendered: dict[str, tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Stable-layer pack for session start, with no query to search against.
 
         Used by the MCP startup instructions and by session-start agent hooks.
         ``cwd`` picks the project when the caller only knows a working directory.
+        ``rendered`` receives each memory's pack line (see pack_memory_context).
         """
         resolver = getattr(self, "project_id_for_path", None)
         actual = str(project_id or (resolver(cwd) if callable(resolver) else None) or "").strip()
@@ -890,6 +896,7 @@ class RetrievalServiceMixin:
                 char_budget=char_budget,
                 node_text_chars=160,
                 tools_available=True,
+                rendered=rendered,
             )
         index_status = getattr(self, "memory_index_status", None)
         index = index_status(actual) if callable(index_status) else {}

@@ -66,10 +66,22 @@ Two client-specific steps the installer cannot do for you:
 
 1. **Session start** (Codex, Claude Code) — injects the stable layer: pinned
    memories, constraints and long-term decisions. Same pack as `memory://briefing`.
-2. **Prompt submit** — captures the user message and injects memory retrieved *for
-   that question*, so the briefing is per-turn rather than once per session. An
-   empty project injects nothing rather than spending tokens on an empty pack.
-3. **Turn end** — captures the final assistant message.
+2. **Prompt submit** — injects memory retrieved *for that question*, so the
+   briefing is per-turn rather than once per session. An empty project injects
+   nothing rather than spending tokens on an empty pack. With a `session_id` the
+   question is only held in the session file (Cursor's `beforeSubmitPrompt` does
+   not even call the app, since Cursor cannot inject); without one it is captured
+   at once, as before.
+3. **Turn end** — captures the held question together with the final assistant
+   message in one `capture_memory_turn(user, assistant)` call: one capture and at
+   most one extractor call per turn, and the extractor sees both sides. The
+   question is removed from the session file as soon as it is taken and is never
+   written to `hooks.log`. Cursor pairs `beforeSubmitPrompt` with
+   `afterAgentResponse` the same way. A turn end with no answer text (the agent
+   was stopped) still captures the question, and a question whose turn end never
+   came is spooled when the next prompt for that project replaces it. Turn end in
+   a subfolder the session has not seen pairs with the question of the project
+   that folder belongs to.
 
 Capture routes through `capture_memory_turn`, which is the same path MCP's
 `memory_turn` uses, so the governance rules are identical:
@@ -110,12 +122,93 @@ MCP tools do **not** use that fallback. An unbound MCP folder errors, lists
 projects, and asks the agent to call `memory_list_projects` then
 `memory_use_project` or `project_create` (see [MCP_MEMORY_SERVER.md](MCP_MEMORY_SERVER.md)).
 
+## Hook pack size
+
+Prompt-submit injection uses a smaller pack than Ask's `context()`: a
+1 600-character budget (≈ 400 tokens), 220-character node excerpts, at most four
+stable-layer nodes, no open tasks or providers, no graph expansion (the ~2 hits
+that fit the budget are direct matches; on the gold queries expansion changed none
+of them and doubled the search time), and an 800 ms cap on vector search. Hits
+scoring below the relevance floor are dropped, and a pack with no
+hit left (and no stable layer due) is not injected at all. Both knobs live in the
+`agent` setting:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `agent.hook_char_budget` | `1600` | Character budget of the whole prompt injection (hook prefix + pack), clamped to 1 301–6 000: a pack never goes below 1 200 (its header alone is ~420), and the hook prefix comes on top |
+| `agent.hook_stable_every_turns` | `20` | A session gets the stable layer again after this many prompts without it (`0` = only at session start) |
+| `agent.hook_cache_ttl_hours` | `24` | The offline hook ignores a project's cached stable lines or hit lines written longer ago than this (`0` = no limit) |
+| `agent.hook_min_score` | `120` | Relevance floor for a hit. Static bonuses (scope, type, source, recency, lifecycle) plus an FTS rank alone reach ~115, so 120 asks for a real query-term match or a vector signal |
+
+`POST /api/memory/turn` takes the same pack with `"hook": true`; `capture: false`
+packs without capturing, `exclude_ids` and `include_stable` shape it, and
+`vector_timeout_ms` overrides the vector-search timeout for that request. Its
+`timing` adds `cache_ms`, the write of the offline briefing cache.
+
+## Session state
+
+When the client sends a `session_id` (Claude Code and Codex always do), the hook
+keeps `data/hook_sessions/<digest>.json`: per project, a prompt counter, the turn
+the stable layer was last injected and every node id injected so far. The project
+is the one the app resolved for the folder, so one project's history never steers
+another's pack, even under the same session id.
+
+- Prompt submit sends the ids the session already holds as `exclude_ids`: each
+  node is injected once per session, and the budget goes to new hits.
+- The stable layer comes with `SessionStart`; on prompts it returns only after
+  `agent.hook_stable_every_turns` prompts without it. A client without
+  `SessionStart` (Cursor) gets it on the session's first prompt.
+- `SessionStart` with `source` `clear` or `compact` opens a new context window, so
+  the injected-id history of that project is forgotten.
+- Files untouched for 3 days are deleted when a new session file is created.
+- Without a `session_id` nothing is kept and every prompt gets the full hook pack.
+
 ## Transport
 
 The hook prefers the running app: it reads `data/architectos.runtime.json` for the
 port and auth token and calls `POST /api/memory/turn` (or
-`GET /api/memory/briefing`). If the app is not running it opens the store directly,
-so hooks work with the desktop app closed.
+`GET /api/memory/briefing`). Each agent turn starts a new interpreter, so the hook
+keeps its imports to a few stdlib modules and speaks HTTP/1.0 over a plain socket
+to the app's loopback server rather than through `urllib`. The registered
+`capture --client X --event Y` command line is read without `argparse`, and the
+hook command never loads `logging`: its own log lines go straight to
+`data/hooks.log` with `ARCHITECTOS_HOOK_DEBUG=1` and are dropped otherwise.
+
+If the app is not running (or does not answer in time) the hook never opens the
+store, so an event costs a few milliseconds instead of a service cold start:
+
+- **Injection** comes from `data/briefing_cache.json`. The app rewrites it on
+  every briefing (the stable layer) and every hook pack (the latest hits) per
+  project, together with the project roots, the hook settings and the default
+  project. The hook resolves the folder's project the way the app does
+  (`.architectos.json` bind, then the deepest root, then the default project)
+  and injects only that project's cached lines, still minus what the session
+  already holds. A cached memory leaves the cache as soon as its status, scope,
+  project, author project, validity (`invalid_at`), label or text changes (in the
+  app or in any MCP server process; access telemetry does not count), when it is
+  wiped, and a project's entry goes with a project wipe or once the registered
+  project no longer exists. Lines older than `agent.hook_cache_ttl_hours` are not
+  injected; a prompt that gets the stable layer from the app re-checks and renews
+  the cached stable lines. Writers of the cache (the app, MCP servers) and the
+  hooks of one session take a lock file first; on Windows, which has no `fcntl`,
+  that lock holds within one process only.
+- **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
+  the project resolved for the folder. The app replays the spool through
+  `capture_memory_turn` into each record's own project when it starts and once a
+  minute (the `chat-session-idle` loop); a record that keeps failing is retried
+  three times and then dropped. The spool stops growing at 5 MB. A capture whose
+  reply timed out after the whole request was sent is *not* spooled: the app
+  already has it. A connect or send that timed out never reached the app and is
+  spooled. The timeout bounds the whole request, not each socket operation. One the app
+  answered with an error (HTTP 4xx/5xx, a cut reply) is spooled, since the app did
+  not store it. The spool keeps the raw question and answer until the app replays
+  them through `capture_memory_turn`, which redacts secrets as for a live turn; like
+  the session files and the briefing cache it is readable by its owner only (0600).
+- Until the app runs again, spooled facts are not in memory. `doctor` shows how
+  many records wait and how old the oldest one is.
+
+`ARCHITECTOS_HOOK_OFFLINE=0` turns the offline path off: with the app closed the
+hook says nothing and spools nothing.
 
 ## Failure behaviour
 
@@ -130,8 +223,9 @@ prints `{}`.
 | --- | --- |
 | `ARCHITECTOS_ROOT` | Which root's `data/architectos.db` to use |
 | `ARCHITECTOS_HOOK_DISABLED=1` | Turn all hooks into no-ops without editing configs |
-| `ARCHITECTOS_HOOK_TIMEOUT` | HTTP timeout in seconds (default `5`) |
-| `ARCHITECTOS_HOOK_OFFLINE=0` | Do not fall back to opening the store directly |
+| `ARCHITECTOS_HOOK_INJECT_TIMEOUT` | HTTP timeout in seconds for events that inject (`SessionStart`, prompt submit; default `2`) |
+| `ARCHITECTOS_HOOK_TIMEOUT` | HTTP timeout in seconds for capture on turn end (default `5`) |
+| `ARCHITECTOS_HOOK_OFFLINE=0` | With the app closed, stay silent: no cached injection, no capture spool |
 | `ARCHITECTOS_HOOK_DEBUG=1` | Append one line per event to `data/hooks.log` (see below) |
 
 With `ARCHITECTOS_HOOK_DEBUG=1` each handled event adds one line with counts and
@@ -141,9 +235,12 @@ timings only, never prompt or answer text:
 2026-11-04T10:00:00+00:00 event=prompt client=claude transport=http ms=312.4 tokens=1003 hits=10 project=architectos queued=0 auto=1
 ```
 
-`transport` is `http` (app running), `offline` (store opened by the hook) or
-`none`; `ms` covers the event inside the hook process, not the interpreter start;
-`tokens` estimates the injected context (0 when the hook stayed silent).
+`transport` is `http` (app running), `offline` (briefing cache and spool),
+`deferred` (Cursor prompt held for turn end) or `none`; `ms` covers the event
+inside the hook process, not the interpreter start;
+`tokens` estimates the injected context (0 when the hook stayed silent). The
+command-line hook also appends its own log lines there (offline cache and spool
+decisions, skipped injections, timeouts), again counts only.
 
 ## Manual check
 

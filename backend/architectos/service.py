@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import ProviderRouter
+from .agent_hook_service import AgentHookServiceMixin
 from .ai_runtime_service import AiRuntimeServiceMixin
 from .azure_sync_service import AzureSyncServiceMixin
 from .chat_service import ChatServiceMixin
@@ -47,7 +48,7 @@ from .tool_gateway import (
 _LOG = logging.getLogger("architectos.service")
 
 
-class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, ProvidersCouncilServiceMixin, IntegrationsServiceMixin, ToolExecServiceMixin, ProjectScanServiceMixin, AzureSyncServiceMixin, IngestionServiceMixin, ChatSessionServiceMixin, ChatServiceMixin, RetrievalServiceMixin, GraphServiceMixin, LifecycleServiceMixin, MemoryWipeMixin, DedupReviewServiceMixin, CaptureExtractorMixin):
+class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, ProvidersCouncilServiceMixin, IntegrationsServiceMixin, ToolExecServiceMixin, ProjectScanServiceMixin, AzureSyncServiceMixin, IngestionServiceMixin, ChatSessionServiceMixin, ChatServiceMixin, RetrievalServiceMixin, GraphServiceMixin, LifecycleServiceMixin, MemoryWipeMixin, DedupReviewServiceMixin, CaptureExtractorMixin, AgentHookServiceMixin):
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         # Per-instance API token: the HTTP layer requires it for every /api/*
@@ -65,6 +66,8 @@ class ArchitectOSService(AiRuntimeServiceMixin, SettingsRouterServiceMixin, Prov
         self._embedding_index_queue: queue.Queue[str] = queue.Queue()
         self._embedding_worker_started = False
         self.repository.register_node_upsert_listener(self._enqueue_embedding_index)
+        # A cached memory that changes where it may be shown leaves the offline hook cache.
+        self.repository.register_node_upsert_listener(self._forget_changed_hook_node)
         # Refreshing duplicate flags rescans every active node in the project, so
         # a single Accept must not pay for it inline. Same opt-in as above: stay
         # synchronous until start_background_maintenance() flips it, so tests and

@@ -16,7 +16,7 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, Iterable, TypeGuard
 
 from .adapters_base import is_local_memory_stub_text
 from .candidate_identity import candidate_origin_key
@@ -412,7 +412,12 @@ class ChatSessionServiceMixin:
         return chat
 
     def _chat_session_idle_loop(self, *, initial_delay_s: float = 90.0, interval_s: float = 60.0) -> None:
-        """Finalize idle chat sessions so memory candidates are created after the conversation ends."""
+        """Finalize idle chat sessions so memory candidates are created after the conversation ends.
+
+        Also replays agent-hook captures spooled while the app was closed: at
+        start and on every sweep (see ``hook_maintenance``).
+        """
+        self.hook_maintenance()
         if self._chat_session_stop.wait(initial_delay_s):
             return
         while not self._chat_session_stop.is_set():
@@ -420,6 +425,7 @@ class ChatSessionServiceMixin:
                 self._finalize_idle_chat_sessions()
             except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
                 _LOG.warning("chat session idle sweep failed: %s", exc)
+            self.hook_maintenance()
             if self._chat_session_stop.wait(interval_s):
                 return
 
@@ -796,6 +802,11 @@ class ChatSessionServiceMixin:
         limit: int = 8,
         cwd: str | None = None,
         client: str | None = None,
+        hook: bool = False,
+        capture: bool = True,
+        include_stable: bool = True,
+        exclude_ids: Iterable[str] = (),
+        vector_timeout_ms: int | None = None,
     ) -> dict[str, Any]:
         """Per-turn hook for MCP agents and IDE hooks: pack memory, enqueue fact atoms.
 
@@ -803,27 +814,38 @@ class ChatSessionServiceMixin:
         which auto-promote to short-term memory. Raw dialogue is not stored.
         ``cwd`` resolves the project when the caller is a hook that only knows a
         working directory; ``client`` is recorded on candidates for auditing.
-        ``timing`` and ``pack_tokens`` are also kept on an ``agent_turn`` keeper
-        event, which ``memory_capture_stats`` aggregates.
+        ``hook`` swaps the ``context()`` pack for the smaller ``hook_context`` one
+        (``include_stable``, ``exclude_ids`` and ``vector_timeout_ms`` shape it);
+        ``capture=False`` only packs. ``timing`` and ``pack_tokens`` are also kept
+        on an ``agent_turn`` keeper event, which ``memory_capture_stats`` aggregates.
         """
         started = time.perf_counter()
         caller_project_id = str(project_id or self.project_id_for_path(cwd) or "").strip() or None
         actual_project_id = caller_project_id or "architectos"
         user = str(user_text or "").strip()
         assistant = str(assistant_text or "").strip()
-        packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
+        if hook:
+            packed = self.hook_context(
+                user or assistant, project_id=actual_project_id, scope=scope, limit=limit,
+                include_stable=include_stable, exclude_ids=exclude_ids, vector_timeout_ms=vector_timeout_ms,
+            )
+        else:
+            packed = self.context(user or assistant, project_id=actual_project_id, scope=scope, limit=limit)
         extract_started = time.perf_counter()
         policy = self.memory_capture_settings()
         mode = policy["chat_memory_mode"]
-        verdict = evaluate_chat_turn(user, assistant, mode=mode)
         source_ref = stable_id("mcp_turn", actual_project_id, user[:240], assistant[:240])
         trigger = f"hook_turn:{client}" if client else "mcp_turn"
-        facts, extraction = self._capture_facts_for_turn(
-            user, assistant, verdict, project_id=actual_project_id, known_hits=packed.get("hits") or [],
-            chat_id=source_ref, trigger=trigger, policy=policy,
-        )
-        kept = bool(facts) if extraction.get("extractor") == "llm" else bool(verdict.keep)
-        reason = verdict.reason if extraction.get("extractor") != "llm" else ("llm_keep" if facts else "llm_nothing_durable")
+        if capture:
+            verdict = evaluate_chat_turn(user, assistant, mode=mode)
+            facts, extraction = self._capture_facts_for_turn(
+                user, assistant, verdict, project_id=actual_project_id, known_hits=packed.get("hits") or [],
+                chat_id=source_ref, trigger=trigger, policy=policy,
+            )
+            kept = bool(facts) if extraction.get("extractor") == "llm" else bool(verdict.keep)
+            reason = verdict.reason if extraction.get("extractor") != "llm" else ("llm_keep" if facts else "llm_nothing_durable")
+        else:
+            facts, extraction, kept, reason = [], {"extractor": None}, False, "inject_only"
         capture_started = time.perf_counter()
         atoms: list[dict[str, Any]] = []
         if kept:
@@ -847,6 +869,7 @@ class ChatSessionServiceMixin:
             "search_ms": float(context_timing.get("search_ms") or 0.0),
             "stable_ms": float(context_timing.get("stable_ms") or 0.0),
             "pack_ms": float(context_timing.get("pack_ms") or 0.0),
+            **({"cache_ms": float(context_timing["cache_ms"])} if "cache_ms" in context_timing else {}),
             "extractor_ms": round((capture_started - extract_started) * 1000.0, 1),
             "capture_ms": round((finished - capture_started) * 1000.0, 1),
             "total_ms": round((finished - started) * 1000.0, 1),
@@ -862,7 +885,8 @@ class ChatSessionServiceMixin:
                 "agent_turn",
                 f"Agent turn: {len(hits)} hit(s), {pack_tokens} pack tokens, {timing['total_ms']} ms",
                 {
-                    "turn": "prompt" if user else "response",
+                    # A hook capturing question + answer on turn end is a response turn.
+                    "turn": "prompt" if user and not (hook and assistant) else "response",
                     "source": "hook" if client else "mcp",
                     "client": client or "",
                     "trigger": trigger,
@@ -883,6 +907,8 @@ class ChatSessionServiceMixin:
             "project_id": actual_project_id,
             "context": context,
             "hits": hits,
+            "stable": packed.get("stable") or [],
+            **({"stable_every_turns": packed["stable_every_turns"]} if "stable_every_turns" in packed else {}),
             "kept": kept,
             "reason": reason,
             "extractor": extraction.get("extractor"),

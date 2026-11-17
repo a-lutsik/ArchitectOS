@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import tempfile
 import threading
 import unittest
@@ -921,6 +922,73 @@ class MemorySearchQualityTests(unittest.TestCase):
                 [(node_id, round(score, 6)) for node_id, score in reloaded],
             )
 
+    def test_sparse_query_vector_scan_matches_the_full_dot_product(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            for index, topic in enumerate(("session expiry", "token rotation", "billing export", "audit trail") * 3):
+                service.add_memory({
+                    "project_id": "architectos",
+                    "label": f"Rule {index}: {topic}",
+                    "type": "Lesson",
+                    "scope": "project",
+                    "text": f"The {topic} job {index} must batch its writes and retry on timeout.",
+                })
+            engine = service.memory_embeddings
+            query = "session token expiry"
+            found = engine.search_scored(query, project_id="architectos", limit=20, min_score=-1.0)
+            vector = engine._embed_query_cached(query)  # noqa: SLF001 - the vector the search used
+            index = engine._vector_cache  # noqa: SLF001
+            norm = math.sqrt(sum(value * value for value in vector))
+            expected = sorted(
+                ((node_id, cosine(vector, list(row)) / norm) for node_id, row in zip(index.node_ids, index.vectors, strict=True)),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        self.assertLessEqual(sum(1 for value in vector if value) * 4, len(vector), "hash query exercises the sparse path")
+        self.assertGreaterEqual(len(found), 12)
+        self.assertEqual([node_id for node_id, _ in found], [node_id for node_id, _ in expected])
+        for (_, score), (_, want) in zip(found, expected, strict=True):
+            self.assertAlmostEqual(score, want, places=9)
+
+    def test_single_token_query_scores_like_the_full_dot_product(self) -> None:
+        # A one-word prompt ("continue", "ledger") hashes to a single non-zero dim.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            for index in range(4):
+                service.add_memory({
+                    "project_id": "architectos", "label": f"Ledger rule {index}", "type": "Lesson", "scope": "project",
+                    "text": f"The ledger job {index} must batch its writes.",
+                })
+            engine = service.memory_embeddings
+            vector = engine._embed_query_cached("ledger")  # noqa: SLF001
+            found = engine.search_scored("ledger", project_id="architectos", limit=20, min_score=-1.0)
+        self.assertEqual(sum(1 for value in vector if value), 1)
+        self.assertGreaterEqual(len(found), 4)
+
+    def test_vector_search_sees_rows_added_or_moved_after_the_first_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+
+            def add(label: str) -> str:
+                return service.add_memory({
+                    "project_id": "proj_a", "label": label, "type": "Lesson", "scope": "project",
+                    "text": f"{label}: the session token rotation job must retry on timeout.",
+                })["id"]
+
+            moved = add("Rotation rule one")
+            engine = service.memory_embeddings
+            query = "session token rotation retry"
+            first = [node_id for node_id, _ in engine.search_scored(query, project_id="proj_a", limit=20, min_score=-1.0)]
+            added = add("Rotation rule two")
+            node = service.repository.get_node(moved)
+            assert node is not None
+            node.project_id = "proj_b"
+            service.repository.upsert_node(node)
+            after = [node_id for node_id, _ in engine.search_scored(query, project_id="proj_a", limit=20, min_score=-1.0)]
+        self.assertIn(moved, first)
+        self.assertIn(added, after)
+        self.assertNotIn(moved, after)
+
 
 class MemoryAsyncIndexingTests(unittest.TestCase):
     def test_queued_indexing_drains_and_covers_node(self) -> None:
@@ -1491,6 +1559,28 @@ class MemoryLifecycleApplicationTests(unittest.TestCase):
             search = service.search_memory("zephyr quixotic", project_id="architectos", limit=5)
             self.assertTrue(search["hits"])
             self.assertEqual(spy, [])
+
+    def test_access_bump_writes_all_hits_in_one_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            ids = [
+                service.repository.add_node("Lesson", f"Zephyr rule {index}", "project", "Zephyr batching rule.",
+                                            "architectos", None, 0.8, {"source": "manual"}).id
+                for index in range(5)
+            ]
+            transaction = service.repository.transaction
+            with mock.patch.object(service.repository, "transaction", wraps=transaction) as opened, \
+                    mock.patch.object(service.repository, "get_node", wraps=service.repository.get_node) as single, \
+                    mock.patch.object(service.repository, "_sync_memory_fts_row") as fts:
+                result = service.memory_lifecycle.refresh_nodes([*ids, ids[0]], "search")
+            counts = [int(service.repository.get_node(node_id).metadata.get("access_count") or 0) for node_id in ids]
+            found = service.repository.search_memory_fts("zephyr batching", project_id="architectos", limit=10)
+        self.assertEqual(result["refreshed"], 5)
+        self.assertEqual(counts, [1] * 5)
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(single.call_count, 0, "hits are read in one query, not one get_node each")
+        self.assertEqual(fts.call_count, 0, "a metadata-only bump leaves the FTS rows alone")
+        self.assertEqual(set(found), set(ids))
 
     def test_decay_loop_runs_decay_once_then_stops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

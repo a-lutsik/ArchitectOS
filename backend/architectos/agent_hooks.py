@@ -3,9 +3,9 @@
 MCP only fires when the model decides to call something, which leaves a silent
 agent with no memory at all. Cursor, Claude Code and Codex each expose lifecycle
 hooks that fire on their own, so this module normalizes their event payloads into
-one shape, forwards the turn to ``capture_memory_turn`` (over HTTP when the app is
-running, straight through the service otherwise) and renders the reply in the form
-each client accepts.
+one shape, forwards the turn to ``capture_memory_turn`` over HTTP when the app is
+running (otherwise it injects from the app's briefing cache and spools the capture
+for the app to replay) and renders the reply in the form each client accepts.
 
 Capture works for every supported client. Injection only happens where the client
 documents it: Claude Code and Codex add hook output back as model-visible context
@@ -17,21 +17,63 @@ Every failure is silent by design: a broken memory hook must never break the age
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import os
+import re
+import socket
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, NamedTuple
+
+try:
+    import fcntl
+except ImportError:  # Windows: files are then serialized within one process only
+    fcntl = None  # type: ignore[assignment]
 
 from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
+
+if TYPE_CHECKING:
+    import argparse
+    import logging
+
+_LOGGER: logging.Logger | None = None
+# Set by the hook command: this interpreter runs one agent event and exits.
+_STANDALONE = False
+
+
+class _HookLog:
+    """Log lines of a standalone hook process.
+
+    Nothing configures logging there, so through ``logging`` these lines would
+    reach only a NullHandler while every agent turn paid its ~10 ms import. With
+    ARCHITECTOS_HOOK_DEBUG they join data/hooks.log (counts only), otherwise they
+    are dropped, as before.
+    """
+
+    def info(self, message: str, *args: object) -> None:
+        _debug(f"INFO {message % args}")
+
+    def warning(self, message: str, *args: object) -> None:
+        _debug(f"WARNING {message % args}")
+
+
+def _log() -> logging.Logger | _HookLog:
+    """The hook's logger: the module logger inside the app, a plain hooks.log writer in the hook command."""
+    global _LOGGER
+    if _STANDALONE:
+        return _HookLog()
+    if _LOGGER is None:
+        import logging
+
+        _LOGGER = logging.getLogger(__name__)
+        _LOGGER.addHandler(logging.NullHandler())
+    return _LOGGER
+
 
 CLIENTS: tuple[str, ...] = ("cursor", "claude", "codex")
 
@@ -73,6 +115,8 @@ _ASSISTANT_TEXT_FIELDS = (
 )
 _CWD_FIELDS = ("cwd", "workspace_root", "workspace_roots", "project_root", "root_path")
 _SESSION_FIELDS = ("session_id", "sessionId", "conversation_id", "chat_id")
+# SessionStart sources that open a fresh context window: what was injected before is gone.
+_RESET_SOURCES = frozenset({"clear", "compact"})
 
 # Clients that document adding hook output back into the model's input.
 _INJECTS: frozenset[tuple[str, str]] = frozenset(
@@ -83,7 +127,26 @@ _JSON_REQUIRED: frozenset[tuple[str, str]] = frozenset({("codex", EVENT_RESPONSE
 
 _INJECT_PREFIX = "ArchitectOS project memory (scoped project context, not user text):"
 _INJECT_MAX_CHARS = 4000
-_DEFAULT_TIMEOUT = 5.0
+
+
+def hook_pack_budget(injection_budget: int) -> int:
+    """Pack budget that keeps prefix + pack within ``agent.hook_char_budget``.
+
+    32 characters of slack cover what pack_memory_context may add past its
+    budget (its "[context budget reached]" marker and section-header accounting).
+    """
+    return injection_budget - len(_INJECT_PREFIX) - 2 - 32
+# A pack is either ready fast or not worth waiting for; capture may take longer.
+_INJECT_TIMEOUT = 2.0
+_CAPTURE_TIMEOUT = 5.0
+
+# Per-session injection state: data/hook_sessions/<digest of session_id>.json.
+_SESSION_DIR = "hook_sessions"
+_SESSION_TTL_S = 3 * 24 * 3600.0
+_STABLE_EVERY_TURNS = 20
+_INJECTED_ID = re.compile(r"^- id=(\S+)", re.MULTILINE)
+# The question waits in the session file until turn end captures it with the answer.
+_PENDING_PROMPT_MAX_CHARS = 20000
 
 # Which client events we register, and the timeout each one gets.
 _REGISTRATIONS: dict[str, tuple[tuple[str, str, int], ...]] = {
@@ -104,9 +167,12 @@ _REGISTRATIONS: dict[str, tuple[tuple[str, str, int], ...]] = {
 }
 
 
-@dataclass(frozen=True)
-class HookTurn:
-    """One normalized agent event, independent of which client produced it."""
+class HookTurn(NamedTuple):
+    """One normalized agent event, independent of which client produced it.
+
+    A NamedTuple rather than a dataclass: dataclasses pulls in inspect, ~20 ms
+    of import on every hook run.
+    """
 
     client: str
     event: str
@@ -115,6 +181,7 @@ class HookTurn:
     assistant_text: str = ""
     session_id: str = ""
     cwd: str = ""
+    source: str = ""
 
     @property
     def can_inject(self) -> bool:
@@ -135,6 +202,49 @@ def _debug(message: str, root: Path | None = None) -> None:
             handle.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {message}\n")
     except OSError:
         pass
+
+
+def write_private(path: Path, text: str, *, append: bool = False) -> None:
+    """Write ``text`` to a file only its owner can read, like the database and runtime.json.
+
+    Session files hold the pending question, the spool the question and answer, the
+    briefing cache memory lines. A file left from an older version is tightened too.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    with open(os.open(path, flags, 0o600), "a" if append else "w", encoding="utf-8") as handle:
+        handle.write(text)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # Windows may ignore or reject POSIX modes
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on ``path`` across processes (hooks of one session, app and MCP servers).
+
+    A lock file that cannot be made or locked (read-only folder, full disk, a file
+    system without flock) must not cost the turn its pack or its capture: the
+    block then runs unlocked, with a warning.
+    """
+    if fcntl is None:
+        yield
+        return
+    fd: int | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
+        if fd is not None:
+            os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing releases the lock
 
 
 def _clean(value: Any) -> str:
@@ -182,7 +292,182 @@ def normalize_payload(payload: Mapping[str, Any], *, client: str, event: str | N
         assistant_text=assistant_text,
         session_id=_first_field(payload, _SESSION_FIELDS),
         cwd=_first_field(payload, _CWD_FIELDS) or os.getcwd(),
+        source=_clean(payload.get("source")).lower() if resolved_event == EVENT_SESSION else "",
     )
+
+
+# -- Session state -----------------------------------------------------------
+def prune_hook_sessions(root: Path, *, max_age_s: float = _SESSION_TTL_S) -> int:
+    """Delete session files untouched for ``max_age_s`` so data/ does not grow forever."""
+    cutoff = time.time() - max_age_s
+    removed = 0
+    try:
+        entries = list((root / "data" / _SESSION_DIR).iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        _log().info("hook sessions pruned: removed=%s max_age_h=%.0f", removed, max_age_s / 3600.0)
+    return removed
+
+
+class HookSession:
+    """What one agent session has already been shown, per project.
+
+    Each project the session touched keeps a prompt counter, the turn the stable
+    layer was last injected and the ids injected so far (id -> turn). State is
+    keyed by project so one project's ids never steer another's pack, even when a
+    session id is reused across folders. ``cwd`` remembers which project the app
+    resolved for a folder, so the next prompt knows whose ids to exclude.
+    """
+
+    def __init__(self, path: Path, state: dict[str, Any]) -> None:
+        self.path = path
+        self.state = state
+
+    @staticmethod
+    def _path(root: Path, session_id: str) -> Path:
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        return root / "data" / _SESSION_DIR / f"{digest}.json"
+
+    @classmethod
+    @contextmanager
+    def edit(cls, root: Path, session_id: str) -> Iterator["HookSession"]:
+        """The session read, changed and saved under its lock file.
+
+        Two hooks of one session can overlap (the next prompt arrives while turn end
+        still waits for the app), so every change re-reads the file under the lock;
+        keep the block short, never across an HTTP call.
+        """
+        with file_lock(cls._path(root, session_id).with_suffix(".lock")):
+            session = cls.open(root, session_id)
+            yield session
+            session.save()
+
+    @classmethod
+    def open(cls, root: Path, session_id: str) -> "HookSession":
+        path = cls._path(root, session_id)
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            prune_hook_sessions(root)
+            state = {}
+        except (OSError, ValueError) as exc:
+            _log().warning("hook session file unreadable, starting fresh: %s (%s)", path.name, exc)
+            state = {}
+        if not isinstance(state, dict):
+            _log().warning("hook session file is not an object, starting fresh: %s", path.name)
+            state = {}
+        return cls(path, state)
+
+    def project(self, project_id: str) -> dict[str, Any]:
+        projects = self.state.setdefault("projects", {})
+        entry = projects.get(project_id)
+        if not isinstance(entry, dict) or not isinstance(entry.get("seen"), dict):
+            entry = projects[project_id] = {"turn": 0, "stable_turn": None, "seen": {}}
+        return entry
+
+    def project_for(self, cwd: str) -> str:
+        """The project for ``cwd``: as the app resolved it in this session, else as it would.
+
+        A folder the session has not seen (the agent moved into a subfolder between
+        prompt and turn end) takes the cached roots and bind files the offline hook
+        uses, and failing those the nearest folder above it that the session saw.
+        """
+        known = self.state.get("cwd") or {}
+        if project := known.get(cwd):
+            return str(project)
+        if not cwd:
+            return ""
+        if project := cached_project_for(cwd, load_briefing_cache(self.path.parents[2])):
+            return project
+        folder = os.path.dirname(cwd)
+        while folder and folder != cwd:
+            if project := known.get(folder):
+                return str(project)
+            cwd, folder = folder, os.path.dirname(folder)
+        return ""
+
+    def plan_prompt(self, cwd: str) -> tuple[bool, list[str]]:
+        """(include the stable layer?, ids to exclude) for the next prompt in ``cwd``.
+
+        The stable layer is due on the session's first prompt for a project (the
+        start for clients without SessionStart) and again after it has been absent
+        for ``stable_every`` prompts, which covers a client-side compaction.
+        """
+        project_id = self.project_for(cwd)
+        entry = (self.state.get("projects") or {}).get(project_id) if project_id else None
+        if not isinstance(entry, dict):
+            return True, []
+        every = int(self.state.get("stable_every", _STABLE_EVERY_TURNS))
+        stable_turn = entry.get("stable_turn")
+        due = stable_turn is None or (every > 0 and int(entry.get("turn") or 0) + 1 - int(stable_turn) >= every)
+        return due, list(entry.get("seen") or {})
+
+    def record(
+        self, turn: HookTurn, result: dict[str, Any] | None, injected: str, *, include_stable: bool, transport: str
+    ) -> None:
+        """Remember what this event injected, under the project the app resolved.
+
+        The stable layer counts as shown only when it reached the agent, or when the
+        app itself answered that the project has none; an offline or empty pack
+        leaves it due for the next prompt.
+        """
+        if result is None:
+            return
+        project_id = str(result.get("project_id") or self.project_for(turn.cwd))
+        if not project_id:
+            return
+        if turn.cwd:
+            self.state.setdefault("cwd", {})[turn.cwd] = project_id
+        if "stable_every_turns" in result:
+            self.state["stable_every"] = int(result["stable_every_turns"])
+        entry = self.project(project_id)
+        shown = STABLE_TITLE in injected or (transport == "http" and not result.get("stable"))
+        if turn.event == EVENT_SESSION:
+            if turn.source in _RESET_SOURCES:
+                entry["seen"] = {}
+            if shown:
+                entry["stable_turn"] = int(entry["turn"])
+        elif turn.event == EVENT_PROMPT:
+            entry["turn"] = int(entry["turn"]) + 1
+            if include_stable and shown:
+                entry["stable_turn"] = entry["turn"]
+        for node_id in _INJECTED_ID.findall(injected):
+            entry["seen"][node_id] = entry["turn"]
+
+    def keep_prompt(self, cwd: str, text: str) -> str:
+        """Hold the question until turn end, under the project resolved for ``cwd``.
+
+        Returns the question it replaces: that turn never ended (the agent was
+        stopped before turn end fired), and the caller spools it instead of losing it.
+        """
+        pending = self.state.setdefault("pending", {})
+        project_id = self.project_for(cwd)
+        orphan = str(pending.get(project_id) or "")
+        pending[project_id] = text[:_PENDING_PROMPT_MAX_CHARS]
+        return orphan
+
+    def take_prompt(self, cwd: str) -> str:
+        """The held question for ``cwd``'s project, removed from the file once taken."""
+        pending = self.state.get("pending")
+        return str(pending.pop(self.project_for(cwd), "") or "") if isinstance(pending, dict) else ""
+
+    def save(self) -> None:
+        self.state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            scratch = self.path.with_suffix(".tmp")
+            write_private(scratch, json.dumps(self.state, ensure_ascii=False))
+            os.replace(scratch, self.path)
+        except OSError as exc:
+            _log().warning("hook session file not saved: %s (%s)", self.path.name, exc)
 
 
 # -- Transport ---------------------------------------------------------------
@@ -209,6 +494,53 @@ def runtime_endpoint(root: Path | None = None) -> tuple[str, str] | None:
     return url.rstrip("/"), token
 
 
+def _exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+    """One HTTP/1.0 request to the app's loopback server: (status, response body).
+
+    The app serves plain HTTP on 127.0.0.1 and closes the connection after each
+    reply, so a socket is all the hook needs; urllib.request would add ~45 ms of
+    imports (http.client, email, ssl) to every agent turn.
+    """
+    authority, _, path = url.split("://", 1)[-1].partition("/")
+    host, _, port = authority.rpartition(":")
+    lines = [
+        f"{'GET' if body is None else 'POST'} /{path} HTTP/1.0",
+        f"Host: {authority}",
+        f"X-ArchitectOS-Token: {token}",
+        "Connection: close",
+    ]
+    if body is not None:
+        lines += ["Content-Type: application/json", f"Content-Length: {len(body)}"]
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
+    # getaddrinfo takes a bytes host as is and runs a str one through the idna
+    # codec (~4 ms of imports); typeshed only lists str.
+    address = ((host or "127.0.0.1").encode("ascii"), int(port or 80))
+    try:
+        connected = socket.create_connection(address, timeout=timeout)  # type: ignore[arg-type]
+    except TimeoutError as exc:
+        raise ConnectionError(f"connect timed out: {exc}") from exc  # the app never got the request
+    with connected as conn:
+        try:
+            conn.settimeout(max(0.001, deadline - time.monotonic()))
+            conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b""))
+        except TimeoutError as exc:
+            raise ConnectionError(f"send timed out: {exc}") from exc  # an incomplete request is never served
+        # One deadline for the whole reply, not per recv: a trickling reply must not
+        # hold the agent past ``timeout``.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no complete reply within {timeout:.1f}s")
+            conn.settimeout(remaining)
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    head, _, reply = b"".join(chunks).partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), reply
+
+
 def _request_json(
     url: str,
     token: str,
@@ -216,38 +548,55 @@ def _request_json(
     payload: dict[str, Any] | None,
     timeout: float,
     root: Path | None = None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str]:
+    """Parsed reply plus why there is none: "" (ok), "timeout", "unreachable" or "error".
+
+    A timeout means the app got the whole request and may still act on it;
+    "unreachable" (refused, or a connect or send that timed out) means the event
+    surely went nowhere.
+    """
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
-    request.add_header("X-ArchitectOS-Token", token)
-    if data:
-        request.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
-            body = response.read().decode("utf-8")
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+        status, body = _exchange(url, token, data, timeout)
+    except TimeoutError as exc:
         _debug(f"http failed: {exc}", root)
-        return None
+        _log().warning("hook request timed out after %.1fs: %s", timeout, url.split("?", 1)[0])
+        return None, "timeout"
+    except OSError as exc:
+        _debug(f"http failed: {exc}", root)
+        return None, "unreachable"
+    except (ValueError, IndexError) as exc:
+        _debug(f"http failed: malformed reply ({exc})", root)
+        return None, "error"
+    if status >= 400:
+        _debug(f"http failed: HTTP {status}", root)
+        return None, "error"
     try:
-        parsed = json.loads(body)
+        parsed = json.loads(body.decode("utf-8"))
     except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        return None, "error"
+    return (parsed, "") if isinstance(parsed, dict) else (None, "error")
 
 
 def _offline_allowed() -> bool:
     return os.environ.get("ARCHITECTOS_HOOK_OFFLINE", "1").strip() not in {"0", "false", "no", "off"}
 
 
-def _direct_service(root: Path | None = None):
-    from .service import ArchitectOSService
-
-    return ArchitectOSService(root or resolve_project_root())
-
-
 def run_turn(turn: HookTurn, *, root: Path | None = None, timeout: float | None = None, limit: int = 8) -> dict[str, Any] | None:
     """Send the turn to ArchitectOS and return its memory pack, or None on failure."""
     return _send_turn(turn, root=root, timeout=timeout, limit=limit)[0]
+
+
+def _timeout(turn: HookTurn) -> float:
+    """HTTP timeout for this event: short when the agent waits for a pack, longer for capture."""
+    if turn.event == EVENT_RESPONSE:
+        name, default = "ARCHITECTOS_HOOK_TIMEOUT", _CAPTURE_TIMEOUT
+    else:
+        name, default = "ARCHITECTOS_HOOK_INJECT_TIMEOUT", _INJECT_TIMEOUT
+    try:
+        return max(0.1, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
 
 
 def _send_turn(
@@ -256,50 +605,266 @@ def _send_turn(
     root: Path | None = None,
     timeout: float | None = None,
     limit: int = 8,
+    include_stable: bool = True,
+    exclude_ids: list[str] | None = None,
+    capture: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
     """Memory pack plus the transport that produced it: http, offline or none."""
-    wait = float(timeout if timeout is not None else os.environ.get("ARCHITECTOS_HOOK_TIMEOUT", _DEFAULT_TIMEOUT))
+    wait = float(timeout) if timeout is not None else _timeout(turn)
     endpoint = runtime_endpoint(root)
-    if turn.event == EVENT_SESSION:
-        if endpoint:
-            url, token = endpoint
-            query = urllib.parse.urlencode({"cwd": turn.cwd}) if turn.cwd else ""
-            result = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait, root=root)
-            if result is not None:
-                return result, "http"
-        if not _offline_allowed():
-            return None, "none"
-        try:
-            return _direct_service(root).memory_briefing(cwd=turn.cwd or None), "offline"
-        except Exception as exc:  # noqa: BLE001 - hooks must stay silent
-            _debug(f"briefing failed: {exc}", root)
-            return None, "none"
-
-    payload = {
-        "user_text": turn.user_text,
-        "assistant_text": turn.assistant_text,
-        "cwd": turn.cwd,
-        "client": turn.client,
-        "limit": limit,
-    }
+    failure = "unreachable"
     if endpoint:
         url, token = endpoint
-        result = _request_json(f"{url}/api/memory/turn", token, payload=payload, timeout=wait, root=root)
+        if turn.event == EVENT_SESSION:
+            from urllib.parse import urlencode  # only the session briefing needs it; keep prompt turns lean
+
+            query = urlencode({"cwd": turn.cwd}) if turn.cwd else ""
+            result, failure = _request_json(f"{url}/api/memory/briefing?{query}", token, payload=None, timeout=wait, root=root)
+        else:
+            payload = {
+                "user_text": turn.user_text,
+                "assistant_text": turn.assistant_text,
+                "cwd": turn.cwd,
+                "client": turn.client,
+                "limit": limit,
+                "hook": True,
+                "include_stable": include_stable,
+                "exclude_ids": exclude_ids or [],
+                "capture": capture,
+            }
+            result, failure = _request_json(f"{url}/api/memory/turn", token, payload=payload, timeout=wait, root=root)
         if result is not None:
             return result, "http"
     if not _offline_allowed():
         return None, "none"
+    # A timed-out capture already reached the app and is likely still running; spooling
+    # it too would capture it twice. An app that answered with an error (500 from a
+    # locked store, a cut reply) did not capture it, and the question has already left
+    # the session file: spool it. A replay of a turn the app did store is deduplicated.
+    spool = capture and turn.event != EVENT_SESSION and failure in ("unreachable", "error")
+    return _offline_turn(turn, root or resolve_project_root(), include_stable=include_stable,
+                         exclude_ids=exclude_ids or [], spool=spool), "offline"
+
+
+# -- Offline: briefing cache and capture spool -------------------------------
+# With the app closed the hook never opens the store: it injects what the app
+# last cached in data/briefing_cache.json and appends captures to
+# data/hook_spool.jsonl, which the app drains on start and every minute.
+BRIEFING_CACHE = "briefing_cache.json"
+HOOK_SPOOL = "hook_spool.jsonl"
+_SPOOL_MAX_BYTES = 5 * 1024 * 1024
+_BRIEFING_CHAR_BUDGET = 2000
+# Mirrors agent_hook_service.HOOK_CACHE_TTL_HOURS for a cache written before the setting existed.
+_CACHE_TTL_HOURS = 24.0
+_HOOK_CHAR_BUDGET = 1600
+# Same bind file and walk as mcp_server.read_mcp_bind_project_id, without its imports.
+_BIND_FILENAME = ".architectos.json"
+# Section titles of search.pack_memory_context: the cache keeps a pack's lines per section.
+STABLE_TITLE = "Stable memory (pinned / constraints / long-term):"
+HITS_TITLE = "Retrieved for this query:"
+def pack_header(context: str) -> str:
+    """The lines of a rendered pack before its first memory section."""
+    header: list[str] = []
+    for line in context.splitlines():
+        if line.strip() in (STABLE_TITLE, HITS_TITLE):
+            break
+        header.append(line)
+    return "\n".join(header).strip()
+
+
+def render_cached_pack(entry: Mapping[str, Any], *, include_stable: bool, exclude: set[str], budget: int) -> tuple[str, list[str], list[str]]:
+    """Rebuild a pack from cached lines: (context, stable ids, hit ids); "" when nothing is new.
+
+    Like the app's hook pack, a requested stable layer ignores ``exclude``.
+    """
+    header = str(entry.get("header") or "")
+    lines, used, taken = [header], len(header), set()
+    picked: dict[str, list[str]] = {"stable": [], "hits": []}
+    for key, title in (("stable", STABLE_TITLE), ("hits", HITS_TITLE)):
+        if key == "stable" and not include_stable:
+            continue
+        section: list[str] = []
+        cost = used + len(title) + 2
+        for item in entry.get(key) or []:
+            if not (isinstance(item, list) and len(item) >= 2):  # [id, line] or [id, line, signature]
+                continue
+            node_id, line = str(item[0]), str(item[1])
+            if node_id in taken or (key == "hits" and node_id in exclude) or cost + len(line) + 1 > budget:
+                continue
+            section.append(line)
+            picked[key].append(node_id)
+            taken.add(node_id)
+            cost += len(line) + 1
+        if section:
+            lines.extend(["", title, *section])
+            used = cost
+    if not taken:
+        return "", [], []
+    return "\n".join(lines).strip(), picked["stable"], picked["hits"]
+
+
+def _fresh_sections(entry: Mapping[str, Any], ttl_hours: float) -> dict[str, Any]:
+    """``entry`` without the sections the app cached more than ``ttl_hours`` ago (0 keeps all).
+
+    Each project's stable lines and hit lines carry their own write time, so a
+    write for one project never renews another's.
+    """
+    fresh = dict(entry)
+    if ttl_hours <= 0:
+        return fresh
+    now = datetime.now(timezone.utc)
+    for key in ("stable", "hits"):
+        written = str(entry.get(f"{key}_at") or entry.get("updated_at") or "")
+        try:
+            age_h = (now - datetime.fromisoformat(written)).total_seconds() / 3600.0
+        except ValueError:
+            age_h = float("inf")
+        if age_h > ttl_hours:
+            fresh[key] = []
+    return fresh
+
+
+def _bound_project_id(cwd: str) -> str:
     try:
-        return _direct_service(root).capture_memory_turn(
-            turn.user_text,
-            turn.assistant_text,
-            cwd=turn.cwd or None,
-            client=turn.client,
-            limit=limit,
-        ), "offline"
-    except Exception as exc:  # noqa: BLE001 - hooks must stay silent
-        _debug(f"capture failed: {exc}", root)
-        return None, "none"
+        current = Path(cwd).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    for folder in (current, *current.parents):
+        candidate = folder / _BIND_FILENAME
+        try:
+            if not candidate.is_file():
+                continue
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            return ""
+        return str(data.get("project_id") or "").strip() if isinstance(data, dict) else ""
+    return ""
+
+
+def cached_project_for(cwd: str, cache: Mapping[str, Any]) -> str:
+    """The project the app would pick for ``cwd``, without the store.
+
+    Bind file first, then the deepest cached root, then the app's default
+    project (as ``capture_memory_turn`` falls back to it). "" only when the app
+    never wrote a cache, and the offline hook then injects nothing.
+    """
+    bound = _bound_project_id(cwd)
+    if bound:
+        return bound
+    try:
+        target = Path(cwd).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    roots = cache.get("roots")
+    best, best_depth = "", -1
+    for project_id, raw_root in (roots.items() if isinstance(roots, dict) else ()):
+        candidate = Path(str(raw_root))
+        if (candidate == target or candidate in target.parents) and len(candidate.parts) > best_depth:
+            best, best_depth = str(project_id), len(candidate.parts)
+    return best or str(cache.get("default_project") or "")
+
+
+def load_briefing_cache(root: Path) -> dict[str, Any]:
+    path = root / "data" / BRIEFING_CACHE
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        _log().warning("briefing cache unreadable, offline hook stays silent: %s", exc)
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def spool_turn(root: Path, record: dict[str, Any]) -> bool:
+    """Append one capture for the app to replay; False when the spool is full or unwritable."""
+    path = root / "data" / HOOK_SPOOL
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    try:
+        size = path.stat().st_size if path.exists() else 0
+        if size + len(line) > _SPOOL_MAX_BYTES:
+            _log().warning("hook spool full, capture dropped: bytes=%s limit=%s", size, _SPOOL_MAX_BYTES)
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_private(path, line, append=True)
+    except OSError as exc:
+        _log().warning("hook spool not written: %s", exc)
+        return False
+    return True
+
+
+def spool_status(root: Path) -> dict[str, Any]:
+    """Captures waiting for the app: count, bytes and age of the oldest one (for doctor)."""
+    data = root / "data"
+    files = [data / HOOK_SPOOL, *sorted(data.glob(f"{HOOK_SPOOL}.*.draining"))]
+    records, size, oldest = 0, 0, ""
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    size += len(line.encode("utf-8"))
+                    if not line.strip():
+                        continue
+                    records += 1
+                    if not oldest:
+                        try:
+                            oldest = str(json.loads(line).get("ts") or "")
+                        except (ValueError, AttributeError):
+                            pass
+        except OSError:
+            continue
+    age_s = None
+    if oldest:
+        try:
+            age_s = round((datetime.now(timezone.utc) - datetime.fromisoformat(oldest)).total_seconds())
+        except ValueError:
+            age_s = None
+    return {"path": str(data / HOOK_SPOOL), "records": records, "bytes": size, "oldest_age_s": age_s}
+
+
+def _offline_turn(
+    turn: HookTurn,
+    root: Path,
+    *,
+    include_stable: bool,
+    exclude_ids: list[str],
+    spool: bool,
+) -> dict[str, Any]:
+    """The app is closed: inject from the briefing cache, spool the capture. Never opens the store."""
+    cache = load_briefing_cache(root)
+    project_id = cached_project_for(turn.cwd, cache) if turn.cwd else ""
+    result: dict[str, Any] = {"project_id": project_id, "context": "", "hits": [], "stable": []}
+    raw_settings = cache.get("settings")
+    settings: dict[str, Any] = raw_settings if isinstance(raw_settings, dict) else {}
+    if "hook_stable_every_turns" in settings:
+        result["stable_every_turns"] = int(settings["hook_stable_every_turns"])
+    if spool:
+        result["spooled"] = spool_turn(root, {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "project_id": project_id,
+            "cwd": turn.cwd,
+            "client": turn.client,
+            "user_text": turn.user_text,
+            "assistant_text": turn.assistant_text,
+        })
+    entry = (cache.get("projects") or {}).get(project_id) if project_id else None
+    if isinstance(entry, dict):
+        entry = _fresh_sections(entry, float(settings.get("hook_cache_ttl_hours", _CACHE_TTL_HOURS)))
+    if turn.can_inject and isinstance(entry, dict):
+        session = turn.event == EVENT_SESSION
+        context, stable, hits = render_cached_pack(
+            {**entry, "hits": []} if session else entry,  # session start is the briefing: stable layer only
+            include_stable=include_stable or session,
+            exclude=set() if session else set(exclude_ids),
+            budget=_BRIEFING_CHAR_BUDGET if session else hook_pack_budget(int(settings.get("hook_char_budget") or _HOOK_CHAR_BUDGET)),
+        )
+        result.update(context=context, stable=stable, hits=hits)
+    _log().info(
+        "offline hook: kind=%s project=%s cached=%s injected_ids=%s spooled=%s",
+        turn.event, project_id or "-", isinstance(entry, dict), len(result["hits"]) + len(result["stable"]),
+        result.get("spooled", False),
+    )
+    return result
 
 
 # -- Rendering ---------------------------------------------------------------
@@ -351,14 +916,62 @@ def handle_capture(
         return _silent(client, event)
     if turn.event == EVENT_PROMPT and not turn.user_text:
         return _silent(turn.client, turn.event)
-    if turn.event == EVENT_RESPONSE and not turn.assistant_text:
+    if turn.event == EVENT_RESPONSE and not turn.assistant_text and not turn.session_id:
         return _silent(turn.client, turn.event)
     started = time.perf_counter()
-    result, transport = _send_turn(turn, root=root)
+    session_root = root or resolve_project_root()
+    # Turn end never injects, so it skips the stable layer. With a session the
+    # prompt only injects and turn end captures question + answer in one call;
+    # without one, each event captures its own text as before.
+    include_stable, capture = turn.event != EVENT_RESPONSE, True
+    exclude_ids: list[str] = []
+    if turn.session_id and turn.event == EVENT_PROMPT:
+        include_stable, exclude_ids = HookSession.open(session_root, turn.session_id).plan_prompt(turn.cwd)
+        capture = False
+    elif turn.session_id and turn.event == EVENT_RESPONSE:
+        # Taken and saved before the send: a prompt hook running meanwhile must not
+        # find the question still held (and spool it a second time).
+        with HookSession.edit(session_root, turn.session_id) as session:
+            turn = turn._replace(user_text=session.take_prompt(turn.cwd))
+        # Turn end with no answer text (the agent was interrupted) still captures the question.
+        if not (turn.user_text or turn.assistant_text):
+            return _silent(turn.client, turn.event)
+    if turn.session_id and turn.event == EVENT_PROMPT and not turn.can_inject:
+        result, transport = None, "deferred"  # nothing to inject; the question waits for turn end
+    else:
+        result, transport = _send_turn(
+            turn, root=root, include_stable=include_stable, exclude_ids=exclude_ids, capture=capture
+        )
     out = render_stdout(turn, result)
+    injected = _injected_text(out)
+    if turn.can_inject and not injected:
+        _log().info("injection skipped: kind=%s transport=%s reason=%s", turn.event, transport,
+                  "no reply" if result is None else "empty pack")
+    if turn.session_id:
+        # Re-read under the lock: another hook of this session may have saved meanwhile.
+        with HookSession.edit(session_root, turn.session_id) as session:
+            session.record(turn, result, injected, include_stable=include_stable, transport=transport)
+            if turn.event == EVENT_PROMPT:
+                orphan = session.keep_prompt(turn.cwd, turn.user_text)
+                if orphan and _offline_allowed():
+                    spool_turn(session_root, {
+                        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "project_id": session.project_for(turn.cwd),
+                        "cwd": turn.cwd,
+                        "client": turn.client,
+                        "user_text": orphan,
+                        "assistant_text": "",
+                    })
     if _debug_enabled():
         _debug(_timing_line(turn, transport, (time.perf_counter() - started) * 1000.0, out, result), root)
     return out
+
+
+def _injected_text(out: str) -> str:
+    """The additionalContext a rendered reply carries ("" when the hook stayed silent)."""
+    if not out or out == "{}":
+        return ""
+    return str(json.loads(out).get("hookSpecificOutput", {}).get("additionalContext") or "")
 
 
 def _timing_line(turn: HookTurn, transport: str, elapsed_ms: float, out: str, result: dict[str, Any] | None) -> str:
@@ -367,9 +980,7 @@ def _timing_line(turn: HookTurn, transport: str, elapsed_ms: float, out: str, re
     ``tokens`` estimates what was actually injected (0 when the hook stayed silent).
     """
     data = result or {}
-    injected = ""
-    if out and out != "{}":
-        injected = str(json.loads(out).get("hookSpecificOutput", {}).get("additionalContext") or "")
+    injected = _injected_text(out)
     return (
         f"event={turn.event} client={turn.client} transport={transport} ms={elapsed_ms:.1f} "
         f"tokens={estimate_tokens_from_text(injected)} hits={len(data.get('hits') or data.get('stable') or [])} "
@@ -535,8 +1146,14 @@ def install(
 
 
 def status(*, project_root: Path | None = None) -> dict[str, Any]:
-    """What is installed where, plus whether the running app is reachable."""
+    """What is installed where, whether the running app is reachable and what waits for it offline."""
     endpoint = runtime_endpoint()
+    data_root = resolve_project_root()
+    cache = load_briefing_cache(data_root)
+    try:
+        sessions = sum(1 for _ in (data_root / "data" / _SESSION_DIR).glob("*.json"))
+    except OSError:
+        sessions = 0
     clients: list[dict[str, Any]] = []
     for client in CLIENTS:
         for scope, base in (("user", None), ("project", project_root)):
@@ -568,6 +1185,15 @@ def status(*, project_root: Path | None = None) -> dict[str, Any]:
         "command": hook_command("codex", "prompt"),
         "server": {"reachable": bool(endpoint), "url": (endpoint or ("", ""))[0]},
         "offline_fallback": _offline_allowed(),
+        "offline": {
+            "spool": spool_status(data_root),
+            "briefing_cache": {
+                "path": str(data_root / "data" / BRIEFING_CACHE),
+                "projects": len(cache.get("projects") or {}),
+                "updated_at": cache.get("updated_at"),
+            },
+            "sessions": sessions,
+        },
         "clients": clients,
     }
 
@@ -590,7 +1216,14 @@ def expand_clients(raw: Any) -> list[str]:
     return list(dict.fromkeys(requested))
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(command: str | None = None) -> argparse.ArgumentParser:
+    """The CLI parser; ``command="capture"`` builds only that subcommand.
+
+    Every agent event runs ``capture``, and building the other subparsers costs
+    it ~8 ms of argparse setup it never uses.
+    """
+    import argparse
+
     parser = argparse.ArgumentParser(
         prog="architectos_hook",
         description="Capture agent turns into ArchitectOS memory through client hooks.",
@@ -600,6 +1233,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture = sub.add_parser("capture", help="Handle one hook event read as JSON on stdin.")
     capture.add_argument("--client", required=True, choices=list(CLIENTS))
     capture.add_argument("--event", choices=list(EVENTS), default=None)
+    if command == "capture":
+        return parser
 
     for name, help_text in (("install", "Register hooks."), ("uninstall", "Remove our hooks.")):
         action = sub.add_parser(name, help=help_text)
@@ -610,22 +1245,46 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _capture_argv(argv: list[str]) -> tuple[str, str | None] | None:
+    """(client, event) when argv is exactly what ``hook_command`` registers, else None.
+
+    Every agent event starts a new interpreter; argparse and the shutil, bz2 and
+    lzma its help formatter imports cost each one ~15 ms. Any other form goes
+    through argparse as before.
+    """
+    if len(argv) not in (3, 5) or argv[:2] != ["capture", "--client"] or argv[2] not in CLIENTS:
+        return None
+    if len(argv) == 3:
+        return argv[2], None
+    return (argv[2], argv[4]) if argv[3] == "--event" and argv[4] in EVENTS else None
+
+
+def _capture(client: str, event: str | None) -> int:
+    global _STANDALONE
+    _STANDALONE = True
+    try:
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        raw = ""
+    try:
+        out = handle_capture(raw, client=client, event=event)
+    except Exception as exc:  # noqa: BLE001 - a hook must never break the agent
+        _debug(f"capture crashed: {exc}")
+        out = "{}" if client == "codex" and event == EVENT_RESPONSE else ""
+    if out:
+        sys.stdout.write(out)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    capture = _capture_argv(argv)
+    if capture is not None:
+        return _capture(*capture)
+    args = build_parser(argv[0] if argv else None).parse_args(argv)
 
     if args.command == "capture":
-        try:
-            raw = sys.stdin.read()
-        except (OSError, ValueError):
-            raw = ""
-        try:
-            out = handle_capture(raw, client=args.client, event=args.event)
-        except Exception as exc:  # noqa: BLE001 - a hook must never break the agent
-            _debug(f"capture crashed: {exc}")
-            out = "{}" if args.client == "codex" and args.event == EVENT_RESPONSE else ""
-        if out:
-            sys.stdout.write(out)
-        return 0
+        return _capture(args.client, args.event)
 
     if args.command == "doctor":
         print(json.dumps(status(project_root=resolve_project_root()), indent=2, sort_keys=True))

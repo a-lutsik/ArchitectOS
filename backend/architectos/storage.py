@@ -112,6 +112,10 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self._node_upsert_listeners: list[Any] = []
+        # get_setting memo: key -> (monotonic read time, raw JSON payload); see storage_sessions.
+        self._settings_memo: dict[str, tuple[float, str | None]] = {}
+        # Bumped by every set_setting: a read that saw it change may hold the old value.
+        self._settings_writes = 0
         # Thread-local slot for the connection owned by transaction(); must exist
         # before _migrate() runs its first _connect().
         self._local = threading.local()
@@ -449,6 +453,25 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
             else:
                 self._notify_node_upsert(node)
         return node
+
+    def update_node_metadata(self, nodes: list[MemoryNode]) -> None:
+        """Persist metadata-only changes (lifecycle access bumps) without re-indexing.
+
+        The caller guarantees label, text, type, scope, project and status are
+        unchanged: those are all the FTS and dedup rows hold, and re-syncing the
+        FTS row costs a scan of the whole FTS table (it is deleted by an
+        unindexed node_id). No upsert listeners run, so nothing is re-embedded.
+        """
+        if not nodes:
+            return
+        now = utc_now()
+        for node in nodes:
+            node.updated_at = now
+        with self._connect() as conn:
+            conn.executemany(
+                "UPDATE memory_nodes SET payload = ?, updated_at = ? WHERE id = ?",
+                [(json.dumps(node.to_dict(), sort_keys=True), now, node.id) for node in nodes],
+            )
 
     def _notify_node_upsert(self, node: MemoryNode) -> None:
         for listener in self._node_upsert_listeners:

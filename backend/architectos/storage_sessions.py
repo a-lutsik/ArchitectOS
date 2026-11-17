@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
 from .models import MemoryEdge, MemoryNode, Project, stable_id, utc_now
 from .storage_defaults import _default_provider_command
+
+SETTINGS_MEMO_TTL_S = 1.0
 
 
 def _sanitize_payload(value: Any) -> tuple[Any, bool]:
@@ -263,12 +266,32 @@ class StorageSessionsMixin:
             clean_payload["security_redacted"] = True
         with self._connect() as conn:
             conn.execute("INSERT OR REPLACE INTO settings(key, payload, updated_at) VALUES (?, ?, ?)", (key, json.dumps(clean_payload, sort_keys=True), utc_now()))
+        self._settings_writes += 1
+        self._settings_memo.pop(key, None)
         return clean_payload
 
     def get_setting(self, key: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute("SELECT payload FROM settings WHERE key = ?", (key,)).fetchone()
-        return json.loads(row["payload"]) if row else None
+        """A setting's payload, a fresh object per call.
+
+        A memory turn reads the same few settings about ten times, and each read
+        opens a connection; reads are memoized for SETTINGS_MEMO_TTL_S. A committed
+        write in this process drops its key at once, and a read that raced any write
+        here is not memoized; a write from another process (the MCP server), or one
+        still inside another thread's open transaction(), shows up within the TTL.
+        Reads inside transaction() are not memoized, since it may still roll back.
+        """
+        memo = self._settings_memo.get(key)
+        now = time.monotonic()
+        if memo is not None and now - memo[0] < SETTINGS_MEMO_TTL_S:
+            raw = memo[1]
+        else:
+            writes = self._settings_writes
+            with self._connect() as conn:
+                row = conn.execute("SELECT payload FROM settings WHERE key = ?", (key,)).fetchone()
+            raw = row["payload"] if row else None
+            if getattr(self._local, "transaction_connection", None) is None and writes == self._settings_writes:
+                self._settings_memo[key] = (now, raw)
+        return json.loads(raw) if raw is not None else None
 
     def all_settings(self) -> dict[str, Any]:
         with self._connect() as conn:

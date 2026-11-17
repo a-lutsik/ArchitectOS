@@ -67,17 +67,22 @@ class MemoryLifecycleEngine:
         return settings
 
     def initialize_node(self, node: Any, source: str = "memory") -> Any:
-        metadata = dict(getattr(node, "metadata", {}) or {})
-        if metadata.get("memory_tier"):
+        if (getattr(node, "metadata", {}) or {}).get("memory_tier"):
             return node
-        node.metadata = self.seed_metadata(
-            node_type=str(getattr(node, "type", "") or ""),
-            created_at=str(getattr(node, "created_at", "") or utc_now()),
-            metadata=metadata,
-            source=source,
-            label=str(getattr(node, "label", "") or ""),
-        )
-        return self.repository.upsert_node(node)
+        return self.repository.upsert_node(self._seeded(node, source))
+
+    def _seeded(self, node: Any, source: str) -> Any:
+        """``node`` with lifecycle metadata seeded when it has none yet; nothing is written."""
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        if not metadata.get("memory_tier"):
+            node.metadata = self.seed_metadata(
+                node_type=str(getattr(node, "type", "") or ""),
+                created_at=str(getattr(node, "created_at", "") or utc_now()),
+                metadata=metadata,
+                source=source,
+                label=str(getattr(node, "label", "") or ""),
+            )
+        return node
 
     def seed_metadata(
         self,
@@ -123,32 +128,33 @@ class MemoryLifecycleEngine:
         settings = self.settings()
         if not settings["enabled"] or not settings["refresh_on_access"]:
             return {"refreshed": 0, "promoted": 0}
-        refreshed = 0
         promoted = 0
-        for node_id in dict.fromkeys(node_ids):
-            node = self.repository.get_node(node_id)
-            if not node or node.status != "active":
-                continue
-            node = self.initialize_node(node, reason)
-            metadata = dict(node.metadata or {})
-            metadata["access_count"] = int(metadata.get("access_count") or 0) + 1
-            metadata["last_accessed_at"] = utc_now()
-            metadata["last_refresh_reason"] = reason
-            if metadata.get("memory_tier") != "long_term":
-                metadata["lifecycle_state"] = "fresh"
-            if metadata.get("memory_tier") != "long_term" and self._should_promote(node, metadata, settings):
-                metadata["memory_tier"] = "long_term"
-                metadata["lifecycle_state"] = "stable"
-                metadata["decay_enabled"] = False
-                metadata["retention_policy"] = "keep"
-                metadata["promoted_to_long_term_at"] = utc_now()
-                promoted += 1
-            metadata["memory_score"] = self._score(node, metadata, settings)
-            node.metadata = metadata
-            # Metadata-only bump (label/text unchanged): skip embedding reindex.
-            self.repository.upsert_node(node, notify=False)
-            refreshed += 1
-        return {"refreshed": refreshed, "promoted": promoted}
+        bumped: list[Any] = []
+        # One transaction for the whole batch keeps the read-modify-write atomic; the
+        # bump only touches metadata, so the FTS and dedup rows are left alone.
+        with self.repository.transaction():
+            for node in self.repository.list_nodes_by_ids(list(dict.fromkeys(node_ids))):
+                if node.status != "active":
+                    continue
+                node = self._seeded(node, reason)
+                metadata = dict(node.metadata or {})
+                metadata["access_count"] = int(metadata.get("access_count") or 0) + 1
+                metadata["last_accessed_at"] = utc_now()
+                metadata["last_refresh_reason"] = reason
+                if metadata.get("memory_tier") != "long_term":
+                    metadata["lifecycle_state"] = "fresh"
+                if metadata.get("memory_tier") != "long_term" and self._should_promote(node, metadata, settings):
+                    metadata["memory_tier"] = "long_term"
+                    metadata["lifecycle_state"] = "stable"
+                    metadata["decay_enabled"] = False
+                    metadata["retention_policy"] = "keep"
+                    metadata["promoted_to_long_term_at"] = utc_now()
+                    promoted += 1
+                metadata["memory_score"] = self._score(node, metadata, settings)
+                node.metadata = metadata
+                bumped.append(node)
+            self.repository.update_node_metadata(bumped)
+        return {"refreshed": len(bumped), "promoted": promoted}
 
     def promote_long_term(self, node_id: str, reason: str = "manual") -> dict[str, Any]:
         node = self.repository.get_node(node_id)
