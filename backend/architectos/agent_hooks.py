@@ -783,6 +783,8 @@ def shown_memories(result: Mapping[str, Any] | None, injected: str) -> list[tupl
     """(id, section) of each memory line that reached the agent whole in ``injected``."""
     if not (result and injected):
         return []
+    if "shown" not in result:
+        return _shown_by_an_older_app(result, injected)
     context = str(result.get("context") or "")
     # render_stdout injects the stripped context after the prefix and cuts it at _INJECT_MAX_CHARS.
     kept = len(context) - len(context.lstrip()) + _INJECT_MAX_CHARS - len(_INJECT_PREFIX) - 2
@@ -791,6 +793,24 @@ def shown_memories(result: Mapping[str, Any] | None, injected: str) -> list[tupl
         for item in result.get("shown") or []
         if isinstance(item, list) and len(item) >= 3 and isinstance(item[2], int) and item[2] <= kept
     ]
+
+
+def _shown_by_an_older_app(result: Mapping[str, Any], injected: str) -> list[tuple[str, str]]:
+    """(id, section) for a reply without ``shown``: an app started before the hook was updated.
+
+    The ids come from the reply's own hit lists, each counted when a pack line of
+    the injection starts with it; a line inside another memory's text cannot add
+    an id the reply did not pack.
+    """
+    starts = {line[5:].split(" ", 1)[0] for line in injected.splitlines() if line.startswith("- id=")}
+    shown: list[tuple[str, str]] = []
+    for section in ("stable", "hits"):
+        for hit in result.get(section) or []:
+            node = hit.get("node") if isinstance(hit, dict) else None
+            node_id = str((node if isinstance(node, dict) else hit if isinstance(hit, dict) else {}).get("id") or "")
+            if node_id and node_id in starts:
+                shown.append((node_id, section))
+    return shown
 
 
 def pack_header(context: str) -> str:
