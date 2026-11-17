@@ -547,9 +547,10 @@ class MemoryEmbeddingEngine:
                 ]
         vectors = index.vectors
         nonzero = [dim for dim, weight in enumerate(query_vector) if weight]
-        if 2 <= len(nonzero) * 4 <= dims:
+        if len(nonzero) >= 2 and len(nonzero) * 4 <= dims:
             # A hashed query sets a few dims; zero terms add nothing, so dot only those
-            # (~7x faster than a full 256-dim sumprod per row).
+            # (~7x faster than a full 256-dim sumprod per row). With one dim itemgetter
+            # returns a number, not a tuple, so a one-word query takes the full path.
             pick = itemgetter(*nonzero)
             weights = [query_vector[dim] for dim in nonzero]
             ranked = [

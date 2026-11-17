@@ -950,6 +950,21 @@ class MemorySearchQualityTests(unittest.TestCase):
         for (_, score), (_, want) in zip(found, expected, strict=True):
             self.assertAlmostEqual(score, want, places=9)
 
+    def test_single_token_query_scores_like_the_full_dot_product(self) -> None:
+        # A one-word prompt ("continue", "ledger") hashes to a single non-zero dim.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            for index in range(4):
+                service.add_memory({
+                    "project_id": "architectos", "label": f"Ledger rule {index}", "type": "Lesson", "scope": "project",
+                    "text": f"The ledger job {index} must batch its writes.",
+                })
+            engine = service.memory_embeddings
+            vector = engine._embed_query_cached("ledger")  # noqa: SLF001
+            found = engine.search_scored("ledger", project_id="architectos", limit=20, min_score=-1.0)
+        self.assertEqual(sum(1 for value in vector if value), 1)
+        self.assertGreaterEqual(len(found), 4)
+
     def test_vector_search_sees_rows_added_or_moved_after_the_first_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
