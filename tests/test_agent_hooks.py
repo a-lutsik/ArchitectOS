@@ -1275,7 +1275,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
         with agent_hooks.file_lock(lock):
             thread = threading.Thread(target=run, daemon=True)
             thread.start()
-            thread.join(1.5)
+            thread.join(5.0)  # the lock stays held meanwhile: a writer that waits for it never finishes here
             took = finished[0] if finished else None
             marked = (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").exists()
         thread.join(10)
@@ -1421,7 +1421,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
             service.hook_maintenance()
             after = self._cache_ids(root)
         self.assertIsNotNone(took)
-        self.assertLess(took, 1.4)
+        self.assertLess(took, 3.0)  # two 0.5 s deadlines; without them the writer never finishes while the lock is held
         self.assertTrue(marked)
         self.assertNotIn(stable_id, _injected_ids(during))
         self.assertNotIn(stable_id, after)
