@@ -388,16 +388,17 @@ class MemoryEmbeddingEngine:
         except Exception as exc:
             LOGGER.warning("memory embedding index failed for %s: %s", node.id, exc)
             return False
-        self.repository.upsert_memory_embedding(
+        if not self.repository.upsert_memory_embedding(
             node_id=node.id,
-            scope=node.scope,
-            project_id=node.project_id,
-            status=node.status,
+            label=node.label,
+            text=node.text,
             provider_id=str(getattr(self.provider, "provider_id", "hash")),
             model=str(getattr(self.provider, "model", "")),
             dimensions=len(vector),
             vector=vector,
-        )
+        ):
+            LOGGER.info("dropped stale embedding for %s: the node changed or was archived while it was embedded", node.id)
+            return False
         if invalidate:
             # Cheap path: patch the live in-RAM index instead of reloading every vector.
             if not self._update_vector_cache(

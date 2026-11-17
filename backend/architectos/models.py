@@ -112,6 +112,8 @@ class MemoryNode:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     schema_version: str = SCHEMA_VERSION
+    # Project that wrote a shared/global node (those carry no project_id); not part of the id.
+    author_project_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -134,7 +136,24 @@ class MemoryNode:
             created_at=str(data.get("created_at") or utc_now()),
             updated_at=str(data.get("updated_at") or utc_now()),
             schema_version=str(data.get("schema_version") or SCHEMA_VERSION),
+            author_project_id=data.get("author_project_id"),
         )
+
+
+def node_owner(node: MemoryNode) -> str | None:
+    """Project a node belongs to: its own project, else the project that wrote it (shared/global).
+
+    Legacy shared/global nodes written before authors were recorded belong to no project.
+    """
+    return node.project_id or node.author_project_id or None
+
+
+def owned_by(node: MemoryNode, caller_project_id: str | None) -> bool:
+    """Whether a write running under ``caller_project_id`` may change ``node``.
+
+    Without a caller project (UI, unbound server, internal maintenance) every node may change.
+    """
+    return caller_project_id is None or node_owner(node) == caller_project_id
 
 
 @dataclass(slots=True)

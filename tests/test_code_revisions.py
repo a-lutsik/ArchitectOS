@@ -4,6 +4,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.architectos.code_revision import (
     build_content_metadata,
@@ -378,6 +379,131 @@ class CodeRevisionIngestTests(unittest.TestCase):
             # Near-duplicate fact atoms without shared subject are skipped.
             self.assertEqual(prepared2, [])
             self.assertGreaterEqual(service.ingestion_engine.skipped_reviewed, 1)
+
+
+def _code_candidate(path: str, text: str, *, candidate_id: str = "") -> dict:
+    meta = build_content_metadata(text, ".py")
+    return {
+        "id": candidate_id or f"cand-{path}",
+        "project_id": "architectos",
+        "source_type": "code",
+        "source_ref": path,
+        "label": f"Code: {path}",
+        "type": "Artifact",
+        "scope": "project",
+        "text": f"Code file {path} structure:\n\n{text}",
+        "confidence": 0.7,
+        "metadata": {"path": path, "extension": ".py", "template": "generic", "source_text": text, **meta},
+    }
+
+
+class DecidedOriginRevisionTests(unittest.TestCase):
+    """Decided candidate without a live node: the hash decides skip vs re-queue."""
+
+    def _prepare_recording(self, service: ArchitectOSService, incoming: dict) -> tuple[list[dict], list[dict | bool | None]]:
+        """Prepare one candidate and record what the origin revision classifier decided.
+
+        False (identical to the decision) and None (sticky decided skip) both drop
+        the candidate, so only the classifier verdict tells them apart.
+        """
+        engine = service.ingestion_engine
+        classify = engine._classify_origin_revision
+        verdicts: list[dict | bool | None] = []
+
+        def record(*args: object, **kwargs: object) -> dict | bool | None:
+            verdict = classify(*args, **kwargs)
+            verdicts.append(verdict)
+            return verdict
+
+        with mock.patch.object(engine, "_classify_origin_revision", side_effect=record):
+            prepared = engine.prepare_candidates("architectos", [incoming], 1)
+        return prepared, verdicts
+
+    def _prepare_against(self, decided_status: str | None, incoming_text: str) -> tuple[list[dict], list[dict | bool | None]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            if decided_status:
+                decided = _code_candidate("auth.py", OLD_AUTH, candidate_id="cand-decided")
+                decided["status"] = decided_status
+                service.repository.upsert_memory_candidate(decided)
+            incoming = _code_candidate("auth.py", incoming_text, candidate_id="cand-incoming")
+            return self._prepare_recording(service, incoming)
+
+    def test_promoted_same_hash_is_skipped(self) -> None:
+        prepared, verdicts = self._prepare_against("promoted", OLD_AUTH)
+        self.assertEqual(prepared, [])
+        self.assertEqual(verdicts, [False])
+
+    def test_rejected_changed_hash_is_requeued(self) -> None:
+        prepared, verdicts = self._prepare_against("rejected", NEW_AUTH_LOGIC)
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(verdicts, [{}])
+        self.assertFalse(prepared[0]["metadata"].get("revision"))
+
+    def test_promoted_changed_hash_stays_sticky(self) -> None:
+        prepared, verdicts = self._prepare_against("promoted", NEW_AUTH_LOGIC)
+        self.assertEqual(prepared, [])
+        self.assertEqual(verdicts, [None])
+
+    def test_no_decided_candidate_is_queued(self) -> None:
+        prepared, verdicts = self._prepare_against(None, NEW_AUTH_LOGIC)
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(verdicts, [None])
+
+    def test_other_project_decision_does_not_apply(self) -> None:
+        # The incoming candidate's own project_id (missing or foreign) must not widen
+        # the decided lookup beyond the project being prepared.
+        for incoming_project in ("", "project_b"):
+            with self.subTest(incoming_project=incoming_project), tempfile.TemporaryDirectory() as tmp:
+                service = ArchitectOSService(Path(tmp))
+                foreign = _code_candidate("auth.py", OLD_AUTH, candidate_id="cand-foreign")
+                foreign["project_id"] = "project_b"
+                foreign["status"] = "promoted"
+                service.repository.upsert_memory_candidate(foreign)
+                incoming = _code_candidate("auth.py", OLD_AUTH, candidate_id="cand-incoming")
+                incoming["project_id"] = incoming_project
+                prepared, verdicts = self._prepare_recording(service, incoming)
+                self.assertEqual(len(prepared), 1)
+                self.assertEqual(verdicts, [None])
+
+    def test_last_decided_in_listing_order_wins(self) -> None:
+        # Listing is updated_at DESC and the last decided candidate with a hash wins,
+        # so the older rejected OLD_AUTH decision beats the newer promoted NEW_AUTH_LOGIC one.
+        cases = ((OLD_AUTH, False, 0), (NEW_AUTH_LOGIC, {}, 1))
+        for incoming_text, expected_verdict, expected_prepared in cases:
+            with self.subTest(expected_verdict=expected_verdict), tempfile.TemporaryDirectory() as tmp:
+                service = ArchitectOSService(Path(tmp))
+                decisions = (
+                    ("cand-old-rejected", OLD_AUTH, "rejected", "2026-01-01T00:00:00Z"),
+                    ("cand-new-promoted", NEW_AUTH_LOGIC, "promoted", "2026-01-02T00:00:00Z"),
+                )
+                for candidate_id, text, status, updated_at in decisions:
+                    decided = _code_candidate("auth.py", text, candidate_id=candidate_id)
+                    decided["status"] = status
+                    with mock.patch("backend.architectos.storage_candidates.utc_now", return_value=updated_at):
+                        service.repository.update_memory_candidate(decided)
+                incoming = _code_candidate("auth.py", incoming_text, candidate_id="cand-incoming")
+                prepared, verdicts = self._prepare_recording(service, incoming)
+                self.assertEqual(verdicts, [expected_verdict])
+                self.assertEqual(len(prepared), expected_prepared)
+
+
+class PrepareCandidatesListingCostTests(unittest.TestCase):
+    def test_candidate_listing_does_not_grow_with_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            batch = [
+                _code_candidate(f"pkg/module_{index}.py", f"def handler_{index}(value):\n    return value * {index}\n")
+                for index in range(200)
+            ]
+            with mock.patch.object(
+                service.repository,
+                "list_memory_candidates",
+                wraps=service.repository.list_memory_candidates,
+            ) as listing:
+                prepared = service.ingestion_engine.prepare_candidates("architectos", batch, 0)
+            self.assertEqual(len(prepared), 200)
+            self.assertLessEqual(listing.call_count, 3)
 
 
 if __name__ == "__main__":

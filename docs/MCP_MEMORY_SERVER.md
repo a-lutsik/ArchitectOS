@@ -88,6 +88,12 @@ Cursor / Codex / Claude folder without that file is unbound again and asks. An
 explicit `project_id` argument on a tool still overrides the bind. Env /
 `--project-id` still beats the file.
 
+Project isolation: a bound server only sees its own project's memory plus shared/global
+nodes; another project's node id answers like a nonexistent one, and writes never modify
+nodes the project does not own (the gate creates a linked copy or holds the write). An
+unbound server keeps the old unrestricted behaviour. Details:
+[PROJECT_ISOLATION_RU.md](PROJECT_ISOLATION_RU.md).
+
 Typical agent loop: if initialize `instructions` name a bound project id, call
 `memory_turn` at the start of every user message (pack + fact capture). If the folder
 is unbound, pick a project first — do not call `memory_turn` / `memory_search` /

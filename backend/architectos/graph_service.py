@@ -26,7 +26,7 @@ from .graph_autolinker import (
 )
 from .graph_code_service import GraphCodeServiceMixin
 from .graph_suggest_service import GraphSuggestServiceMixin
-from .models import stable_id, utc_now
+from .models import owned_by, stable_id, utc_now
 from .storage import like_prefilter_supported
 
 _LOG = logging.getLogger(__name__)
@@ -656,11 +656,12 @@ class GraphServiceMixin(GraphCodeServiceMixin, GraphSuggestServiceMixin):
         if not source_node or not target_node or hidden:
             raise ValueError("source and target must be durable memory nodes")
         edge_type = str(payload.get("type") or "RELATED_TO")
-        # A visible shared/global node of another project (or of none) may be linked, not rewritten.
-        if project_id and edge_type in _TARGET_MUTATING_EDGE_TYPES and target_node.project_id != project_id:
+        # A visible shared/global node another project wrote (or a legacy one without an
+        # author) may be linked, not rewritten; its author may supersede it.
+        if edge_type in _TARGET_MUTATING_EDGE_TYPES and not owned_by(target_node, project_id or None):
             _LOG.info(
-                "create_graph_edge refused %s %s -> %s: target project=%s, caller project=%s",
-                edge_type, source, target, target_node.project_id, project_id,
+                "create_graph_edge refused %s %s -> %s: target project=%s author=%s, caller project=%s",
+                edge_type, source, target, target_node.project_id, target_node.author_project_id, project_id,
             )
             raise ValueError(f"{edge_type} target must belong to project {project_id}")
         scope = str(payload.get("scope") or source_node.scope or target_node.scope or "project")

@@ -27,6 +27,8 @@ DEFAULT_EXCLUDES = {
     ".playwright-mcp", ".playwright", "playwright-report", "test-results",
     ".cache", ".venv", "venv", ".mypy_cache", ".ruff_cache", ".terraform",
     ".gradle-cache", ".egg-info",
+    # Nested git worktrees duplicate the project sources.
+    "worktrees",
 }
 # Files that are pure build/runtime artifacts: text-like enough to slip past the
 # binary sniff, but noise as memory (logs, lockfiles, sourcemaps, temp files).

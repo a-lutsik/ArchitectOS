@@ -841,21 +841,27 @@ class MemoryMCPServer:
         return _tool_result(summary, data)
 
     def _tool_add(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = self._write_project_id(args)
         node = self.service.add_memory_from_agent({
             "label": args.get("label"),
             "text": args.get("text"),
             "type": args.get("type") or "Lesson",
             "scope": args.get("scope") or "project",
-            "project_id": self._write_project_id(args),
+            "project_id": project_id,
             "confidence": args.get("confidence"),
             "source_id": args.get("source_id"),
             "source": "mcp",
-        })
+        }, caller_project_id=project_id)
         extras = [item for item in (node.get("also_created") or []) if item]
         dedup = dict(node.get("dedup") or {})
         action = str(dedup.get("action") or "")
         target = f'"{dedup.get("target_label") or ""}" (id {dedup.get("target_id") or ""})'
-        if node.get("dedup_merged") and action == "enrich":
+        if node.get("dedup_held"):
+            summary = (
+                f'Already in memory as [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}), '
+                "stored by another project; left unchanged, no new node."
+            )
+        elif node.get("dedup_merged") and action == "enrich":
             summary = (
                 f'Merged into existing [{node.get("type")}] "{node.get("label")}" (id {node.get("id")}); '
                 "its text was replaced by your fuller version, no new node."
@@ -876,7 +882,7 @@ class MemoryMCPServer:
                 summary += f' Possible {suggested} of id {dedup.get("near_id") or ""}; left for review.'
         if extras:
             summary += f" Split into {1 + len(extras)} fact(s)."
-        return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id"), "source_id": node.get("source_id"), "also_created": extras, "dedup": dedup})
+        return _tool_result(summary, {"id": node.get("id"), "label": node.get("label"), "type": node.get("type"), "scope": node.get("scope"), "project_id": node.get("project_id"), "source_id": node.get("source_id"), "also_created": extras, "dedup": dedup, "dedup_held": bool(node.get("dedup_held"))})
 
     def _tool_memory_compact(self, args: dict[str, Any]) -> dict[str, Any]:
         # Read-only preview: the bound project when there is one, else every project.
@@ -895,18 +901,20 @@ class MemoryMCPServer:
         raw_items: Any = args.get("items")
         if not isinstance(raw_items, list) or not raw_items:
             raise _RpcError(INVALID_PARAMS, "items must be a non-empty list")
+        project_id = self._write_project_id(args)
         result = self.service.add_memory_bulk({
             "items": raw_items,
-            "project_id": self._write_project_id(args),
+            "project_id": project_id,
             "scope": args.get("scope"),
             "source_id": args.get("source_id"),
             "type": args.get("type"),
             "source": "mcp",
-        })
+        }, caller_project_id=project_id)
         stats = result.get("stats") or {}
         summary = (
             f'Bulk stored {stats.get("created", 0)} memor(y/ies)'
             f' ({stats.get("deduplicated", 0)} deduplicated incl. {stats.get("enriched", 0)} enriched,'
+            f' {stats.get("held", 0)} already stored by another project,'
             f' {stats.get("superseded", 0)} superseding older values,'
             f' {stats.get("conflicts", 0)} conflicting, {stats.get("errors", 0)} error(s)).'
         )

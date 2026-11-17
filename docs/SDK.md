@@ -14,6 +14,12 @@ pack = mem.context("how do we ship?")
 mem.capture_turn("Remember: no secrets in git.", "Will redact before commit.")
 ```
 
+Pass `project_id` to `search`, `context`, `add` and `capture_turn` to work as that
+project: reads see only its own, project-less and shared/global nodes, and `add` never
+changes a node the project does not own (it creates a linked copy or holds an exact
+restatement). Without `project_id`, `add` writes to project `architectos` with the
+previous unrestricted behaviour. Rules: [PROJECT_ISOLATION_RU.md](PROJECT_ISOLATION_RU.md).
+
 CLI after `pip install -e .`:
 
 ```bash
