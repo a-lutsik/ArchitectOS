@@ -882,6 +882,22 @@ class HookFileLockTests(unittest.TestCase):
         levels = [record.levelname for record in logs.records]
         self.assertEqual(levels, ["WARNING", "DEBUG", "DEBUG", "WARNING"])
 
+    def test_the_hook_process_logs_an_unusable_lock_without_debug(self) -> None:
+        # The hook command never configures logging; this warning must still reach
+        # data/hooks.log, once per process, with debug logging off.
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp, "ARCHITECTOS_HOOK_DEBUG": ""}), \
+                mock.patch.object(agent_hooks, "_STANDALONE", True):
+            blocker = Path(tmp) / "blocked"
+            blocker.write_text("a file where the folder should be", encoding="utf-8")
+            for _ in range(2):
+                with agent_hooks.file_lock(blocker / "z.lock"):
+                    pass
+            log = Path(tmp) / "data" / "hooks.log"
+            lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        self.assertEqual(len(lines), 1)
+        self.assertIn("WARNING lock file unusable", lines[0])
+
     @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
     def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -201,8 +201,9 @@ def _debug_enabled() -> bool:
     return os.environ.get("ARCHITECTOS_HOOK_DEBUG", "").strip() in {"1", "true", "yes", "on"}
 
 
-def _debug(message: str, root: Path | None = None) -> None:
-    if not _debug_enabled():
+def _debug(message: str, root: Path | None = None, *, always: bool = False) -> None:
+    """Append a line to data/hooks.log: with ARCHITECTOS_HOOK_DEBUG, or ``always``."""
+    if not (always or _debug_enabled()):
         return
     try:
         path = (root or resolve_project_root()) / "data" / "hooks.log"
@@ -312,7 +313,10 @@ def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
             _log().debug("lock file still unusable, going on without it: %s (%s)", path.name, exc)
         else:
             _LOCK_WARNED.add(str(path))
-            _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
+            if _STANDALONE:  # nothing else would ever show it: hooks.log takes it even without debug
+                _debug(f"WARNING lock file unusable, going on without it: {path.name} ({exc})", always=True)
+            else:
+                _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
         if fd is not None:
             os.close(fd)
             fd = None
