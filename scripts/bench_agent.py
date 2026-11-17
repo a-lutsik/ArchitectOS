@@ -248,7 +248,7 @@ def bench_hooks_http(service: ArchitectOSService, root: Path, env: dict[str, str
 
 def bench_size(size: int, args: argparse.Namespace) -> dict[str, Any]:
     rng = random.Random(size)
-    with tempfile.TemporaryDirectory(prefix="architectos-bench-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="architectos-bench-", dir=args.work_dir) as tmp:
         root = Path(tmp)
         service = ArchitectOSService(root)
         print(f"[bench] {size} nodes: building corpus", file=sys.stderr, flush=True)
@@ -337,6 +337,12 @@ def main() -> None:
     parser.add_argument("--hook-runs", type=int, default=5, help="Subprocess runs per hook event and transport.")
     parser.add_argument("--out", default="-", help="JSON report path ('-' prints it after the table).")
     parser.add_argument(
+        "--work-dir",
+        default=None,
+        help="Parent folder of the throwaway corpus (default: the system temp folder). The store "
+        "of a real install lives in the project's data/, and on macOS the temp folder can be slower.",
+    )
+    parser.add_argument(
         "--real-provider",
         action="store_true",
         help="Use the embedding provider from ./.env.local and ./.env instead of hash; the corpus is embedded through it (network).",
@@ -363,6 +369,7 @@ def main() -> None:
             "embeddings": sorted({result["embeddings"] for result in results.values()}),
             "queries": args.queries,
             "hook_runs": args.hook_runs,
+            "work_dir": args.work_dir or tempfile.gettempdir(),
             "elapsed_s": round(time.perf_counter() - started, 1),
         },
         "sizes": results,
