@@ -61,6 +61,8 @@ _WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
 _ARTICLES = frozenset({"an", "the"})
 _NEGATION_CARRIERS = {"cannot": "can", "can't": "can", "won't": "will", "shan't": "shall", "нельзя": "можно"}
 _DO_WORDS = frozenset({"do", "does", "did"})
+_STATEMENT_NUMBER_RE = re.compile(r"[-+−]?\d+(?:[.,]\d+)*%?")
+_THOUSANDS_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
 # Short upper-case words are names, not filler: "Service A" vs "Service B", "БД", "UI".
 _SHORT_NAME_RE = re.compile(r"(?<!\w)[^\W\d_a-zа-яё]{1,2}(?!\w)")
 _NUMBER_RE = re.compile(r"^[-+−]?v?\d+(?:[.,:/\-]\d+)*[^\W\d_%°]*[%°]?$")
@@ -176,51 +178,67 @@ def _number_value(token: str) -> str:
     return token.lstrip("+").replace("−", "-").replace(",", ".").removeprefix("v")
 
 
-def statement_shape(statement: str) -> tuple[frozenset[str], tuple[str, ...], tuple[str, ...]]:
-    """Frame, template and values of one statement.
+def _statement_number(token: str) -> str:
+    """Value of a standalone number ("1,000" and "1000" are one value); "" for any other token."""
+    if not _STATEMENT_NUMBER_RE.fullmatch(token):
+        return ""
+    value = token.lstrip("+").replace("−", "-")
+    digits = value.lstrip("-").rstrip("%")
+    return value.replace(",", "") if _THOUSANDS_RE.fullmatch(digits) else value.replace(",", ".")
 
-    Every word counts, function words too ("after"/"before", "with"/"without");
-    only articles, numbers and negation markers are dropped, a marker together
-    with its carrier ("do not", "cannot" → "can", "нельзя" → "можно"). The frame
-    is the set of stemmed words, the template the same words in order with
-    numbers as "#", the values the numbers in order.
+
+def statement_shape(statement: str) -> tuple[frozenset[str], tuple[str, ...], tuple[str, ...], bool]:
+    """Frame, template, values and polarity of one statement.
+
+    Every whitespace token counts, function words too ("after"/"before",
+    "with"/"without"). A plain word is stemmed; articles and negation markers
+    are dropped, a marker together with its carrier ("do not", "cannot" → "can",
+    "hasn't" → "has", "нельзя" → "можно"), and any marker makes the statement
+    negated. A standalone number becomes "#" in the template and a value. Every
+    other token (identifiers, "p95", "TLS1.2", "<100ms", ">=", "not-null") is
+    kept whole. The frame is the set of tokens without numbers, the template
+    the tokens in order.
     """
     tokens: list[str] = []
     values: list[str] = []
+    negated = False
     # Whether the last token is a do-word: "not" right after it drops both.
     after_do = False
     for raw in statement.split():
-        ident = _identifier(raw)
-        if ident:
-            tokens.append(ident)
-            after_do = False
+        token = _identifier(raw) or normalize_fact_text(raw)
+        if not token:
             continue
-        token = normalize_fact_text(raw)
-        if token and _is_number(token):
+        value = _statement_number(token)
+        if value:
             tokens.append("#")
-            values.append(_number_value(token))
+            values.append(value)
             after_do = False
             continue
-        for word in _WORD_RE.findall(raw):
-            # Lower-case "a" only: "Service A" names a service.
-            if word == "a" or word.lower() in _ARTICLES:
-                continue
-            word = normalize_fact_text(word)
-            if word in _NEGATION_CARRIERS:
-                word = _NEGATION_CARRIERS[word]
-            elif word.endswith("n't"):
-                word = word[:-3]
-                if word in _DO_WORDS:
-                    after_do = False
-                    continue
-            elif word in NEGATION_WORDS:
-                if word == "not" and after_do:
-                    tokens.pop()
+        if not _WORD_RE.fullmatch(token):
+            tokens.append(token)
+            after_do = False
+            continue
+        # Lower-case "a" only: "Service A" names a service.
+        if raw.strip(_EDGE_PUNCTUATION) == "a" or token in _ARTICLES:
+            continue
+        if token in _NEGATION_CARRIERS:
+            negated = True
+            token = _NEGATION_CARRIERS[token]
+        elif token.endswith("n't"):
+            negated = True
+            token = token[:-3]
+            if token in _DO_WORDS:
                 after_do = False
                 continue
-            after_do = word in _DO_WORDS
-            tokens.append(stem(word))
-    return frozenset(tokens) - {"#"}, tuple(tokens), tuple(values)
+        elif token in NEGATION_WORDS:
+            negated = True
+            if token == "not" and after_do:
+                tokens.pop()
+            after_do = False
+            continue
+        after_do = token in _DO_WORDS
+        tokens.append(stem(token))
+    return frozenset(tokens) - {"#"}, tuple(tokens), tuple(values), negated
 
 
 def fact_features(label: str, text: str) -> FactFeatures:
@@ -228,13 +246,17 @@ def fact_features(label: str, text: str) -> FactFeatures:
 
     An atom (a text with a chat/MCP fact header) is its statement alone: the
     header is shared by every atom and the label is a truncated copy of the
-    statement ("window" → "windo", "12000" → "12"), so neither takes part.
+    statement ("window" → "windo", "12000" → "12"), so neither takes part. Its
+    numbers and polarity come from the same pass as its frame and template.
     """
     statement = atom_statement(text)
     if not statement:
         return _text_features(label, text)
-    frame, template, values = statement_shape(statement)
-    return replace(_text_features("", statement), label_core=frame, template=template, values=values)
+    frame, template, values, negated = statement_shape(statement)
+    return replace(
+        _text_features("", statement),
+        label_core=frame, numbers=frozenset(values), negated=negated, template=template, values=values,
+    )
 
 
 def _text_features(label: str, text: str) -> FactFeatures:
@@ -332,19 +354,22 @@ def features_from_json(raw: str) -> FactFeatures:
 def replacement_allowed(incoming_text: str, existing_text: str, *, same_turn: bool) -> bool:
     """Whether an incoming atom may retire a stored one it ``update``-s (SUPERSEDES).
 
-    Only one changed value of the same statement: equal templates (the same
-    words, order and identifiers), exactly one number on each side and it
-    changed, that number does not stand right after the first word, where it
-    names the item ("Stage 2", "Спринт 15"), and the facts come from different
-    turns. Whether the target is the writer's own active head is the caller's
+    Only one changed value of the same statement: the same polarity, equal
+    templates (the same words, order and identifiers), exactly one number on
+    each side and it changed, that number does not stand right after the first
+    word, where it names the item ("Stage 2", "Спринт 15"), and the facts come
+    from different turns. Whether the target is the writer's own active head is the caller's
     check. Both texts may carry the atom header.
     """
     if same_turn:
         return False
-    _, template, values = statement_shape(_strip_chat_fact_boilerplate(incoming_text))
-    _, existing_template, existing_values = statement_shape(_strip_chat_fact_boilerplate(existing_text))
+    _, template, values, negated = statement_shape(_strip_chat_fact_boilerplate(incoming_text))
+    _, existing_template, existing_values, existing_negated = statement_shape(
+        _strip_chat_fact_boilerplate(existing_text)
+    )
     return (
-        template == existing_template
+        negated == existing_negated
+        and template == existing_template
         and len(values) == len(existing_values) == 1
         and values != existing_values
         and template.index("#") != 1

@@ -91,6 +91,57 @@ class GateClassifierTests(unittest.TestCase):
         features = fact_features("Chat fact: not-null", f"{header}\n\nThe not-null constraint is enforced")
         self.assertIn("constraint", features.template)
 
+    def test_atom_tokens_with_digits_or_operators_stay_whole(self) -> None:
+        pairs = [
+            ("p95", "p99"), ("sha256", "sha512"), ("ipv4", "ipv6"), ("TLS1.2", "TLS1.3"), ("AES128", "AES256"),
+            ("utf8", "utf16"), ("python3.11", "python3.12"), ("x86", "x64"), ("k8s", "k3s"), ("1e6", "1e9"),
+            ("$5", "$10"), ("<100ms", "<200ms"), ("~75k", "~90k"), (">=3.11", "<=3.11"), ("#5", "#6"), ("x2", "x4"),
+            (">=", "<="), ("+", "-"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                verdict = self._compare_atoms(
+                    f"The release check compares {old} against the stored baseline",
+                    f"The release check compares {new} against the stored baseline",
+                )
+                self.assertEqual(verdict.action, "new")
+
+    def test_any_contracted_negation_flips_the_polarity(self) -> None:
+        for word in ("hasn't", "haven't", "hadn't", "couldn't", "wouldn't", "needn't", "couldn\u2019t"):
+            plain = word.replace("\u2019", "'").removesuffix("n't")
+            with self.subTest(word=word):
+                verdict = self._compare_atoms(f"The worker {plain} open the store", f"The worker {word} open the store")
+                self.assertEqual(verdict.action, "conflict")
+        self.assertEqual(
+            self._compare_atoms("The not-null constraint is enforced", "The not-null constraint is not enforced").action,
+            "conflict",
+        )
+
+    def test_thousands_separator_does_not_change_an_atom_number(self) -> None:
+        verdict = self._compare_atoms(
+            "The queue holds 1,000 messages per partition", "The queue holds 1000 messages per partition",
+        )
+        self.assertEqual(verdict.action, "duplicate")
+
+    def test_no_replacement_across_a_changed_token_or_polarity(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        cases = [
+            ("The p95 latency of the search API is 200 ms", "The p99 latency of the search API is 300 ms"),
+            ("The cluster has 3 nodes in every region", "The cluster hasn't 4 nodes in every region"),
+            ("Backups use AES128 and rotate keys every 30 days", "Backups use AES256 and rotate keys every 60 days"),
+            ("Search requests finish in <100ms for 5 regions", "Search requests finish in <200ms for 6 regions"),
+        ]
+        for old, new in cases:
+            with self.subTest(old=old, new=new):
+                self.assertFalse(
+                    memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False)
+                )
+        self.assertTrue(memory_dedup.replacement_allowed(
+            f"{header}\n\nThe p95 latency of the search API is 300 ms",
+            f"{header}\n\nThe p95 latency of the search API is 200 ms",
+            same_turn=False,
+        ))
+
     def test_atom_with_a_second_not_keeps_every_word(self) -> None:
         verdict = self._compare_atoms(
             "The app does not cache not-found responses", "The app does not log not-found responses",
@@ -174,6 +225,16 @@ class GateWritePathTests(unittest.TestCase):
             with self.subTest(fact=fact):
                 node = self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson")
                 self.assertEqual(node["dedup"]["action"], "new")
+
+    def test_atoms_that_differ_in_a_token_with_digits_are_both_written(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
+        written = []
+        for token in ("p95", "p99"):
+            fact = f"The {token} latency of the search API stays below the alert threshold"
+            written.append(self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson"))
+        self.assertFalse(written[1].get("dedup_merged"))
+        self.assertNotEqual(written[0]["id"], written[1]["id"])
+        self.assertEqual(written[1]["dedup"]["action"], "new")
 
     def _edges(self, source: str, target: str, edge_type: str) -> list[Any]:
         return [

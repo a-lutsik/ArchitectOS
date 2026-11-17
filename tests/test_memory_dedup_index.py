@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from backend.architectos import memory_dedup
 from backend.architectos.memory_dedup import (
     DEDUP_INDEX_VERSION,
     MemoryDedupGate,
@@ -100,6 +101,11 @@ class DedupIndexTests(unittest.TestCase):
                     conn.execute("UPDATE memory_dedup_index SET subject = ? WHERE node_id = ?", (subject, node_id))
                 if drop_stems:
                     conn.execute("DELETE FROM memory_dedup_stems WHERE node_id = ?", (node_id,))
+
+    @staticmethod
+    def _written_by_v1() -> Any:
+        """Index rows written while active, exactly as release v1 wrote them (features of label and text)."""
+        return mock.patch.multiple(memory_dedup, fact_features=memory_dedup._text_features, DEDUP_INDEX_VERSION=1)
 
     def _index_dump(self) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
         with self.repo._connect() as conn:
@@ -397,6 +403,21 @@ class DedupIndexTests(unittest.TestCase):
         for entry in reference:
             with self.subTest(label=entry["label"][:40], text=entry["text"][:40]):
                 self.assertEqual(features_to_json(fact_features(entry["label"], entry["text"])), entry["features"])
+
+    def test_compaction_after_the_pass_keeps_atoms_that_differ_in_tokens_with_digits(self) -> None:
+        pairs = [("p95", "p99"), ("AES128", "AES256"), ("k8s", "k3s"), ("x86", "x64"), ("ipv4", "ipv6")]
+        with self._written_by_v1():
+            ids = [
+                self._add_atom(f"The {token} setting of the search cluster is checked on every deploy")
+                for pair in pairs for token in pair
+            ]
+        self.assertEqual(self._row_versions(), {1})
+        self.service.rebuild_memory_dedup_index()
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        report = self.service.compact_memory({"project_id": "architectos", "dry_run": True})
+        self.assertEqual(report["would_merge"], 0)
+        self.service.run_scheduled_compaction()
+        self.assertEqual([self.repo.get_node(node_id).status for node_id in ids], ["active"] * len(ids))
 
     def test_manual_reindex_reports_indexed_nodes(self) -> None:
         node = self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})
