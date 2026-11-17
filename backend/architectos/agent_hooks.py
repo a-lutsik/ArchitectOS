@@ -322,7 +322,25 @@ class HookSession:
         return entry
 
     def project_for(self, cwd: str) -> str:
-        return str((self.state.get("cwd") or {}).get(cwd) or "")
+        """The project for ``cwd``: as the app resolved it in this session, else as it would.
+
+        A folder the session has not seen (the agent moved into a subfolder between
+        prompt and turn end) takes the cached roots and bind files the offline hook
+        uses, and failing those the nearest folder above it that the session saw.
+        """
+        known = self.state.get("cwd") or {}
+        if project := known.get(cwd):
+            return str(project)
+        if not cwd:
+            return ""
+        if project := cached_project_for(cwd, load_briefing_cache(self.path.parents[2])):
+            return project
+        folder = os.path.dirname(cwd)
+        while folder and folder != cwd:
+            if project := known.get(folder):
+                return str(project)
+            cwd, folder = folder, os.path.dirname(folder)
+        return ""
 
     def plan_prompt(self, cwd: str) -> tuple[bool, list[str]]:
         """(include the stable layer?, ids to exclude) for the next prompt in ``cwd``.

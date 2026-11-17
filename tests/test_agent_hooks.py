@@ -546,6 +546,41 @@ class HookCaptureOnStopTests(unittest.TestCase):
     def _captures(spy: mock.MagicMock) -> list[tuple[str, str]]:
         return [(call.args[0], call.args[1]) for call in spy.call_args_list if call.kwargs.get("capture", True)]
 
+    def _requests(self, root: Path, steps: list[tuple[str, Path, dict[str, str]]]) -> list[dict[str, object]]:
+        """POST bodies the hook sent for ``steps`` (raw event, cwd, fields) against a stub app."""
+        sent: list[dict[str, object]] = []
+
+        def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+            sent.append(json.loads(body or b"{}"))
+            return 200, json.dumps({"project_id": "architectos", "context": "", "hits": [], "stable": []}).encode("utf-8")
+
+        (root / "data").mkdir(exist_ok=True)
+        (root / "data" / "architectos.runtime.json").write_text(
+            json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+        )
+        with mock.patch.object(agent_hooks, "_exchange", side_effect=exchange):
+            for raw_event, cwd, fields in steps:
+                _hook(root, raw_event, cwd=cwd, session="s1", **fields)
+        return sent
+
+    @staticmethod
+    def _spooled(root: Path) -> list[tuple[str, str]]:
+        spool = root / "data" / "hook_spool.jsonl"
+        lines = spool.read_text(encoding="utf-8").splitlines() if spool.exists() else []
+        return [(json.loads(line)["user_text"], json.loads(line)["assistant_text"]) for line in lines]
+
+    def test_turn_end_pairs_the_question_after_the_agent_changed_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "packages" / "billing"
+            nested.mkdir(parents=True)
+            sent = self._requests(root, [
+                ("UserPromptSubmit", root, {"prompt": self.PROMPT}),
+                ("Stop", nested, {"last_assistant_message": self.ANSWER}),
+            ])
+        captures = [(item["user_text"], item["assistant_text"]) for item in sent if item.get("capture")]
+        self.assertEqual(captures, [(self.PROMPT, self.ANSWER)])
+
     def test_turn_end_spools_the_turn_when_the_app_answers_with_an_error(self) -> None:
         # The question leaves the session file before the send; an app error (500 from
         # "database is locked", a cut reply) must not lose the turn.
