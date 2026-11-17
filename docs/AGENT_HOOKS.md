@@ -194,17 +194,28 @@ store, so an event costs a few milliseconds instead of a service cold start:
   injected; a prompt that gets the stable layer from the app re-checks and renews
   the cached stable lines. Writers of the cache (the app, MCP servers) and the
   hooks of one session take a lock file first (`flock` on POSIX, a one-byte
-  `msvcrt` lock on Windows, given up after 10 s there). A memory the cache does
-  not hold costs its write one read of the cached ids and no lock; a writer that
-  just cached lines re-checks them against the store once the file is replaced.
-  When a changed cached memory cannot be evicted (the lock stays held past
-  0.25 s, a deletion or maintenance waits past 0.5 s, or Windows will not replace
-  the file), the process leaves `data/briefing_cache.json.dirty`. While it (or its
-  `.claimed` form, held by a writer re-checking the cache) exists, the offline
-  hook injects no cached lines and `hooks status` reports `dirty`; the next locked
-  write re-checks every cached line and removes it only after writing the result.
+  `msvcrt` lock on Windows, given up after 1.5 s there, and not waited for again by
+  that process). The cache keeps one invariant: any state of the file that may hold
+  a line older than its last re-check against the store reads as dirty, that is,
+  `data/briefing_cache.json.dirty` or its `.claimed` form exists.
+  - A memory the cache does not hold costs its write one read of the cached ids
+    and no lock. A writer that caches fresh lines creates the `.claimed` marker
+    before it replaces the file, re-checks those lines against the store and
+    removes the marker only once the result is written; a writer that dies in
+    between leaves the cache dirty, and the next write re-checks it whole.
+  - When a changed cached memory cannot be evicted (the lock stays held past
+    0.25 s, a deletion or maintenance waits past 0.5 s, or Windows will not
+    replace the file), the process leaves `.dirty`. The next locked write claims
+    it (renames it to `.claimed`), re-checks every cached line and removes it after
+    writing the result. While `.dirty` waits, a later change to a cached memory
+    tries the lock once without waiting, so an MCP server alone heals the cache.
+  - The offline hook looks for the markers before and after it reads the cache and
+    checks that the file it read is still the one in place; a dirty cache injects
+    no cached lines, and `hooks status` reports `dirty`.
+
   A lock file the hook cannot use is reported in `data/hooks.log` even without
-  `ARCHITECTOS_HOOK_DEBUG`.
+  `ARCHITECTOS_HOOK_DEBUG`, at most once a day per lock file
+  (`data/hooks_warned.json`).
 - **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
   the project resolved for the folder. The app replays the spool through
   `capture_memory_turn` into each record's own project when it starts and once a
