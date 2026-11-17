@@ -266,6 +266,7 @@ class StorageSessionsMixin:
             clean_payload["security_redacted"] = True
         with self._connect() as conn:
             conn.execute("INSERT OR REPLACE INTO settings(key, payload, updated_at) VALUES (?, ?, ?)", (key, json.dumps(clean_payload, sort_keys=True), utc_now()))
+        self._settings_writes += 1
         self._settings_memo.pop(key, None)
         return clean_payload
 
@@ -273,20 +274,22 @@ class StorageSessionsMixin:
         """A setting's payload, a fresh object per call.
 
         A memory turn reads the same few settings about ten times, and each read
-        opens a connection; reads are memoized for SETTINGS_MEMO_TTL_S. A write in
-        this process drops its key at once, a write from another process (the MCP
-        server) shows up within the TTL. Reads inside transaction() are not
-        memoized, since that transaction may still roll back.
+        opens a connection; reads are memoized for SETTINGS_MEMO_TTL_S. A committed
+        write in this process drops its key at once, and a read that raced any write
+        here is not memoized; a write from another process (the MCP server), or one
+        still inside another thread's open transaction(), shows up within the TTL.
+        Reads inside transaction() are not memoized, since it may still roll back.
         """
         memo = self._settings_memo.get(key)
         now = time.monotonic()
         if memo is not None and now - memo[0] < SETTINGS_MEMO_TTL_S:
             raw = memo[1]
         else:
+            writes = self._settings_writes
             with self._connect() as conn:
                 row = conn.execute("SELECT payload FROM settings WHERE key = ?", (key,)).fetchone()
             raw = row["payload"] if row else None
-            if getattr(self._local, "transaction_connection", None) is None:
+            if getattr(self._local, "transaction_connection", None) is None and writes == self._settings_writes:
                 self._settings_memo[key] = (now, raw)
         return json.loads(raw) if raw is not None else None
 

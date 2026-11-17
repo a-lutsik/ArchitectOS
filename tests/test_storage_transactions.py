@@ -5,7 +5,10 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from backend.architectos.memory_ingestion import FINGERPRINT_VERSION, candidate_fingerprint
@@ -150,6 +153,36 @@ class StorageTransactionTests(unittest.TestCase):
             self.assertEqual(repository.get_setting("agent"), {"hook_char_budget": 2000})
             with mock.patch("backend.architectos.storage_sessions.time.monotonic", return_value=time.monotonic() + 2.0):
                 self.assertEqual(repository.get_setting("agent"), {"hook_char_budget": 2400})
+
+    def test_a_read_racing_a_write_does_not_memoize_the_old_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SQLiteMemoryRepository(Path(tmp))
+            repository.set_setting("agent", {"hook_char_budget": 1600})
+            real_connect = repository._connect  # noqa: SLF001
+            raced: list[bool] = []
+
+            @contextmanager
+            def racing_connect() -> Iterator[Any]:
+                with real_connect() as conn:
+                    if raced:
+                        yield conn
+                        return
+
+                    class Racing:
+                        def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+                            row = conn.execute(sql, params).fetchone()
+                            raced.append(True)
+                            # Another thread commits a new value after this SELECT, before its memo.
+                            repository.set_setting("agent", {"hook_char_budget": 2000})
+                            return mock.Mock(fetchone=mock.Mock(return_value=row))
+
+                    yield Racing()
+
+            with mock.patch.object(repository, "_connect", racing_connect):
+                stale = repository.get_setting("agent")
+            fresh = repository.get_setting("agent")
+        self.assertEqual(stale, {"hook_char_budget": 1600})
+        self.assertEqual(fresh, {"hook_char_budget": 2000})
 
     def test_setting_read_inside_a_rolled_back_transaction_is_not_memoized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
