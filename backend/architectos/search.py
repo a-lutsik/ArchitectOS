@@ -40,6 +40,8 @@ SOURCE_TRUST = {
 DEFAULT_CONTEXT_CHAR_BUDGET = 6000
 # pack_memory_context never packs below this many characters (its header alone is ~420).
 MIN_CONTEXT_CHAR_BUDGET = 1200
+# A search hit carries at most this much of its node's text.
+SEARCH_HIT_TEXT_CHARS = 1200
 DEFAULT_NODE_TEXT_CHARS = 700
 RRF_K = 60.0
 RRF_SCALE = 2400.0
@@ -494,8 +496,13 @@ def pack_memory_context(
     node_text_chars: int = DEFAULT_NODE_TEXT_CHARS,
     tools_available: bool = True,
     stable_hits: list[dict[str, Any]] | None = None,
+    rendered: dict[str, tuple[str, str]] | None = None,
 ) -> str:
-    """Build a budgeted, cited memory pack: stable layer, then query hits."""
+    """Build a budgeted, cited memory pack: stable layer, then query hits.
+
+    ``rendered``, when given, receives node id -> (section, line) for every memory
+    line the pack holds, section being "stable" or "hits", in pack order.
+    """
     lines = [
         "ArchitectOS Memory Context",
         f"Project: {project_id or 'all'}",
@@ -539,7 +546,7 @@ def pack_memory_context(
         else:
             query_section.append(hit)
 
-    def _append_section(title: str, section_hits: list[dict[str, Any]]) -> None:
+    def _append_section(title: str, section_hits: list[dict[str, Any]], key: str) -> None:
         nonlocal used
         if not section_hits or used >= budget:
             return
@@ -578,15 +585,19 @@ def pack_memory_context(
                     return
                 line = line[:remaining].rstrip() + "…"
                 lines.append(line)
+                if rendered is not None:
+                    rendered[str(node.get("id") or "")] = (key, line)
                 used = budget
                 return
             lines.append(line)
+            if rendered is not None:
+                rendered[str(node.get("id") or "")] = (key, line)
             used += len(line) + 1
             if bag:
                 selected_bags.append(bag)
 
-    _append_section("Stable memory (pinned / constraints / long-term):", stable_section)
-    _append_section("Retrieved for this query:", query_section)
+    _append_section("Stable memory (pinned / constraints / long-term):", stable_section, "stable")
+    _append_section("Retrieved for this query:", query_section, "hits")
     if not stable_section and not query_section:
         lines.append("")
         lines.append("Retrieved for this query:")

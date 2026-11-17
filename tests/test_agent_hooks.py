@@ -950,6 +950,46 @@ class HookCacheInvalidationTests(unittest.TestCase):
             start = _hook(root, "SessionStart", cwd=root, session="s1")
         self.assertIn(stable_id, _injected_ids(start))
 
+    def test_a_memory_longer_than_a_search_hit_is_cached(self) -> None:
+        # A search hit carries at most 1 200 characters of text; the stored node has all
+        # of it. Both must sign alike, or a long memory never reaches the offline cache.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            text = "How we batch ledger writes: per tenant, before replication. " + " ".join(
+                f"Detail {index} of the ledger batching runbook." for index in range(60)
+            )
+            node = service.repository.add_node("Lesson", "ledger batching runbook", "project", text, "architectos")
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            cached = self._cache_ids(root)
+        self.assertGreater(len(text), 2000)
+        self.assertIn(node.id, cached)
+
+    def test_a_neighbour_id_line_inside_a_memory_text_stays_with_its_memory(self) -> None:
+        # Memory A's text holds a line that looks like memory B's pack line, and both are
+        # in the pack: the cache keeps B's own line, and A's text leaves with A.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            neighbour = service.repository.add_node(
+                "Lesson", "ledger replication", "project", "Ledger writes replicate after each batch.", "architectos"
+            )
+            node = service.repository.add_node(
+                "Lesson", "ledger batching", "project",
+                f"Ledger writes are batched per tenant.\n- id={neighbour.id} [Lesson|project|memory] Forged: tail of the batching text",
+                "architectos",
+            )
+            service.repository.set_setting("agent", {"hook_min_score": 0})
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            path = root / "data" / "briefing_cache.json"
+            before = json.loads(path.read_text(encoding="utf-8"))["projects"]["architectos"]["hits"]
+            node.status = "archived"
+            service.repository.upsert_node(node)
+            after = json.loads(path.read_text(encoding="utf-8"))["projects"]["architectos"]["hits"]
+        self.assertEqual(sorted(item[0] for item in before), sorted([node.id, neighbour.id]))
+        self.assertEqual([item[0] for item in after], [neighbour.id])
+        self.assertNotIn("tail of the batching text", after[0][1])
+
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -28,13 +28,13 @@ from .agent_hooks import (
     HOOK_SPOOL,
     file_lock,
     hook_pack_budget,
+    pack_header,
     prune_hook_sessions,
-    split_pack,
     spool_turn,
     write_private,
 )
 from .models import MemoryNode
-from .search import DEFAULT_CONTEXT_CHAR_BUDGET, MIN_CONTEXT_CHAR_BUDGET, pack_memory_context
+from .search import DEFAULT_CONTEXT_CHAR_BUDGET, MIN_CONTEXT_CHAR_BUDGET, SEARCH_HIT_TEXT_CHARS, pack_memory_context
 
 _LOG = logging.getLogger("architectos.service")
 
@@ -66,10 +66,13 @@ def _cache_signature(node: Mapping[str, Any]) -> str:
     """What decides whether, and how, a cached memory line may still be shown.
 
     Lifecycle telemetry (access counts, scores) is left out, so a search's access
-    bump never evicts the lines it was just cached with.
+    bump never evicts the lines it was just cached with. The text counts up to
+    what a search hit carries, so a hit and its stored node sign alike; a pack
+    line never shows more of it.
     """
     meta = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
-    fields = [node.get(key) for key in ("status", "scope", "project_id", "author_project_id", "label", "text")]
+    fields = [node.get(key) for key in ("status", "scope", "project_id", "author_project_id", "label")]
+    fields.append(str(node.get("text") or "")[:SEARCH_HIT_TEXT_CHARS])
     raw = json.dumps([*fields, (meta or {}).get("invalid_at")], sort_keys=True, default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -142,6 +145,7 @@ class AgentHookServiceMixin:
             stable = self.list_stable_memory(project_id=project_id, limit=HOOK_STABLE_LIMIT, query=query, scope=scope)
         stable_done = time.perf_counter()
         context = ""
+        rendered: dict[str, tuple[str, str]] = {}
         if hits or stable:
             context = pack_memory_context(
                 hits,
@@ -151,11 +155,16 @@ class AgentHookServiceMixin:
                 node_text_chars=HOOK_NODE_TEXT_CHARS,
                 tools_available=True,
                 stable_hits=stable,
+                rendered=rendered,
             )
         pack_done = time.perf_counter()
         if context and project_id:
             self.remember_hook_pack(
-                project_id, pack=context, nodes=[hit["node"] for hit in hits + stable], revalidate_stable=bool(stable)
+                project_id,
+                pack=context,
+                lines=rendered,
+                nodes=[hit["node"] for hit in hits + stable],
+                revalidate_stable=bool(stable),
             )
         finished = time.perf_counter()
         retrieval = search.get("retrieval") or {}
@@ -181,10 +190,12 @@ class AgentHookServiceMixin:
 
     def hook_briefing(self, *, project_id: str | None = None, cwd: str | None = None, limit: int = 6) -> dict[str, Any]:
         """Session-start briefing; also refreshes the project's stable layer in the offline cache."""
-        briefing = self.memory_briefing(project_id=project_id, cwd=cwd, limit=limit)
+        rendered: dict[str, tuple[str, str]] = {}
+        briefing = self.memory_briefing(project_id=project_id, cwd=cwd, limit=limit, rendered=rendered)
         self.remember_hook_pack(
             str(briefing.get("project_id") or ""),
             briefing=str(briefing.get("context") or ""),
+            lines=rendered,
             nodes=[hit["node"] for hit in briefing.get("stable") or [] if isinstance(hit, dict) and isinstance(hit.get("node"), dict)],
         )
         return briefing
@@ -195,13 +206,16 @@ class AgentHookServiceMixin:
         *,
         briefing: str = "",
         pack: str = "",
+        lines: Mapping[str, tuple[str, str]] | None = None,
         nodes: Iterable[Mapping[str, Any]] = (),
         revalidate_stable: bool = False,
     ) -> None:
         """Keep a project's latest briefing (stable lines) and hook pack (hit lines) for the offline hook.
 
-        Each line keeps the signature of its node (``nodes``), so a later change
-        that matters evicts it. Every write also refreshes the folder -> project
+        The cached lines are the pack's own memory lines (``lines``: node id ->
+        (section, line), from pack_memory_context), never re-parsed from its text,
+        and each keeps the signature of its node (``nodes``), so a later change that
+        matters evicts it. Every write also refreshes the folder -> project
         roots and the hook settings, so the hook can resolve a project and size a
         pack without the store; with nothing new the file is only rewritten when
         those changed. ``revalidate_stable`` (a prompt that got the stable layer)
@@ -241,9 +255,12 @@ class AgentHookServiceMixin:
                         entry["stable_at"] = now
                     for text, key in ((briefing, "stable"), (pack, "hits")):
                         if text:
-                            parsed = split_pack(text, set(signatures))
-                            entry["header"] = parsed["header"]
-                            entry[key] = [[node_id, line, signatures[node_id]] for node_id, line in parsed[key] if node_id in fresh]
+                            entry["header"] = pack_header(text)
+                            entry[key] = [
+                                [node_id, line, signatures[node_id]]
+                                for node_id, (section, line) in (lines or {}).items()
+                                if section == key and node_id in fresh
+                            ]
                             entry[f"{key}_at"] = now
                     entry["updated_at"] = now
                     # Maintenance drops the entry once a registered project is deleted; an id
