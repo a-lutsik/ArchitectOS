@@ -36,33 +36,38 @@ if TYPE_CHECKING:
     import logging
 
 _LOGGER: logging.Logger | None = None
+# Set by the hook command: this interpreter runs one agent event and exits.
+_STANDALONE = False
 
 
-def _log() -> logging.Logger:
-    """The hook's logger, created on first use.
+class _HookLog:
+    """Log lines of a standalone hook process.
 
-    Every agent turn starts a new interpreter and a turn that injects normally
-    logs nothing, so importing logging up front would cost each turn ~10 ms.
-    The hook runs inside the agent's process tree: it stays off stderr unless
-    ARCHITECTOS_HOOK_DEBUG sends its lines (counts only) to data/hooks.log.
+    Nothing configures logging there, so through ``logging`` these lines would
+    reach only a NullHandler while every agent turn paid its ~10 ms import. With
+    ARCHITECTOS_HOOK_DEBUG they join data/hooks.log (counts only), otherwise they
+    are dropped, as before.
     """
+
+    def info(self, message: str, *args: object) -> None:
+        _debug(f"INFO {message % args}")
+
+    def warning(self, message: str, *args: object) -> None:
+        _debug(f"WARNING {message % args}")
+
+
+def _log() -> logging.Logger | _HookLog:
+    """The hook's logger: the module logger inside the app, a plain hooks.log writer in the hook command."""
     global _LOGGER
+    if _STANDALONE:
+        return _HookLog()
     if _LOGGER is None:
         import logging
 
         _LOGGER = logging.getLogger(__name__)
         _LOGGER.addHandler(logging.NullHandler())
-        if _debug_enabled():
-            try:
-                path = resolve_project_root() / "data" / "hooks.log"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                handler = logging.FileHandler(path, encoding="utf-8")
-            except OSError:
-                return _LOGGER
-            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            _LOGGER.addHandler(handler)
-            _LOGGER.setLevel(logging.INFO)
     return _LOGGER
+
 
 CLIENTS: tuple[str, ...] = ("cursor", "claude", "codex")
 
@@ -1101,6 +1106,8 @@ def _capture_argv(argv: list[str]) -> tuple[str, str | None] | None:
 
 
 def _capture(client: str, event: str | None) -> int:
+    global _STANDALONE
+    _STANDALONE = True
     try:
         raw = sys.stdin.read()
     except (OSError, ValueError):

@@ -1113,10 +1113,30 @@ class HookTimingLogTests(unittest.TestCase):
         assert match is not None, lines
         self.assertEqual(match["transport"], "http")
 
+    # Every agent event starts a fresh interpreter: argparse (with the shutil, bz2
+    # and lzma its help formatter pulls in), logging and the idna codec cost each
+    # turn ~25 ms, and the hook process needs none of them.
+    HOOK_PROCESS = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(agent_hooks.__file__).resolve().parents[1])!r})\n"
+        "from architectos.agent_hooks import main\n"
+        "main(['capture', '--client', 'claude', '--event', 'prompt'])\n"
+        "print()\n"
+        "print(sorted(n for n in ('argparse', 'logging', 'shutil', 'encodings.idna') if n in sys.modules))\n"
+    )
+
+    def _hook_process(self, root: str, *, offline: str) -> tuple[str, str, str]:
+        """(stdout, modules the hook loaded, hooks.log) of one prompt event run as the hook command."""
+        env = {**os.environ, "ARCHITECTOS_ROOT": root, "ARCHITECTOS_HOOK_DEBUG": "1", "ARCHITECTOS_HOOK_OFFLINE": offline}
+        proc = subprocess.run(
+            [sys.executable, "-c", self.HOOK_PROCESS],
+            input=json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": self.PROMPT, "cwd": root}),
+            capture_output=True, text=True, env=env, check=True, timeout=60,
+        )
+        out, modules = proc.stdout.rsplit("\n", 2)[:2]
+        return out, modules, (Path(root) / "data" / "hooks.log").read_text(encoding="utf-8")
+
     def test_injecting_prompt_turn_loads_no_cli_or_logging_modules(self) -> None:
-        # Every agent event starts a fresh interpreter: argparse (with the shutil,
-        # bz2 and lzma its help formatter pulls in), logging and the idna codec cost
-        # each turn ~25 ms, and a prompt turn that injects normally needs none of them.
         pack = {"context": "- id=node_a [Decision] Hooks talk to the app over a socket.", "hits": [{"id": "node_a"}]}
         listener = socket.create_server(("127.0.0.1", 0))
 
@@ -1132,14 +1152,6 @@ class HookTimingLogTests(unittest.TestCase):
                     body += conn.recv(65536)
                 conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n" + json.dumps(pack).encode("utf-8"))
 
-        script = (
-            "import sys\n"
-            f"sys.path.insert(0, {str(Path(agent_hooks.__file__).resolve().parents[1])!r})\n"
-            "from architectos.agent_hooks import main\n"
-            "main(['capture', '--client', 'claude', '--event', 'prompt'])\n"
-            "print()\n"
-            "print(sorted(n for n in ('argparse', 'logging', 'shutil', 'encodings.idna') if n in sys.modules))\n"
-        )
         thread = threading.Thread(target=reply, daemon=True)
         thread.start()
         with tempfile.TemporaryDirectory() as tmp, listener:
@@ -1147,17 +1159,20 @@ class HookTimingLogTests(unittest.TestCase):
             (Path(tmp) / "data" / "architectos.runtime.json").write_text(
                 json.dumps({"url": f"http://127.0.0.1:{listener.getsockname()[1]}", "auth_token": "token"}), encoding="utf-8"
             )
-            env = {**os.environ, "ARCHITECTOS_ROOT": tmp, "ARCHITECTOS_HOOK_DEBUG": "1", "ARCHITECTOS_HOOK_OFFLINE": "0"}
-            proc = subprocess.run(
-                [sys.executable, "-c", script],
-                input=json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": self.PROMPT, "cwd": tmp}),
-                capture_output=True, text=True, env=env, check=True, timeout=60,
-            )
+            out, modules, log = self._hook_process(tmp, offline="0")
             thread.join(timeout=5)
-            log = (Path(tmp) / "data" / "hooks.log").read_text(encoding="utf-8")
-        out, modules = proc.stdout.rsplit("\n", 2)[:2]
         self.assertIn("Hooks talk to the app", json.loads(out)["hookSpecificOutput"]["additionalContext"])
         self.assertIn("transport=http", log)
+        self.assertEqual(modules, "[]")
+
+    def test_offline_turn_logs_to_the_debug_file_without_logging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out, modules, log = self._hook_process(tmp, offline="1")
+        self.assertEqual(out, "")
+        self.assertIn(" INFO offline hook: kind=prompt project=- cached=False", log)
+        self.assertIn(" INFO injection skipped: kind=prompt transport=offline", log)
+        self.assertIn("transport=offline", log)
+        self.assertNotIn(self.PROMPT, log)
         self.assertEqual(modules, "[]")
 
     def test_debug_log_stays_off_by_default(self) -> None:
