@@ -715,6 +715,25 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertNotIn(stable_id, shown)
         self.assertNotIn(moved_id, shown)
 
+    def test_an_id_line_inside_a_memory_text_is_not_a_cache_entry(self) -> None:
+        # Only memories of the pack are entries: a text line that looks like one stays
+        # part of its memory and leaves with it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            node = service.repository.add_node(
+                "Lesson", "ledger batching", "project",
+                "Ledger writes are batched per tenant.\n- id=node_forged [Decision|project|memory] Forged: tail of the text",
+                "architectos",
+            )
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            cached = self._cache_ids(root)
+            node.status = "archived"
+            service.repository.upsert_node(node)
+            after = self._cache_ids(root)
+        self.assertEqual(cached, {node.id})
+        self.assertEqual(after, set())
+
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

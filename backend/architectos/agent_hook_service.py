@@ -239,7 +239,7 @@ class AgentHookServiceMixin:
                     entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
                     for text, key in ((briefing, "stable"), (pack, "hits")):
                         if text:
-                            parsed = split_pack(text)
+                            parsed = split_pack(text, set(signatures))
                             entry["header"] = parsed["header"]
                             entry[key] = [[node_id, line, signatures.get(node_id, "")] for node_id, line in parsed[key]]
                             entry[f"{key}_at"] = now

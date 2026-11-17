@@ -615,8 +615,12 @@ _PACK_TAIL_STARTS = ("Open Tasks:", "Enabled Providers:", "Known Boards IDs from
 _PACK_MARKERS = ("- …[context budget reached]", "- (no memory hits)")
 
 
-def split_pack(context: str) -> dict[str, Any]:
-    """A rendered pack as ``{header, stable: [[id, line]], hits: [[id, line]]}``."""
+def split_pack(context: str, ids: set[str] | None = None) -> dict[str, Any]:
+    """A rendered pack as ``{header, stable: [[id, line]], hits: [[id, line]]}``.
+
+    With ``ids`` only those memories start an entry: a line of a memory's text
+    that merely looks like "- id=..." stays part of that memory.
+    """
     header: list[str] = []
     sections: dict[str, list[list[str]]] = {"stable": [], "hits": []}
     current: str | None = None
@@ -629,7 +633,7 @@ def split_pack(context: str) -> dict[str, Any]:
             header.append(line)
         elif current not in sections:
             continue
-        elif match := _INJECTED_ID.match(line):
+        elif (match := _INJECTED_ID.match(line)) and (ids is None or match.group(1) in ids):
             entry = [match.group(1), line]
             sections[current].append(entry)
         elif stripped.startswith(_PACK_TAIL_STARTS) or stripped in _PACK_MARKERS:
