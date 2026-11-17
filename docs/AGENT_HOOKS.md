@@ -277,3 +277,27 @@ Silence means the turn was captured but there was nothing worth injecting yet.
 Run it a second time on a related question and the stored memory comes back as
 `additionalContext`. Facts that landed in review appear in the app under memory candidates with the
 **MCP** chip.
+
+## Follow-ups
+
+Known gaps of the offline briefing cache, left for later work:
+
+- **Commit → eviction window.** A changed memory leaves the cache only when its
+  listener runs, after the commit and after the listeners registered before it; in
+  an MCP server an inline embedding can delay that by 20–60 s, and the offline hook
+  may inject the memory meanwhile. A hard delete has the same gap: it removes the
+  rows, then the evidence files, and only then the cached lines
+  (`memory_wipe_service._hard_delete_memory`).
+- **Lock warning log.** `_warn_daily` keys its once-a-day warning by lock file, and
+  each session has its own session lock file, so a lasting problem still adds a
+  line per session; `data/hooks_warned.json` is never pruned and is not written
+  atomically.
+- **Healing without the app.** An MCP server clears a waiting `.dirty` marker only
+  when it changes a cached memory; with only uncached writes and the app closed,
+  the offline hook stays silent until the app starts.
+- **Not verified on a real Windows machine:** that `os.fstat` of the open cache
+  file and `os.stat` of its path give the same (inode, size, mtime) in
+  `load_clean_briefing_cache`; the worst-case time of a turn end whose session lock
+  is unusable (1.5 s plus the capture timeout); and a process running without the
+  cache lock (an unusable lock file) renaming or removing another writer's
+  `.claimed` marker.
