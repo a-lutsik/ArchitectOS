@@ -1548,29 +1548,39 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertTrue(ran)
         self.assertNotIn(stable_id, _injected_ids(out))
 
+    def _offline_hook_racing_its_read(self, root: Path, *, heal: bool) -> tuple[str, list[str]]:
+        """(archived id, ids the offline hook injected) when, right after the hook's own read of
+        the stale file, its listener marks it and (``heal``) the app re-checks and unmarks it."""
+        service, stable_id = self._deferred_eviction(root)
+        (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").unlink()  # the archive is not marked yet
+        real_load, real_read = agent_hooks.load_clean_briefing_cache, agent_hooks._read_briefing_cache  # noqa: SLF001
+        armed: list[int] = []
+
+        def load(where: Path) -> tuple[dict[str, Any], bool]:
+            armed.append(1)
+            return real_load(where)
+
+        def read(where: Path) -> tuple[dict[str, Any], Any]:
+            result = real_read(where)
+            if len(armed) == 1:
+                armed.append(2)  # once: right after the offline hook's own read
+                service._mark_hook_cache_dirty()  # noqa: SLF001
+                if heal:
+                    service.hook_maintenance()
+            return result
+
+        with mock.patch.object(agent_hooks, "load_clean_briefing_cache", side_effect=load), \
+                mock.patch.object(agent_hooks, "_read_briefing_cache", side_effect=read):
+            out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+        self.assertEqual(len(armed), 2)
+        return stable_id, _injected_ids(out)
+
     def test_the_offline_hook_rereads_a_cache_replaced_while_it_read(self) -> None:
-        # The re-check ends between the hook's read and its second look at the marker:
-        # the marker is gone, but the file the hook read is not the file there now.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            service, stable_id = self._deferred_eviction(root)
-            (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").unlink()  # the archive is not marked yet
-            real = agent_hooks.briefing_cache_dirty
-            looks: list[bool] = []
-
-            def look(where: Path) -> bool:
-                if len(looks) == 1:  # the hook has read the stale file; now its listener marks it
-                    service._mark_hook_cache_dirty()  # noqa: SLF001
-                    service.hook_maintenance()  # and the app claims, re-checks, writes, unmarks
-                looks.append(real(where))
-                return looks[-1]
-
-            with mock.patch.object(agent_hooks, "briefing_cache_dirty", side_effect=look), \
-                    mock.patch.object(agent_hooks, "_read_briefing_cache", wraps=agent_hooks._read_briefing_cache) as reads:  # noqa: SLF001
-                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
-        self.assertGreaterEqual(reads.call_count, 2)  # the replaced file was read again, and was clean
-        self.assertTrue(_injected_ids(out))
-        self.assertNotIn(stable_id, _injected_ids(out))
+        # Either way the copy the hook read before the mark must not be injected.
+        for heal in (False, True):
+            with self.subTest(app_rechecks_meanwhile=heal), tempfile.TemporaryDirectory() as tmp:
+                stable_id, injected = self._offline_hook_racing_its_read(Path(tmp), heal=heal)
+                self.assertNotIn(stable_id, injected)
 
     def test_a_dirty_cache_heals_without_the_app_when_a_cached_memory_changes(self) -> None:
         # The app is closed and an MCP server writes memory: it never runs maintenance
@@ -1650,6 +1660,137 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertFalse({stable_id, other} & set(_injected_ids(during)))
         self.assertFalse({stable_id, other} & after)
         self.assertEqual(left, [])
+
+    # -- The dirty-cache invariant, at each side effect of a cache writer -------------------
+    # Any state of the cache file that may hold a line older than its last re-check reads
+    # as dirty (docs/AGENT_HOOKS.md). The writer is killed (BaseException: no except
+    # Exception, only finally blocks run) right after one named side effect; then the
+    # offline reader must see the cache dirty or find no stale line in it, and after the
+    # app restarts the cache holds neither a stale line nor a marker.
+
+    def _stale_lines(self, root: Path) -> set[str]:
+        """Cached memories whose line no longer matches the store."""
+        try:
+            cache = json.loads((root / "data" / agent_hooks.BRIEFING_CACHE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        rows = [(str(item[0]), str(item[2]) if len(item) > 2 else "")
+                for entry in (cache.get("projects") or {}).values() for key in ("stable", "hits") for item in entry.get(key) or []]
+        store = ArchitectOSService(root).repository
+        current = {node.id: agent_hook_service._cache_signature(node.to_dict()) for node in store.list_nodes_by_ids([row[0] for row in rows])}  # noqa: SLF001
+        return {node_id for node_id, signature in rows if current.get(node_id) != signature}
+
+    def _writer_shape(self, root: Path, shape: str) -> tuple[Any, Any]:
+        """(run, race) for one writer: race(text) runs as the first cache scratch file is written."""
+        if shape == "pack":  # a hook turn caches fresh lines; another process archives one meanwhile
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 6)
+            other = ArchitectOSService(root)
+
+            def race(text: str) -> None:
+                racer = threading.Thread(target=self._archive, args=(other, json.loads(text)["projects"]["architectos"]["hits"][0][0]))
+                racer.start()
+                racer.join(5)
+
+            return lambda: service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False), race
+        _, stable_id = self._deferred_eviction(root)  # an archived line whose eviction waits behind .dirty
+        if shape in ("left", "left_listener"):  # a writer died after its first replace instead
+            marker = root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty"
+            marker.rename(marker.with_name(agent_hooks.BRIEFING_CACHE_DIRTY_CLAIMED))
+        other = sorted(node_id for node_id in self._cache_ids(root) if node_id != stable_id)[0]
+        if shape == "left":
+            return ArchitectOSService(root).hook_maintenance, None
+        mcp = ArchitectOSService(root)  # heal / left_listener: an MCP server changes a cached memory
+        return lambda: self._archive(mcp, other), None
+
+    def _kill_writer_at(self, root: Path, shape: str, step: str | None, occurrence: int = 1) -> bool:
+        """Run ``shape``'s writer and kill it right after the ``occurrence``-th ``step``; True when it was killed."""
+        run, race = self._writer_shape(root, shape)
+        seen: dict[str, int] = {}
+
+        def after(name: str) -> None:
+            seen[name] = seen.get(name, 0) + 1
+            if name == step and seen[name] == occurrence:
+                raise _Killed(name)
+
+        real_write, real_replace = agent_hook_service.write_private, agent_hook_service.replace_file
+        real_open, real_unlink = os.open, os.unlink
+        real_recheck = agent_hook_service.AgentHookServiceMixin._revalidate_hook_cache  # noqa: SLF001
+        raced: list[int] = []
+
+        def write(path: Path, text: str, *, append: bool = False) -> None:
+            if race and not raced and agent_hooks.BRIEFING_CACHE in path.name:
+                raced.append(1)
+                race(text)
+            real_write(path, text, append=append)
+
+        def replace(source: Path, target: Path) -> None:
+            real_replace(source, target)
+            after(f"replace {target.name}")
+
+        def open_(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
+            fd = real_open(path, flags, mode, **kwargs)
+            if ".dirty" in Path(path).name:
+                os.close(fd)
+                after(f"create {Path(path).name}")
+                fd = real_open(path, os.O_RDONLY)
+            return fd
+
+        def unlink(path: Any, **kwargs: Any) -> None:
+            real_unlink(path, **kwargs)
+            if ".dirty" in Path(path).name:
+                after(f"unlink {Path(path).name}")
+
+        def recheck(service: Any, cache: dict[str, Any], only: set[str] | None = None) -> int:
+            after("re-check read")
+            return real_recheck(service, cache, only)
+
+        killed = False
+        with mock.patch.object(agent_hook_service, "write_private", write), \
+                mock.patch.object(agent_hook_service, "replace_file", replace), \
+                mock.patch.object(agent_hook_service.os, "open", open_), \
+                mock.patch.object(agent_hook_service.os, "unlink", unlink), \
+                mock.patch.object(agent_hook_service.AgentHookServiceMixin, "_revalidate_hook_cache", recheck):
+            try:
+                run()
+            except _Killed:
+                killed = True
+        return killed
+
+    def test_every_kill_point_of_a_cache_writer_keeps_the_dirty_invariant(self) -> None:
+        cache, claimed = agent_hooks.BRIEFING_CACHE, agent_hooks.BRIEFING_CACHE_DIRTY_CLAIMED
+        points: list[tuple[str, str | None, int]] = [
+            ("pack", f"create {claimed}", 1),
+            ("pack", f"replace {cache}", 1),  # fresh lines on disk, not re-checked yet
+            ("pack", "re-check read", 1),
+            ("pack", f"replace {cache}", 2),
+            ("pack", f"unlink {claimed}", 1),
+            ("pack", None, 0),
+            ("heal", f"replace {claimed}", 1),  # .dirty claimed
+            ("heal", f"replace {cache}", 1),
+            ("heal", f"unlink {claimed}", 1),
+            ("heal", None, 0),
+            ("left", f"unlink {claimed}", 1),
+            ("left", None, 0),
+            ("left_listener", f"unlink {claimed}", 1),
+            ("left_listener", None, 0),
+        ]
+        for shape, step, occurrence in points:
+            with self.subTest(shape=shape, step=step, occurrence=occurrence), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+                root = Path(tmp)
+                killed = self._kill_writer_at(root, shape, step, occurrence)
+                _, dirty = agent_hooks.load_clean_briefing_cache(root)
+                stale = self._stale_lines(root)
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+                ArchitectOSService(root).hook_maintenance()  # the app starts again
+                stale_after = self._stale_lines(root)
+                markers_after = sorted(path.name for path in (root / "data").glob(f"{cache}.dirty*"))
+                self.assertEqual(killed, step is not None, "the kill point was not reached")
+                self.assertTrue(dirty or not stale, f"stale lines {sorted(stale)} in a cache that reads clean")
+                self.assertFalse(stale & set(_injected_ids(out)))
+                self.assertEqual(stale_after, set())
+                self.assertEqual(markers_after, [])
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
