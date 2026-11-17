@@ -67,7 +67,14 @@ HITS_TITLE = "Retrieved for this query:"
 
 def stats(values: list[float]) -> dict[str, float]:
     ordered = sorted(values)
-    return {"p50": nearest_rank(ordered, 0.5), "p95": nearest_rank(ordered, 0.95), "mean": round(statistics.mean(values), 1) if values else 0.0}
+    return {
+        "p50": nearest_rank(ordered, 0.5),
+        "p95": nearest_rank(ordered, 0.95),
+        "p99": nearest_rank(ordered, 0.99),
+        "max": round(ordered[-1], 1) if ordered else 0.0,
+        "mean": round(statistics.mean(values), 1) if values else 0.0,
+        "runs": len(values),
+    }
 
 
 def build_corpus(service: ArchitectOSService, size: int, rng: random.Random) -> float:
