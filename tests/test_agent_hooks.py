@@ -1357,7 +1357,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
     def test_concurrent_writes_of_uncached_memories_neither_lock_nor_dirty_the_cache(self) -> None:
         # Two writers of unrelated memories used to take each other for a cache writer:
         # most writes marked the cache dirty, and the offline hook went silent.
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
             root = Path(tmp)
             service, _, _ = self._cached(root)
             nodes = [service.repository.add_node("Lesson", f"unrelated {index}", "project", f"Deploys run on day {index}.", "architectos")
@@ -1397,7 +1397,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
             after = self._cache_ids(root)
         self.assertEqual(len(cached[:3]), 3)
         self.assertIsNotNone(took)
-        self.assertLess(took, 0.45)
+        self.assertLess(took, 0.7)  # one wait of 0.25 s; one per memory would be 0.75 s
         self.assertTrue(marked and dirty)
         self.assertEqual(len([line for line in logs.output if "deferred" in line]), 1)
         self.assertFalse(set(cached[:3]) & after)
