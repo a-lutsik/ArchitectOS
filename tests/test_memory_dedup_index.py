@@ -53,6 +53,15 @@ STALE_ROW_CASES = (
     ("negation en", "We use Redis for the session cache", "We do not use Redis for the session cache", None),
     ("negation ru", "Мы используем Redis для кэша сессий", "Мы не используем Redis для кэша сессий", None),
 )
+# What 801f8d2 (index version 2) stored for one atom: "p95" split to "p" in the frame and template.
+V2_ATOM_FACT = "The p95 latency of the search API stays below the alert threshold"
+V2_ATOM_FEATURES = (
+    '{"identifiers": [], "key": ["", "the p95 latency of the search api stays below the alert threshold"], '
+    '"label_core": ["alert", "api", "below", "latency", "of", "p", "search", "stay", "threshold"], "negated": false, '
+    '"numbers": [], "stems": ["alert", "api", "below", "latency", "p95", "search", "stay", "threshold"], '
+    '"template": ["p", "latency", "of", "search", "api", "stay", "below", "alert", "threshold"], "values": []}'
+)
+V2_ATOM_SUBJECT = "c404adec1ab48fcf5ebd"
 FEATURES_V1_REFERENCE = Path(__file__).parent / "data" / "dedup_features_v1.jsonl"
 
 
@@ -592,6 +601,17 @@ class DedupIndexTests(unittest.TestCase):
         self.service.run_scheduled_compaction()
         self.assertEqual([self.repo.get_node(node_id).status for node_id in swapped], ["active", "active"])
         self.assertEqual(sorted(self.repo.get_node(node_id).status == "active" for node_id in verbatim), [False, True])
+
+    def test_atom_row_written_by_index_version_2_is_recomputed(self) -> None:
+        node_id = self._add_atom(V2_ATOM_FACT)
+        with self.repo._connect() as conn:
+            conn.execute(
+                "UPDATE memory_dedup_index SET version = 2, features = ?, subject = ? WHERE node_id = ?",
+                (V2_ATOM_FEATURES, V2_ATOM_SUBJECT, node_id),
+            )
+        self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
 
     def test_manual_reindex_reports_indexed_nodes(self) -> None:
         node = self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})

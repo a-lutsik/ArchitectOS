@@ -315,7 +315,7 @@ def incoming_features(label: str, text: str) -> FactFeatures:
 # Bump when fact_features / the serialized format changes: the app's background
 # pass (``refresh_dedup_index``) brings rows of an older version up to date, and
 # until then the index readers compute their features on the fly.
-DEDUP_INDEX_VERSION = 2
+DEDUP_INDEX_VERSION = 3
 
 
 def source_hash(label: str, text: str) -> str:
