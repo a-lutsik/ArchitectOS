@@ -322,9 +322,12 @@ class AgentHookServiceMixin:
         """Cached memory id -> the signatures its lines were cached with, re-read when the file changes."""
         path = Path(self.project_root) / "data" / BRIEFING_CACHE
         try:
-            stamp = path.stat().st_mtime_ns
+            stat = path.stat()
         except OSError:
             return {}
+        # A coarse clock gives two writes one mtime; each write replaces the file
+        # (a new inode) and its size usually moves too.
+        stamp = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
         memo = getattr(self, "_hook_cache_memo", None)
         if memo is not None and memo[0] == stamp:
             return memo[1]

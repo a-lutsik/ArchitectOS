@@ -1022,6 +1022,29 @@ class HookCacheInvalidationTests(unittest.TestCase):
             cached = self._cache_ids(root)
         self.assertNotIn(archived, cached)
 
+    def test_cache_index_follows_a_rewrite_within_one_clock_tick(self) -> None:
+        # On a file system with coarse timestamps two writes share an mtime; the
+        # index must still see the second one.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            path = root / "data" / "briefing_cache.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            def write(node_id: str, stamp: int) -> None:
+                scratch = path.with_suffix(".next")
+                scratch.write_text(json.dumps({"projects": {"architectos": {"hits": [[node_id, "- line", "sig"]]}}}), encoding="utf-8")
+                os.replace(scratch, path)
+                os.utime(path, ns=(stamp, stamp))
+
+            stamp = time.time_ns()
+            write("node_first", stamp)
+            first = set(service._hook_cache_index())  # noqa: SLF001
+            write("node_second_longer", stamp)
+            second = set(service._hook_cache_index())  # noqa: SLF001
+        self.assertEqual(first, {"node_first"})
+        self.assertEqual(second, {"node_second_longer"})
+
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
