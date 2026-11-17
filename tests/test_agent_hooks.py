@@ -1058,7 +1058,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
             with agent_hooks.file_lock(path.with_name(f"{agent_hooks.BRIEFING_CACHE}.lock")):
                 thread = threading.Thread(target=write, daemon=True)
                 thread.start()
-                blocked = not done.wait(0.5)
+                blocked = not done.wait(0.25)  # within the writer's wait for the lock
                 written_while_held = path.exists()
             thread.join(timeout=10)
             written = path.exists()
@@ -1261,6 +1261,30 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertTrue(marked and dirty)
         self.assertEqual(len([line for line in logs.output if "deferred" in line]), 1)
         self.assertFalse(set(cached[:3]) & after)
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_stuck_cache_lock_neither_hangs_a_turn_nor_loses_a_deletion(self) -> None:
+        # Cache writers (every hook turn, deletions, maintenance) used to wait for the
+        # lock without limit while holding the thread lock: a stuck holder hung the
+        # app's hook turns. They give up after a short wait; a deletion that could not
+        # be written marks the cache dirty instead of being lost.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            with service.repository._connect() as conn:  # noqa: SLF001 - a hard delete
+                conn.execute("DELETE FROM memory_nodes WHERE id = ?", (stable_id,))
+            took, marked = self._write_while_the_cache_lock_is_held(root, lambda: (
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False),
+                service.forget_hook_memories([stable_id]),
+            ))
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 1.4)
+        self.assertTrue(marked)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer

@@ -64,6 +64,8 @@ HOOK_CACHE_TTL_HOURS = 24
 # How long the upsert listener, after commit, waits for the cache lock to evict a cached
 # memory before it marks the cache dirty instead.
 HOOK_CACHE_LOCK_WAIT_S = 0.25
+# How long a cache writer (a hook turn's pack, a deletion, maintenance) waits for the lock.
+HOOK_CACHE_WRITE_WAIT_S = 0.5
 
 _CACHE_LOCK = threading.Lock()
 _SPOOL_LOCK = threading.Lock()
@@ -462,10 +464,22 @@ class AgentHookServiceMixin:
         """Read, ``change`` and rewrite data/briefing_cache.json; ``change`` returns False to skip the write.
 
         Serialized across threads and, through a lock file, across processes.
+        The locks are waited for at most HOOK_CACHE_WRITE_WAIT_S (a stuck holder
+        must not hang the app's hook turns), then TimeoutError: a pack is then just
+        not cached, an eviction marks the cache dirty (_evict_hook_cache).
         ``recheck``: see _rewrite_briefing_cache.
         """
-        with _CACHE_LOCK, file_lock(self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")):
-            self._rewrite_briefing_cache(change, recheck=recheck)
+        started = time.monotonic()
+        if not _CACHE_LOCK.acquire(timeout=HOOK_CACHE_WRITE_WAIT_S):
+            raise TimeoutError(f"briefing cache lock held in this process past {HOOK_CACHE_WRITE_WAIT_S}s")
+        try:
+            lock = self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")
+            with file_lock(lock, wait=max(0.0, HOOK_CACHE_WRITE_WAIT_S - (time.monotonic() - started))) as held:
+                if not held:
+                    raise TimeoutError(f"briefing cache lock held by another process past {HOOK_CACHE_WRITE_WAIT_S}s")
+                self._rewrite_briefing_cache(change, recheck=recheck)
+        finally:
+            _CACHE_LOCK.release()
 
     def _briefing_cache_path(self) -> Path:
         return Path(self.project_root) / "data" / BRIEFING_CACHE
