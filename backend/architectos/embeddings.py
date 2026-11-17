@@ -9,6 +9,7 @@ import threading
 import time
 from collections import OrderedDict
 from hashlib import sha1
+from operator import itemgetter
 from typing import Any
 
 from .embedding_providers import (
@@ -177,7 +178,7 @@ def node_embedding_text(node: MemoryNode) -> str:
 class _VectorIndex:
     """In-RAM cosine index. Prefer a float32 matrix when numpy is available."""
 
-    __slots__ = ("node_ids", "scopes", "projects", "dims", "matrix", "vectors")
+    __slots__ = ("node_ids", "scopes", "projects", "dims", "matrix", "vectors", "visible")
 
     def __init__(
         self,
@@ -195,6 +196,9 @@ class _VectorIndex:
         self.dims = dims
         self.matrix = matrix
         self.vectors = vectors or []
+        # (project_id, scope) -> positions a search with that filter may see; rows never
+        # change scope or project inside one index, so each filter is evaluated once.
+        self.visible: dict[tuple[str | None, str | None], list[int]] = {}
 
     def __len__(self) -> int:
         return len(self.node_ids)
@@ -527,20 +531,36 @@ class MemoryEmbeddingEngine:
             order = np.argsort(-cand_scores)
             return [(index.node_ids[int(cand[i])], float(cand_scores[i])) for i in order]
 
-        # Pure-Python fallback (no numpy).
+        # Pure-Python fallback (no numpy). Every vector has the index's dims (the loader
+        # drops the rest). The scan holds the GIL, which stalls the FTS query running
+        # beside it, so it stays a tight comprehension over the cached visible rows;
+        # math.sumprod does each dot product in C.
         q_norm = math.sqrt(sum(v * v for v in query_vector)) or 1.0
-        ranked: list[tuple[str, float]] = []
-        for node_id, node_scope, node_project, vector in zip(
-            index.node_ids, index.scopes, index.projects, index.vectors, strict=True
-        ):
-            if len(vector) != dims:
-                continue
-            if not self._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope):
-                continue
-            # math.sumprod runs the dot product in C: ~4x the generator on a 15k x 256 scan.
-            score = math.sumprod(query_vector, vector) / q_norm
-            if score >= threshold:
-                ranked.append((node_id, float(score)))
+        visible = index.visible.get((project_id, scope))
+        if visible is None:
+            visible = index.visible[(project_id, scope)] = [
+                position
+                for position, (node_scope, node_project) in enumerate(zip(index.scopes, index.projects, strict=True))
+                if self._passes_scope_filter(node_scope, node_project, project_id=project_id, scope=scope)
+            ]
+        vectors = index.vectors
+        nonzero = [dim for dim, weight in enumerate(query_vector) if weight]
+        if 2 <= len(nonzero) * 4 <= dims:
+            # A hashed query sets a few dims; zero terms add nothing, so dot only those
+            # (~7x faster than a full 256-dim sumprod per row).
+            pick = itemgetter(*nonzero)
+            weights = [query_vector[dim] for dim in nonzero]
+            ranked = [
+                (index.node_ids[position], score)
+                for position in visible
+                if (score := math.sumprod(weights, pick(vectors[position])) / q_norm) >= threshold
+            ]
+        else:
+            ranked = [
+                (index.node_ids[position], score)
+                for position in visible
+                if (score := math.sumprod(query_vector, vectors[position]) / q_norm) >= threshold
+            ]
         ranked.sort(key=lambda item: item[1], reverse=True)
         return ranked[:limit]
 

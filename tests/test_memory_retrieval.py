@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import tempfile
 import threading
 import unittest
@@ -920,6 +921,34 @@ class MemorySearchQualityTests(unittest.TestCase):
                 [(node_id, round(score, 6)) for node_id, score in incremental],
                 [(node_id, round(score, 6)) for node_id, score in reloaded],
             )
+
+    def test_sparse_query_vector_scan_matches_the_full_dot_product(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            for index, topic in enumerate(("session expiry", "token rotation", "billing export", "audit trail") * 3):
+                service.add_memory({
+                    "project_id": "architectos",
+                    "label": f"Rule {index}: {topic}",
+                    "type": "Lesson",
+                    "scope": "project",
+                    "text": f"The {topic} job {index} must batch its writes and retry on timeout.",
+                })
+            engine = service.memory_embeddings
+            query = "session token expiry"
+            found = engine.search_scored(query, project_id="architectos", limit=20, min_score=-1.0)
+            vector = engine._embed_query_cached(query)  # noqa: SLF001 - the vector the search used
+            index = engine._vector_cache  # noqa: SLF001
+            norm = math.sqrt(sum(value * value for value in vector))
+            expected = sorted(
+                ((node_id, cosine(vector, list(row)) / norm) for node_id, row in zip(index.node_ids, index.vectors)),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        self.assertLessEqual(sum(1 for value in vector if value) * 4, len(vector), "hash query exercises the sparse path")
+        self.assertGreaterEqual(len(found), 12)
+        self.assertEqual([node_id for node_id, _ in found], [node_id for node_id, _ in expected])
+        for (_, score), (_, want) in zip(found, expected):
+            self.assertAlmostEqual(score, want, places=9)
 
 
 class MemoryAsyncIndexingTests(unittest.TestCase):
