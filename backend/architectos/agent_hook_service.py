@@ -291,18 +291,19 @@ class AgentHookServiceMixin:
     def _forget_changed_hook_node(self, node: MemoryNode) -> None:
         """Upsert listener: a cached memory whose status, scope, project or text changed leaves the cache.
 
-        Runs in every process that writes memory (the app, each MCP server). The
-        ids the cache holds are re-read only when the file changed, so a write that
-        touches no cached memory costs one stat.
+        Runs in every process that writes memory (the app, each MCP server). It
+        decides under the cache lock: read without it, the file could be one a
+        writer is about to replace with a line for this very node. The ids the cache
+        holds are re-read only when the file changed, so a write that touches no
+        cached memory costs the lock and one stat.
         """
         try:
-            cached = self._hook_cache_index().get(node.id)
-            if cached is None:
-                return
             signature = _cache_signature(node.to_dict())
-            if cached == {signature}:
-                return
-            self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set())
+            with _CACHE_LOCK, file_lock(self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")):
+                cached = self._hook_cache_index().get(node.id)
+                if cached is None or cached == {signature}:
+                    return
+                self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set(), locked=True)
         except Exception as exc:  # noqa: BLE001 - a listener must never break the write
             _LOG.warning("briefing cache not pruned for node %s: %s", node.id, exc)
 
@@ -340,8 +341,11 @@ class AgentHookServiceMixin:
         self._hook_cache_memo = (stamp, index)
         return index
 
-    def _evict_hook_cache(self, evict: Callable[[str, str], bool], projects: set[str]) -> None:
-        """Remove the cached lines ``evict(node_id, signature)`` picks, and the entries of ``projects``."""
+    def _evict_hook_cache(self, evict: Callable[[str, str], bool], projects: set[str], *, locked: bool = False) -> None:
+        """Remove the cached lines ``evict(node_id, signature)`` picks, and the entries of ``projects``.
+
+        ``locked``: the caller already holds the cache locks.
+        """
         removed = {"lines": 0, "projects": 0}
 
         def change(cache: dict[str, Any]) -> bool:
@@ -363,7 +367,7 @@ class AgentHookServiceMixin:
                     entry[key] = kept
             return bool(removed["lines"] or removed["projects"])
 
-        self._update_briefing_cache(change)
+        (self._rewrite_briefing_cache if locked else self._update_briefing_cache)(change)
         if removed["lines"] or removed["projects"]:
             _LOG.info("briefing cache pruned: lines=%s projects=%s", removed["lines"], removed["projects"])
 
@@ -372,19 +376,26 @@ class AgentHookServiceMixin:
 
         Serialized across threads and, through a lock file, across processes.
         """
-        path = Path(self.project_root) / "data" / BRIEFING_CACHE
-        with _CACHE_LOCK, file_lock(path.with_name(f"{BRIEFING_CACHE}.lock")):
-            try:
-                cache = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                cache = {}
-            cache = cache if isinstance(cache, dict) else {}
-            if not change(cache):
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            scratch = path.with_name(f"{BRIEFING_CACHE}.{os.getpid()}.tmp")
-            write_private(scratch, json.dumps(cache, ensure_ascii=False))
-            os.replace(scratch, path)
+        with _CACHE_LOCK, file_lock(self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")):
+            self._rewrite_briefing_cache(change)
+
+    def _briefing_cache_path(self) -> Path:
+        return Path(self.project_root) / "data" / BRIEFING_CACHE
+
+    def _rewrite_briefing_cache(self, change: Callable[[dict[str, Any]], bool]) -> None:
+        """The body of _update_briefing_cache, for a caller that holds its locks."""
+        path = self._briefing_cache_path()
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+        cache = cache if isinstance(cache, dict) else {}
+        if not change(cache):
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        scratch = path.with_name(f"{BRIEFING_CACHE}.{os.getpid()}.tmp")
+        write_private(scratch, json.dumps(cache, ensure_ascii=False))
+        os.replace(scratch, path)
 
     @staticmethod
     def _hook_project_roots(projects: Iterable[Any]) -> dict[str, str]:

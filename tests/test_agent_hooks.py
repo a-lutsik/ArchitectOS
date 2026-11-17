@@ -990,6 +990,38 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertEqual([item[0] for item in after], [neighbour.id])
         self.assertNotIn("tail of the batching text", after[0][1])
 
+    def test_an_archive_while_the_cache_file_is_written_is_not_lost(self) -> None:
+        # Another writer archives a hit while this turn is writing the cache file: its
+        # listener must not decide from the file as it was before this write.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            ids = _seed(service, "architectos", 6)
+            other = ArchitectOSService(root)
+            real_write = agent_hook_service.write_private
+            racers: list[threading.Thread] = []
+
+            def archive(node_id: str) -> None:
+                node = other.repository.get_node(node_id)
+                assert node is not None
+                node.status = "archived"
+                other.repository.upsert_node(node)
+
+            def write_while_archiving(path: Path, text: str, *, append: bool = False) -> None:
+                if not racers and "briefing_cache" in path.name:
+                    cached = [item[0] for item in json.loads(text)["projects"]["architectos"]["hits"]]
+                    racers.append(threading.Thread(target=archive, args=(cached[0],), daemon=True))
+                    racers[0].start()
+                    racers[0].join(0.5)  # its listener runs now, unless it has to wait for this write
+                real_write(path, text, append=append)
+
+            with mock.patch.object(agent_hook_service, "write_private", side_effect=write_while_archiving):
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            racers[0].join(10)
+            archived = next(node_id for node_id in ids if (other.repository.get_node(node_id) or service.repository.get_node(node_id)).status == "archived")
+            cached = self._cache_ids(root)
+        self.assertNotIn(archived, cached)
+
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
