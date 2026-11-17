@@ -861,25 +861,34 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
     DEDUP_REFRESH_INTERVAL_SECONDS = 3600.0
 
     def rebuild_memory_dedup_index(self) -> dict[str, Any]:
-        """Bring dedup index rows of an older feature version up to date (manual reindex).
+        """Bring the dedup index up to date, batch by batch (manual reindex).
 
-        The same batched pass the app runs at start and hourly, so a manual
+        The same pass the app runs at start and hourly: rows of an older feature
+        version first, then rows for active nodes that have none. A manual
         reindex never holds the write lock for the whole index.
         """
         started = time.monotonic()
-        totals = {"recomputed": 0, "stamped": 0, "locked": 0}
-        while True:
-            result = self.repository.refresh_dedup_index()
-            totals = {key: totals[key] + int(result[key]) for key in totals}
-            if result["locked"] or not result["remaining"]:
+        totals = {"recomputed": 0, "stamped": 0, "added": 0, "locked": 0}
+        for batch in (self.repository.refresh_dedup_index, self.repository.index_missing_dedup_rows):
+            cursor = 0
+            while True:
+                result = batch(after_rowid=cursor)
+                for key, value in result.items():
+                    if key in totals:
+                        totals[key] += int(value)
+                if result["locked"] or not result["remaining"]:
+                    break
+                cursor = result["cursor"]
+                time.sleep(self.DEDUP_REFRESH_PAUSE_SECONDS)
+            if totals["locked"]:
                 break
-            time.sleep(self.DEDUP_REFRESH_PAUSE_SECONDS)
+        status = self.repository.dedup_index_status()
         _LOG.info(
-            "dedup index refresh done · recomputed=%s stamped=%s locked=%s remaining=%s indexed=%s duration=%.2fs",
-            totals["recomputed"], totals["stamped"], totals["locked"], result["remaining"], result["indexed"],
-            time.monotonic() - started,
+            "dedup index refresh done · recomputed=%s stamped=%s added=%s locked=%s remaining=%s indexed=%s duration=%.2fs",
+            totals["recomputed"], totals["stamped"], totals["added"], totals["locked"], status["remaining"],
+            status["indexed"], time.monotonic() - started,
         )
-        return {**totals, "remaining": result["remaining"], "indexed": result["indexed"]}
+        return {**totals, **status}
 
     def _dedup_refresh_loop(self) -> None:
         """App-only background pass over outdated dedup index rows: at start, then hourly."""

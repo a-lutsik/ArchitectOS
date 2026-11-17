@@ -12,10 +12,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from backend.architectos import memory_dedup
+from backend.architectos import memory_dedup, storage_dedup
 from backend.architectos.memory_dedup import (
     DEDUP_INDEX_VERSION,
     MemoryDedupGate,
@@ -480,6 +481,100 @@ class DedupIndexTests(unittest.TestCase):
         self.assertEqual(report["would_merge"], 0)
         self.service.run_scheduled_compaction()
         self.assertEqual([self.repo.get_node(node_id).status for node_id in ids], ["active"] * len(ids))
+
+    def test_background_pass_cost_per_batch_does_not_grow_towards_the_end(self) -> None:
+        with self.repo.transaction():
+            ids = [self._add_plain(f"Узел {i}", f"Сервис номер {i} слушает свой порт") for i in range(600)]
+        self._age(ids)
+        steps = [0]
+
+        def count_step() -> int:
+            steps[0] += 1
+            return 0
+
+        prepare = SQLiteMemoryRepository._prepare_connection
+
+        def prepare_counting(conn: sqlite3.Connection) -> None:
+            prepare(conn)
+            conn.set_progress_handler(count_step, 1)
+
+        # Every clock read is 50 ms later, so each batch takes the same few rows.
+        clock = itertools.count(step=0.05)
+        refresh = self.repo.refresh_dedup_index
+        per_batch: list[int] = []
+
+        def counted_refresh(*args: Any, **kwargs: Any) -> dict[str, int]:
+            before = steps[0]
+            result = refresh(*args, **kwargs)
+            if result["stamped"]:
+                per_batch.append(steps[0] - before)
+            return result
+
+        with (
+            mock.patch.object(SQLiteMemoryRepository, "_prepare_connection", staticmethod(prepare_counting)),
+            mock.patch.object(storage_dedup, "time", SimpleNamespace(monotonic=lambda: next(clock))),
+            mock.patch.object(type(self.service), "DEDUP_REFRESH_PAUSE_SECONDS", 0.0),
+            mock.patch.object(self.repo, "refresh_dedup_index", side_effect=counted_refresh),
+        ):
+            self.service.rebuild_memory_dedup_index()
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self.assertGreater(len(per_batch), 50)
+        first, last = per_batch[:20], per_batch[-20:]
+        self.assertLessEqual(sum(last) / len(last), 1.1 * sum(first) / len(first), "SQLite steps per batch grow")
+        # A few rows per batch: no batch reads the whole index (a full scan costs several steps per row).
+        self.assertLess(max(per_batch), 3 * len(ids))
+
+    def test_an_idle_pass_takes_no_write_lock(self) -> None:
+        self._add_plain("Кэш", "Используем Redis для кэша сессий")
+        # Active but never indexed: it must not keep the pass busy.
+        self.repo.add_node("Concept", "Root", "project", "Structural root of the project", "architectos", metadata={"structural": True})
+        holder = sqlite3.connect(self.repo.db_path, timeout=1)
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            result = self.service.rebuild_memory_dedup_index()
+        finally:
+            holder.rollback()
+            holder.close()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual((result["locked"], result["remaining"], result["added"]), (0, 0, 0))
+
+    def test_a_locked_database_skips_the_batch_and_other_errors_raise(self) -> None:
+        self._age([self._add_atom("Cache entries live 30 minutes")])
+        with mock.patch.object(self.repo, "transaction", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertLogs("backend.architectos.storage_dedup", "WARNING"):
+                result = self.repo.refresh_dedup_index()
+            self.assertEqual((result["locked"], result["recomputed"]), (1, 0))
+            self.assertEqual(self.service.rebuild_memory_dedup_index()["locked"], 1)
+        with mock.patch.object(self.repo, "transaction", side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.repo.refresh_dedup_index()
+        self.assertEqual(self._row_versions(), {OUTDATED_VERSION})
+
+    def test_background_pass_drops_the_row_of_a_node_that_is_gone(self) -> None:
+        gone, kept = self._add_atom("Cache entries live 30 minutes"), self._add_atom("Таймаут сессии кэша составляет 30 минут")
+        self._age([gone, kept])
+        with self.repo._connect() as conn:
+            conn.execute("DELETE FROM memory_nodes WHERE id = ?", (gone,))
+        self._refresh_until_current()
+        self.assertEqual(self._indexed_ids(), {kept})
+        self.assertNotIn(gone, {row[1] for row in self._index_dump()[1]})
+
+    def test_manual_reindex_adds_rows_for_active_nodes_without_one(self) -> None:
+        lost = self._add_plain("Кэш", "Используем Redis для кэша сессий")
+        self._add_atom("Cache entries live 30 minutes")
+        structural = self.repo.add_node(
+            "Concept", "Root", "project", "Structural root of the project", "architectos", metadata={"structural": True},
+        ).id
+        with self.repo._connect() as conn:
+            conn.execute("DELETE FROM memory_dedup_stems WHERE node_id = ?", (lost,))
+            conn.execute("DELETE FROM memory_dedup_index WHERE node_id = ?", (lost,))
+        result = self.service.rebuild_memory_dedup_index()
+        self.assertIn(lost, self._indexed_ids())
+        self.assertNotIn(structural, self._indexed_ids())
+        self.assertEqual(result["added"], 1)
+        self._assert_equals_a_build_from_scratch()
+        self.assertEqual(self.service.rebuild_memory_dedup_index()["added"], 0)
 
     def test_manual_reindex_reports_indexed_nodes(self) -> None:
         node = self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})

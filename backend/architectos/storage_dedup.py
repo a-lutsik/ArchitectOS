@@ -25,6 +25,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Iterator
 from typing import Any
 
 from .models import MemoryNode
@@ -37,7 +38,7 @@ UNSTEMMED_TYPES = frozenset({"Artifact"})
 MAX_QUERY_STEMS = 400
 # Outdated rows one read recomputes in memory; the rest only count for the near flag.
 MAX_STALE_RECOMPUTE = 50
-# Outdated rows the background pass reads per query inside its batch.
+# Rows the background pass reads per query.
 REFRESH_READ_ROWS = 50
 # A background batch that held the write lock longer than this is logged as a warning.
 REFRESH_SLOW_BATCH_SECONDS = 0.5
@@ -111,13 +112,18 @@ class StorageDedupMixin:
                     count += 1
         return {"indexed": count}
 
-    def refresh_dedup_index(self, budget_seconds: float = 0.15) -> dict[str, int]:
+    def refresh_dedup_index(self, budget_seconds: float = 0.15, *, after_rowid: int = 0) -> dict[str, int]:
         """One background batch over rows of an older feature version, in rowid order.
 
         The batch is one transaction that stops taking rows once ``budget_seconds``
         have passed, so a foreground writer waits for one batch, not the whole
         pass; progress lives in the row versions, a rolled-back batch is simply
-        redone. Atom rows (text starts with a chat/MCP fact header) are recomputed
+        redone. The caller hands the returned ``cursor`` to the next batch of the
+        same pass as ``after_rowid``, so no batch walks rows an earlier one has
+        finished, and the first outdated row is found by a read before the
+        transaction: an idle round takes no write lock. ``remaining`` is 1 when
+        the batch did work (call again) and 0 when nothing is outdated after the
+        cursor. Atom rows (text starts with a chat/MCP fact header) are recomputed
         from the node read inside the transaction; the features of other texts do
         not depend on the version, so their rows only get the new version.
         ``database is locked`` is reported as ``locked`` for the caller to retry
@@ -125,65 +131,134 @@ class StorageDedupMixin:
         """
         from .memory_dedup import DEDUP_INDEX_VERSION, atom_statement
 
-        recomputed = stamped = locked = 0
-        held = 0.0
+        with self._connect() as conn:  # type: ignore[attr-defined]
+            first = conn.execute(
+                "SELECT rowid FROM memory_dedup_index WHERE version < ? AND rowid > ? ORDER BY rowid LIMIT 1",
+                (DEDUP_INDEX_VERSION, after_rowid),
+            ).fetchone()
+        if first is None:
+            return {"recomputed": 0, "stamped": 0, "locked": 0, "remaining": 0, "cursor": after_rowid}
+        cursor = int(first[0]) - 1
+        recomputed = stamped = 0
         try:
             with self.transaction() as conn:  # type: ignore[attr-defined]
                 started = time.monotonic()
-                last_rowid = 0
-                while time.monotonic() - started < budget_seconds:
-                    rows = conn.execute(
-                        """
-                        SELECT i.rowid AS row_id, i.node_id, n.payload FROM memory_dedup_index AS i
-                        LEFT JOIN memory_nodes AS n ON n.id = i.node_id
-                        WHERE i.version < ? AND i.rowid > ? ORDER BY i.rowid LIMIT ?
-                        """,
-                        (DEDUP_INDEX_VERSION, last_rowid, REFRESH_READ_ROWS),
-                    ).fetchall()
-                    if not rows:
-                        break
-                    for row in rows:
-                        last_rowid = int(row["row_id"])
-                        if row["payload"] is None:
-                            # The node is gone: nothing to compare against any more.
-                            self._delete_dedup_rows(conn, [str(row["node_id"])])
+                outdated = self._walk_rowids(
+                    conn,
+                    """
+                    SELECT i.rowid AS row_id, i.node_id, n.payload FROM memory_dedup_index AS i
+                    LEFT JOIN memory_nodes AS n ON n.id = i.node_id
+                    WHERE i.version < ? AND i.rowid > ? ORDER BY i.rowid LIMIT ?
+                    """,
+                    (DEDUP_INDEX_VERSION,),
+                    cursor,
+                )
+                for row in outdated:
+                    cursor = int(row["row_id"])
+                    if row["payload"] is None:
+                        # The node is gone: nothing to compare against any more.
+                        self._delete_dedup_rows(conn, [str(row["node_id"])])
+                    else:
+                        node = MemoryNode.from_dict(json.loads(row["payload"]))
+                        if atom_statement(str(node.text or "")):
+                            self._sync_dedup_index_row(conn, node)
+                            recomputed += 1
                         else:
-                            node = MemoryNode.from_dict(json.loads(row["payload"]))
-                            if atom_statement(str(node.text or "")):
-                                self._sync_dedup_index_row(conn, node)
-                                recomputed += 1
-                            else:
-                                conn.execute(
-                                    "UPDATE memory_dedup_index SET version = ? WHERE node_id = ?",
-                                    (DEDUP_INDEX_VERSION, node.id),
-                                )
-                                stamped += 1
-                        if time.monotonic() - started >= budget_seconds:
-                            break
+                            conn.execute(
+                                "UPDATE memory_dedup_index SET version = ? WHERE node_id = ?",
+                                (DEDUP_INDEX_VERSION, node.id),
+                            )
+                            stamped += 1
+                    if time.monotonic() - started >= budget_seconds:
+                        break
                 held = time.monotonic() - started
         except sqlite3.OperationalError as exc:
-            if "database is locked" not in str(exc):
-                raise
-            locked = 1
-            _LOG.warning("dedup index refresh batch skipped, database is locked: %s", exc)
-        if held > REFRESH_SLOW_BATCH_SECONDS:
-            _LOG.warning(
-                "dedup index refresh batch held the write lock %.3fs · recomputed=%s stamped=%s",
-                held, recomputed, stamped,
+            self._skip_locked_batch("refresh", exc)
+            return {"recomputed": 0, "stamped": 0, "locked": 1, "remaining": 1, "cursor": after_rowid}
+        self._log_dedup_batch("refresh", held, recomputed=recomputed, stamped=stamped)
+        return {"recomputed": recomputed, "stamped": stamped, "locked": 0, "remaining": 1, "cursor": cursor}
+
+    def index_missing_dedup_rows(self, budget_seconds: float = 0.15, *, after_rowid: int = 0) -> dict[str, int]:
+        """One background batch adding index rows for active nodes without one, in node rowid order.
+
+        A lost (or never written) row leaves its node out of every gate decision.
+        Candidates are read and checked for eligibility before the transaction,
+        so nodes that are never indexed (structural, hubs) cost no write lock;
+        the transaction re-reads each node before writing its row. The cursor,
+        ``remaining`` and ``locked`` work as in ``refresh_dedup_index``.
+        """
+        candidates: list[tuple[int, str]] = []
+        with self._connect() as conn:  # type: ignore[attr-defined]
+            nodes = self._walk_rowids(
+                conn,
+                """
+                SELECT n.rowid AS row_id, n.id, n.payload FROM memory_nodes AS n
+                WHERE n.status = 'active'
+                  AND NOT EXISTS (SELECT 1 FROM memory_dedup_index AS i WHERE i.node_id = n.id)
+                  AND n.rowid > ? ORDER BY n.rowid LIMIT ?
+                """,
+                (),
+                after_rowid,
             )
-        else:
-            _LOG.debug("dedup index refresh batch %.3fs · recomputed=%s stamped=%s", held, recomputed, stamped)
+            for row in nodes:
+                if dedup_index_eligible(MemoryNode.from_dict(json.loads(row["payload"]))):
+                    candidates.append((int(row["row_id"]), str(row["id"])))
+                    if len(candidates) == REFRESH_READ_ROWS:
+                        break
+        if not candidates:
+            return {"added": 0, "locked": 0, "remaining": 0, "cursor": after_rowid}
+        cursor = after_rowid
+        added = 0
+        try:
+            with self.transaction() as conn:  # type: ignore[attr-defined]
+                started = time.monotonic()
+                for row_id, node_id in candidates:
+                    cursor = row_id
+                    row = conn.execute("SELECT payload FROM memory_nodes WHERE id = ?", (node_id,)).fetchone()
+                    if row is not None and self._sync_dedup_index_row(conn, MemoryNode.from_dict(json.loads(row["payload"]))):
+                        added += 1
+                    if time.monotonic() - started >= budget_seconds:
+                        break
+                held = time.monotonic() - started
+        except sqlite3.OperationalError as exc:
+            self._skip_locked_batch("backfill", exc)
+            return {"added": 0, "locked": 1, "remaining": 1, "cursor": after_rowid}
+        self._log_dedup_batch("backfill", held, added=added)
+        return {"added": added, "locked": 0, "remaining": 1, "cursor": cursor}
+
+    def dedup_index_status(self) -> dict[str, int]:
+        """Indexed rows and rows of an older feature version still left (one full read, no lock)."""
+        from .memory_dedup import DEDUP_INDEX_VERSION
+
         with self._connect() as conn:  # type: ignore[attr-defined]
             indexed, remaining = conn.execute(
                 "SELECT count(*), coalesce(sum(version < ?), 0) FROM memory_dedup_index", (DEDUP_INDEX_VERSION,)
             ).fetchone()
-        return {
-            "recomputed": recomputed,
-            "stamped": stamped,
-            "locked": locked,
-            "remaining": int(remaining),
-            "indexed": int(indexed),
-        }
+        return {"indexed": int(indexed), "remaining": int(remaining)}
+
+    @staticmethod
+    def _walk_rowids(
+        conn: sqlite3.Connection, sql: str, params: tuple[Any, ...], after_rowid: int
+    ) -> Iterator[sqlite3.Row]:
+        """Rows of ``sql`` (``row_id`` column, ending in ``rowid > ? ORDER BY rowid LIMIT ?``) read in chunks."""
+        while True:
+            rows = conn.execute(sql, (*params, after_rowid, REFRESH_READ_ROWS)).fetchall()
+            yield from rows
+            if len(rows) < REFRESH_READ_ROWS:
+                return
+            after_rowid = int(rows[-1]["row_id"])
+
+    @staticmethod
+    def _skip_locked_batch(name: str, exc: sqlite3.OperationalError) -> None:
+        """Let a background batch give way to a held write lock; any other error is raised."""
+        if "database is locked" not in str(exc):
+            raise exc
+        _LOG.warning("dedup index %s batch skipped, database is locked: %s", name, exc)
+
+    @staticmethod
+    def _log_dedup_batch(name: str, held: float, **counts: int) -> None:
+        level = logging.WARNING if held > REFRESH_SLOW_BATCH_SECONDS else logging.DEBUG
+        _LOG.log(level, "dedup index %s batch held the write lock %.3fs · %s", name, held, counts)
 
     @staticmethod
     def _delete_dedup_rows(conn: sqlite3.Connection, node_ids: list[str]) -> None:
