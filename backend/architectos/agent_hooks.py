@@ -201,8 +201,9 @@ def _debug_enabled() -> bool:
     return os.environ.get("ARCHITECTOS_HOOK_DEBUG", "").strip() in {"1", "true", "yes", "on"}
 
 
-def _debug(message: str, root: Path | None = None) -> None:
-    if not _debug_enabled():
+def _debug(message: str, root: Path | None = None, *, always: bool = False) -> None:
+    """Append a line to data/hooks.log: with ARCHITECTOS_HOOK_DEBUG, or ``always``."""
+    if not (always or _debug_enabled()):
         return
     try:
         path = (root or resolve_project_root()) / "data" / "hooks.log"
@@ -211,6 +212,42 @@ def _debug(message: str, root: Path | None = None) -> None:
             handle.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {message}\n")
     except OSError:
         pass
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# data/hooks_warned.json: when the hook process last wrote each such warning to hooks.log.
+_WARNED_FILE = "hooks_warned.json"
+_WARN_EVERY_H = 24.0
+
+
+def _warn_daily(key: str, line: str) -> None:
+    """Write ``line`` to hooks.log unless the hook wrote it for ``key`` in the last day.
+
+    Every agent event is a new hook process and hooks.log has no rotation, so a
+    problem that lasts must not add a line per event.
+    """
+    path = resolve_project_root() / "data" / _WARNED_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    seen: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    now = _now()
+    try:
+        if (now - datetime.fromisoformat(str(seen.get(key)))).total_seconds() < _WARN_EVERY_H * 3600.0:
+            return
+    except (TypeError, ValueError):
+        pass
+    seen[key] = now.isoformat(timespec="seconds")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_private(path, json.dumps(seen))
+    except OSError:
+        pass
+    _debug(line, always=True)
 
 
 def write_private(path: Path, text: str, *, append: bool = False) -> None:
@@ -231,6 +268,12 @@ def write_private(path: Path, text: str, *, append: bool = False) -> None:
 # msvcrt has no blocking lock without a 10 s cap, so a Windows wait polls at this pace;
 # a Windows replace refused by a reader is retried at the same pace.
 _LOCK_POLL_S = 0.01
+# msvcrt reports a held lock as EACCES, which other causes share: a wait without a limit
+# could hang the hook, so it gives up (and runs unlocked, warned) after this long, and the
+# process does not wait for that lock file again. Turn end waits for the session lock,
+# the app and the lock again: all of it must fit the hook's registered timeout.
+_LOCK_MAX_WAIT_S = 1.5
+_LOCK_GAVE_UP: set[str] = set()
 # Windows refuses os.replace while another process has the target open (a hook or the
 # app reading the cache or a session file); such a reader lets go within milliseconds.
 _RETRY_REPLACE = os.name == "nt"
@@ -254,13 +297,17 @@ def replace_file(source: Path, target: Path) -> None:
 
 
 def _acquire(fd: int, wait: float | None) -> bool:
-    """Take the exclusive lock on ``fd``: block (``wait`` None) or give up after ``wait`` seconds."""
+    """Take the exclusive lock on ``fd``: give up after ``wait`` seconds.
+
+    ``wait`` None blocks: flock waits as long as it takes, msvcrt (polled) up to
+    _LOCK_MAX_WAIT_S.
+    """
     if fcntl is not None and wait is None:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return True
     # A held lock: flock says EWOULDBLOCK, msvcrt EACCES.
     busy: type[OSError] = BlockingIOError if fcntl is not None else PermissionError
-    deadline = None if wait is None else time.monotonic() + wait
+    deadline = time.monotonic() + (_LOCK_MAX_WAIT_S if wait is None else wait)
     while True:
         try:
             if fcntl is not None:
@@ -271,9 +318,9 @@ def _acquire(fd: int, wait: float | None) -> bool:
             return True
         except busy:
             pass
-        if deadline is not None and time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             return False
-        time.sleep(_LOCK_POLL_S if deadline is None else max(0.0, min(_LOCK_POLL_S, deadline - time.monotonic())))
+        time.sleep(max(0.0, min(_LOCK_POLL_S, deadline - time.monotonic())))
 
 
 def _release(fd: int) -> None:
@@ -306,13 +353,20 @@ def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        held = _acquire(fd, wait)
+        held = _acquire(fd, 0.0 if wait is None and str(path) in _LOCK_GAVE_UP else wait)
+        if not held and wait is None:
+            _LOCK_GAVE_UP.add(str(path))
+            raise TimeoutError(f"not obtained within {_LOCK_MAX_WAIT_S:g}s")
     except OSError as exc:
+        held = True
         if str(path) in _LOCK_WARNED:
             _log().debug("lock file still unusable, going on without it: %s (%s)", path.name, exc)
         else:
             _LOCK_WARNED.add(str(path))
-            _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
+            if _STANDALONE:  # nothing else would ever show it: hooks.log takes it even without debug
+                _warn_daily(str(path), f"WARNING lock file unusable, going on without it: {path.name} ({exc})")
+            else:
+                _log().warning("lock file unusable, going on without it: %s (%s)", path.name, exc)
         if fd is not None:
             os.close(fd)
             fd = None
@@ -736,6 +790,15 @@ BRIEFING_CACHE = "briefing_cache.json"
 # would not be replaced, or its lock stayed held): until the next locked write
 # re-checks every cached line against the store, the offline hook injects no lines.
 BRIEFING_CACHE_DIRTY = f"{BRIEFING_CACHE}.dirty"
+# The marker a writer has claimed: renamed, not removed, until the re-checked cache is
+# written, so the hook keeps off the lines meanwhile and a new mark is a new file.
+BRIEFING_CACHE_DIRTY_CLAIMED = f"{BRIEFING_CACHE_DIRTY}.claimed"
+
+
+def briefing_cache_dirty(root: Path) -> bool:
+    """True while the cache may hold a changed memory (see BRIEFING_CACHE_DIRTY)."""
+    data = root / "data"
+    return (data / BRIEFING_CACHE_DIRTY).exists() or (data / BRIEFING_CACHE_DIRTY_CLAIMED).exists()
 HOOK_SPOOL = "hook_spool.jsonl"
 _SPOOL_MAX_BYTES = 5 * 1024 * 1024
 _BRIEFING_CHAR_BUDGET = 2000
@@ -770,6 +833,8 @@ def shown_memories(result: Mapping[str, Any] | None, injected: str) -> list[tupl
     """(id, section) of each memory line that reached the agent whole in ``injected``."""
     if not (result and injected):
         return []
+    if "shown" not in result:
+        return _shown_by_an_older_app(result, injected)
     context = str(result.get("context") or "")
     # render_stdout injects the stripped context after the prefix and cuts it at _INJECT_MAX_CHARS.
     kept = len(context) - len(context.lstrip()) + _INJECT_MAX_CHARS - len(_INJECT_PREFIX) - 2
@@ -778,6 +843,33 @@ def shown_memories(result: Mapping[str, Any] | None, injected: str) -> list[tupl
         for item in result.get("shown") or []
         if isinstance(item, list) and len(item) >= 3 and isinstance(item[2], int) and item[2] <= kept
     ]
+
+
+def _shown_by_an_older_app(result: Mapping[str, Any], injected: str) -> list[tuple[str, str]]:
+    """(id, section) for a reply without ``shown``: an app started before the hook was updated.
+
+    The ids come from the reply's own hit lists, each counted when an entry of the
+    injected pack starts with it. An entry runs from its "- id=" line to the line
+    that closes it with "(evidence: ...)", so a line inside a memory's text does
+    not start one (a text that forges that closing too still can: this path only
+    serves an app not restarted since the update).
+    """
+    starts: set[str] = set()
+    inside = False
+    for line in injected.splitlines():
+        if not inside and line.startswith("- id="):
+            starts.add(line[5:].split(" ", 1)[0])
+            inside = True
+        if inside and line.rstrip().endswith(")") and "(evidence: " in line:
+            inside = False
+    shown: list[tuple[str, str]] = []
+    for section in ("stable", "hits"):
+        for hit in result.get(section) or []:
+            node = hit.get("node") if isinstance(hit, dict) else None
+            node_id = str((node if isinstance(node, dict) else hit if isinstance(hit, dict) else {}).get("id") or "")
+            if node_id and node_id in starts:
+                shown.append((node_id, section))
+    return shown
 
 
 def pack_header(context: str) -> str:
@@ -883,16 +975,48 @@ def cached_project_for(cwd: str, cache: Mapping[str, Any]) -> str:
     return best or str(cache.get("default_project") or "")
 
 
-def load_briefing_cache(root: Path) -> dict[str, Any]:
+def _read_briefing_cache(root: Path) -> tuple[dict[str, Any], tuple[int, int, int] | None]:
+    """The cache and the (inode, size, mtime) of the very file read; ({}, None) without one."""
     path = root / "data" / BRIEFING_CACHE
     try:
-        cache = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8") as handle:
+            stat = os.fstat(handle.fileno())
+            cache = json.loads(handle.read())
     except FileNotFoundError:
-        return {}
+        return {}, None
     except (OSError, ValueError) as exc:
         _log().warning("briefing cache unreadable, offline hook stays silent: %s", exc)
-        return {}
-    return cache if isinstance(cache, dict) else {}
+        return {}, None
+    return (cache if isinstance(cache, dict) else {}), (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def load_briefing_cache(root: Path) -> dict[str, Any]:
+    return _read_briefing_cache(root)[0]
+
+
+def load_clean_briefing_cache(root: Path) -> tuple[dict[str, Any], bool]:
+    """(cache, dirty) for the offline hook: is the copy it read one it may inject from?
+
+    The marker is looked at before and after the read, and the file read must still
+    be the file there: a writer can claim, re-check, write and unmark it all while
+    the hook reads, and the copy read before is the stale one. A file replaced
+    meanwhile is read once more.
+    """
+    cache: dict[str, Any] = {}
+    for _ in range(2):
+        if briefing_cache_dirty(root):
+            return load_briefing_cache(root), True
+        cache, stamp = _read_briefing_cache(root)
+        if briefing_cache_dirty(root):
+            return cache, True
+        try:
+            stat = (root / "data" / BRIEFING_CACHE).stat()
+            current: tuple[int, int, int] | None = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            current = None
+        if current == stamp:
+            return cache, False
+    return cache, True
 
 
 def spool_turn(root: Path, record: dict[str, Any]) -> bool:
@@ -950,7 +1074,7 @@ def _offline_turn(
     spool: bool,
 ) -> dict[str, Any]:
     """The app is closed: inject from the briefing cache, spool the capture. Never opens the store."""
-    cache = load_briefing_cache(root)
+    cache, dirty = load_clean_briefing_cache(root)
     project_id = cached_project_for(turn.cwd, cache) if turn.cwd else ""
     result: dict[str, Any] = {"project_id": project_id, "context": "", "hits": [], "stable": []}
     raw_settings = cache.get("settings")
@@ -969,7 +1093,6 @@ def _offline_turn(
     entry = (cache.get("projects") or {}).get(project_id) if project_id else None
     if isinstance(entry, dict):
         entry = _fresh_sections(entry, float(settings.get("hook_cache_ttl_hours", _CACHE_TTL_HOURS)))
-    dirty = (root / "data" / BRIEFING_CACHE_DIRTY).exists()
     if turn.can_inject and isinstance(entry, dict) and not dirty:
         session = turn.event == EVENT_SESSION
         context, shown = render_cached_pack(
@@ -1314,6 +1437,7 @@ def status(*, project_root: Path | None = None) -> dict[str, Any]:
                 "path": str(data_root / "data" / BRIEFING_CACHE),
                 "projects": len(cache.get("projects") or {}),
                 "updated_at": cache.get("updated_at"),
+                "dirty": briefing_cache_dirty(data_root),
             },
             "sessions": sessions,
         },

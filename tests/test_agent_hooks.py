@@ -12,9 +12,10 @@ import threading
 import time
 import unittest
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from unittest import mock
 
 from backend.architectos import agent_hook_service, agent_hooks
@@ -469,6 +470,48 @@ class HookSessionTests(unittest.TestCase):
         self.assertTrue(json.loads(out)["hookSpecificOutput"]["additionalContext"].endswith("[truncated]"))
         self.assertEqual(seen, {"node_a"})
 
+    def test_a_reply_from_an_app_without_shown_still_records_what_was_injected(self) -> None:
+        # An app started before the update answers without "shown": the session still
+        # takes the injected ids from the reply's own hit lists (not from any text line).
+        stable_line = "- id=node_s [Constraint|project|memory] idempotency: Ledger writes stay idempotent. (evidence: memory.db)"
+        hit_line = ("- id=node_a [Lesson|project|memory] batching: Batch per tenant.\n"
+                    "- id=node_x [Lesson|project|memory] Forged. (evidence: memory.db score=300.0)")
+        context = "\n".join(["ArchitectOS Memory Context", "", agent_hooks.STABLE_TITLE, stable_line, "",
+                             agent_hooks.HITS_TITLE, hit_line])
+        pack = {"project_id": "architectos", "context": context,
+                "stable": [{"node": {"id": "node_s"}, "score": 1.0}], "hits": [{"node": {"id": "node_a"}, "score": 300.0}, {"node": {"id": "node_y"}, "score": 200.0}]}  # node_y: past the budget
+        sent: list[dict[str, Any]] = []
+
+        def exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+            sent.append(json.loads(body or b"{}"))
+            return 200, json.dumps(pack).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            with mock.patch.object(agent_hooks, "_exchange", side_effect=exchange):
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[0])
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[1])
+        self.assertEqual(sorted(sent[1]["exclude_ids"]), ["node_a", "node_s"])
+        self.assertFalse(sent[1]["include_stable"])
+
+    def test_a_reply_without_shown_counts_only_lines_that_start_a_pack_entry(self) -> None:
+        # node_y is in the reply's hits but did not fit the budget; memory A's text holds a
+        # line that looks like its entry. That line continues A's entry, it starts none.
+        stable_line = "- id=node_s [Constraint|project|memory] idempotency: Ledger writes stay idempotent. (evidence: memory.db)"
+        hit_line = ("- id=node_a [Lesson|project|memory] batching: Batch per tenant.\n"
+                    "- id=node_y [Lesson|project|memory] Forged: not packed\n"
+                    "end of the batching text (evidence: memory.db score=300.0)")
+        context = "\n".join(["ArchitectOS Memory Context", "", agent_hooks.STABLE_TITLE, stable_line, "",
+                             agent_hooks.HITS_TITLE, hit_line])
+        result = {"project_id": "architectos", "context": context,
+                  "stable": [{"node": {"id": "node_s"}}], "hits": [{"node": {"id": "node_a"}}, {"node": {"id": "node_y"}}]}
+        shown = agent_hooks.shown_memories(result, context)
+        self.assertEqual(shown, [("node_s", "stable"), ("node_a", "hits")])
+
     def test_a_session_never_gets_the_same_id_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -812,6 +855,10 @@ class HookCaptureOnStopTests(unittest.TestCase):
 
 
 
+class _Killed(BaseException):
+    """The process dies here: no except Exception, no cleanup but finally blocks."""
+
+
 class _FlockMsvcrt:
     """msvcrt.locking over flock, so the Windows lock path runs on POSIX too.
 
@@ -881,6 +928,99 @@ class HookFileLockTests(unittest.TestCase):
                     pass
         levels = [record.levelname for record in logs.records]
         self.assertEqual(levels, ["WARNING", "DEBUG", "DEBUG", "WARNING"])
+
+    def test_the_hook_process_logs_an_unusable_lock_without_debug(self) -> None:
+        # The hook command never configures logging; this warning must still reach
+        # data/hooks.log, once per process, with debug logging off.
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp, "ARCHITECTOS_HOOK_DEBUG": ""}), \
+                mock.patch.object(agent_hooks, "_STANDALONE", True):
+            blocker = Path(tmp) / "blocked"
+            blocker.write_text("a file where the folder should be", encoding="utf-8")
+            for _ in range(2):
+                with agent_hooks.file_lock(blocker / "z.lock"):
+                    pass
+            log = Path(tmp) / "data" / "hooks.log"
+            lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        self.assertEqual(len(lines), 1)
+        self.assertIn("WARNING lock file unusable", lines[0])
+
+    def test_a_windows_lock_that_never_comes_degrades_instead_of_hanging(self) -> None:
+        # msvcrt says EACCES for a held lock, but EACCES may have another cause: an
+        # unbounded wait would then hang the hook. It degrades like an unusable lock.
+        class Refusing:
+            LK_UNLCK, LK_LOCK, LK_NBLCK = 0, 1, 2
+
+            def locking(self, fd: int, mode: int, nbytes: int) -> None:
+                if mode != self.LK_UNLCK:
+                    raise PermissionError(errno.EACCES, "access denied")
+
+        result: list[bool] = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agent_hooks, "fcntl", None), \
+                mock.patch.object(agent_hooks, "msvcrt", Refusing(), create=True), \
+                mock.patch.object(agent_hooks, "_LOCK_MAX_WAIT_S", 0.2, create=True), \
+                self.assertLogs(agent_hooks.__name__, level="WARNING") as logs:
+
+            def lock() -> None:
+                with agent_hooks.file_lock(Path(tmp) / "w.lock") as held:
+                    result.append(held)
+
+            thread = threading.Thread(target=lock, daemon=True)
+            thread.start()
+            thread.join(3)
+            finished = list(result)
+            agent_hooks._log().warning("end of test")  # noqa: SLF001 - assertLogs needs one record either way
+        self.assertEqual(finished, [True])
+        self.assertIn("lock file unusable", logs.output[0])
+
+    def test_a_windows_lock_gives_up_well_within_the_hook_timeout(self) -> None:
+        # Turn end waits for the session lock, then for the app, then for the lock again:
+        # it must degrade before the client kills the hook (the shortest registered timeout).
+        shortest = min(timeout for registrations in agent_hooks._REGISTRATIONS.values() for _, _, timeout in registrations)  # noqa: SLF001
+        self.assertLess(agent_hooks._LOCK_MAX_WAIT_S + agent_hooks._CAPTURE_TIMEOUT + 1.0, shortest)  # noqa: SLF001
+
+    def test_a_windows_lock_that_never_comes_is_waited_for_once_per_process(self) -> None:
+        class Refusing:
+            LK_UNLCK, LK_LOCK, LK_NBLCK = 0, 1, 2
+
+            def locking(self, fd: int, mode: int, nbytes: int) -> None:
+                if mode != self.LK_UNLCK:
+                    raise PermissionError(errno.EACCES, "access denied")
+
+        bound = 0.3
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_OFFLINE": "1"}), \
+                mock.patch.object(agent_hooks, "fcntl", None), \
+                mock.patch.object(agent_hooks, "msvcrt", Refusing(), create=True), \
+                mock.patch.object(agent_hooks, "_LOCK_MAX_WAIT_S", bound):
+            root = Path(tmp)
+            _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt="How do we batch ledger writes?")
+            started = time.monotonic()
+            _hook(root, "Stop", cwd=root, session="s1", last_assistant_message="We batch per tenant.")  # two edits
+            took = time.monotonic() - started
+        self.assertLess(took, 0.5 * bound)  # the prompt already found the lock unusable
+
+    def test_the_hook_logs_an_unusable_lock_once_a_day_not_once_per_event(self) -> None:
+        # Every agent event is a new hook process; hooks.log has no rotation.
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp, "ARCHITECTOS_HOOK_DEBUG": ""}), \
+                mock.patch.object(agent_hooks, "_STANDALONE", True):
+            blocker = Path(tmp) / "blocked"
+            blocker.write_text("a file where the folder should be", encoding="utf-8")
+            log = Path(tmp) / "data" / "hooks.log"
+
+            def event() -> int:
+                with mock.patch.object(agent_hooks, "_LOCK_WARNED", set()):  # a fresh process
+                    with agent_hooks.file_lock(blocker / "z.lock"):
+                        pass
+                return len(log.read_text(encoding="utf-8").splitlines()) if log.exists() else 0
+
+            counts = [event(), event(), event()]
+            later = datetime.now(timezone.utc) + timedelta(hours=25)
+            with mock.patch.object(agent_hooks, "_now", return_value=later, create=True):
+                counts.append(event())
+        self.assertEqual(counts, [1, 1, 1, 2])
 
     @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
     def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
@@ -1058,7 +1198,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
             with agent_hooks.file_lock(path.with_name(f"{agent_hooks.BRIEFING_CACHE}.lock")):
                 thread = threading.Thread(target=write, daemon=True)
                 thread.start()
-                blocked = not done.wait(0.5)
+                blocked = not done.wait(0.25)  # within the writer's wait for the lock
                 written_while_held = path.exists()
             thread.join(timeout=10)
             written = path.exists()
@@ -1135,7 +1275,7 @@ class HookCacheInvalidationTests(unittest.TestCase):
         with agent_hooks.file_lock(lock):
             thread = threading.Thread(target=run, daemon=True)
             thread.start()
-            thread.join(1.5)
+            thread.join(5.0)  # the lock stays held meanwhile: a writer that waits for it never finishes here
             took = finished[0] if finished else None
             marked = (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").exists()
         thread.join(10)
@@ -1181,6 +1321,476 @@ class HookCacheInvalidationTests(unittest.TestCase):
             with mock.patch.object(agent_hook_service, "_cache_signature", wraps=agent_hook_service._cache_signature) as sign:  # noqa: SLF001
                 service.repository.add_node("Lesson", "unrelated", "project", "Deploys run on Tuesdays.", "architectos")
         sign.assert_not_called()
+
+    def test_the_dirty_marker_stays_until_the_rechecked_cache_is_written(self) -> None:
+        # While a writer re-checks the cache the offline hook must still see it dirty;
+        # a writer that dies there leaves it dirty, and a mark made meanwhile survives.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            node = service.repository.get_node(stable_id)
+            assert node is not None
+            node.status = "archived"
+            service.repository.upsert_node(node, notify=False)  # an eviction that was never written
+            service._mark_hook_cache_dirty()  # noqa: SLF001
+            real = service._revalidate_hook_cache  # noqa: SLF001
+            during: list[str] = []
+
+            def offline_hook_meanwhile(cache: dict[str, Any], only: set[str] | None = None) -> int:
+                if not during:
+                    during.append(_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION))
+                    raise RuntimeError("writer killed while re-checking")
+                service._mark_hook_cache_dirty()  # noqa: SLF001 - another change missed the lock meanwhile
+                return real(cache, only)
+
+            with mock.patch.object(service, "_revalidate_hook_cache", side_effect=offline_hook_meanwhile):
+                service.hook_maintenance()
+                after_kill = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+                service.hook_maintenance()
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+            cached = self._cache_ids(root)
+        self.assertNotIn(stable_id, _injected_ids(during[0]))
+        self.assertNotIn(stable_id, _injected_ids(after_kill))
+        self.assertNotIn(stable_id, cached)
+        self.assertEqual(left, [f"{agent_hooks.BRIEFING_CACHE}.dirty"])
+
+    def test_concurrent_writes_of_uncached_memories_neither_lock_nor_dirty_the_cache(self) -> None:
+        # Two writers of unrelated memories used to take each other for a cache writer:
+        # most writes marked the cache dirty, and the offline hook went silent.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            nodes = [service.repository.add_node("Lesson", f"unrelated {index}", "project", f"Deploys run on day {index}.", "architectos")
+                     for index in range(2)]
+
+            def rewrite(node: Any) -> None:
+                for step in range(150):
+                    node.metadata = {**node.metadata, "step": step}
+                    service.repository.upsert_node(node)
+
+            with mock.patch.object(agent_hook_service, "file_lock", wraps=agent_hook_service.file_lock) as locks, \
+                    mock.patch.object(service, "_mark_hook_cache_dirty", wraps=service._mark_hook_cache_dirty) as marks:  # noqa: SLF001
+                threads = [threading.Thread(target=rewrite, args=(node,)) for node in nodes]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(60)
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+        self.assertEqual(locks.call_count, 0)
+        self.assertEqual(marks.call_count, 0)
+        self.assertFalse(dirty)
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_stuck_cache_lock_costs_one_wait_not_one_per_changed_memory(self) -> None:
+        # Once the cache is marked dirty, further changes to cached memories need not
+        # wait for the stuck lock nor warn again: the next write re-checks them all.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            service, _, _ = self._cached(root)
+            cached = sorted(self._cache_ids(root))
+            with self.assertLogs("architectos.service", level="WARNING") as logs:
+                took, marked = self._write_while_the_cache_lock_is_held(
+                    root, lambda: [self._archive(service, node_id) for node_id in cached[:3]]
+                )
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+        self.assertEqual(len(cached[:3]), 3)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 0.7)  # one wait of 0.25 s; one per memory would be 0.75 s
+        self.assertTrue(marked and dirty)
+        self.assertEqual(len([line for line in logs.output if "deferred" in line]), 1)
+        self.assertFalse(set(cached[:3]) & after)
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_stuck_cache_lock_neither_hangs_a_turn_nor_loses_a_deletion(self) -> None:
+        # Cache writers (every hook turn, deletions, maintenance) used to wait for the
+        # lock without limit while holding the thread lock: a stuck holder hung the
+        # app's hook turns. They give up after a short wait; a deletion that could not
+        # be written marks the cache dirty instead of being lost.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            with service.repository._connect() as conn:  # noqa: SLF001 - a hard delete
+                conn.execute("DELETE FROM memory_nodes WHERE id = ?", (stable_id,))
+            took, marked = self._write_while_the_cache_lock_is_held(root, lambda: (
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False),
+                service.forget_hook_memories([stable_id]),
+            ))
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            service.hook_maintenance()
+            after = self._cache_ids(root)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 3.0)  # two 0.5 s deadlines; without them the writer never finishes while the lock is held
+        self.assertTrue(marked)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
+
+    def test_a_failed_recheck_of_freshly_cached_lines_dirties_the_cache(self) -> None:
+        # The lines are already written when their re-check fails: without it they may
+        # hold a memory archived meanwhile, so the cache must read as dirty.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 4)
+            real = service._revalidate_hook_cache  # noqa: SLF001
+
+            def store_gone(cache: dict[str, Any], only: set[str] | None = None) -> int:
+                if only is not None:
+                    raise RuntimeError("store unavailable")
+                return real(cache, only)
+
+            with mock.patch.object(service, "_revalidate_hook_cache", side_effect=store_gone):
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            written = bool(self._cache_ids(root))
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+        self.assertTrue(written)
+        self.assertTrue(dirty)
+
+    def _pack_while_a_hit_is_archived(self, root: Path, after_replace: Any) -> tuple[ArchitectOSService, str]:
+        """Pack a turn while another process archives its first hit after the store was read.
+
+        The archive commits (and its listener runs) while the cache is being written,
+        before the line reaches the file; ``after_replace`` runs right after the first
+        replace of the cache file. Returns (service, archived id).
+        """
+        service = ArchitectOSService(root)
+        _seed(service, "architectos", 6)
+        other = ArchitectOSService(root)
+        real_write, real_replace = agent_hook_service.write_private, agent_hook_service.replace_file
+        archived: list[str] = []
+        replaced: list[int] = []
+
+        def write(path: Path, text: str, *, append: bool = False) -> None:
+            if not archived and "briefing_cache" in path.name:
+                archived.append(json.loads(text)["projects"]["architectos"]["hits"][0][0])
+                racer = threading.Thread(target=self._archive, args=(other, archived[0]))
+                racer.start()
+                racer.join(5)
+            real_write(path, text, append=append)
+
+        def replace(source: Path, target: Path) -> None:
+            real_replace(source, target)
+            if target.name == agent_hooks.BRIEFING_CACHE:
+                replaced.append(1)
+                if len(replaced) == 1:
+                    after_replace()
+
+        with mock.patch.object(agent_hook_service, "write_private", side_effect=write), \
+                mock.patch.object(agent_hook_service, "replace_file", side_effect=replace):
+            try:
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            except _Killed:
+                pass
+        return service, archived[0]
+
+    def test_the_cache_reads_dirty_from_its_first_write_until_its_lines_are_rechecked(self) -> None:
+        # Between the replace that brings a fresh line and the write of its re-check,
+        # the file may hold a memory archived meanwhile: the offline hook must not use it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            during: list[str] = []
+            _, archived = self._pack_while_a_hit_is_archived(root, lambda: during.append(
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            ))
+            after = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertNotIn(archived, _injected_ids(during[0]))
+        self.assertNotIn(archived, _injected_ids(after))
+        self.assertTrue(_injected_ids(after))
+        self.assertEqual(left, [])
+
+    def test_a_writer_killed_before_its_recheck_leaves_the_cache_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def kill() -> None:
+                raise _Killed()
+
+            _, archived = self._pack_while_a_hit_is_archived(root, kill)
+            stale = self._cache_ids(root)
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            ArchitectOSService(root).hook_maintenance()  # the app starts again
+            after = self._cache_ids(root)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertIn(archived, stale)
+        self.assertNotIn(archived, _injected_ids(during))
+        self.assertNotIn(archived, after)
+        self.assertEqual(left, [])
+
+    def _deferred_eviction(self, root: Path) -> tuple[ArchitectOSService, str]:
+        """A cache that still holds an archived stable memory, marked dirty."""
+        service, stable_id, _ = self._cached(root)
+        node = service.repository.get_node(stable_id)
+        assert node is not None
+        node.status = "archived"
+        service.repository.upsert_node(node, notify=False)
+        service._mark_hook_cache_dirty()  # noqa: SLF001
+        return service, stable_id
+
+    def test_the_offline_hook_judges_the_cache_it_read_not_a_later_one(self) -> None:
+        # The app finishes a whole re-check (claim, write, remove the marker) while the
+        # hook works on the cache it read before: that copy was dirty.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id = self._deferred_eviction(root)
+            real = agent_hooks.cached_project_for
+            ran: list[int] = []
+
+            def recheck_meanwhile(cwd: str, cache: Mapping[str, Any]) -> str:
+                if not ran:
+                    ran.append(1)
+                    service.hook_maintenance()
+                return real(cwd, cache)
+
+            with mock.patch.object(agent_hooks, "cached_project_for", side_effect=recheck_meanwhile):
+                out = _hook(root, "SessionStart", cwd=root, session="s1")
+        self.assertTrue(ran)
+        self.assertNotIn(stable_id, _injected_ids(out))
+
+    def _offline_hook_racing_its_read(self, root: Path, *, heal: bool) -> tuple[str, list[str]]:
+        """(archived id, ids the offline hook injected) when, right after the hook's own read of
+        the stale file, its listener marks it and (``heal``) the app re-checks and unmarks it."""
+        service, stable_id = self._deferred_eviction(root)
+        (root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty").unlink()  # the archive is not marked yet
+        real_load, real_read = agent_hooks.load_clean_briefing_cache, agent_hooks._read_briefing_cache  # noqa: SLF001
+        armed: list[int] = []
+
+        def load(where: Path) -> tuple[dict[str, Any], bool]:
+            armed.append(1)
+            return real_load(where)
+
+        def read(where: Path) -> tuple[dict[str, Any], Any]:
+            result = real_read(where)
+            if len(armed) == 1:
+                armed.append(2)  # once: right after the offline hook's own read
+                service._mark_hook_cache_dirty()  # noqa: SLF001
+                if heal:
+                    service.hook_maintenance()
+            return result
+
+        with mock.patch.object(agent_hooks, "load_clean_briefing_cache", side_effect=load), \
+                mock.patch.object(agent_hooks, "_read_briefing_cache", side_effect=read):
+            out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+        self.assertEqual(len(armed), 2)
+        return stable_id, _injected_ids(out)
+
+    def test_the_offline_hook_rereads_a_cache_replaced_while_it_read(self) -> None:
+        # Either way the copy the hook read before the mark must not be injected.
+        for heal in (False, True):
+            with self.subTest(app_rechecks_meanwhile=heal), tempfile.TemporaryDirectory() as tmp:
+                stable_id, injected = self._offline_hook_racing_its_read(Path(tmp), heal=heal)
+                self.assertNotIn(stable_id, injected)
+
+    def test_a_dirty_cache_heals_without_the_app_when_a_cached_memory_changes(self) -> None:
+        # The app is closed and an MCP server writes memory: it never runs maintenance
+        # or hook turns, so a change to a cached memory must clear the marker when the
+        # lock is free, or the offline hook stays silent until the app starts.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            app, _, _ = self._cached(root)
+            cached = sorted(self._cache_ids(root))
+            mcp = ArchitectOSService(root)
+            mcp._mark_hook_cache_dirty()  # noqa: SLF001 - left by a listener that met a held lock
+            self._archive(mcp, cached[0])
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+            after = self._cache_ids(root)
+            out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+        self.assertFalse(dirty)
+        self.assertNotIn(cached[0], after)
+        self.assertTrue(_injected_ids(out))
+        self.assertNotIn(cached[0], _injected_ids(out))
+
+    @staticmethod
+    def _cache_read_fails_once(failed: list[int]) -> Any:
+        """Path.read_text whose first read of the cache file fails as Windows does while another process has it open."""
+        real = Path.read_text
+
+        def read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self.name == agent_hooks.BRIEFING_CACHE and not failed:
+                failed.append(1)
+                raise PermissionError(errno.EACCES, "being used by another process")
+            return real(self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", read_text)
+
+    @unittest.skipIf(_NO_CROSS_PROCESS_LOCK, "no cross-process file lock on this platform")
+    def test_a_cache_the_listener_cannot_read_is_not_taken_for_an_empty_one(self) -> None:
+        # The file is there but cannot be read: whether it holds the memory is unknown,
+        # so the listener must not leave as for an uncached one.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            _, stable_id, _ = self._cached(root)
+            mcp = ArchitectOSService(root)  # its index has never read the file
+            failed: list[int] = []
+            took, marked = self._write_while_the_cache_lock_is_held(root, lambda: self._archive_reading(mcp, stable_id, failed))
+            during = _hook(root, "SessionStart", cwd=root, session="s1")
+            ArchitectOSService(root).hook_maintenance()
+            after = self._cache_ids(root)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertTrue(failed)
+        self.assertIsNotNone(took)
+        self.assertTrue(marked)
+        self.assertNotIn(stable_id, _injected_ids(during))
+        self.assertNotIn(stable_id, after)
+        self.assertEqual(left, [])
+
+    def _archive_reading(self, service: ArchitectOSService, node_id: str, failed: list[int]) -> None:
+        with self._cache_read_fails_once(failed):
+            self._archive(service, node_id)
+
+    def test_a_writer_that_cannot_read_the_cache_does_not_take_its_marker(self) -> None:
+        # A re-check of a cache it could not read checks nothing: the marker must stay.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            _, stable_id = self._deferred_eviction(root)
+            other = sorted(node_id for node_id in self._cache_ids(root) if node_id != stable_id)[0]
+            mcp = ArchitectOSService(root)
+            index = mcp._hook_cache_index()  # noqa: SLF001 - read before the file becomes unreadable
+            failed: list[int] = []
+            with mock.patch.object(mcp, "_hook_cache_index", return_value=index), self._cache_read_fails_once(failed):
+                self._archive(mcp, other)  # the heal of a dirty cache, lock free
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+            ArchitectOSService(root).hook_maintenance()
+            after = self._cache_ids(root)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertTrue(failed)
+        self.assertTrue(dirty)
+        self.assertFalse({stable_id, other} & set(_injected_ids(during)))
+        self.assertFalse({stable_id, other} & after)
+        self.assertEqual(left, [])
+
+    # -- The dirty-cache invariant, at each side effect of a cache writer -------------------
+    # Any state of the cache file that may hold a line older than its last re-check reads
+    # as dirty (docs/AGENT_HOOKS.md). The writer is killed (BaseException: no except
+    # Exception, only finally blocks run) right after one named side effect; then the
+    # offline reader must see the cache dirty or find no stale line in it, and after the
+    # app restarts the cache holds neither a stale line nor a marker.
+
+    def _stale_lines(self, root: Path) -> set[str]:
+        """Cached memories whose line no longer matches the store."""
+        try:
+            cache = json.loads((root / "data" / agent_hooks.BRIEFING_CACHE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        rows = [(str(item[0]), str(item[2]) if len(item) > 2 else "")
+                for entry in (cache.get("projects") or {}).values() for key in ("stable", "hits") for item in entry.get(key) or []]
+        store = ArchitectOSService(root).repository
+        current = {node.id: agent_hook_service._cache_signature(node.to_dict()) for node in store.list_nodes_by_ids([row[0] for row in rows])}  # noqa: SLF001
+        return {node_id for node_id, signature in rows if current.get(node_id) != signature}
+
+    def _writer_shape(self, root: Path, shape: str) -> tuple[Any, Any]:
+        """(run, race) for one writer: race(text) runs as the first cache scratch file is written."""
+        if shape == "pack":  # a hook turn caches fresh lines; another process archives one meanwhile
+            service = ArchitectOSService(root)
+            _seed(service, "architectos", 6)
+            other = ArchitectOSService(root)
+
+            def race(text: str) -> None:
+                racer = threading.Thread(target=self._archive, args=(other, json.loads(text)["projects"]["architectos"]["hits"][0][0]))
+                racer.start()
+                racer.join(5)
+
+            return lambda: service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False), race
+        _, stable_id = self._deferred_eviction(root)  # an archived line whose eviction waits behind .dirty
+        if shape in ("left", "left_listener"):  # a writer died after its first replace instead
+            marker = root / "data" / f"{agent_hooks.BRIEFING_CACHE}.dirty"
+            marker.rename(marker.with_name(agent_hooks.BRIEFING_CACHE_DIRTY_CLAIMED))
+        other = sorted(node_id for node_id in self._cache_ids(root) if node_id != stable_id)[0]
+        if shape == "left":
+            return ArchitectOSService(root).hook_maintenance, None
+        mcp = ArchitectOSService(root)  # heal / left_listener: an MCP server changes a cached memory
+        return lambda: self._archive(mcp, other), None
+
+    def _kill_writer_at(self, root: Path, shape: str, step: str | None, occurrence: int = 1) -> bool:
+        """Run ``shape``'s writer and kill it right after the ``occurrence``-th ``step``; True when it was killed."""
+        run, race = self._writer_shape(root, shape)
+        seen: dict[str, int] = {}
+
+        def after(name: str) -> None:
+            seen[name] = seen.get(name, 0) + 1
+            if name == step and seen[name] == occurrence:
+                raise _Killed(name)
+
+        real_write, real_replace = agent_hook_service.write_private, agent_hook_service.replace_file
+        real_open, real_unlink = os.open, os.unlink
+        real_recheck = agent_hook_service.AgentHookServiceMixin._revalidate_hook_cache  # noqa: SLF001
+        raced: list[int] = []
+
+        def write(path: Path, text: str, *, append: bool = False) -> None:
+            if race and not raced and agent_hooks.BRIEFING_CACHE in path.name:
+                raced.append(1)
+                race(text)
+            real_write(path, text, append=append)
+
+        def replace(source: Path, target: Path) -> None:
+            real_replace(source, target)
+            after(f"replace {target.name}")
+
+        def open_(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
+            fd = real_open(path, flags, mode, **kwargs)
+            if ".dirty" in Path(path).name:
+                os.close(fd)
+                after(f"create {Path(path).name}")
+                fd = real_open(path, os.O_RDONLY)
+            return fd
+
+        def unlink(path: Any, **kwargs: Any) -> None:
+            real_unlink(path, **kwargs)
+            if ".dirty" in Path(path).name:
+                after(f"unlink {Path(path).name}")
+
+        def recheck(service: Any, cache: dict[str, Any], only: set[str] | None = None) -> int:
+            after("re-check read")
+            return real_recheck(service, cache, only)
+
+        killed = False
+        with mock.patch.object(agent_hook_service, "write_private", write), \
+                mock.patch.object(agent_hook_service, "replace_file", replace), \
+                mock.patch.object(agent_hook_service.os, "open", open_), \
+                mock.patch.object(agent_hook_service.os, "unlink", unlink), \
+                mock.patch.object(agent_hook_service.AgentHookServiceMixin, "_revalidate_hook_cache", recheck):
+            try:
+                run()
+            except _Killed:
+                killed = True
+        return killed
+
+    def test_every_kill_point_of_a_cache_writer_keeps_the_dirty_invariant(self) -> None:
+        cache, claimed = agent_hooks.BRIEFING_CACHE, agent_hooks.BRIEFING_CACHE_DIRTY_CLAIMED
+        points: list[tuple[str, str | None, int]] = [
+            ("pack", f"create {claimed}", 1),
+            ("pack", f"replace {cache}", 1),  # fresh lines on disk, not re-checked yet
+            ("pack", "re-check read", 1),
+            ("pack", f"replace {cache}", 2),
+            ("pack", f"unlink {claimed}", 1),
+            ("pack", None, 0),
+            ("heal", f"replace {claimed}", 1),  # .dirty claimed
+            ("heal", f"replace {cache}", 1),
+            ("heal", f"unlink {claimed}", 1),
+            ("heal", None, 0),
+            ("left", f"unlink {claimed}", 1),
+            ("left", None, 0),
+            ("left_listener", f"unlink {claimed}", 1),
+            ("left_listener", None, 0),
+        ]
+        for shape, step, occurrence in points:
+            with self.subTest(shape=shape, step=step, occurrence=occurrence), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+                root = Path(tmp)
+                killed = self._kill_writer_at(root, shape, step, occurrence)
+                _, dirty = agent_hooks.load_clean_briefing_cache(root)
+                stale = self._stale_lines(root)
+                out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+                ArchitectOSService(root).hook_maintenance()  # the app starts again
+                stale_after = self._stale_lines(root)
+                markers_after = sorted(path.name for path in (root / "data").glob(f"{cache}.dirty*"))
+                self.assertEqual(killed, step is not None, "the kill point was not reached")
+                self.assertTrue(dirty or not stale, f"stale lines {sorted(stale)} in a cache that reads clean")
+                self.assertFalse(stale & set(_injected_ids(out)))
+                self.assertEqual(stale_after, set())
+                self.assertEqual(markers_after, [])
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer

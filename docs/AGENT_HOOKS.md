@@ -194,11 +194,28 @@ store, so an event costs a few milliseconds instead of a service cold start:
   injected; a prompt that gets the stable layer from the app re-checks and renews
   the cached stable lines. Writers of the cache (the app, MCP servers) and the
   hooks of one session take a lock file first (`flock` on POSIX, a one-byte
-  `msvcrt` lock on Windows). A memory write never waits long for the cache lock:
-  when it cannot evict a changed memory (the lock stays held past 0.25 s, or
-  Windows will not replace the file), it leaves `data/briefing_cache.json.dirty`.
-  While that file exists the offline hook injects no cached lines; the next
-  locked write re-checks every cached line against the store and removes it.
+  `msvcrt` lock on Windows, given up after 1.5 s there, and not waited for again by
+  that process). The cache keeps one invariant: any state of the file that may hold
+  a line older than its last re-check against the store reads as dirty, that is,
+  `data/briefing_cache.json.dirty` or its `.claimed` form exists.
+  - A memory the cache does not hold costs its write one read of the cached ids
+    and no lock. A writer that caches fresh lines creates the `.claimed` marker
+    before it replaces the file, re-checks those lines against the store and
+    removes the marker only once the result is written; a writer that dies in
+    between leaves the cache dirty, and the next write re-checks it whole.
+  - When a changed cached memory cannot be evicted (the lock stays held past
+    0.25 s, a deletion or maintenance waits past 0.5 s, or Windows will not
+    replace the file), the process leaves `.dirty`. The next locked write claims
+    it (renames it to `.claimed`), re-checks every cached line and removes it after
+    writing the result. While `.dirty` waits, a later change to a cached memory
+    tries the lock once without waiting, so an MCP server alone heals the cache.
+  - The offline hook looks for the markers before and after it reads the cache and
+    checks that the file it read is still the one in place; a dirty cache injects
+    no cached lines, and `hooks status` reports `dirty`.
+
+  A lock file the hook cannot use is reported in `data/hooks.log` even without
+  `ARCHITECTOS_HOOK_DEBUG`, at most once a day per lock file
+  (`data/hooks_warned.json`).
 - **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
   the project resolved for the folder. The app replays the spool through
   `capture_memory_turn` into each record's own project when it starts and once a
@@ -260,3 +277,27 @@ Silence means the turn was captured but there was nothing worth injecting yet.
 Run it a second time on a related question and the stored memory comes back as
 `additionalContext`. Facts that landed in review appear in the app under memory candidates with the
 **MCP** chip.
+
+## Follow-ups
+
+Known gaps of the offline briefing cache, left for later work:
+
+- **Commit → eviction window.** A changed memory leaves the cache only when its
+  listener runs, after the commit and after the listeners registered before it; in
+  an MCP server an inline embedding can delay that by 20–60 s, and the offline hook
+  may inject the memory meanwhile. A hard delete has the same gap: it removes the
+  rows, then the evidence files, and only then the cached lines
+  (`memory_wipe_service._hard_delete_memory`).
+- **Lock warning log.** `_warn_daily` keys its once-a-day warning by lock file, and
+  each session has its own session lock file, so a lasting problem still adds a
+  line per session; `data/hooks_warned.json` is never pruned and is not written
+  atomically.
+- **Healing without the app.** An MCP server clears a waiting `.dirty` marker only
+  when it changes a cached memory; with only uncached writes and the app closed,
+  the offline hook stays silent until the app starts.
+- **Not verified on a real Windows machine:** that `os.fstat` of the open cache
+  file and `os.stat` of its path give the same (inode, size, mtime) in
+  `load_clean_briefing_cache`; the worst-case time of a turn end whose session lock
+  is unusable (1.5 s plus the capture timeout); and a process running without the
+  cache lock (an unusable lock file) renaming or removing another writer's
+  `.claimed` marker.

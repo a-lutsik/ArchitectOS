@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable, Mapping
 from .agent_hooks import (
     BRIEFING_CACHE,
     BRIEFING_CACHE_DIRTY,
+    BRIEFING_CACHE_DIRTY_CLAIMED,
     HOOK_SPOOL,
     file_lock,
     hook_pack_budget,
@@ -63,6 +64,8 @@ HOOK_CACHE_TTL_HOURS = 24
 # How long the upsert listener, after commit, waits for the cache lock to evict a cached
 # memory before it marks the cache dirty instead.
 HOOK_CACHE_LOCK_WAIT_S = 0.25
+# How long a cache writer (a hook turn's pack, a deletion, maintenance) waits for the lock.
+HOOK_CACHE_WRITE_WAIT_S = 0.5
 
 _CACHE_LOCK = threading.Lock()
 _SPOOL_LOCK = threading.Lock()
@@ -307,7 +310,7 @@ class AgentHookServiceMixin:
                 cache.update(shared, version=2, projects=projects, updated_at=now)
                 return True
 
-            self._update_briefing_cache(change)
+            self._update_briefing_cache(change, recheck=set(signatures))
             _LOG.debug(
                 "briefing cache updated project=%s briefing=%s pack=%s roots=%s",
                 project_id or "-", bool(briefing), bool(pack), len(roots),
@@ -330,49 +333,51 @@ class AgentHookServiceMixin:
 
         Runs in every process that writes memory (the app, each MCP server), after
         commit, so it never waits long. The ids the cache holds are read without the
-        lock (re-read only when the file changed), and only a cached memory is signed.
-        One whose signature changed is evicted under the lock, waited for at most
-        HOOK_CACHE_LOCK_WAIT_S. An uncached one only tries the lock once: a writer
-        holding it may be about to write a line for this memory built before the
-        change, and a free lock means no such writer. When the lock stays held, the
-        cache is marked dirty instead (see BRIEFING_CACHE_DIRTY): the holder's own
-        write, or the next one, re-checks every line.
+        lock (re-read only when the file changed); a memory the cache does not hold
+        costs that read and nothing else. A writer that is writing a line for it
+        right now, built before this change, re-checks its lines against the store
+        once the file is replaced (see _rewrite_briefing_cache). A cached memory
+        whose signature changed is evicted under the lock, waited for at most
+        HOOK_CACHE_LOCK_WAIT_S; when the lock stays held, the cache is marked dirty
+        instead (see BRIEFING_CACHE_DIRTY) and the next locked write re-checks it;
+        while that marker waits, a later change only tries the lock once.
         """
         try:
-            cached = self._hook_cache_index().get(node.id)
-            signature = ""
-            if cached is not None:
-                signature = _cache_signature(node.to_dict())
-                if cached == {signature}:
-                    return
-            wait = HOOK_CACHE_LOCK_WAIT_S if cached is not None else 0.0
+            index = self._hook_cache_index()
+            if index is not None and node.id not in index:
+                return
+            cached = index.get(node.id) if index is not None else None  # None: unknown, take the lock path
+            signature = _cache_signature(node.to_dict())
+            if cached == {signature}:
+                return
+            # Already marked and not yet claimed: the write that claims it reads the store
+            # after this change, so a held lock is not waited for (nor warned about) again;
+            # a free one is taken to evict and re-check now, since an MCP server alone
+            # never runs the app's maintenance or hook turns.
+            dirty = (Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY).exists()
+            wait = 0.0 if dirty else HOOK_CACHE_LOCK_WAIT_S
             started = time.monotonic()
             if not _CACHE_LOCK.acquire(timeout=wait):
-                self._hook_cache_lock_busy(node.id, cached is not None)
+                self._hook_cache_lock_busy(node.id, dirty)
                 return
             try:
                 lock = self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")
                 with file_lock(lock, wait=max(0.0, wait - (time.monotonic() - started))) as held:
                     if not held:
-                        self._hook_cache_lock_busy(node.id, cached is not None)
+                        self._hook_cache_lock_busy(node.id, dirty)
                         return
-                    cached = self._hook_cache_index().get(node.id)
-                    if cached is not None:
-                        signature = signature or _cache_signature(node.to_dict())
-                    if cached is not None and cached != {signature}:
-                        self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set(), locked=True)
-                    elif (Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY).exists():
-                        self._rewrite_briefing_cache(lambda cache: False)  # re-checks the lines, takes the marker
+                    # Also claims a waiting marker and re-checks the whole cache.
+                    self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set(), locked=True)
             finally:
                 _CACHE_LOCK.release()
         except Exception as exc:  # noqa: BLE001 - a listener must never break the write
             _LOG.warning("briefing cache not pruned for node %s: %s", node.id, exc)
 
-    def _hook_cache_lock_busy(self, node_id: str, cached: bool) -> None:
-        if cached:
-            _LOG.warning("briefing cache lock held past %ss, eviction of node %s deferred", HOOK_CACHE_LOCK_WAIT_S, node_id)
-        else:
-            _LOG.debug("briefing cache lock held while node %s changed: the holder re-checks the cache", node_id)
+    def _hook_cache_lock_busy(self, node_id: str, marked: bool) -> None:
+        if marked:
+            _LOG.debug("briefing cache lock held, node %s left to the pending re-check", node_id)
+            return
+        _LOG.warning("briefing cache lock held past %ss, eviction of node %s deferred", HOOK_CACHE_LOCK_WAIT_S, node_id)
         self._mark_hook_cache_dirty()
 
     def _registered_hook_cache_projects(self) -> set[str]:
@@ -386,13 +391,20 @@ class AgentHookServiceMixin:
             return set()
         return {str(project_id) for project_id, entry in projects.items() if isinstance(entry, dict) and entry.get("registered")}
 
-    def _hook_cache_index(self) -> dict[str, set[str]]:
-        """Cached memory id -> the signatures its lines were cached with, re-read when the file changes."""
+    def _hook_cache_index(self) -> dict[str, set[str]] | None:
+        """Cached memory id -> the signatures its lines were cached with, re-read when the file changes.
+
+        {} without a cache file (or with one no reader can parse); None when the file
+        is there but cannot be read now (Windows, while another process has it open):
+        what it holds is unknown.
+        """
         path = Path(self.project_root) / "data" / BRIEFING_CACHE
         try:
             stat = path.stat()
-        except OSError:
+        except FileNotFoundError:
             return {}
+        except OSError:
+            return None
         # A coarse clock gives two writes one mtime; each write replaces the file
         # (a new inode) and its size usually moves too.
         stamp = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
@@ -401,7 +413,11 @@ class AgentHookServiceMixin:
             return memo[1]
         try:
             cache = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            return None
+        except ValueError:
             return {}
         index: dict[str, set[str]] = {}
         for entry in ((cache.get("projects") or {}) if isinstance(cache, dict) else {}).values():
@@ -449,49 +465,88 @@ class AgentHookServiceMixin:
         except OSError as exc:
             _LOG.error("briefing cache may keep a changed memory until its TTL: marker not written (%s)", exc)
 
-    def _revalidate_hook_cache(self, cache: dict[str, Any]) -> int:
-        """Drop every cached line whose memory is gone or no longer matches its signature."""
-        ids = list(_cached_lines(cache))
+    def _revalidate_hook_cache(self, cache: dict[str, Any], only: set[str] | None = None) -> int:
+        """Drop the cached lines (of ``only``, else all) whose memory is gone or no longer matches its signature."""
+        ids = [node_id for node_id in _cached_lines(cache) if only is None or node_id in only]
         current = {node.id: _cache_signature(node.to_dict()) for node in self.repository.list_nodes_by_ids(ids)} if ids else {}
-        dropped = _drop_cached_lines(cache, lambda node_id, signature: current.get(node_id) != signature)
-        _LOG.info("briefing cache revalidated: lines=%s dropped=%s", sum(_cached_lines(cache).values()) + dropped, dropped)
+        dropped = _drop_cached_lines(
+            cache, lambda node_id, signature: node_id in ids and current.get(node_id) != signature
+        )
+        log = _LOG.info if only is None or dropped else _LOG.debug
+        log("briefing cache re-checked: memories=%s dropped_lines=%s scope=%s", len(ids), dropped, "all" if only is None else "written")
         return dropped
 
-    def _update_briefing_cache(self, change: Callable[[dict[str, Any]], bool]) -> None:
+    def _update_briefing_cache(self, change: Callable[[dict[str, Any]], bool], *, recheck: set[str] | None = None) -> None:
         """Read, ``change`` and rewrite data/briefing_cache.json; ``change`` returns False to skip the write.
 
         Serialized across threads and, through a lock file, across processes.
+        The locks are waited for at most HOOK_CACHE_WRITE_WAIT_S (a stuck holder
+        must not hang the app's hook turns), then TimeoutError: a pack is then just
+        not cached, an eviction marks the cache dirty (_evict_hook_cache).
+        ``recheck``: see _rewrite_briefing_cache.
         """
-        with _CACHE_LOCK, file_lock(self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")):
-            self._rewrite_briefing_cache(change)
+        started = time.monotonic()
+        if not _CACHE_LOCK.acquire(timeout=HOOK_CACHE_WRITE_WAIT_S):
+            raise TimeoutError(f"briefing cache lock held in this process past {HOOK_CACHE_WRITE_WAIT_S}s")
+        try:
+            lock = self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")
+            with file_lock(lock, wait=max(0.0, HOOK_CACHE_WRITE_WAIT_S - (time.monotonic() - started))) as held:
+                if not held:
+                    raise TimeoutError(f"briefing cache lock held by another process past {HOOK_CACHE_WRITE_WAIT_S}s")
+                self._rewrite_briefing_cache(change, recheck=recheck)
+        finally:
+            _CACHE_LOCK.release()
 
     def _briefing_cache_path(self) -> Path:
         return Path(self.project_root) / "data" / BRIEFING_CACHE
 
-    def _rewrite_briefing_cache(self, change: Callable[[dict[str, Any]], bool]) -> None:
+    def _rewrite_briefing_cache(self, change: Callable[[dict[str, Any]], bool], *, recheck: set[str] | None = None) -> None:
         """The body of _update_briefing_cache, for a caller that holds its locks.
 
-        Then a cache marked dirty is re-checked against the store. The marker is
-        taken after the write and before the store is read: one left while this
-        write ran (a change that missed the lock) is covered, one left later stays
-        for the next write.
+        Invariant: any state of the file that may hold a line older than its last
+        re-check against the store reads as dirty (briefing_cache_dirty).
+
+        ``recheck``: memories whose lines ``change`` may have added. Once the file is
+        replaced, their lines are checked against the store again: a memory that
+        changed after this write read the store was not in the file yet when its
+        listener looked, so this check, not the listener, drops it. The claimed
+        marker is written before that replace and removed only once the re-check is
+        written, so the file reads as dirty all along, and stays dirty if this
+        process dies in between.
+
+        A cache marked dirty is re-checked whole. The marker is claimed (renamed)
+        after the write and before the store is read: a mark made while this write
+        ran is covered, one made later is a new marker for the next write. A claimed
+        marker this write did not make was left by a writer that died: the whole
+        cache is re-checked then too.
         """
         path = self._briefing_cache_path()
+        claimed = Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY_CLAIMED
+        left = claimed.exists()
         try:
             cache = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (FileNotFoundError, ValueError):  # none yet, or one no reader can use
             cache = {}
+        # Any other OSError raises: a cache that is there but unreadable now must not be
+        # taken for an empty one, whose re-check would clear the marker of a stale file.
         cache = cache if isinstance(cache, dict) else {}
-        if change(cache):
+        written = change(cache)
+        holds = bool(written and recheck)
+        if holds:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(claimed, os.O_WRONLY | os.O_CREAT, 0o600))
+        if written:
             self._write_briefing_cache(cache)
-        if not self._take_hook_cache_dirty():
+        whole = self._claim_hook_cache_dirty() or left
+        only = None if whole else recheck if holds else set()
+        if only is not None and not only:
             return
+        if self._revalidate_hook_cache(cache, only):
+            self._write_briefing_cache(cache)
         try:
-            if self._revalidate_hook_cache(cache):
-                self._write_briefing_cache(cache)
-        except Exception:
-            self._mark_hook_cache_dirty()
-            raise
+            os.unlink(claimed)
+        except OSError as exc:  # stays dirty: the next write re-checks once more
+            _LOG.debug("briefing cache dirty marker not removed: %s", exc)
 
     def _write_briefing_cache(self, cache: dict[str, Any]) -> None:
         path = self._briefing_cache_path()
@@ -500,16 +555,17 @@ class AgentHookServiceMixin:
         write_private(scratch, json.dumps(cache, ensure_ascii=False))
         replace_file(scratch, path)
 
-    def _take_hook_cache_dirty(self) -> bool:
-        """Remove the dirty marker; True when there was one to re-check for."""
+    def _claim_hook_cache_dirty(self) -> bool:
+        """Rename the dirty marker to its claimed name; True when there was one."""
+        data = Path(self.project_root) / "data"
         try:
-            os.unlink(Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY)
+            replace_file(data / BRIEFING_CACHE_DIRTY, data / BRIEFING_CACHE_DIRTY_CLAIMED)
+            return True
         except FileNotFoundError:
             return False
-        except OSError as exc:  # Windows: its writer still has it open; the next write takes it
-            _LOG.debug("briefing cache dirty marker not taken yet: %s", exc)
+        except OSError as exc:  # Windows: its writer still has it open; the next write claims it
+            _LOG.debug("briefing cache dirty marker not claimed yet: %s", exc)
             return False
-        return True
 
     @staticmethod
     def _hook_project_roots(projects: Iterable[Any]) -> dict[str, str]:
