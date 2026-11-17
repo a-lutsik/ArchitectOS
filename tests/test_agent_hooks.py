@@ -1045,6 +1045,32 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertEqual(first, {"node_first"})
         self.assertEqual(second, {"node_second_longer"})
 
+    def test_renewing_the_stable_lines_drops_those_the_store_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            kept = service.repository.add_node("Constraint", "invoice constraint", "project", "Invoices close at midnight UTC.", "architectos")
+            service.hook_briefing(cwd=str(root))
+            node = service.repository.get_node(stable_id)
+            assert node is not None
+            node.status = "archived"
+            service.repository.upsert_node(node, notify=False)  # a change the listener never saw
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=True)
+            entry = json.loads((root / "data" / "briefing_cache.json").read_text(encoding="utf-8"))["projects"]["architectos"]
+        self.assertEqual([item[0] for item in entry["stable"]], [kept.id])
+
+    def test_a_prompt_without_the_stable_layer_does_not_renew_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            path = root / "data" / "briefing_cache.json"
+            cache = json.loads(path.read_text(encoding="utf-8"))
+            cache["projects"]["architectos"]["stable_at"] = "2000-01-01T00:00:00+00:00"
+            path.write_text(json.dumps(cache), encoding="utf-8")
+            service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            start = _hook(root, "SessionStart", cwd=root, session="s1")
+        self.assertNotIn(stable_id, _injected_ids(start))
+
     def test_access_telemetry_keeps_the_cached_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
