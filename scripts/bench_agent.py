@@ -339,8 +339,8 @@ def main() -> None:
     parser.add_argument(
         "--work-dir",
         default=None,
-        help="Parent folder of the throwaway corpus (default: the system temp folder). The store "
-        "of a real install lives in the project's data/, and on macOS the temp folder can be slower.",
+        help="Parent folder of the throwaway corpus (default: the system temp folder). It must lie "
+        "outside any folder bound to a project (.architectos.json), or the hooks resolve that project.",
     )
     parser.add_argument(
         "--real-provider",
