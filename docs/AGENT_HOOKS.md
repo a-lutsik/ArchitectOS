@@ -194,11 +194,17 @@ store, so an event costs a few milliseconds instead of a service cold start:
   injected; a prompt that gets the stable layer from the app re-checks and renews
   the cached stable lines. Writers of the cache (the app, MCP servers) and the
   hooks of one session take a lock file first (`flock` on POSIX, a one-byte
-  `msvcrt` lock on Windows). A memory write never waits long for the cache lock:
-  when it cannot evict a changed memory (the lock stays held past 0.25 s, or
-  Windows will not replace the file), it leaves `data/briefing_cache.json.dirty`.
-  While that file exists the offline hook injects no cached lines; the next
-  locked write re-checks every cached line against the store and removes it.
+  `msvcrt` lock on Windows, given up after 10 s there). A memory the cache does
+  not hold costs its write one read of the cached ids and no lock; a writer that
+  just cached lines re-checks them against the store once the file is replaced.
+  When a changed cached memory cannot be evicted (the lock stays held past
+  0.25 s, a deletion or maintenance waits past 0.5 s, or Windows will not replace
+  the file), the process leaves `data/briefing_cache.json.dirty`. While it (or its
+  `.claimed` form, held by a writer re-checking the cache) exists, the offline
+  hook injects no cached lines and `hooks status` reports `dirty`; the next locked
+  write re-checks every cached line and removes it only after writing the result.
+  A lock file the hook cannot use is reported in `data/hooks.log` even without
+  `ARCHITECTOS_HOOK_DEBUG`.
 - **Capture** is appended to `data/hook_spool.jsonl`, one record per turn with
   the project resolved for the folder. The app replays the spool through
   `capture_memory_turn` into each record's own project when it starts and once a
