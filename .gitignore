@@ -31,6 +31,8 @@ memory_search_design_preview.html
 
 # Runtime state and local data (mirrors the release exclusion list)
 data/
+# Test fixtures are sources, not runtime data.
+!tests/data/
 backups/
 memory/
 .idea/

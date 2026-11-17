@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .chat_memory import _FACT_TYPE_RANK
-from .memory_ingestion import DUPLICATE_STOPWORDS, _token_set
+from .memory_ingestion import CHAT_FACT_BOILERPLATE_PREFIXES, DUPLICATE_STOPWORDS, _token_set
 from .storage import sanitize_text
 
 # Stripped from both ends only: inner punctuation ("5.0" vs "50") is content.
@@ -78,6 +78,19 @@ def normalize_fact_text(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
     text = text.replace("’", "'")
     return " ".join(text.split()).strip(_EDGE_PUNCTUATION)
+
+
+def atom_statement(text: str) -> str:
+    """The fact of a chat/MCP fact atom without its header; "" for any other text.
+
+    The header is what makes a text an atom: an atom restored by undo has no
+    ``metadata.template``, and an explicit save ("Favorite: ...") is not one.
+    """
+    stripped = (text or "").strip()
+    for prefix in CHAT_FACT_BOILERPLATE_PREFIXES:
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return ""
 
 
 def stem(word: str) -> str:
@@ -188,8 +201,9 @@ def incoming_features(label: str, text: str) -> FactFeatures:
     return fact_features(sanitize_text(label)[0], sanitize_text(text)[0])
 
 
-# Bump when fact_features / the serialized format changes: the storage layer
-# rebuilds every index row written with an older version on startup.
+# Bump when fact_features / the serialized format changes: the app's background
+# pass (``refresh_dedup_index``) brings rows of an older version up to date, and
+# until then the index readers compute their features on the fly.
 DEDUP_INDEX_VERSION = 1
 
 
@@ -380,20 +394,38 @@ class MemoryDedupGate:
         """Relation of an incoming fact to the indexed nodes of its scope/project.
 
         Two indexed reads instead of a scan: duplicate/update/conflict all need
-        the same label subject (one lookup by subject key), and the
-        possible-duplicate flag reads stem neighbours (``near_min_shared``).
-        Only active, non-structural, non-superseded nodes are indexed.
+        the same subject (one lookup by subject key), and the possible-duplicate
+        flag reads stem neighbours (``near_min_shared``). Stem neighbours get the
+        full comparison too: a row of an older feature version is still filed
+        under its old subject. Only active, non-structural, non-superseded nodes
+        are indexed.
         """
         incoming = incoming_features(label, text)
         excluded = set(exclude_ids)
         best = DedupDecision()
         best_rank = 0
-        subject_rows = self.repository.dedup_subject_rows(scope, project_id, subject_key(incoming))
-        for row in sorted(subject_rows, key=lambda item: str(item["node_id"])):
-            node_id = str(row["node_id"])
+        rows = {
+            str(row["node_id"]): row
+            for row in self.repository.dedup_subject_rows(scope, project_id, subject_key(incoming))
+        }
+        if incoming.stems:
+            neighbours = self.repository.dedup_stem_neighbours(
+                scope, project_id, sorted(incoming.stems), self.near_min_shared(len(incoming.stems)),
+            )
+            for row in neighbours:
+                rows.setdefault(str(row["node_id"]), row)
+        for node_id in sorted(rows):
+            row = rows[node_id]
             if node_id in excluded or not self.type_matches(str(row["node_type"]), node_type):
                 continue
-            verdict = self.compare(incoming, features_from_json(str(row["features"])))
+            existing = features_from_json(str(row["features"]))
+            if not row["current"]:
+                # Outdated features past the recompute limit: good for the near flag only.
+                near = self.near_score(incoming, existing)
+                if near > best.near_score:
+                    best.near_id, best.near_score = node_id, near
+                continue
+            verdict = self.compare(incoming, existing)
             if verdict.near_score > best.near_score:
                 best.near_id, best.near_score = node_id, verdict.near_score
             rank = _ACTION_RANK.get(verdict.action, 0)
@@ -409,17 +441,6 @@ class MemoryDedupGate:
                 )
                 best.target_id, best.target_label = node_id, str(row["label"] or "")
                 best_rank = rank
-        if incoming.stems:
-            neighbours = self.repository.dedup_stem_neighbours(
-                scope, project_id, sorted(incoming.stems), self.near_min_shared(len(incoming.stems)),
-            )
-            for row in sorted(neighbours, key=lambda item: str(item["node_id"])):
-                node_id = str(row["node_id"])
-                if node_id in excluded or not self.type_matches(str(row["node_type"]), node_type):
-                    continue
-                near = self.near_score(incoming, features_from_json(str(row["features"])))
-                if near > best.near_score:
-                    best.near_id, best.near_score = node_id, near
         return best
 
     def near_score(self, incoming: FactFeatures, existing: FactFeatures) -> float:
