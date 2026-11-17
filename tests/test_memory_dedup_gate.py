@@ -162,6 +162,24 @@ class GateClassifierTests(unittest.TestCase):
         )
         self.assertEqual(verdict.action, "new")
 
+    def test_leading_punctuation_of_an_atom_token_is_content(self) -> None:
+        pairs = [
+            ("The status != active is rejected by the export job", "The status = active is rejected by the export job"),
+            ("The flag is !enabled for the export job", "The flag is enabled for the export job"),
+            ("The ratio is .5 for the export job", "The ratio is 5 for the export job"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        self.assertEqual(
+            self._compare_atoms("The export job reads (5) rows.", "The export job reads 5 rows").action, "duplicate",
+        )
+
+    def test_lower_case_a_is_an_article_and_capital_a_a_name(self) -> None:
+        verdict = self._compare_atoms("The export job reads a row from the queue", "The export job reads the row from the queue")
+        self.assertEqual(verdict.action, "duplicate")
+        self.assertIn("a", memory_dedup.statement_shape("Service A owns the queue")[1])
+
     def test_atom_with_a_second_not_keeps_every_word(self) -> None:
         verdict = self._compare_atoms(
             "The app does not cache not-found responses", "The app does not log not-found responses",

@@ -48,6 +48,10 @@ from .storage import sanitize_text
 # Stripped from both ends only: inner punctuation ("5.0" vs "50") is content.
 # No dashes: a leading minus is a sign ("-5 °C" vs "5 °C").
 _EDGE_PUNCTUATION = " .,;:!?…\"'`«»“”„()[]"
+# Around one statement token quotes and brackets are stripped from both ends but
+# sentence punctuation only from the end: "!=", "!enabled" and ".5" keep their mark.
+_TOKEN_OPENING = "\"'`«»“”„(["
+_TOKEN_CLOSING = "\"'`«»“”„)].,;:!?…"
 
 NEGATION_WORDS = frozenset({
     "не", "нет", "никогда", "нельзя", "ни",
@@ -88,9 +92,13 @@ def normalize_fact_text(value: str) -> str:
     edges do not change a fact, so "Data lives in SQLite" and "data lives in
     SQLite." compare equal. Digits, signs and inner punctuation are kept.
     """
+    return _fold_text(value).strip(_EDGE_PUNCTUATION)
+
+
+def _fold_text(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
     text = text.replace("’", "'")
-    return " ".join(text.split()).strip(_EDGE_PUNCTUATION)
+    return " ".join(text.split())
 
 
 def atom_statement(text: str) -> str:
@@ -205,7 +213,7 @@ def statement_shape(statement: str) -> tuple[frozenset[str], tuple[str, ...], tu
     # Whether the last token is a do-word: "not" right after it drops both.
     after_do = False
     for raw in statement.split():
-        token = _identifier(raw) or normalize_fact_text(raw)
+        token = _identifier(raw) or _fold_text(raw).lstrip(_TOKEN_OPENING).rstrip(_TOKEN_CLOSING)
         if not token:
             continue
         value = _statement_number(token)
