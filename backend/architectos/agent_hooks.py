@@ -1025,7 +1025,12 @@ def expand_clients(raw: Any) -> list[str]:
     return list(dict.fromkeys(requested))
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(command: str | None = None) -> argparse.ArgumentParser:
+    """The CLI parser; ``command="capture"`` builds only that subcommand.
+
+    Every agent event runs ``capture``, and building the other subparsers costs
+    it ~8 ms of argparse setup it never uses.
+    """
     parser = argparse.ArgumentParser(
         prog="architectos_hook",
         description="Capture agent turns into ArchitectOS memory through client hooks.",
@@ -1035,6 +1040,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture = sub.add_parser("capture", help="Handle one hook event read as JSON on stdin.")
     capture.add_argument("--client", required=True, choices=list(CLIENTS))
     capture.add_argument("--event", choices=list(EVENTS), default=None)
+    if command == "capture":
+        return parser
 
     for name, help_text in (("install", "Register hooks."), ("uninstall", "Remove our hooks.")):
         action = sub.add_parser(name, help=help_text)
@@ -1059,7 +1066,8 @@ def _log_to_hooks_file() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    args = build_parser(argv[0] if argv else None).parse_args(argv)
 
     if args.command == "capture":
         if _debug_enabled():
