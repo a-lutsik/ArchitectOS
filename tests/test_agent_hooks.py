@@ -925,6 +925,35 @@ class HookFileLockTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("WARNING lock file unusable", lines[0])
 
+    def test_a_windows_lock_that_never_comes_degrades_instead_of_hanging(self) -> None:
+        # msvcrt says EACCES for a held lock, but EACCES may have another cause: an
+        # unbounded wait would then hang the hook. It degrades like an unusable lock.
+        class Refusing:
+            LK_UNLCK, LK_LOCK, LK_NBLCK = 0, 1, 2
+
+            def locking(self, fd: int, mode: int, nbytes: int) -> None:
+                if mode != self.LK_UNLCK:
+                    raise PermissionError(errno.EACCES, "access denied")
+
+        result: list[bool] = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agent_hooks, "fcntl", None), \
+                mock.patch.object(agent_hooks, "msvcrt", Refusing(), create=True), \
+                mock.patch.object(agent_hooks, "_LOCK_MAX_WAIT_S", 0.2, create=True), \
+                self.assertLogs(agent_hooks.__name__, level="WARNING") as logs:
+
+            def lock() -> None:
+                with agent_hooks.file_lock(Path(tmp) / "w.lock") as held:
+                    result.append(held)
+
+            thread = threading.Thread(target=lock, daemon=True)
+            thread.start()
+            thread.join(3)
+            finished = list(result)
+            agent_hooks._log().warning("end of test")  # noqa: SLF001 - assertLogs needs one record either way
+        self.assertEqual(finished, [True])
+        self.assertIn("lock file unusable", logs.output[0])
+
     @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
     def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

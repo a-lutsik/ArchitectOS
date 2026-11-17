@@ -232,6 +232,9 @@ def write_private(path: Path, text: str, *, append: bool = False) -> None:
 # msvcrt has no blocking lock without a 10 s cap, so a Windows wait polls at this pace;
 # a Windows replace refused by a reader is retried at the same pace.
 _LOCK_POLL_S = 0.01
+# msvcrt reports a held lock as EACCES, which other causes share: a wait without a limit
+# could hang the hook, so it gives up (and runs unlocked, warned) after this long.
+_LOCK_MAX_WAIT_S = 10.0
 # Windows refuses os.replace while another process has the target open (a hook or the
 # app reading the cache or a session file); such a reader lets go within milliseconds.
 _RETRY_REPLACE = os.name == "nt"
@@ -255,13 +258,17 @@ def replace_file(source: Path, target: Path) -> None:
 
 
 def _acquire(fd: int, wait: float | None) -> bool:
-    """Take the exclusive lock on ``fd``: block (``wait`` None) or give up after ``wait`` seconds."""
+    """Take the exclusive lock on ``fd``: give up after ``wait`` seconds.
+
+    ``wait`` None blocks: flock waits as long as it takes, msvcrt (polled) up to
+    _LOCK_MAX_WAIT_S.
+    """
     if fcntl is not None and wait is None:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return True
     # A held lock: flock says EWOULDBLOCK, msvcrt EACCES.
     busy: type[OSError] = BlockingIOError if fcntl is not None else PermissionError
-    deadline = None if wait is None else time.monotonic() + wait
+    deadline = time.monotonic() + (_LOCK_MAX_WAIT_S if wait is None else wait)
     while True:
         try:
             if fcntl is not None:
@@ -272,9 +279,9 @@ def _acquire(fd: int, wait: float | None) -> bool:
             return True
         except busy:
             pass
-        if deadline is not None and time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             return False
-        time.sleep(_LOCK_POLL_S if deadline is None else max(0.0, min(_LOCK_POLL_S, deadline - time.monotonic())))
+        time.sleep(max(0.0, min(_LOCK_POLL_S, deadline - time.monotonic())))
 
 
 def _release(fd: int) -> None:
@@ -308,7 +315,10 @@ def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         held = _acquire(fd, wait)
+        if not held and wait is None:
+            raise TimeoutError(f"not obtained within {_LOCK_MAX_WAIT_S:g}s")
     except OSError as exc:
+        held = True
         if str(path) in _LOCK_WARNED:
             _log().debug("lock file still unusable, going on without it: %s (%s)", path.name, exc)
         else:
