@@ -164,7 +164,9 @@ The hook prefers the running app: it reads `data/architectos.runtime.json` for t
 port and auth token and calls `POST /api/memory/turn` (or
 `GET /api/memory/briefing`). Each agent turn starts a new interpreter, so the hook
 keeps its imports to a few stdlib modules and speaks HTTP/1.0 over a plain socket
-to the app's loopback server rather than through `urllib`.
+to the app's loopback server rather than through `urllib`. The registered
+`capture --client X --event Y` command line is read without `argparse`, and
+`logging` loads only when the hook has something to log.
 
 If the app is not running (or does not answer in time) the hook never opens the
 store, so an event costs a few milliseconds instead of a service cold start:

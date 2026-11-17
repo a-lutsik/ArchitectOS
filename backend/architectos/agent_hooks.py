@@ -17,7 +17,6 @@ Every failure is silent by design: a broken memory hook must never break the age
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -33,6 +32,7 @@ from .paths import is_frozen, resolve_project_root
 from .usage import estimate_tokens_from_text
 
 if TYPE_CHECKING:
+    import argparse
     import logging
 
 _LOGGER: logging.Logger | None = None
@@ -43,8 +43,8 @@ def _log() -> logging.Logger:
 
     Every agent turn starts a new interpreter and a turn that injects normally
     logs nothing, so importing logging up front would cost each turn ~10 ms.
-    The hook runs inside the agent's process tree: it stays off stderr unless a
-    handler is configured.
+    The hook runs inside the agent's process tree: it stays off stderr unless
+    ARCHITECTOS_HOOK_DEBUG sends its lines (counts only) to data/hooks.log.
     """
     global _LOGGER
     if _LOGGER is None:
@@ -52,6 +52,16 @@ def _log() -> logging.Logger:
 
         _LOGGER = logging.getLogger(__name__)
         _LOGGER.addHandler(logging.NullHandler())
+        if _debug_enabled():
+            try:
+                path = resolve_project_root() / "data" / "hooks.log"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handler = logging.FileHandler(path, encoding="utf-8")
+            except OSError:
+                return _LOGGER
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            _LOGGER.addHandler(handler)
+            _LOGGER.setLevel(logging.INFO)
     return _LOGGER
 
 CLIENTS: tuple[str, ...] = ("cursor", "claude", "codex")
@@ -395,7 +405,10 @@ def _exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple
     if body is not None:
         lines += ["Content-Type: application/json", f"Content-Length: {len(body)}"]
     chunks: list[bytes] = []
-    with socket.create_connection((host or "127.0.0.1", int(port or 80)), timeout=timeout) as conn:
+    # getaddrinfo takes a bytes host as is and runs a str one through the idna
+    # codec (~4 ms of imports); typeshed only lists str.
+    address = ((host or "127.0.0.1").encode("ascii"), int(port or 80))
+    with socket.create_connection(address, timeout=timeout) as conn:  # type: ignore[arg-type]
         conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b""))
         while chunk := conn.recv(65536):
             chunks.append(chunk)
@@ -1050,6 +1063,8 @@ def build_parser(command: str | None = None) -> argparse.ArgumentParser:
     Every agent event runs ``capture``, and building the other subparsers costs
     it ~8 ms of argparse setup it never uses.
     """
+    import argparse
+
     parser = argparse.ArgumentParser(
         prog="architectos_hook",
         description="Capture agent turns into ArchitectOS memory through client hooks.",
@@ -1071,40 +1086,44 @@ def build_parser(command: str | None = None) -> argparse.ArgumentParser:
     return parser
 
 
-def _log_to_hooks_file() -> None:
-    """With ARCHITECTOS_HOOK_DEBUG the hook's own log lines (counts only) join data/hooks.log."""
-    import logging
+def _capture_argv(argv: list[str]) -> tuple[str, str | None] | None:
+    """(client, event) when argv is exactly what ``hook_command`` registers, else None.
 
+    Every agent event starts a new interpreter; argparse and the shutil, bz2 and
+    lzma its help formatter imports cost each one ~15 ms. Any other form goes
+    through argparse as before.
+    """
+    if len(argv) not in (3, 5) or argv[:2] != ["capture", "--client"] or argv[2] not in CLIENTS:
+        return None
+    if len(argv) == 3:
+        return argv[2], None
+    return (argv[2], argv[4]) if argv[3] == "--event" and argv[4] in EVENTS else None
+
+
+def _capture(client: str, event: str | None) -> int:
     try:
-        path = resolve_project_root() / "data" / "hooks.log"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(path, encoding="utf-8")
-    except OSError:
-        return
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    _log().addHandler(handler)
-    _log().setLevel(logging.INFO)
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        raw = ""
+    try:
+        out = handle_capture(raw, client=client, event=event)
+    except Exception as exc:  # noqa: BLE001 - a hook must never break the agent
+        _debug(f"capture crashed: {exc}")
+        out = "{}" if client == "codex" and event == EVENT_RESPONSE else ""
+    if out:
+        sys.stdout.write(out)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    capture = _capture_argv(argv)
+    if capture is not None:
+        return _capture(*capture)
     args = build_parser(argv[0] if argv else None).parse_args(argv)
 
     if args.command == "capture":
-        if _debug_enabled():
-            _log_to_hooks_file()
-        try:
-            raw = sys.stdin.read()
-        except (OSError, ValueError):
-            raw = ""
-        try:
-            out = handle_capture(raw, client=args.client, event=args.event)
-        except Exception as exc:  # noqa: BLE001 - a hook must never break the agent
-            _debug(f"capture crashed: {exc}")
-            out = "{}" if args.client == "codex" and args.event == EVENT_RESPONSE else ""
-        if out:
-            sys.stdout.write(out)
-        return 0
+        return _capture(args.client, args.event)
 
     if args.command == "doctor":
         print(json.dumps(status(project_root=resolve_project_root()), indent=2, sort_keys=True))

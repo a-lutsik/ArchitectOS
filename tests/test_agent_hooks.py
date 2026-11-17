@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1111,6 +1112,53 @@ class HookTimingLogTests(unittest.TestCase):
         match = self.LINE.match(lines[0])
         assert match is not None, lines
         self.assertEqual(match["transport"], "http")
+
+    def test_injecting_prompt_turn_loads_no_cli_or_logging_modules(self) -> None:
+        # Every agent event starts a fresh interpreter: argparse (with the shutil,
+        # bz2 and lzma its help formatter pulls in), logging and the idna codec cost
+        # each turn ~25 ms, and a prompt turn that injects normally needs none of them.
+        pack = {"context": "- id=node_a [Decision] Hooks talk to the app over a socket.", "hits": [{"id": "node_a"}]}
+        listener = socket.create_server(("127.0.0.1", 0))
+
+        def reply() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += conn.recv(65536)
+                head, _, body = data.partition(b"\r\n\r\n")
+                length = int(re.search(rb"Content-Length: (\d+)", head)[1])
+                while len(body) < length:
+                    body += conn.recv(65536)
+                conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n" + json.dumps(pack).encode("utf-8"))
+
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(Path(agent_hooks.__file__).resolve().parents[1])!r})\n"
+            "from architectos.agent_hooks import main\n"
+            "main(['capture', '--client', 'claude', '--event', 'prompt'])\n"
+            "print()\n"
+            "print(sorted(n for n in ('argparse', 'logging', 'shutil', 'encodings.idna') if n in sys.modules))\n"
+        )
+        thread = threading.Thread(target=reply, daemon=True)
+        thread.start()
+        with tempfile.TemporaryDirectory() as tmp, listener:
+            (Path(tmp) / "data").mkdir()
+            (Path(tmp) / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": f"http://127.0.0.1:{listener.getsockname()[1]}", "auth_token": "token"}), encoding="utf-8"
+            )
+            env = {**os.environ, "ARCHITECTOS_ROOT": tmp, "ARCHITECTOS_HOOK_DEBUG": "1", "ARCHITECTOS_HOOK_OFFLINE": "0"}
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                input=json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": self.PROMPT, "cwd": tmp}),
+                capture_output=True, text=True, env=env, check=True, timeout=60,
+            )
+            thread.join(timeout=5)
+            log = (Path(tmp) / "data" / "hooks.log").read_text(encoding="utf-8")
+        out, modules = proc.stdout.rsplit("\n", 2)[:2]
+        self.assertIn("Hooks talk to the app", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("transport=http", log)
+        self.assertEqual(modules, "[]")
 
     def test_debug_log_stays_off_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_DEBUG": ""}):
