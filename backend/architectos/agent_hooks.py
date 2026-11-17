@@ -736,6 +736,15 @@ BRIEFING_CACHE = "briefing_cache.json"
 # would not be replaced, or its lock stayed held): until the next locked write
 # re-checks every cached line against the store, the offline hook injects no lines.
 BRIEFING_CACHE_DIRTY = f"{BRIEFING_CACHE}.dirty"
+# The marker a writer has claimed: renamed, not removed, until the re-checked cache is
+# written, so the hook keeps off the lines meanwhile and a new mark is a new file.
+BRIEFING_CACHE_DIRTY_CLAIMED = f"{BRIEFING_CACHE_DIRTY}.claimed"
+
+
+def briefing_cache_dirty(root: Path) -> bool:
+    """True while the cache may hold a changed memory (see BRIEFING_CACHE_DIRTY)."""
+    data = root / "data"
+    return (data / BRIEFING_CACHE_DIRTY).exists() or (data / BRIEFING_CACHE_DIRTY_CLAIMED).exists()
 HOOK_SPOOL = "hook_spool.jsonl"
 _SPOOL_MAX_BYTES = 5 * 1024 * 1024
 _BRIEFING_CHAR_BUDGET = 2000
@@ -969,7 +978,7 @@ def _offline_turn(
     entry = (cache.get("projects") or {}).get(project_id) if project_id else None
     if isinstance(entry, dict):
         entry = _fresh_sections(entry, float(settings.get("hook_cache_ttl_hours", _CACHE_TTL_HOURS)))
-    dirty = (root / "data" / BRIEFING_CACHE_DIRTY).exists()
+    dirty = briefing_cache_dirty(root)
     if turn.can_inject and isinstance(entry, dict) and not dirty:
         session = turn.event == EVENT_SESSION
         context, shown = render_cached_pack(

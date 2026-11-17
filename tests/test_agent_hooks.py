@@ -1182,6 +1182,38 @@ class HookCacheInvalidationTests(unittest.TestCase):
                 service.repository.add_node("Lesson", "unrelated", "project", "Deploys run on Tuesdays.", "architectos")
         sign.assert_not_called()
 
+    def test_the_dirty_marker_stays_until_the_rechecked_cache_is_written(self) -> None:
+        # While a writer re-checks the cache the offline hook must still see it dirty;
+        # a writer that dies there leaves it dirty, and a mark made meanwhile survives.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, stable_id, _ = self._cached(root)
+            node = service.repository.get_node(stable_id)
+            assert node is not None
+            node.status = "archived"
+            service.repository.upsert_node(node, notify=False)  # an eviction that was never written
+            service._mark_hook_cache_dirty()  # noqa: SLF001
+            real = service._revalidate_hook_cache  # noqa: SLF001
+            during: list[str] = []
+
+            def offline_hook_meanwhile(cache: dict[str, Any]) -> int:
+                if not during:
+                    during.append(_hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION))
+                    raise RuntimeError("writer killed while re-checking")
+                service._mark_hook_cache_dirty()  # noqa: SLF001 - another change missed the lock meanwhile
+                return real(cache)
+
+            with mock.patch.object(service, "_revalidate_hook_cache", side_effect=offline_hook_meanwhile):
+                service.hook_maintenance()
+                after_kill = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+                service.hook_maintenance()
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+            cached = self._cache_ids(root)
+        self.assertNotIn(stable_id, _injected_ids(during[0]))
+        self.assertNotIn(stable_id, _injected_ids(after_kill))
+        self.assertNotIn(stable_id, cached)
+        self.assertEqual(left, [f"{agent_hooks.BRIEFING_CACHE}.dirty"])
+
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
         # from the store re-checks the cached lines and renews their age.

@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable, Mapping
 from .agent_hooks import (
     BRIEFING_CACHE,
     BRIEFING_CACHE_DIRTY,
+    BRIEFING_CACHE_DIRTY_CLAIMED,
     HOOK_SPOOL,
     file_lock,
     hook_pack_budget,
@@ -472,9 +473,10 @@ class AgentHookServiceMixin:
         """The body of _update_briefing_cache, for a caller that holds its locks.
 
         Then a cache marked dirty is re-checked against the store. The marker is
-        taken after the write and before the store is read: one left while this
-        write ran (a change that missed the lock) is covered, one left later stays
-        for the next write.
+        claimed after the write and before the store is read, and removed only once
+        the re-checked cache is written: a mark made while this write ran (a change
+        that missed the lock) is covered, one made later is a new marker for the next
+        write, and a writer that dies on the way leaves the cache dirty.
         """
         path = self._briefing_cache_path()
         try:
@@ -484,14 +486,14 @@ class AgentHookServiceMixin:
         cache = cache if isinstance(cache, dict) else {}
         if change(cache):
             self._write_briefing_cache(cache)
-        if not self._take_hook_cache_dirty():
+        if not self._claim_hook_cache_dirty():
             return
+        if self._revalidate_hook_cache(cache):
+            self._write_briefing_cache(cache)
         try:
-            if self._revalidate_hook_cache(cache):
-                self._write_briefing_cache(cache)
-        except Exception:
-            self._mark_hook_cache_dirty()
-            raise
+            os.unlink(Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY_CLAIMED)
+        except OSError as exc:  # stays dirty: the next write re-checks once more
+            _LOG.debug("briefing cache dirty marker not removed: %s", exc)
 
     def _write_briefing_cache(self, cache: dict[str, Any]) -> None:
         path = self._briefing_cache_path()
@@ -500,16 +502,20 @@ class AgentHookServiceMixin:
         write_private(scratch, json.dumps(cache, ensure_ascii=False))
         replace_file(scratch, path)
 
-    def _take_hook_cache_dirty(self) -> bool:
-        """Remove the dirty marker; True when there was one to re-check for."""
+    def _claim_hook_cache_dirty(self) -> bool:
+        """Rename the dirty marker to its claimed name; True when the cache is to be re-checked.
+
+        A claimed marker already there was left by a writer that died re-checking.
+        """
+        data = Path(self.project_root) / "data"
         try:
-            os.unlink(Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY)
+            replace_file(data / BRIEFING_CACHE_DIRTY, data / BRIEFING_CACHE_DIRTY_CLAIMED)
+            return True
         except FileNotFoundError:
-            return False
-        except OSError as exc:  # Windows: its writer still has it open; the next write takes it
-            _LOG.debug("briefing cache dirty marker not taken yet: %s", exc)
-            return False
-        return True
+            pass
+        except OSError as exc:  # Windows: its writer still has it open; the next write claims it
+            _LOG.debug("briefing cache dirty marker not claimed yet: %s", exc)
+        return (data / BRIEFING_CACHE_DIRTY_CLAIMED).exists()
 
     @staticmethod
     def _hook_project_roots(projects: Iterable[Any]) -> dict[str, str]:
