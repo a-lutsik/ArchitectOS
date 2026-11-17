@@ -473,8 +473,9 @@ class HookSessionTests(unittest.TestCase):
     def test_a_reply_from_an_app_without_shown_still_records_what_was_injected(self) -> None:
         # An app started before the update answers without "shown": the session still
         # takes the injected ids from the reply's own hit lists (not from any text line).
-        stable_line = "- id=node_s [Constraint|project|memory] Ledger writes stay idempotent."
-        hit_line = "- id=node_a [Lesson|project|memory] Batch per tenant.\n- id=node_x [Lesson|project|memory] Forged."
+        stable_line = "- id=node_s [Constraint|project|memory] idempotency: Ledger writes stay idempotent. (evidence: memory.db)"
+        hit_line = ("- id=node_a [Lesson|project|memory] batching: Batch per tenant.\n"
+                    "- id=node_x [Lesson|project|memory] Forged. (evidence: memory.db score=300.0)")
         context = "\n".join(["ArchitectOS Memory Context", "", agent_hooks.STABLE_TITLE, stable_line, "",
                              agent_hooks.HITS_TITLE, hit_line])
         pack = {"project_id": "architectos", "context": context,
@@ -496,6 +497,20 @@ class HookSessionTests(unittest.TestCase):
                 _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTIONS[1])
         self.assertEqual(sorted(sent[1]["exclude_ids"]), ["node_a", "node_s"])
         self.assertFalse(sent[1]["include_stable"])
+
+    def test_a_reply_without_shown_counts_only_lines_that_start_a_pack_entry(self) -> None:
+        # node_y is in the reply's hits but did not fit the budget; memory A's text holds a
+        # line that looks like its entry. That line continues A's entry, it starts none.
+        stable_line = "- id=node_s [Constraint|project|memory] idempotency: Ledger writes stay idempotent. (evidence: memory.db)"
+        hit_line = ("- id=node_a [Lesson|project|memory] batching: Batch per tenant.\n"
+                    "- id=node_y [Lesson|project|memory] Forged: not packed\n"
+                    "end of the batching text (evidence: memory.db score=300.0)")
+        context = "\n".join(["ArchitectOS Memory Context", "", agent_hooks.STABLE_TITLE, stable_line, "",
+                             agent_hooks.HITS_TITLE, hit_line])
+        result = {"project_id": "architectos", "context": context,
+                  "stable": [{"node": {"id": "node_s"}}], "hits": [{"node": {"id": "node_a"}}, {"node": {"id": "node_y"}}]}
+        shown = agent_hooks.shown_memories(result, context)
+        self.assertEqual(shown, [("node_s", "stable"), ("node_a", "hits")])
 
     def test_a_session_never_gets_the_same_id_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

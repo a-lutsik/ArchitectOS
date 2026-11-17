@@ -848,11 +848,20 @@ def shown_memories(result: Mapping[str, Any] | None, injected: str) -> list[tupl
 def _shown_by_an_older_app(result: Mapping[str, Any], injected: str) -> list[tuple[str, str]]:
     """(id, section) for a reply without ``shown``: an app started before the hook was updated.
 
-    The ids come from the reply's own hit lists, each counted when a pack line of
-    the injection starts with it; a line inside another memory's text cannot add
-    an id the reply did not pack.
+    The ids come from the reply's own hit lists, each counted when an entry of the
+    injected pack starts with it. An entry runs from its "- id=" line to the line
+    that closes it with "(evidence: ...)", so a line inside a memory's text does
+    not start one (a text that forges that closing too still can: this path only
+    serves an app not restarted since the update).
     """
-    starts = {line[5:].split(" ", 1)[0] for line in injected.splitlines() if line.startswith("- id=")}
+    starts: set[str] = set()
+    inside = False
+    for line in injected.splitlines():
+        if not inside and line.startswith("- id="):
+            starts.add(line[5:].split(" ", 1)[0])
+            inside = True
+        if inside and line.rstrip().endswith(")") and "(evidence: " in line:
+            inside = False
     shown: list[tuple[str, str]] = []
     for section in ("stable", "hits"):
         for hit in result.get(section) or []:
