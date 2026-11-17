@@ -184,7 +184,9 @@ store, so an event costs a few milliseconds instead of a service cold start:
   `capture_memory_turn` into each record's own project when it starts and once a
   minute (the `chat-session-idle` loop); a record that keeps failing is retried
   three times and then dropped. The spool stops growing at 5 MB. A capture whose
-  HTTP request timed out is *not* spooled: the app already has it. One the app
+  reply timed out after the whole request was sent is *not* spooled: the app
+  already has it. A connect or send that timed out never reached the app and is
+  spooled. The timeout bounds the whole request, not each socket operation. One the app
   answered with an error (HTTP 4xx/5xx, a cut reply) is spooled, since the app did
   not store it. The spool keeps the raw question and answer until the app replays
   them through `capture_memory_turn`, which redacts secrets as for a live turn; like

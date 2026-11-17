@@ -434,12 +434,30 @@ def _exchange(url: str, token: str, body: bytes | None, timeout: float) -> tuple
     if body is not None:
         lines += ["Content-Type: application/json", f"Content-Length: {len(body)}"]
     chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
     # getaddrinfo takes a bytes host as is and runs a str one through the idna
     # codec (~4 ms of imports); typeshed only lists str.
     address = ((host or "127.0.0.1").encode("ascii"), int(port or 80))
-    with socket.create_connection(address, timeout=timeout) as conn:  # type: ignore[arg-type]
-        conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b""))
-        while chunk := conn.recv(65536):
+    try:
+        connected = socket.create_connection(address, timeout=timeout)  # type: ignore[arg-type]
+    except TimeoutError as exc:
+        raise ConnectionError(f"connect timed out: {exc}") from exc  # the app never got the request
+    with connected as conn:
+        try:
+            conn.settimeout(max(0.001, deadline - time.monotonic()))
+            conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b""))
+        except TimeoutError as exc:
+            raise ConnectionError(f"send timed out: {exc}") from exc  # an incomplete request is never served
+        # One deadline for the whole reply, not per recv: a trickling reply must not
+        # hold the agent past ``timeout``.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no complete reply within {timeout:.1f}s")
+            conn.settimeout(remaining)
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
             chunks.append(chunk)
     head, _, reply = b"".join(chunks).partition(b"\r\n\r\n")
     return int(head.split(b" ", 2)[1]), reply
@@ -455,8 +473,9 @@ def _request_json(
 ) -> tuple[dict[str, Any] | None, str]:
     """Parsed reply plus why there is none: "" (ok), "timeout", "unreachable" or "error".
 
-    A timeout means the app got the request and may still act on it; only an
-    unreachable app means the event surely went nowhere.
+    A timeout means the app got the whole request and may still act on it;
+    "unreachable" (refused, or a connect or send that timed out) means the event
+    surely went nowhere.
     """
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     try:

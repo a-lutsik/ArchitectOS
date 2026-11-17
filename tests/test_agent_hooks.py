@@ -135,6 +135,47 @@ class HookTimeoutTests(unittest.TestCase):
         seen = self._timeouts({"ARCHITECTOS_HOOK_TIMEOUT": "7", "ARCHITECTOS_HOOK_INJECT_TIMEOUT": "0.5"})
         self.assertEqual(seen, {"session": 0.5, "prompt": 0.5, "response": 7.0})
 
+    def test_a_trickling_reply_hits_one_deadline_for_the_whole_request(self) -> None:
+        # The timeout bounds the whole exchange, not each socket operation: a reply
+        # that keeps sending a byte at a time must not hold the agent past it.
+        listener = socket.create_server(("127.0.0.1", 0))
+
+        def trickle() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(65536)
+                try:
+                    for byte in b"HTTP/1.0 200 OK\r\n\r\n{}" + b" " * 40:
+                        conn.sendall(bytes([byte]))
+                        time.sleep(0.05)
+                except OSError:
+                    pass  # the hook gave up and closed
+
+        thread = threading.Thread(target=trickle, daemon=True)
+        thread.start()
+        with listener:
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                agent_hooks._exchange(f"http://127.0.0.1:{listener.getsockname()[1]}/api/memory/turn", "token", b"{}", 0.5)
+            elapsed = time.monotonic() - started
+            thread.join(timeout=5)
+        self.assertLess(elapsed, 1.5)
+
+    def test_turn_end_spools_a_turn_whose_connect_timed_out(self) -> None:
+        # A connect that timed out never delivered the request: spooling it cannot
+        # capture the turn twice, and not spooling it would lose the turn.
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(socket, "create_connection", side_effect=TimeoutError("timed out")):
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "architectos.runtime.json").write_text(
+                json.dumps({"url": "http://127.0.0.1:9", "auth_token": "token"}), encoding="utf-8"
+            )
+            _hook(root, "Stop", cwd=root, last_assistant_message="Batch ledger writes per tenant.")
+            spool = root / "data" / "hook_spool.jsonl"
+            spooled = spool.read_text(encoding="utf-8").splitlines() if spool.exists() else []
+        self.assertEqual(len(spooled), 1)
+
     def test_hook_pack_cuts_vector_search_at_800_ms(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = ArchitectOSService(Path(tmp))
