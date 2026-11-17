@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -131,6 +132,34 @@ class StorageTransactionTests(unittest.TestCase):
             finally:
                 peek.close()
             self.assertEqual(count, 1)
+
+    def test_setting_reads_are_memoized_until_a_write_or_the_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SQLiteMemoryRepository(Path(tmp))
+            other = SQLiteMemoryRepository(Path(tmp))  # another process, e.g. the MCP server
+            repository.set_setting("agent", {"hook_char_budget": 1600})
+            with mock.patch.object(repository, "_connect", wraps=repository._connect) as opened:  # noqa: SLF001
+                first = repository.get_setting("agent")
+                first["hook_char_budget"] = 9999  # callers get their own copy
+                second = repository.get_setting("agent")
+            self.assertEqual(opened.call_count, 1)
+            self.assertEqual(second, {"hook_char_budget": 1600})
+            repository.set_setting("agent", {"hook_char_budget": 2000})
+            self.assertEqual(repository.get_setting("agent"), {"hook_char_budget": 2000})
+            other.set_setting("agent", {"hook_char_budget": 2400})
+            self.assertEqual(repository.get_setting("agent"), {"hook_char_budget": 2000})
+            with mock.patch("backend.architectos.storage_sessions.time.monotonic", return_value=time.monotonic() + 2.0):
+                self.assertEqual(repository.get_setting("agent"), {"hook_char_budget": 2400})
+
+    def test_setting_read_inside_a_rolled_back_transaction_is_not_memoized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SQLiteMemoryRepository(Path(tmp))
+            repository.set_setting("agent", {"hook_char_budget": 1600})
+            with self.assertRaises(RuntimeError), repository.transaction():
+                repository.set_setting("agent", {"hook_char_budget": 2000})
+                self.assertEqual(repository.get_setting("agent"), {"hook_char_budget": 2000})
+                raise RuntimeError("roll back")
+            self.assertEqual(repository.get_setting("agent"), {"hook_char_budget": 1600})
 
 
 class SchemaMigrationTests(unittest.TestCase):

@@ -112,6 +112,8 @@ class SQLiteMemoryRepository(StorageSearchMixin, StorageDedupMixin, StorageCandi
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self._node_upsert_listeners: list[Any] = []
+        # get_setting memo: key -> (monotonic read time, raw JSON payload); see storage_sessions.
+        self._settings_memo: dict[str, tuple[float, str | None]] = {}
         # Thread-local slot for the connection owned by transaction(); must exist
         # before _migrate() runs its first _connect().
         self._local = threading.local()
