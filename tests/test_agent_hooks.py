@@ -1508,6 +1508,25 @@ class HookCacheInvalidationTests(unittest.TestCase):
         self.assertTrue(_injected_ids(out))
         self.assertNotIn(stable_id, _injected_ids(out))
 
+    def test_a_dirty_cache_heals_without_the_app_when_a_cached_memory_changes(self) -> None:
+        # The app is closed and an MCP server writes memory: it never runs maintenance
+        # or hook turns, so a change to a cached memory must clear the marker when the
+        # lock is free, or the offline hook stays silent until the app starts.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ARCHITECTOS_ROOT": tmp}):
+            root = Path(tmp)
+            app, _, _ = self._cached(root)
+            cached = sorted(self._cache_ids(root))
+            mcp = ArchitectOSService(root)
+            mcp._mark_hook_cache_dirty()  # noqa: SLF001 - left by a listener that met a held lock
+            self._archive(mcp, cached[0])
+            dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
+            after = self._cache_ids(root)
+            out = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+        self.assertFalse(dirty)
+        self.assertNotIn(cached[0], after)
+        self.assertTrue(_injected_ids(out))
+        self.assertNotIn(cached[0], _injected_ids(out))
+
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer
         # from the store re-checks the cached lines and renews their age.

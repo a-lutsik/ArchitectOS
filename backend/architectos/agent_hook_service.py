@@ -340,7 +340,7 @@ class AgentHookServiceMixin:
         whose signature changed is evicted under the lock, waited for at most
         HOOK_CACHE_LOCK_WAIT_S; when the lock stays held, the cache is marked dirty
         instead (see BRIEFING_CACHE_DIRTY) and the next locked write re-checks it;
-        while that marker waits, later changes leave themselves to it.
+        while that marker waits, a later change only tries the lock once.
         """
         try:
             cached = self._hook_cache_index().get(node.id)
@@ -349,29 +349,35 @@ class AgentHookServiceMixin:
             signature = _cache_signature(node.to_dict())
             if cached == {signature}:
                 return
-            if (Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY).exists():
-                # Already marked and not yet claimed: the write that claims it reads the
-                # store after this change, so waiting for a stuck lock again buys nothing.
-                _LOG.debug("briefing cache already marked for revalidation, node %s left to it", node.id)
-                return
+            # Already marked and not yet claimed: the write that claims it reads the store
+            # after this change, so a held lock is not waited for (nor warned about) again;
+            # a free one is taken to evict and re-check now, since an MCP server alone
+            # never runs the app's maintenance or hook turns.
+            dirty = (Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY).exists()
+            wait = 0.0 if dirty else HOOK_CACHE_LOCK_WAIT_S
             started = time.monotonic()
-            if not _CACHE_LOCK.acquire(timeout=HOOK_CACHE_LOCK_WAIT_S):
-                self._hook_cache_lock_busy(node.id)
+            if not _CACHE_LOCK.acquire(timeout=wait):
+                self._hook_cache_lock_busy(node.id, dirty)
                 return
             try:
                 lock = self._briefing_cache_path().with_name(f"{BRIEFING_CACHE}.lock")
-                with file_lock(lock, wait=max(0.0, HOOK_CACHE_LOCK_WAIT_S - (time.monotonic() - started))) as held:
+                with file_lock(lock, wait=max(0.0, wait - (time.monotonic() - started))) as held:
                     if not held:
-                        self._hook_cache_lock_busy(node.id)
+                        self._hook_cache_lock_busy(node.id, dirty)
                         return
                     if self._hook_cache_index().get(node.id, {signature}) != {signature}:
                         self._evict_hook_cache(lambda node_id, old: node_id == node.id and old != signature, set(), locked=True)
+                    elif dirty:
+                        self._rewrite_briefing_cache(lambda cache: False)  # claims the marker, re-checks all
             finally:
                 _CACHE_LOCK.release()
         except Exception as exc:  # noqa: BLE001 - a listener must never break the write
             _LOG.warning("briefing cache not pruned for node %s: %s", node.id, exc)
 
-    def _hook_cache_lock_busy(self, node_id: str) -> None:
+    def _hook_cache_lock_busy(self, node_id: str, marked: bool) -> None:
+        if marked:
+            _LOG.debug("briefing cache lock held, node %s left to the pending re-check", node_id)
+            return
         _LOG.warning("briefing cache lock held past %ss, eviction of node %s deferred", HOOK_CACHE_LOCK_WAIT_S, node_id)
         self._mark_hook_cache_dirty()
 
