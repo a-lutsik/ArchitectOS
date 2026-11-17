@@ -233,8 +233,11 @@ def write_private(path: Path, text: str, *, append: bool = False) -> None:
 # a Windows replace refused by a reader is retried at the same pace.
 _LOCK_POLL_S = 0.01
 # msvcrt reports a held lock as EACCES, which other causes share: a wait without a limit
-# could hang the hook, so it gives up (and runs unlocked, warned) after this long.
-_LOCK_MAX_WAIT_S = 10.0
+# could hang the hook, so it gives up (and runs unlocked, warned) after this long, and the
+# process does not wait for that lock file again. Turn end waits for the session lock,
+# the app and the lock again: all of it must fit the hook's registered timeout.
+_LOCK_MAX_WAIT_S = 1.5
+_LOCK_GAVE_UP: set[str] = set()
 # Windows refuses os.replace while another process has the target open (a hook or the
 # app reading the cache or a session file); such a reader lets go within milliseconds.
 _RETRY_REPLACE = os.name == "nt"
@@ -314,8 +317,9 @@ def file_lock(path: Path, *, wait: float | None = None) -> Iterator[bool]:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        held = _acquire(fd, wait)
+        held = _acquire(fd, 0.0 if wait is None and str(path) in _LOCK_GAVE_UP else wait)
         if not held and wait is None:
+            _LOCK_GAVE_UP.add(str(path))
             raise TimeoutError(f"not obtained within {_LOCK_MAX_WAIT_S:g}s")
     except OSError as exc:
         held = True

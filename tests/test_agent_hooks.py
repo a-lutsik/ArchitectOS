@@ -958,6 +958,33 @@ class HookFileLockTests(unittest.TestCase):
         self.assertEqual(finished, [True])
         self.assertIn("lock file unusable", logs.output[0])
 
+    def test_a_windows_lock_gives_up_well_within_the_hook_timeout(self) -> None:
+        # Turn end waits for the session lock, then for the app, then for the lock again:
+        # it must degrade before the client kills the hook (the shortest registered timeout).
+        shortest = min(timeout for registrations in agent_hooks._REGISTRATIONS.values() for _, _, timeout in registrations)  # noqa: SLF001
+        self.assertLess(agent_hooks._LOCK_MAX_WAIT_S + agent_hooks._CAPTURE_TIMEOUT + 1.0, shortest)  # noqa: SLF001
+
+    def test_a_windows_lock_that_never_comes_is_waited_for_once_per_process(self) -> None:
+        class Refusing:
+            LK_UNLCK, LK_LOCK, LK_NBLCK = 0, 1, 2
+
+            def locking(self, fd: int, mode: int, nbytes: int) -> None:
+                if mode != self.LK_UNLCK:
+                    raise PermissionError(errno.EACCES, "access denied")
+
+        bound = 0.3
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ARCHITECTOS_HOOK_OFFLINE": "1"}), \
+                mock.patch.object(agent_hooks, "fcntl", None), \
+                mock.patch.object(agent_hooks, "msvcrt", Refusing(), create=True), \
+                mock.patch.object(agent_hooks, "_LOCK_MAX_WAIT_S", bound):
+            root = Path(tmp)
+            _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt="How do we batch ledger writes?")
+            started = time.monotonic()
+            _hook(root, "Stop", cwd=root, session="s1", last_assistant_message="We batch per tenant.")  # two edits
+            took = time.monotonic() - started
+        self.assertLess(took, 0.5 * bound)  # the prompt already found the lock unusable
+
     @unittest.skipUnless(os.name == "nt", "real msvcrt byte locks")
     def test_real_msvcrt_lock_excludes_a_second_holder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
