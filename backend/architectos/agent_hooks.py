@@ -536,6 +536,9 @@ _BIND_FILENAME = ".architectos.json"
 # Section titles of search.pack_memory_context: the cache keeps a pack's lines per section.
 STABLE_TITLE = "Stable memory (pinned / constraints / long-term):"
 HITS_TITLE = "Retrieved for this query:"
+# Lines that start the blocks pack_memory_context puts after the memory sections.
+_PACK_TAIL_STARTS = ("Open Tasks:", "Enabled Providers:", "Known Boards IDs from memory:")
+_PACK_MARKERS = ("- …[context budget reached]", "- (no memory hits)")
 
 
 def split_pack(context: str) -> dict[str, Any]:
@@ -543,16 +546,25 @@ def split_pack(context: str) -> dict[str, Any]:
     header: list[str] = []
     sections: dict[str, list[list[str]]] = {"stable": [], "hits": []}
     current: str | None = None
+    entry: list[str] | None = None
     for line in context.splitlines():
         stripped = line.strip()
         if stripped in (STABLE_TITLE, HITS_TITLE):
-            current = "stable" if stripped == STABLE_TITLE else "hits"
+            current, entry = ("stable" if stripped == STABLE_TITLE else "hits"), None
         elif current is None:
             header.append(line)
-        elif (match := _INJECTED_ID.match(line)) and current in sections:
-            sections[current].append([match.group(1), line])
-        elif stripped:
-            current = ""  # a trailing block (tasks, providers) ends the pack lines
+        elif current not in sections:
+            continue
+        elif match := _INJECTED_ID.match(line):
+            entry = [match.group(1), line]
+            sections[current].append(entry)
+        elif stripped.startswith(_PACK_TAIL_STARTS) or stripped in _PACK_MARKERS:
+            current, entry = "", None  # a trailing block (tasks, providers) or a marker ends the pack lines
+        elif entry is not None:
+            entry[1] += "\n" + line  # a memory's text spans lines ("Durable fact ...\n\n<fact>")
+    for items in sections.values():
+        for item in items:
+            item[1] = item[1].rstrip()
     return {"header": "\n".join(header).strip(), **sections}
 
 

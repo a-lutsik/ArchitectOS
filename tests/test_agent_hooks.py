@@ -551,6 +551,22 @@ class HookOfflineTests(unittest.TestCase):
         self.assertEqual([(item["project_id"], item["user_text"], item["assistant_text"]) for item in spooled],
                          [("architectos", self.QUESTION, "Batch them per tenant.")])
 
+    def test_offline_briefing_keeps_every_multiline_fact(self) -> None:
+        facts = ("Ledger writes must stay idempotent.", "Invoices close at midnight UTC.", "Refunds need two approvals.")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ArchitectOSService(root)
+            for index, fact in enumerate(facts):
+                text = f"Durable fact captured from an MCP agent turn (not a full transcript).\n\n{fact}"
+                service.repository.add_node("Constraint", f"MCP fact {index}", "project", text, "architectos")
+            service.hook_briefing(cwd=str(root))
+            with self._no_store():
+                start = _hook(root, "SessionStart", cwd=root, session="s1")
+        context = json.loads(start)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(len(_injected_ids(start)), 3)
+        for fact in facts:
+            self.assertIn(fact, context)
+
     def test_app_replays_the_spool_into_each_records_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
