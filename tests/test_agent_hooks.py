@@ -839,6 +839,10 @@ class HookCaptureOnStopTests(unittest.TestCase):
 
 
 
+class _Killed(BaseException):
+    """The process dies here: no except Exception, no cleanup but finally blocks."""
+
+
 class _FlockMsvcrt:
     """msvcrt.locking over flock, so the Windows lock path runs on POSIX too.
 
@@ -1378,6 +1382,77 @@ class HookCacheInvalidationTests(unittest.TestCase):
             dirty = agent_hooks.status(project_root=root)["offline"]["briefing_cache"]["dirty"]
         self.assertTrue(written)
         self.assertTrue(dirty)
+
+    def _pack_while_a_hit_is_archived(self, root: Path, after_replace: Any) -> tuple[ArchitectOSService, str]:
+        """Pack a turn while another process archives its first hit after the store was read.
+
+        The archive commits (and its listener runs) while the cache is being written,
+        before the line reaches the file; ``after_replace`` runs right after the first
+        replace of the cache file. Returns (service, archived id).
+        """
+        service = ArchitectOSService(root)
+        _seed(service, "architectos", 6)
+        other = ArchitectOSService(root)
+        real_write, real_replace = agent_hook_service.write_private, agent_hook_service.replace_file
+        archived: list[str] = []
+        replaced: list[int] = []
+
+        def write(path: Path, text: str, *, append: bool = False) -> None:
+            if not archived and "briefing_cache" in path.name:
+                archived.append(json.loads(text)["projects"]["architectos"]["hits"][0][0])
+                racer = threading.Thread(target=self._archive, args=(other, archived[0]))
+                racer.start()
+                racer.join(5)
+            real_write(path, text, append=append)
+
+        def replace(source: Path, target: Path) -> None:
+            real_replace(source, target)
+            if target.name == agent_hooks.BRIEFING_CACHE:
+                replaced.append(1)
+                if len(replaced) == 1:
+                    after_replace()
+
+        with mock.patch.object(agent_hook_service, "write_private", side_effect=write), \
+                mock.patch.object(agent_hook_service, "replace_file", side_effect=replace):
+            try:
+                service.capture_memory_turn(self.QUESTION, hook=True, capture=False, include_stable=False)
+            except _Killed:
+                pass
+        return service, archived[0]
+
+    def test_the_cache_reads_dirty_from_its_first_write_until_its_lines_are_rechecked(self) -> None:
+        # Between the replace that brings a fresh line and the write of its re-check,
+        # the file may hold a memory archived meanwhile: the offline hook must not use it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            during: list[str] = []
+            _, archived = self._pack_while_a_hit_is_archived(root, lambda: during.append(
+                _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            ))
+            after = _hook(root, "UserPromptSubmit", cwd=root, session="s2", prompt=self.QUESTION)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertNotIn(archived, _injected_ids(during[0]))
+        self.assertNotIn(archived, _injected_ids(after))
+        self.assertTrue(_injected_ids(after))
+        self.assertEqual(left, [])
+
+    def test_a_writer_killed_before_its_recheck_leaves_the_cache_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def kill() -> None:
+                raise _Killed()
+
+            _, archived = self._pack_while_a_hit_is_archived(root, kill)
+            stale = self._cache_ids(root)
+            during = _hook(root, "UserPromptSubmit", cwd=root, session="s1", prompt=self.QUESTION)
+            ArchitectOSService(root).hook_maintenance()  # the app starts again
+            after = self._cache_ids(root)
+            left = sorted(path.name for path in (root / "data").glob(f"{agent_hooks.BRIEFING_CACHE}.dirty*"))
+        self.assertIn(archived, stale)
+        self.assertNotIn(archived, _injected_ids(during))
+        self.assertNotIn(archived, after)
+        self.assertEqual(left, [])
 
     def test_a_prompt_that_shows_the_stable_layer_renews_its_cached_lines(self) -> None:
         # Only SessionStart rewrote the stable lines; a prompt that got the stable layer

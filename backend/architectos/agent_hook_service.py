@@ -487,42 +487,48 @@ class AgentHookServiceMixin:
     def _rewrite_briefing_cache(self, change: Callable[[dict[str, Any]], bool], *, recheck: set[str] | None = None) -> None:
         """The body of _update_briefing_cache, for a caller that holds its locks.
 
+        Invariant: any state of the file that may hold a line older than its last
+        re-check against the store reads as dirty (briefing_cache_dirty).
+
         ``recheck``: memories whose lines ``change`` may have added. Once the file is
         replaced, their lines are checked against the store again: a memory that
         changed after this write read the store was not in the file yet when its
-        listener looked, so this check, not the listener, drops it.
+        listener looked, so this check, not the listener, drops it. The claimed
+        marker is written before that replace and removed only once the re-check is
+        written, so the file reads as dirty all along, and stays dirty if this
+        process dies in between.
 
-        A cache marked dirty is re-checked whole. The marker is claimed after the
-        write and before the store is read, and removed only once the re-checked
-        cache is written: a mark made while this write ran is covered, one made
-        later is a new marker for the next write, and a writer that dies on the way
-        leaves the cache dirty.
+        A cache marked dirty is re-checked whole. The marker is claimed (renamed)
+        after the write and before the store is read: a mark made while this write
+        ran is covered, one made later is a new marker for the next write. A claimed
+        marker this write did not make was left by a writer that died: the whole
+        cache is re-checked then too.
         """
         path = self._briefing_cache_path()
+        claimed = Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY_CLAIMED
+        left = claimed.exists()
         try:
             cache = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             cache = {}
         cache = cache if isinstance(cache, dict) else {}
         written = change(cache)
+        holds = bool(written and recheck)
+        if holds:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(claimed, os.O_WRONLY | os.O_CREAT, 0o600))
         if written:
             self._write_briefing_cache(cache)
-        claimed = self._claim_hook_cache_dirty()
-        only = None if claimed else (recheck or set()) if written else set()
+        whole = self._claim_hook_cache_dirty() or left
+        only = None if whole else recheck if holds else set()
         if only is not None and not only:
             return
+        if self._revalidate_hook_cache(cache, only):
+            self._write_briefing_cache(cache)
         try:
-            if self._revalidate_hook_cache(cache, only):
-                self._write_briefing_cache(cache)
-        except Exception:
-            if not claimed:  # the lines just written may hold a changed memory
-                self._mark_hook_cache_dirty()
-            raise
-        if claimed:
-            try:
-                os.unlink(Path(self.project_root) / "data" / BRIEFING_CACHE_DIRTY_CLAIMED)
-            except OSError as exc:  # stays dirty: the next write re-checks once more
-                _LOG.debug("briefing cache dirty marker not removed: %s", exc)
+            os.unlink(claimed)
+        except OSError as exc:  # stays dirty: the next write re-checks once more
+            _LOG.debug("briefing cache dirty marker not removed: %s", exc)
 
     def _write_briefing_cache(self, cache: dict[str, Any]) -> None:
         path = self._briefing_cache_path()
@@ -532,19 +538,16 @@ class AgentHookServiceMixin:
         replace_file(scratch, path)
 
     def _claim_hook_cache_dirty(self) -> bool:
-        """Rename the dirty marker to its claimed name; True when the cache is to be re-checked.
-
-        A claimed marker already there was left by a writer that died re-checking.
-        """
+        """Rename the dirty marker to its claimed name; True when there was one."""
         data = Path(self.project_root) / "data"
         try:
             replace_file(data / BRIEFING_CACHE_DIRTY, data / BRIEFING_CACHE_DIRTY_CLAIMED)
             return True
         except FileNotFoundError:
-            pass
+            return False
         except OSError as exc:  # Windows: its writer still has it open; the next write claims it
             _LOG.debug("briefing cache dirty marker not claimed yet: %s", exc)
-        return (data / BRIEFING_CACHE_DIRTY_CLAIMED).exists()
+            return False
 
     @staticmethod
     def _hook_project_roots(projects: Iterable[Any]) -> dict[str, str]:
