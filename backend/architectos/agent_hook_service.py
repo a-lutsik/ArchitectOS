@@ -31,13 +31,14 @@ from .agent_hooks import (
     spool_turn,
     write_private,
 )
-from .search import DEFAULT_CONTEXT_CHAR_BUDGET, pack_memory_context
+from .search import DEFAULT_CONTEXT_CHAR_BUDGET, MIN_CONTEXT_CHAR_BUDGET, pack_memory_context
 
 _LOG = logging.getLogger("architectos.service")
 
 HOOK_CHAR_BUDGET = 1600
-# pack_memory_context never packs below 1200 characters (its header alone is ~420).
-HOOK_CHAR_BUDGET_MIN = 1200
+# The smallest injection whose pack budget (hook_pack_budget: minus the hook prefix and
+# slack) still reaches the pack's own floor, so the whole injection fits the setting.
+HOOK_CHAR_BUDGET_MIN = 2 * MIN_CONTEXT_CHAR_BUDGET - hook_pack_budget(MIN_CONTEXT_CHAR_BUDGET)
 HOOK_NODE_TEXT_CHARS = 220
 HOOK_VECTOR_TIMEOUT_MS = 800
 HOOK_STABLE_LIMIT = 4

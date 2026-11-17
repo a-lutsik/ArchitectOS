@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.architectos import agent_hooks
+from backend.architectos.agent_hook_service import HOOK_CHAR_BUDGET_MIN
 from backend.architectos.mcp_server import MemoryMCPServer, write_mcp_bind_file
 from backend.architectos.models import Project
 from backend.architectos.server import ArchitectOSHandler
@@ -189,7 +190,22 @@ class HookBudgetTests(unittest.TestCase):
             settings = service.agent_hook_settings()
         self.assertGreater(len(wide), 1600)
         self.assertLessEqual(len(wide), 2600)
-        self.assertEqual(settings["hook_char_budget"], 1200)
+        self.assertEqual(settings["hook_char_budget"], HOOK_CHAR_BUDGET_MIN)
+
+    def test_injection_stays_within_the_smallest_hook_char_budget(self) -> None:
+        # pack_memory_context never packs below its 1 200-character floor, so the
+        # smallest allowed budget must leave room for that floor plus the hook prefix.
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ArchitectOSService(Path(tmp))
+            _seed(service, "architectos", 12)
+            service.repository.set_setting("agent", {"hook_char_budget": 300})
+            budget = service.agent_hook_settings()["hook_char_budget"]
+            hook = service.capture_memory_turn(self.QUESTION, hook=True, capture=False)
+        injected = agent_hooks._injected_text(agent_hooks.render_stdout(
+            agent_hooks.HookTurn(client="claude", event="prompt", raw_event="UserPromptSubmit"), hook
+        ))
+        self.assertGreater(len(injected), budget - 200, "the pack fills the budget")
+        self.assertLessEqual(len(injected), budget)
 
     def test_pack_without_hits_above_the_relevance_floor_is_not_injected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

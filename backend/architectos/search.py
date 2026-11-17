@@ -38,6 +38,8 @@ SOURCE_TRUST = {
     "manual": 1.0,
 }
 DEFAULT_CONTEXT_CHAR_BUDGET = 6000
+# pack_memory_context never packs below this many characters (its header alone is ~420).
+MIN_CONTEXT_CHAR_BUDGET = 1200
 DEFAULT_NODE_TEXT_CHARS = 700
 RRF_K = 60.0
 RRF_SCALE = 2400.0
@@ -508,7 +510,7 @@ def pack_memory_context(
         "Each memory line includes id=… for citations" + (" / tool refine." if tools_available else "."),
     ])
     used = sum(len(line) + 1 for line in lines)
-    budget = max(1200, int(char_budget or DEFAULT_CONTEXT_CHAR_BUDGET))
+    budget = max(MIN_CONTEXT_CHAR_BUDGET, int(char_budget or DEFAULT_CONTEXT_CHAR_BUDGET))
     text_cap = max(160, int(node_text_chars or DEFAULT_NODE_TEXT_CHARS))
     selected_bags: list[set[str]] = []
     seen_ids: set[str] = set()
