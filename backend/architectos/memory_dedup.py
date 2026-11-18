@@ -81,6 +81,8 @@ _DO_WORDS = frozenset({"do", "does", "did"})
 _ARTICLES = frozenset({"a", "an", "the"})
 # A value: a number, optionally with a sign, a "v" or one unit ("30s", "512mb", "2026-11-17", "v1.2", "5%").
 _VALUE_RE = re.compile(r"[-+]?v?\d+(?:[.,:/-]\d+)*(?:%|°[^\W\d_]?|[^\W\d_]+)?")
+# A number right after a number sign designates an item ("Invoice № 5", "Order No. 7"): not a value.
+_NUMBER_SIGNS = frozenset({"№", "no", "no.", "nr", "nr.", "#", "номер"})
 _VALUE_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
 _THOUSANDS_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")
 # Markers opening a list item ("1.", "1)", "-", "•", "*", "#", ">", "[x]", "[ ]", "(1)") are no words:
@@ -252,7 +254,8 @@ def statement_edit(incoming: tuple[str, ...], existing: tuple[str, ...]) -> tupl
 
     ``same``: no edit. ``negation``: one negation marker inserted or removed
     in one place, with or without its do-carrier. ``value``: one value
-    replaced in place by a value of the same shape. ``other``: anything else
+    replaced in place by a value of the same shape, not right after a number
+    sign. ``other``: anything else
     (position -1), however small: a moved word, a moved or second negation,
     two values, a changed unit or name.
     """
@@ -261,9 +264,11 @@ def statement_edit(incoming: tuple[str, ...], existing: tuple[str, ...]) -> tupl
     if len(incoming) == len(existing):
         changed = [index for index, (left, right) in enumerate(zip(incoming, existing)) if left != right]
         if len(changed) == 1:
-            new, old = incoming[changed[0]], existing[changed[0]]
-            if _is_value(new) and _is_value(old) and _value_shape(new) == _value_shape(old):
-                return "value", changed[0]
+            index = changed[0]
+            new, old = incoming[index], existing[index]
+            designation = index > 0 and incoming[index - 1] in _NUMBER_SIGNS
+            if not designation and _is_value(new) and _is_value(old) and _value_shape(new) == _value_shape(old):
+                return "value", index
         return "other", -1
     longer, shorter = (incoming, existing) if len(incoming) > len(existing) else (existing, incoming)
     index = next((i for i, (left, right) in enumerate(zip(longer, shorter)) if left != right), len(shorter))

@@ -98,7 +98,12 @@ def _fuzz_norm(token: str) -> str:
 
 
 def _fuzz_is_value(words: list[str], index: int) -> bool:
-    return index > 0 and bool(_FUZZ_VALUE_RE.fullmatch(_fuzz_norm(words[index])))
+    """A value the design lets one edit replace: not the first word and not a number after a number sign."""
+    return (
+        index > 0
+        and words[index - 1].casefold() not in {"№", "no.", "nr.", "#", "номер"}
+        and bool(_FUZZ_VALUE_RE.fullmatch(_fuzz_norm(words[index])))
+    )
 
 
 def _fuzz_is_negation(word: str) -> bool:
@@ -464,6 +469,21 @@ class GateClassifierTests(unittest.TestCase):
                     self._compare_atoms(f"{marker} The export job runs nightly", "The export job runs nightly").action,
                     "duplicate",
                 )
+
+    def test_number_after_a_number_sign_is_a_designation(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        pairs = [
+            ("Invoice № 5 is paid by the billing job", "Invoice № 6 is paid by the billing job"),
+            ("Order No. 7 ships from the main warehouse", "Order No. 8 ships from the main warehouse"),
+            ("Order Nr. 7 ships from the main warehouse", "Order Nr. 8 ships from the main warehouse"),
+            ("The ticket # 12 is closed by the team", "The ticket # 13 is closed by the team"),
+            ("Счёт № 5 оплачен клиентом вчера", "Счёт № 6 оплачен клиентом вчера"),
+            ("Счёт номер 5 оплачен клиентом вчера", "Счёт номер 6 оплачен клиентом вчера"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+                self.assertFalse(memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False))
 
     def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
         for old, new in (
