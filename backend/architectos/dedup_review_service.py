@@ -140,9 +140,8 @@ class DedupReviewServiceMixin:
                     continue
                 if not gate.type_matches(str(node.type or ""), str(keeper.type or "")):
                     continue
-                # Atoms merge only as the same statement: equal words in another order
-                # may swap roles ("A calls B" / "B calls A"), which a write may refuse
-                # but stored memory must not lose.
+                # Atoms merge only with no edit between their statements: any other
+                # difference (a moved word, value or negation) may be another fact.
                 if (features.template or keeper_features.template) and features.template != keeper_features.template:
                     continue
                 verdict = gate.compare(features, keeper_features)

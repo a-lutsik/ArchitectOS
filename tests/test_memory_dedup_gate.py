@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import random
 import re
 import tempfile
 import threading
@@ -65,6 +66,140 @@ def with_negation(text: str, lang: str) -> str:
 
 def with_added_words(text: str, lang: str) -> str:
     return text.rstrip(".") + _ADDED_WORDS[lang]
+
+
+# Base facts of the atom fuzz test: every pair statement plus the review findings.
+FUZZ_BASES = sorted({
+    *(row[key] for row in DEDUP_PAIRS for key in ("a", "b")),
+    "Service A has a 30s timeout and service B has a 60s timeout",
+    "The worker pool uses 512MB of memory and the cache uses 2GB",
+    "The release window opens on 2026-11-17 and closes on 2026-12-01",
+    "Clients on v1.2 call the gateway that runs v1.3",
+    "Service A tracks p95 latency and service B tracks p99 latency",
+    "Hooks cannot open the DB but can read the config",
+    "The cache is not used when the flag is not set",
+    "Кэш не используется, когда флаг не установлен",
+    "Хукам нельзя открывать базу, но можно читать конфиг",
+    "Задача № 5 закрыта после ревью",
+    "The export query keeps rows with !isDeleted before upload",
+    "The job skips tenants where !is_active holds",
+    "The cache stays off while !cfg.enabled is true",
+    "1. The importer reads the queue first",
+    "The API limit is documented in [1] for every client",
+})
+_FUZZ_WORDS = ("zebra", "quickly", "зебра", "also")
+_FUZZ_VALUE_RE = re.compile(r"[-+]?v?\d+(?:[.,:/-]\d+)*(?:%|[^\W\d_]+)?")
+_FUZZ_EXPANDING = {"cannot", "can't", "won't", "shan't", "нельзя"}
+
+
+def _fuzz_norm(token: str) -> str:
+    """Test-local token key: case and closing punctuation only ("!" stays)."""
+    return token.casefold().rstrip(".,;:?").strip("\"'()")
+
+
+def _fuzz_is_value(words: list[str], index: int) -> bool:
+    return index > 0 and bool(_FUZZ_VALUE_RE.fullmatch(_fuzz_norm(words[index])))
+
+
+def _fuzz_is_negation(word: str) -> bool:
+    return _fuzz_norm(word) in {"not", "не", "нет"}
+
+
+def _fuzz_negation(words: list[str]) -> str:
+    return "не" if any("а" <= ch <= "я" for word in words for ch in word.lower()) else "not"
+
+
+def _fuzz_bump(word: str, step: int) -> str:
+    """The same value with its first number changed."""
+    return re.sub(r"\d+", lambda match: str(int(match.group()) + step), word, count=1)
+
+
+def fuzz_edit(rng: random.Random, words: list[str]) -> tuple[str, list[str], int] | None:
+    """One random edit of a whitespace-token fact: (kind, edited words, value position) or None if not applicable.
+
+    Kinds: ``same``, ``negation`` and ``value`` are the three allowed edits;
+    every ``other`` edit (swap, moved negation, two values, glued or split unit,
+    sign, added word, two allowed edits at once) must never give a destructive verdict.
+    """
+    values = [index for index in range(len(words)) if _fuzz_is_value(words, index)]
+    negations = [index for index, word in enumerate(words) if _fuzz_is_negation(word)]
+    kind = rng.choice((
+        "same", "negation", "value", "swap", "move_negation", "two_values", "unit", "sign", "add_word",
+        "value_and_negation", "two_negations",
+    ))
+    edited = list(words)
+    if kind == "same":
+        edited[-1] = edited[-1].rstrip(".") + "."
+        edited[0] = edited[0].swapcase()
+        return "same", edited, -1
+    if kind == "negation":
+        if negations and rng.random() < 0.5:
+            del edited[rng.choice(negations)]
+        else:
+            edited.insert(rng.randrange(1, len(words) + 1), _fuzz_negation(words))
+        return "negation", edited, -1
+    if kind == "value":
+        if not values:
+            return None
+        index = rng.choice(values)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+        expanded = sum(1 for word in words[:index] if _fuzz_norm(word) in _FUZZ_EXPANDING or _fuzz_norm(word).endswith("n't"))
+        article = 1 if _fuzz_norm(words[0]) in {"a", "an", "the"} else 0
+        return "value", edited, index + expanded - article
+    if kind == "swap":
+        pairs = [(i, j) for i in range(len(words)) for j in range(i + 1, len(words)) if _fuzz_norm(words[i]) != _fuzz_norm(words[j])]
+        i, j = rng.choice(pairs)
+        edited[i], edited[j] = edited[j], edited[i]
+    elif kind == "move_negation":
+        if not negations:
+            return None
+        index = rng.choice(negations)
+        word = edited.pop(index)
+        target = rng.choice([position for position in range(1, len(edited) + 1) if position != index])
+        edited.insert(target, word)
+        if [_fuzz_norm(item) for item in edited] == [_fuzz_norm(item) for item in words]:
+            return None
+    elif kind == "two_values":
+        if len(values) < 2:
+            return None
+        for index in rng.sample(values, 2):
+            edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+    elif kind == "unit":
+        split = [index for index in values if re.fullmatch(r"\d+[^\W\d_]+", _fuzz_norm(words[index]))]
+        glue = [index for index in values[:-1] if re.fullmatch(r"\d+", _fuzz_norm(words[index])) and index + 1 < len(words)
+                and words[index + 1].isalpha()]
+        if split:
+            index = rng.choice(split)
+            number = re.match(r"\d+", words[index]).group()
+            edited[index:index + 1] = [number, words[index][len(number):]]
+        elif glue:
+            index = rng.choice(glue)
+            edited[index:index + 2] = [words[index] + words[index + 1]]
+        else:
+            return None
+    elif kind == "sign":
+        bangs = [index for index, word in enumerate(words) if word.startswith("!")]
+        if bangs and rng.random() < 0.5:
+            index = rng.choice(bangs)
+            edited[index] = words[index][1:]
+        else:
+            index = rng.randrange(len(words))
+            mark = "!" if _fuzz_is_value(words, index) or index == 0 else rng.choice("!+-")
+            edited[index] = mark + words[index]
+    elif kind == "add_word":
+        edited.insert(rng.randrange(1, len(words) + 1), rng.choice(_FUZZ_WORDS))
+    elif kind == "value_and_negation":
+        if not values:
+            return None
+        index = rng.choice(values)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+        edited.insert(rng.randrange(1, len(edited) + 1), _fuzz_negation(words))
+    elif kind == "two_negations":
+        first, second = sorted(rng.sample(range(1, len(words) + 1), 2))
+        negation = _fuzz_negation(words)
+        edited.insert(second, negation)
+        edited.insert(first, negation)
+    return "other", edited, -1
 
 
 class GateClassifierTests(unittest.TestCase):
@@ -175,10 +310,127 @@ class GateClassifierTests(unittest.TestCase):
             self._compare_atoms("The export job reads (5) rows.", "The export job reads 5 rows").action, "duplicate",
         )
 
-    def test_lower_case_a_is_an_article_and_capital_a_a_name(self) -> None:
+    def test_articles_are_part_of_an_atom_statement(self) -> None:
         verdict = self._compare_atoms("The export job reads a row from the queue", "The export job reads the row from the queue")
-        self.assertEqual(verdict.action, "duplicate")
-        self.assertIn("a", memory_dedup.statement_shape("Service A owns the queue")[1])
+        self.assertEqual(verdict.action, "new")
+        self.assertEqual(memory_dedup.statement_tokens("Service A owns the queue"), ("service", "a", "owns", "the", "queue"))
+
+    def test_moved_values_with_units_dates_or_versions_are_a_new_fact(self) -> None:
+        pairs = [
+            ("Service A has a 30s timeout and service B has a 60s timeout",
+             "Service A has a 60s timeout and service B has a 30s timeout"),
+            ("The worker pool uses 512MB of memory and the cache uses 2GB",
+             "The worker pool uses 2GB of memory and the cache uses 512MB"),
+            ("The release window opens on 2026-11-17 and closes on 2026-12-01",
+             "The release window opens on 2026-12-01 and closes on 2026-11-17"),
+            ("Clients on v1.2 call the gateway that runs v1.3", "Clients on v1.3 call the gateway that runs v1.2"),
+            ("Service A tracks p95 latency and service B tracks p99 latency",
+             "Service A tracks p99 latency and service B tracks p95 latency"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        timeouts = [fact_features("Chat fact", f"{header}\n\nThe export job has a {value} timeout") for value in ("30s", "60s")]
+        self.assertFalse(memory_dedup.guards_compatible(*timeouts))
+
+    def test_moved_negation_is_new_and_one_removed_negation_a_conflict(self) -> None:
+        moved = [
+            ("Hooks cannot open the DB but can read the config", "Hooks can open the DB but cannot read the config"),
+            ("Хукам нельзя открывать базу, но можно читать конфиг", "Хукам можно открывать базу, но нельзя читать конфиг"),
+            ("Кэш не используется, когда флаг установлен", "Кэш используется, когда флаг не установлен"),
+        ]
+        for old, new in moved:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        removed = [
+            ("The cache is not used when the flag is not set", "The cache is used when the flag is not set"),
+            ("Кэш не используется, когда флаг не установлен", "Кэш используется, когда флаг не установлен"),
+            # "№" folds to "No": a number sign, not a negation.
+            ("Задача № 5 закрыта после ревью", "Задача № 5 не закрыта после ревью"),
+        ]
+        for old, new in removed:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "conflict")
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        self.assertFalse(memory_dedup.replacement_allowed(
+            f"{header}\n\nThe cache is used for 6 hours when the flag is not set",
+            f"{header}\n\nThe cache is not used for 5 hours when the flag is set",
+            same_turn=False,
+        ))
+
+    def test_a_leading_bang_of_an_identifier_is_content(self) -> None:
+        for token in ("!isDeleted", "!is_active", "!cfg.enabled"):
+            with self.subTest(token=token):
+                verdict = self._compare_atoms(
+                    f"The export query keeps rows with {token} before upload",
+                    f"The export query keeps rows with {token.lstrip('!')} before upload",
+                )
+                self.assertEqual(verdict.action, "new")
+
+    def test_one_value_with_the_same_unit_replaced_in_place_is_an_update(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        cases = [
+            ("The export job has a 30s timeout for every tenant", "The export job has a 60s timeout for every tenant", "update"),
+            ("The worker pool uses 512MB of memory", "The worker pool uses 1024MB of memory", "update"),
+            ("The release window opens on 2026-11-17 for every team", "The release window opens on 2026-12-01 for every team", "update"),
+            ("Clients call the gateway that runs v1.2 in production", "Clients call the gateway that runs v1.3 in production", "update"),
+            ("The batch size is 1.5 thousand rows per run", "The batch size is 2 thousand rows per run", "update"),
+            ("The worker pool uses 512MB of memory", "The worker pool uses 2GB of memory", "new"),
+            ("The export job tracks p95 latency per tenant", "The export job tracks p99 latency per tenant", "new"),
+            ("The importer reads the queue first # 5", "The importer reads the queue first 5 #", "new"),
+            ("1. The importer reads the queue first", "2. The importer reads the queue first", "new"),
+            ("The API limit is documented in [1] for every client", "The API limit is documented in [2] for every client", "new"),
+        ]
+        for old, new, action in cases:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, action)
+                self.assertEqual(
+                    memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False),
+                    action == "update",
+                )
+        # A leading article is not the first word: the value still names the stage.
+        self.assertEqual(self._compare_atoms("The stage 1 runs on Linux runners", "The stage 2 runs on Linux runners").action, "update")
+        self.assertFalse(memory_dedup.replacement_allowed(
+            f"{header}\n\nThe stage 2 runs on Linux runners", f"{header}\n\nThe stage 1 runs on Linux runners", same_turn=False,
+        ))
+
+    def test_only_the_three_allowed_edits_give_a_destructive_verdict(self) -> None:
+        rng = random.Random(20261118)
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        seen: dict[str, int] = {}
+        checked = 0
+        while checked < 4000:
+            base = rng.choice(FUZZ_BASES)
+            words = base.split()
+            edit = fuzz_edit(rng, words)
+            if edit is None:
+                continue
+            kind, edited, position = edit
+            seen[kind] = seen.get(kind, 0) + 1
+            checked += 1
+            for stored, incoming in ((base, " ".join(edited)), (" ".join(edited), base)):
+                stored_body, incoming_body = f"{header}\n\n{stored}", f"{header}\n\n{incoming}"
+                stored_features = fact_features("Chat fact", stored_body)
+                incoming_features = fact_features("Chat fact", incoming_body)
+                action = self.gate.compare(incoming_features, stored_features).action
+                replaces = memory_dedup.replacement_allowed(incoming_body, stored_body, same_turn=False)
+                merges = incoming_features.template == stored_features.template
+                expected = {"same": "duplicate", "negation": "conflict", "value": "update", "other": "new"}[kind]
+                with self.subTest(kind=kind, stored=stored, incoming=incoming):
+                    self.assertEqual(action, expected)
+                    self.assertEqual(replaces, kind == "value" and position > 1)
+                    self.assertEqual(merges, kind == "same")
+        self.assertEqual(set(seen), {"same", "negation", "value", "other"})
+        self.assertGreater(seen["other"], 2000)
+
+    def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
+        for old, new in (
+            ("The worker don't open the store", "The worker do not open the store"),
+            ("The worker couldn\u02bct open the store", "The worker couldn't open the store"),
+        ):
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "duplicate")
 
     def test_atom_with_a_second_not_keeps_every_word(self) -> None:
         verdict = self._compare_atoms(
@@ -275,6 +527,19 @@ class GateWritePathTests(unittest.TestCase):
         self.assertEqual(written[1]["dedup"]["action"], "new")
         self.assertNotEqual(written[1]["id"], written[0]["id"])
         self.assertEqual(written[1]["metadata"].get("possible_duplicate_of"), written[0]["id"])
+
+    def test_value_with_a_unit_and_a_negation_are_found_through_the_index(self) -> None:
+        cases = [
+            ("The export job has a 30s timeout for every tenant", "The export job has a 60s timeout for every tenant",
+             ("update", "replace")),
+            ("Clients call the gateway that runs v1.2 in production", "Clients call the gateway that runs v1.3 in production",
+             ("update", "replace")),
+            ("The export job does retry failed uploads for every tenant",
+             "The export job does not retry failed uploads for every tenant", ("conflict", "reject")),
+        ]
+        for old, new, expected in cases:
+            with self.subTest(old=old):
+                self.assertEqual(self._gate_outcome(("chat_session_atom", old), ("chat_session_atom", new)), expected)
 
     def test_atoms_that_differ_in_a_token_with_digits_are_both_written(self) -> None:
         header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
@@ -486,13 +751,13 @@ class GateWritePathTests(unittest.TestCase):
 
     def test_pairs_that_must_fire_are_decided_from_the_whole_statement(self) -> None:
         rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"reject", "fold", "replace"}]
-        self.assertEqual(len(rows), 8)
+        self.assertEqual(len(rows), 7)
         for row in rows:
             self._assert_pair(row)
 
     def test_pairs_that_must_stay_alive_never_fold_or_replace(self) -> None:
         rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"keep_both", "write"}]
-        self.assertEqual(len(rows), 13)
+        self.assertEqual(len(rows), 15)
         for row in rows:
             self._assert_pair(row)
 

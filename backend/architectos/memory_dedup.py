@@ -20,8 +20,9 @@ incoming fact is relative to what is already stored:
   lexical match so callers can flag a possible duplicate.
 
 Numbers, negation and identifiers are protected: facts that differ in them are
-never folded together. Two chat/MCP fact atoms are compared on their whole
-statement, not on the label (``statement_shape``, ``replacement_allowed``). This module is stdlib-only and deterministic; the
+never folded together. Two chat/MCP fact atoms are decided only by the edit
+between their statement token sequences, not by the label (``statement_edit``,
+``replacement_allowed``). This module is stdlib-only and deterministic; the
 optional semantic neighbours (embeddings) and LLM judge for the gray zone are
 orchestrated by the ingestion service on top of ``gray_candidates``.
 """
@@ -48,10 +49,15 @@ from .storage import sanitize_text
 # Stripped from both ends only: inner punctuation ("5.0" vs "50") is content.
 # No dashes: a leading minus is a sign ("-5 °C" vs "5 °C").
 _EDGE_PUNCTUATION = " .,;:!?…\"'`«»“”„()[]"
-# Around one statement token quotes and brackets are stripped from both ends but
-# sentence punctuation only from the end: "!=", "!enabled" and ".5" keep their mark.
-_TOKEN_OPENING = "\"'`«»“”„(["
-_TOKEN_CLOSING = "\"'`«»“”„)].,;:!?…"
+# Atom statements are compared token by token (``statement_tokens``). Quotes and
+# parentheses are stripped from both ends of a token, sentence punctuation only
+# from its end: "!=", "!enabled" and ".5" keep their mark. Square brackets stay:
+# "[1]" is a reference, "(10)" a value.
+_TOKEN_OPENING = "\"'`«»“”„("
+_TOKEN_CLOSING = "\"'`«»“”„).,;:!?…"
+_TOKEN_CHARACTERS = str.maketrans({
+    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "―": "-", "−": "-", "ʼ": "'",
+})
 
 NEGATION_WORDS = frozenset({
     "не", "нет", "никогда", "нельзя", "ни",
@@ -60,13 +66,23 @@ NEGATION_WORDS = frozenset({
 })
 
 _WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
-# Statement shape of an atom: articles carry nothing; a negation marker leaves the
-# word it negates ("cannot open" has the frame of "can open", only the polarity differs).
-_ARTICLES = frozenset({"an", "the"})
-_NEGATION_CARRIERS = {"cannot": "can", "can't": "can", "won't": "will", "shan't": "shall", "нельзя": "можно"}
+# The negation marker of an atom statement. A marker word leaves its carrier as a
+# token of its own: "cannot open" is "can ¬ open", "don't" and "do not" are "do ¬".
+NEGATION_MARKER = "¬"
+_NEGATION_TOKENS: dict[str, tuple[str, ...]] = {
+    "not": (), "не": (), "нет": (),
+    "cannot": ("can",), "can't": ("can",), "won't": ("will",), "shan't": ("shall",), "нельзя": ("можно",),
+}
+_NEGATION_BLOCKS = ((NEGATION_MARKER,), *((word, NEGATION_MARKER) for word in ("do", "does", "did")))
 _DO_WORDS = frozenset({"do", "does", "did"})
-_STATEMENT_NUMBER_RE = re.compile(r"[-+−]?\d+(?:[.,]\d+)*%?")
-_THOUSANDS_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+# A replaced value right after the first word names the item ("Stage 2"); a leading article does not count.
+_ARTICLES = frozenset({"a", "an", "the"})
+# A value: a number, optionally with a sign, a "v" or one unit ("30s", "512mb", "2026-11-17", "v1.2", "5%").
+_VALUE_RE = re.compile(r"[-+]?v?\d+(?:[.,:/-]\d+)*(?:%|°[^\W\d_]?|[^\W\d_]+)?")
+_VALUE_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
+_THOUSANDS_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+# "1." or "1)" opening a statement numbers a list item: not a value.
+_LIST_MARKER_RE = re.compile(r"\d+[.)]")
 # Short upper-case words are names, not filler: "Service A" vs "Service B", "БД", "UI".
 _SHORT_NAME_RE = re.compile(r"(?<!\w)[^\W\d_a-zа-яё]{1,2}(?!\w)")
 _NUMBER_RE = re.compile(r"^[-+−]?v?\d+(?:[.,:/\-]\d+)*[^\W\d_%°]*[%°]?$")
@@ -170,7 +186,7 @@ class FactFeatures:
     # Label words without numbers and negation: two statements are only folded,
     # superseded or marked contradictory when they are filed under the same
     # subject, so "Service A" never swallows or retires "Service B". For an atom
-    # it is the frame of its statement (see ``statement_shape``).
+    # it is the frame of its statement (see ``fact_features``).
     label_core: frozenset[str]
     stems: frozenset[str]
     numbers: frozenset[str]
@@ -186,67 +202,68 @@ def _number_value(token: str) -> str:
     return token.lstrip("+").replace("−", "-").replace(",", ".").removeprefix("v")
 
 
-def _statement_number(token: str) -> str:
-    """Value of a standalone number ("1,000" and "1000" are one value); "" for any other token."""
-    if not _STATEMENT_NUMBER_RE.fullmatch(token):
-        return ""
-    value = token.lstrip("+").replace("−", "-")
-    digits = value.lstrip("-").rstrip("%")
-    return value.replace(",", "") if _THOUSANDS_RE.fullmatch(digits) else value.replace(",", ".")
+def statement_tokens(statement: str) -> tuple[str, ...]:
+    """The tokens of one atom statement, in order.
 
-
-def statement_shape(statement: str) -> tuple[frozenset[str], tuple[str, ...], tuple[str, ...], bool]:
-    """Frame, template, values and polarity of one statement.
-
-    Every whitespace token counts, function words too ("after"/"before",
-    "with"/"without"). A plain word is stemmed; articles and negation markers
-    are dropped, a marker together with its carrier ("do not", "cannot" → "can",
-    "hasn't" → "has", "нельзя" → "можно"), and any marker makes the statement
-    negated. A standalone number becomes "#" in the template and a value. Every
-    other token (identifiers, "p95", "TLS1.2", "<100ms", ">=", "not-null") is
-    kept whole. The frame is the set of tokens without numbers, the template
-    the tokens in order.
+    Whitespace tokens folded for case, Unicode form, quotes, dashes,
+    apostrophes and thousands separators ("1,000" = "1000"); nothing else is
+    dropped or merged: articles, function words, "p95", "!isdeleted" and
+    "<100ms" are tokens as written. A negation marker word becomes
+    ``NEGATION_MARKER`` after its carrier.
     """
     tokens: list[str] = []
-    values: list[str] = []
-    negated = False
-    # Whether the last token is a do-word: "not" right after it drops both.
-    after_do = False
-    for raw in statement.split():
-        token = _identifier(raw) or _fold_text(raw).lstrip(_TOKEN_OPENING).rstrip(_TOKEN_CLOSING)
+    for index, raw in enumerate(statement.split()):
+        folded = _fold_text(raw).translate(_TOKEN_CHARACTERS)
+        if index == 0 and _LIST_MARKER_RE.fullmatch(folded):
+            tokens.append(folded)
+            continue
+        token = folded.lstrip(_TOKEN_OPENING).rstrip(_TOKEN_CLOSING)
         if not token:
             continue
-        value = _statement_number(token)
-        if value:
-            tokens.append("#")
-            values.append(value)
-            after_do = False
-            continue
-        if not _WORD_RE.fullmatch(token):
-            tokens.append(token)
-            after_do = False
-            continue
-        # Lower-case "a" only: "Service A" names a service.
-        if raw.strip(_EDGE_PUNCTUATION) == "a" or token in _ARTICLES:
-            continue
-        if token in _NEGATION_CARRIERS:
-            negated = True
-            token = _NEGATION_CARRIERS[token]
+        if _THOUSANDS_RE.fullmatch(token):
+            token = token.replace(",", "")
+        if token in _NEGATION_TOKENS:
+            tokens.extend((*_NEGATION_TOKENS[token], NEGATION_MARKER))
         elif token.endswith("n't"):
-            negated = True
-            token = token[:-3]
-            if token in _DO_WORDS:
-                after_do = False
-                continue
-        elif token in NEGATION_WORDS:
-            negated = True
-            if token == "not" and after_do:
-                tokens.pop()
-            after_do = False
-            continue
-        after_do = token in _DO_WORDS
-        tokens.append(stem(token))
-    return frozenset(tokens) - {"#"}, tuple(tokens), tuple(values), negated
+            tokens.extend((token[:-3], NEGATION_MARKER))
+        else:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def _is_value(token: str) -> bool:
+    return bool(_VALUE_RE.fullmatch(token))
+
+
+def _value_shape(token: str) -> str:
+    """A value with its numbers blanked: values of one shape ("30s"/"60s", "1.5"/"2") replace each other."""
+    return _VALUE_NUMBER_RE.sub("9", token)
+
+
+def statement_edit(incoming: tuple[str, ...], existing: tuple[str, ...]) -> tuple[str, int]:
+    """The edit that turns ``existing`` tokens into ``incoming`` ones, and its position.
+
+    ``same``: no edit. ``negation``: one negation marker inserted or removed
+    in one place, with or without its do-carrier. ``value``: one value
+    replaced in place by a value of the same shape. ``other``: anything else
+    (position -1), however small: a moved word, a moved or second negation,
+    two values, a changed unit or name.
+    """
+    if incoming == existing:
+        return "same", -1
+    if len(incoming) == len(existing):
+        changed = [index for index, (left, right) in enumerate(zip(incoming, existing)) if left != right]
+        if len(changed) == 1:
+            new, old = incoming[changed[0]], existing[changed[0]]
+            if _is_value(new) and _is_value(old) and _value_shape(new) == _value_shape(old):
+                return "value", changed[0]
+        return "other", -1
+    longer, shorter = (incoming, existing) if len(incoming) > len(existing) else (existing, incoming)
+    index = next((i for i, (left, right) in enumerate(zip(longer, shorter)) if left != right), len(shorter))
+    for block in _NEGATION_BLOCKS:
+        if longer[index:index + len(block)] == block and longer[:index] + longer[index + len(block):] == shorter:
+            return "negation", index
+    return "other", -1
 
 
 def fact_features(label: str, text: str) -> FactFeatures:
@@ -255,15 +272,22 @@ def fact_features(label: str, text: str) -> FactFeatures:
     An atom (a text with a chat/MCP fact header) is its statement alone: the
     header is shared by every atom and the label is a truncated copy of the
     statement ("window" → "windo", "12000" → "12"), so neither takes part. Its
-    numbers and polarity come from the same pass as its frame and template.
+    ``template`` is the token sequence its verdicts are decided on; the frame
+    (``label_core``: tokens without values, negation markers and do-carriers)
+    only files it for the neighbour lookup, so the three allowed edits keep the
+    subject.
     """
     statement = atom_statement(text)
     if not statement:
         return _text_features(label, text)
-    frame, template, values, negated = statement_shape(statement)
+    tokens = statement_tokens(statement)
+    values = tuple(token for token in tokens if _is_value(token))
+    frame = frozenset(
+        token for token in tokens if token != NEGATION_MARKER and token not in _DO_WORDS and not _is_value(token)
+    )
     return replace(
         _text_features("", statement),
-        label_core=frame, numbers=frozenset(values), negated=negated, template=template, values=values,
+        label_core=frame, numbers=frozenset(values), negated=NEGATION_MARKER in tokens, template=tokens, values=values,
     )
 
 
@@ -371,26 +395,19 @@ def features_from_json(raw: str) -> FactFeatures:
 def replacement_allowed(incoming_text: str, existing_text: str, *, same_turn: bool) -> bool:
     """Whether an incoming atom may retire a stored one it ``update``-s (SUPERSEDES).
 
-    Only one changed value of the same statement: the same polarity, equal
-    templates (the same words, order and identifiers), exactly one number on
-    each side and it changed, that number does not stand right after the first
-    word, where it names the item ("Stage 2", "Спринт 15"), and the facts come
-    from different turns. Whether the target is the writer's own active head is the caller's
-    check. Both texts may carry the atom header.
+    Only one value replaced in place (``statement_edit`` is ``value``), not the
+    first token and not right after the first word, where it names the item
+    ("Stage 2", "Спринт 15"; a leading article is not a word here), and the
+    facts come from different turns. Whether the target is the writer's own
+    active head is the caller's check. Both texts may carry the atom header.
     """
     if same_turn:
         return False
-    _, template, values, negated = statement_shape(_strip_chat_fact_boilerplate(incoming_text))
-    _, existing_template, existing_values, existing_negated = statement_shape(
-        _strip_chat_fact_boilerplate(existing_text)
-    )
-    return (
-        negated == existing_negated
-        and template == existing_template
-        and len(values) == len(existing_values) == 1
-        and values != existing_values
-        and template.index("#") != 1
-    )
+    tokens = statement_tokens(_strip_chat_fact_boilerplate(incoming_text))
+    kind, position = statement_edit(tokens, statement_tokens(_strip_chat_fact_boilerplate(existing_text)))
+    if tokens and tokens[0] in _ARTICLES:
+        position -= 1
+    return kind == "value" and position > 1
 
 
 def content_salt(text: str) -> str:
@@ -493,6 +510,9 @@ def guards_compatible(incoming: FactFeatures, existing: FactFeatures) -> bool:
     identifiers nested (one side may add some, neither may change them).
     """
     if incoming.negated != existing.negated:
+        return False
+    if incoming.template and existing.template and incoming.values != existing.values:
+        # Two atoms: a changed, added or moved value is another fact.
         return False
     return (
         _set_relation(incoming.numbers, existing.numbers) != "disjoint"
@@ -606,10 +626,11 @@ class MemoryDedupGate:
 
     def compare(self, incoming: FactFeatures, existing: FactFeatures) -> DedupDecision:
         """Relation of one incoming fact to one stored fact (no repository access)."""
+        if incoming.template and existing.template:
+            # Not the normalized key: it drops edge marks such as a leading "!".
+            return self._compare_statements(incoming, existing)
         if incoming.key == existing.key:
             return DedupDecision("duplicate", score=1.0, reason="exact restatement", near_score=1.0)
-        if incoming.template and existing.template:
-            return self._compare_statements(incoming, existing)
         left, right = incoming.stems, existing.stems
         if not left or not right:
             return DedupDecision()
@@ -661,43 +682,29 @@ class MemoryDedupGate:
         return verdict
 
     def _compare_statements(self, incoming: FactFeatures, existing: FactFeatures) -> DedupDecision:
-        """Atom against atom, decided on the whole statement.
+        """Atom against atom, decided only by the edit between their token sequences.
 
-        Equal templates: the same values are a duplicate (a conflict if the
-        polarity flipped), changed values an update. Equal frames without
-        numbers and negation are the same words in another order. Anything
-        else is new, a statement nested in the other too: the extra words may
-        narrow or reverse it ("members can delete projects" inside "admins can
-        delete projects but members can only archive them"), so it is left to
-        the near flag and the judge.
+        No edit is a duplicate, one inserted or removed negation marker a
+        conflict, one value replaced in place an update. Anything else is new,
+        left to the near flag and the judge: a moved word may swap roles, a
+        moved negation or value says another thing, a nested statement may
+        narrow or reverse the other.
         """
         near = self.near_score(incoming, existing)
-        verdict = DedupDecision(near_score=near)
-        same_polarity = incoming.negated == existing.negated
-        if incoming.template == existing.template:
-            if incoming.values == existing.values:
-                if same_polarity:
-                    return DedupDecision("duplicate", score=1.0, reason="same statement", near_score=near)
-                return DedupDecision(
-                    "conflict", score=1.0, reason="same statement with negation flipped", near_score=near,
-                )
-            if not same_polarity:
-                return verdict
-            changed = [(old, new) for old, new in zip(existing.values, incoming.values) if old != new]
+        kind, position = statement_edit(incoming.template, existing.template)
+        if kind == "same":
+            return DedupDecision("duplicate", score=1.0, reason="same statement", near_score=near)
+        if kind == "negation":
+            return DedupDecision("conflict", score=1.0, reason="same statement with negation flipped", near_score=near)
+        if kind == "value":
             return DedupDecision(
                 "update",
                 score=1.0,
                 reason="same statement with changed values",
                 near_score=near,
-                details={"values_from": [old for old, _ in changed], "values_to": [new for _, new in changed]},
+                details={"values_from": [existing.template[position]], "values_to": [incoming.template[position]]},
             )
-        if (
-            incoming.label_core == existing.label_core
-            and not (incoming.numbers or existing.numbers)
-            and not (incoming.negated or existing.negated)
-        ):
-            return DedupDecision("duplicate", score=1.0, reason="same words in another order", near_score=near)
-        return verdict
+        return DedupDecision(near_score=near)
 
     def gray_candidates(
         self,
