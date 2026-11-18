@@ -71,6 +71,15 @@ V3_ATOM_FEATURES = (
     '"template": ["servic", "a", "has", "30s", "timeout", "and", "servic", "b", "has", "60s", "timeout"], "values": []}'
 )
 V3_ATOM_SUBJECT = "42033573b05685d79db7"
+# What ba3dbc7 (index version 4) stored for one atom: the marker of "нельзя" after "можно".
+V4_ATOM_FACT = "Миграцию нельзя запускать без резервной копии"
+V4_ATOM_FEATURES = (
+    '{"identifiers": [], "key": ["", "миграцию нельзя запускать без резервной копии"], '
+    '"label_core": ["без", "запускать", "копии", "миграцию", "можно", "резервной"], "negated": true, "numbers": [], '
+    '"stems": ["запускат", "коп", "миграц", "резервн"], '
+    '"template": ["миграцию", "можно", "¬", "запускать", "без", "резервной", "копии"], "values": []}'
+)
+V4_ATOM_SUBJECT = "cede2adaa3d5fc15e1d7"
 FEATURES_V1_REFERENCE = Path(__file__).parent / "data" / "dedup_features_v1.jsonl"
 
 
@@ -662,6 +671,17 @@ class DedupIndexTests(unittest.TestCase):
         with self.assertLogs("backend.architectos.storage_dedup", "WARNING"):
             decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
         self.assertEqual(decision.action, "new")
+
+    def test_atom_row_written_by_index_version_4_is_recomputed(self) -> None:
+        node_id = self._add_atom(V4_ATOM_FACT)
+        with self.repo._connect() as conn:
+            conn.execute(
+                "UPDATE memory_dedup_index SET version = 4, features = ?, subject = ? WHERE node_id = ?",
+                (V4_ATOM_FEATURES, V4_ATOM_SUBJECT, node_id),
+            )
+        self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
 
     def test_manual_reindex_reports_indexed_nodes(self) -> None:
         node = self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})
