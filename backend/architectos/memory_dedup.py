@@ -83,8 +83,9 @@ _ARTICLES = frozenset({"a", "an", "the"})
 _VALUE_RE = re.compile(r"[-+]?v?\d+(?:[.,:/-]\d+)*(?:%|°[^\W\d_]?|[^\W\d_]+)?")
 _VALUE_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
 _THOUSANDS_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")
-# "1." or "1)" opening a statement numbers a list item: not a value.
-_LIST_MARKER_RE = re.compile(r"\d+[.)]")
+# Markers opening a list item ("1.", "1)", "-", "•", "*", "#", ">", "[x]", "[ ]", "(1)") are no words:
+# they are dropped from an atom statement, "1. X" and "X" are one statement.
+_LIST_MARKER_RE = re.compile(r"(?:\d+[.)]|[-‐‑‒–—―•*#>]|\[[ x]?\]|\(\d+\))\s+", re.IGNORECASE)
 # Short upper-case words are names, not filler: "Service A" vs "Service B", "БД", "UI".
 _SHORT_NAME_RE = re.compile(r"(?<!\w)[^\W\d_a-zа-яё]{1,2}(?!\w)")
 _NUMBER_RE = re.compile(r"^[-+−]?v?\d+(?:[.,:/\-]\d+)*[^\W\d_%°]*[%°]?$")
@@ -207,20 +208,20 @@ def _number_value(token: str) -> str:
 def statement_tokens(statement: str) -> tuple[str, ...]:
     """The tokens of one atom statement, in order.
 
-    Whitespace tokens folded for case, Unicode form, quotes, dashes,
-    apostrophes, separators after a token, the sentence mark closing the
-    statement and thousands separators ("1,000" = "1000"); nothing else is
+    Leading list markers are dropped; whitespace tokens are folded for case,
+    Unicode form, quotes, dashes, apostrophes, separators after a token, the
+    sentence mark closing the statement and thousands separators ("1,000" =
+    "1000"); nothing else is
     dropped or merged: articles, function words, "p95", "!isdeleted", "try!"
     and "<100ms" are tokens as written. A negation marker word becomes
     ``NEGATION_MARKER`` after its carrier.
     """
     tokens: list[str] = []
+    while marker := _LIST_MARKER_RE.match(statement):
+        statement = statement[marker.end():]
     words = statement.split()
     for index, raw in enumerate(words):
         folded = _fold_text(raw).translate(_TOKEN_CHARACTERS)
-        if index == 0 and _LIST_MARKER_RE.fullmatch(folded):
-            tokens.append(folded)
-            continue
         token = folded.lstrip(_TOKEN_OPENING).rstrip(_TOKEN_CLOSING)
         if index == len(words) - 1 and token.endswith(_SENTENCE_MARKS):
             token = token[:-1].rstrip(_TOKEN_CLOSING)

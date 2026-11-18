@@ -380,7 +380,8 @@ class GateClassifierTests(unittest.TestCase):
             ("The worker pool uses 512MB of memory", "The worker pool uses 2GB of memory", "new"),
             ("The export job tracks p95 latency per tenant", "The export job tracks p99 latency per tenant", "new"),
             ("The importer reads the queue first # 5", "The importer reads the queue first 5 #", "new"),
-            ("1. The importer reads the queue first", "2. The importer reads the queue first", "new"),
+            # List markers are no words: both statements are "the importer reads the queue first".
+            ("1. The importer reads the queue first", "2. The importer reads the queue first", "duplicate"),
             ("The API limit is documented in [1] for every client", "The API limit is documented in [2] for every client", "new"),
         ]
         for old, new, action in cases:
@@ -451,6 +452,18 @@ class GateClassifierTests(unittest.TestCase):
         ):
             with self.subTest(old=old, new=new):
                 self.assertEqual(self._compare_atoms(old, new).action, "duplicate")
+
+    def test_leading_list_markers_are_not_words(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        for marker in ("1.", "1)", "-", "•", "*", "—", "#", ">", "[x]", "[ ]", "(1)", "- [ ]"):
+            old, new = (f"{marker} Stage {number} of the pipeline runs on Linux runners" for number in (2, 3))
+            with self.subTest(marker=marker):
+                self.assertEqual(self._compare_atoms(old, new).action, "update")
+                self.assertFalse(memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False))
+                self.assertEqual(
+                    self._compare_atoms(f"{marker} The export job runs nightly", "The export job runs nightly").action,
+                    "duplicate",
+                )
 
     def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
         for old, new in (
