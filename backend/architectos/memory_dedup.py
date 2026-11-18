@@ -49,12 +49,14 @@ from .storage import sanitize_text
 # Stripped from both ends only: inner punctuation ("5.0" vs "50") is content.
 # No dashes: a leading minus is a sign ("-5 °C" vs "5 °C").
 _EDGE_PUNCTUATION = " .,;:!?…\"'`«»“”„()[]"
-# Atom statements are compared token by token (``statement_tokens``). Quotes and
-# parentheses are stripped from both ends of a token, sentence punctuation only
-# from its end: "!=", "!enabled" and ".5" keep their mark. Square brackets stay:
+# Atom statements are compared token by token (``statement_tokens``). Quotes,
+# backticks and parentheses around a token are stripped, and a separator after
+# it; "!", "?", "." and "'" are content ("try!", "string?", "5'", "!=", ".5"),
+# except one sentence mark closing the whole statement. Square brackets stay:
 # "[1]" is a reference, "(10)" a value.
-_TOKEN_OPENING = "\"'`«»“”„("
-_TOKEN_CLOSING = "\"'`«»“”„).,;:!?…"
+_TOKEN_OPENING = "\"`«»“”„("
+_TOKEN_CLOSING = "\"`«»“”„),;:"
+_SENTENCE_MARKS = (".", "!", "?", "…")
 _TOKEN_CHARACTERS = str.maketrans({
     "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "―": "-", "−": "-", "ʼ": "'",
 })
@@ -206,18 +208,22 @@ def statement_tokens(statement: str) -> tuple[str, ...]:
     """The tokens of one atom statement, in order.
 
     Whitespace tokens folded for case, Unicode form, quotes, dashes,
-    apostrophes and thousands separators ("1,000" = "1000"); nothing else is
-    dropped or merged: articles, function words, "p95", "!isdeleted" and
-    "<100ms" are tokens as written. A negation marker word becomes
+    apostrophes, separators after a token, the sentence mark closing the
+    statement and thousands separators ("1,000" = "1000"); nothing else is
+    dropped or merged: articles, function words, "p95", "!isdeleted", "try!"
+    and "<100ms" are tokens as written. A negation marker word becomes
     ``NEGATION_MARKER`` after its carrier.
     """
     tokens: list[str] = []
-    for index, raw in enumerate(statement.split()):
+    words = statement.split()
+    for index, raw in enumerate(words):
         folded = _fold_text(raw).translate(_TOKEN_CHARACTERS)
         if index == 0 and _LIST_MARKER_RE.fullmatch(folded):
             tokens.append(folded)
             continue
         token = folded.lstrip(_TOKEN_OPENING).rstrip(_TOKEN_CLOSING)
+        if index == len(words) - 1 and token.endswith(_SENTENCE_MARKS):
+            token = token[:-1].rstrip(_TOKEN_CLOSING)
         if not token:
             continue
         if _THOUSANDS_RE.fullmatch(token):

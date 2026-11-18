@@ -136,7 +136,8 @@ def fuzz_edit(rng: random.Random, words: list[str]) -> tuple[str, list[str], int
         if negations and rng.random() < 0.5:
             del edited[rng.choice(negations)]
         else:
-            edited.insert(rng.randrange(1, len(words) + 1), _fuzz_negation(words))
+            # Not after the last word: its closing sentence mark would become content.
+            edited.insert(rng.randrange(1, len(words)), _fuzz_negation(words))
         return "negation", edited, -1
     if kind == "value":
         if not values:
@@ -423,6 +424,33 @@ class GateClassifierTests(unittest.TestCase):
                     self.assertEqual(merges, kind == "same")
         self.assertEqual(set(seen), {"same", "negation", "value", "other"})
         self.assertGreater(seen["other"], 2000)
+
+    def test_bang_question_mark_and_apostrophe_inside_a_statement_are_content(self) -> None:
+        pairs = [
+            ("We call try! before every save in the job", "We call try? before every save in the job"),
+            ("We call save! before the export in the job", "We call save before the export in the job"),
+            ("The model uses `find_by!` for every lookup", "The model uses `find_by` for every lookup"),
+            ("The parser returns string? for optional fields", "The parser returns string for optional fields"),
+            ("The query keeps rows where ! isDeleted holds", "The query keeps rows where isDeleted holds"),
+            ("The value!! flag marks urgent rows", "The value flag marks urgent rows"),
+            ("The factor 5! is used in the formula", "The factor 5 is used in the formula"),
+            ("The plank is 5' long in the spec", "The plank is 5 long in the spec"),
+        ]
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+                self.assertNotEqual(
+                    fact_features("Chat fact", f"{header}\n\n{old}").template,
+                    fact_features("Chat fact", f"{header}\n\n{new}").template,
+                )
+        # One sentence mark closing the statement and separators after a token are not content.
+        for old, new in (
+            ("The export job runs every night.", "The export job runs every night!"),
+            ("The export job runs, every night", "The export job runs every night?"),
+        ):
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, "duplicate")
 
     def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
         for old, new in (
