@@ -159,8 +159,10 @@ class StorageDedupMixin:
                         # The node is gone: nothing to compare against any more.
                         self._delete_dedup_rows(conn, [str(row["node_id"])])
                     else:
-                        node = MemoryNode.from_dict(json.loads(row["payload"]))
-                        if atom_statement(str(node.text or "")):
+                        node = self._node_from_payload(str(row["node_id"]), str(row["payload"]))
+                        if node is None:
+                            pass
+                        elif atom_statement(str(node.text or "")):
                             self._sync_dedup_index_row(conn, node)
                             recomputed += 1
                         else:
@@ -235,6 +237,19 @@ class StorageDedupMixin:
                 "SELECT count(*), coalesce(sum(version < ?), 0) FROM memory_dedup_index", (DEDUP_INDEX_VERSION,)
             ).fetchone()
         return {"indexed": int(indexed), "remaining": int(remaining)}
+
+    @staticmethod
+    def _node_from_payload(node_id: str, payload: str) -> MemoryNode | None:
+        """The node an index row belongs to; None, with a warning, when its stored payload is not JSON.
+
+        The row is then left as it is (outdated, near flag only) instead of
+        failing the read or rolling back a background batch every round.
+        """
+        try:
+            return MemoryNode.from_dict(json.loads(payload))
+        except json.JSONDecodeError as exc:
+            _LOG.warning("dedup index row %s left as is, its node payload is unreadable: %s", node_id, exc)
+            return None
 
     @staticmethod
     def _walk_rowids(
@@ -344,9 +359,11 @@ class StorageDedupMixin:
             return result
         placeholders = ", ".join("?" for _ in outdated)
         for node_row in conn.execute(
-            f"SELECT payload FROM memory_nodes WHERE id IN ({placeholders})", list(outdated)
+            f"SELECT id, payload FROM memory_nodes WHERE id IN ({placeholders})", list(outdated)
         ).fetchall():
-            node = MemoryNode.from_dict(json.loads(node_row["payload"]))
+            node = StorageDedupMixin._node_from_payload(str(node_row["id"]), str(node_row["payload"]))
+            if node is None:
+                continue
             row = outdated[node.id]
             row["features"] = features_to_json(fact_features(str(node.label or ""), str(node.text or "")))
             row["current"] = True

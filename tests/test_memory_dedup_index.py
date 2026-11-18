@@ -633,6 +633,36 @@ class DedupIndexTests(unittest.TestCase):
         self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
         self._assert_equals_a_build_from_scratch()
 
+    def _break_payload(self, node_id: str) -> None:
+        with self.repo._connect() as conn:
+            conn.execute("UPDATE memory_nodes SET payload = '{broken' WHERE id = ?", (node_id,))
+
+    def test_background_pass_skips_a_row_whose_node_payload_is_unreadable(self) -> None:
+        broken, fine = self._add_atom("Cache entries live 30 minutes"), self._add_atom("Таймаут сессии кэша составляет 30 минут")
+        self._age([broken, fine], features=STALE_FEATURES)
+        self._break_payload(broken)
+        with self.assertLogs("backend.architectos.storage_dedup", "WARNING") as logs:
+            result = self.service.rebuild_memory_dedup_index()
+        self.assertIn(broken, "\n".join(logs.output))
+        self.assertEqual((result["recomputed"], result["remaining"]), (1, 1))
+        with self.repo._connect() as conn:
+            versions = dict(conn.execute("SELECT node_id, version FROM memory_dedup_index").fetchall())
+        self.assertEqual(versions, {broken: OUTDATED_VERSION, fine: DEDUP_INDEX_VERSION})
+
+    def test_reads_keep_an_outdated_row_with_an_unreadable_node_for_the_near_flag_only(self) -> None:
+        fact = "Session store keeps entry zebra alive for the configured window"
+        node_id = self._add_atom(fact)
+        self._age([node_id], features=STALE_FEATURES)
+        self._break_payload(node_id)
+        label, body = self._atom(fact)
+        features = fact_features(label, body)
+        with self.assertLogs("backend.architectos.storage_dedup", "WARNING"):
+            neighbours = self.repo.dedup_stem_neighbours("project", "architectos", sorted(features.stems), 1)
+        self.assertEqual([(row["node_id"], row["current"]) for row in neighbours], [(node_id, False)])
+        with self.assertLogs("backend.architectos.storage_dedup", "WARNING"):
+            decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
+        self.assertEqual(decision.action, "new")
+
     def test_manual_reindex_reports_indexed_nodes(self) -> None:
         node = self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})
         result = self.service.rebuild_memory_dedup_index()
