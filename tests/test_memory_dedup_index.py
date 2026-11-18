@@ -62,6 +62,15 @@ V2_ATOM_FEATURES = (
     '"template": ["p", "latency", "of", "search", "api", "stay", "below", "alert", "threshold"], "values": []}'
 )
 V2_ATOM_SUBJECT = "c404adec1ab48fcf5ebd"
+# What e1a3974 (index version 3) stored for one atom: a frame and template that ignore where the values stand.
+V3_ATOM_FACT = "Service A has a 30s timeout and service B has a 60s timeout"
+V3_ATOM_FEATURES = (
+    '{"identifiers": [], "key": ["", "service a has a 30s timeout and service b has a 60s timeout"], '
+    '"label_core": ["30s", "60s", "a", "and", "b", "has", "servic", "timeout"], "negated": false, "numbers": [], '
+    '"stems": ["has", "servic", "timeout", "~a", "~b"], '
+    '"template": ["servic", "a", "has", "30s", "timeout", "and", "servic", "b", "has", "60s", "timeout"], "values": []}'
+)
+V3_ATOM_SUBJECT = "42033573b05685d79db7"
 FEATURES_V1_REFERENCE = Path(__file__).parent / "data" / "dedup_features_v1.jsonl"
 
 
@@ -608,6 +617,17 @@ class DedupIndexTests(unittest.TestCase):
             conn.execute(
                 "UPDATE memory_dedup_index SET version = 2, features = ?, subject = ? WHERE node_id = ?",
                 (V2_ATOM_FEATURES, V2_ATOM_SUBJECT, node_id),
+            )
+        self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
+
+    def test_atom_row_written_by_index_version_3_is_recomputed(self) -> None:
+        node_id = self._add_atom(V3_ATOM_FACT)
+        with self.repo._connect() as conn:
+            conn.execute(
+                "UPDATE memory_dedup_index SET version = 3, features = ?, subject = ? WHERE node_id = ?",
+                (V3_ATOM_FEATURES, V3_ATOM_SUBJECT, node_id),
             )
         self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
         self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
