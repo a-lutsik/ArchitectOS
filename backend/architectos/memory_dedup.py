@@ -57,8 +57,9 @@ _EDGE_PUNCTUATION = " .,;:!?…\"'`«»“”„()[]"
 _TOKEN_OPENING = "\"`«»“”„("
 _TOKEN_CLOSING = "\"`«»“”„),;:"
 _SENTENCE_MARKS = (".", "!", "?", "…")
+# Folded in an atom token besides case (NFC, not NFKC: "10²" is not "102").
 _TOKEN_CHARACTERS = str.maketrans({
-    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "―": "-", "−": "-", "ʼ": "'",
+    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "―": "-", "−": "-", "’": "'", "ʼ": "'", "ё": "е",
 })
 
 NEGATION_WORDS = frozenset({
@@ -210,8 +211,8 @@ def _number_value(token: str) -> str:
 def statement_tokens(statement: str) -> tuple[str, ...]:
     """The tokens of one atom statement, in order.
 
-    Leading list markers are dropped; whitespace tokens are folded for case,
-    Unicode form, quotes, dashes, apostrophes, separators after a token, the
+    Leading list markers are dropped; whitespace tokens are folded for case
+    (NFC only), quotes, dashes, apostrophes, separators after a token, the
     sentence mark closing the statement and thousands separators ("1,000" =
     "1000"); nothing else is
     dropped or merged: articles, function words, "p95", "!isdeleted", "try!"
@@ -223,7 +224,7 @@ def statement_tokens(statement: str) -> tuple[str, ...]:
         statement = statement[marker.end():]
     words = statement.split()
     for index, raw in enumerate(words):
-        folded = _fold_text(raw).translate(_TOKEN_CHARACTERS)
+        folded = unicodedata.normalize("NFC", raw).casefold().translate(_TOKEN_CHARACTERS)
         token = folded.lstrip(_TOKEN_OPENING).rstrip(_TOKEN_CLOSING)
         if index == len(words) - 1 and token.endswith(_SENTENCE_MARKS):
             token = token[:-1].rstrip(_TOKEN_CLOSING)

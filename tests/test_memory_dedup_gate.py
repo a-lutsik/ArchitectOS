@@ -485,6 +485,20 @@ class GateClassifierTests(unittest.TestCase):
                 self.assertEqual(self._compare_atoms(old, new).action, "new")
                 self.assertFalse(memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False))
 
+    def test_superscripts_and_subscripts_keep_their_form(self) -> None:
+        for old, new in (
+            ("The matrix has 10² cells per block", "The matrix has 102 cells per block"),
+            ("The batch holds 10⁶ rows per run", "The batch holds 106 rows per run"),
+            ("The probe measures H₂O vapour in the room", "The probe measures H2O vapour in the room"),
+        ):
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        # Spaces, quotes and dashes are still folded.
+        self.assertEqual(
+            self._compare_atoms("The job \u201cexport\u201d runs\u00a0nightly \u2014 always", 'The job "export" runs nightly - always').action,
+            "duplicate",
+        )
+
     def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
         for old, new in (
             ("The worker don't open the store", "The worker do not open the store"),
