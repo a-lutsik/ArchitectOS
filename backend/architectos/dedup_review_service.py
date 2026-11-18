@@ -140,6 +140,10 @@ class DedupReviewServiceMixin:
                     continue
                 if not gate.type_matches(str(node.type or ""), str(keeper.type or "")):
                     continue
+                # Atoms merge only with no edit between their statements: any other
+                # difference (a moved word, value or negation) may be another fact.
+                if (features.template or keeper_features.template) and features.template != keeper_features.template:
+                    continue
                 verdict = gate.compare(features, keeper_features)
                 if verdict.action != "duplicate":
                     continue

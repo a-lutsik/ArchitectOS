@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
@@ -855,9 +856,48 @@ class IngestionServiceMixin(IngestionTimeoutsMixin, IngestionRescanMixin, Ingest
             "confidence": confidence,
         }
 
+    # Pause between background dedup index batches: writers get the lock in between.
+    DEDUP_REFRESH_PAUSE_SECONDS = 0.15
+    DEDUP_REFRESH_INTERVAL_SECONDS = 3600.0
+
     def rebuild_memory_dedup_index(self) -> dict[str, Any]:
-        """Recompute the dedup gate index from ``memory_nodes`` (repair / manual reindex)."""
-        return self.repository.rebuild_dedup_index()
+        """Bring the dedup index up to date, batch by batch (manual reindex).
+
+        The same pass the app runs at start and hourly: rows of an older feature
+        version first, then rows for active nodes that have none. A manual
+        reindex never holds the write lock for the whole index.
+        """
+        started = time.monotonic()
+        totals = {"recomputed": 0, "stamped": 0, "added": 0, "locked": 0}
+        for batch in (self.repository.refresh_dedup_index, self.repository.index_missing_dedup_rows):
+            cursor = 0
+            while True:
+                result = batch(after_rowid=cursor)
+                for key, value in result.items():
+                    if key in totals:
+                        totals[key] += int(value)
+                if result["locked"] or not result["remaining"]:
+                    break
+                cursor = result["cursor"]
+                time.sleep(self.DEDUP_REFRESH_PAUSE_SECONDS)
+            if totals["locked"]:
+                break
+        status = self.repository.dedup_index_status()
+        _LOG.info(
+            "dedup index refresh done · recomputed=%s stamped=%s added=%s locked=%s remaining=%s indexed=%s duration=%.2fs",
+            totals["recomputed"], totals["stamped"], totals["added"], totals["locked"], status["remaining"],
+            status["indexed"], time.monotonic() - started,
+        )
+        return {**totals, **status}
+
+    def _dedup_refresh_loop(self) -> None:
+        """App-only background pass over outdated dedup index rows: at start, then hourly."""
+        while True:
+            try:
+                self.rebuild_memory_dedup_index()
+            except Exception as exc:  # noqa: BLE001 - background worker must not crash the app
+                _LOG.warning("dedup index refresh failed: %s", exc)
+            time.sleep(self.DEDUP_REFRESH_INTERVAL_SECONDS)
 
     def _label_collision_salt(
         self,

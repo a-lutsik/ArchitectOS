@@ -1,25 +1,86 @@
 """Stage 2: the dedup gate reads an index instead of scanning every node."""
 from __future__ import annotations
 
+import dataclasses
+import itertools
+import json
 import random
+import sqlite3
+import string
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
+from backend.architectos import memory_dedup, storage_dedup
 from backend.architectos.memory_dedup import (
+    DEDUP_INDEX_VERSION,
     MemoryDedupGate,
     fact_features,
+    features_to_json,
     incoming_features,
+    normalize_fact_text,
+    subject_key,
 )
+from backend.architectos.memory_ingestion import CHAT_FACT_BOILERPLATE_PREFIXES
 from backend.architectos.service import ArchitectOSService
-from backend.architectos.storage_dedup import dedup_index_eligible
+from backend.architectos.storage import SQLiteMemoryRepository
+from backend.architectos.storage_dedup import StorageDedupMixin, dedup_index_eligible
 
 _LABELS = ["Лимит API", "Кэш", "Деплой", "Порт", "Cache", "Queue"]
 _WORDS = (
     "сервис база кэш лимит запрос порт очередь деплой релиз узел агент "
     "service cache limit request port queue deploy release node agent"
 ).split()
+
+
+# A row written by an older release: a version below the current one.
+OUTDATED_VERSION = DEDUP_INDEX_VERSION - 1
+ASK_HEADER = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+MCP_HEADER = CHAT_FACT_BOILERPLATE_PREFIXES[2]
+# Features release v1 stored for an atom (label and header included), but of another text than the row's.
+STALE_FEATURES = features_to_json(memory_dedup._text_features("MCP fact: stale atom", f"{MCP_HEADER}\n\nstale atom"))
+# Statement of an atom, the stored one, the incoming one, and the gate verdict the v1 features already give.
+STALE_ROW_CASES = (
+    ("repeat", "Review candidates expire after 7 days unless a person accepts them",
+     "Review candidates expire after 7 days unless a person accepts them.", "duplicate"),
+    ("number en", "The session cache TTL is 30 minutes", "The session cache TTL is 45 minutes", "update"),
+    ("number ru", "Таймаут сессии кэша составляет 30 минут", "Таймаут сессии кэша составляет 45 минут", "update"),
+    ("negation en", "We use Redis for the session cache", "We do not use Redis for the session cache", None),
+    ("negation ru", "Мы используем Redis для кэша сессий", "Мы не используем Redis для кэша сессий", None),
+)
+# What 801f8d2 (index version 2) stored for one atom: "p95" split to "p" in the frame and template.
+V2_ATOM_FACT = "The p95 latency of the search API stays below the alert threshold"
+V2_ATOM_FEATURES = (
+    '{"identifiers": [], "key": ["", "the p95 latency of the search api stays below the alert threshold"], '
+    '"label_core": ["alert", "api", "below", "latency", "of", "p", "search", "stay", "threshold"], "negated": false, '
+    '"numbers": [], "stems": ["alert", "api", "below", "latency", "p95", "search", "stay", "threshold"], '
+    '"template": ["p", "latency", "of", "search", "api", "stay", "below", "alert", "threshold"], "values": []}'
+)
+V2_ATOM_SUBJECT = "c404adec1ab48fcf5ebd"
+# What e1a3974 (index version 3) stored for one atom: a frame and template that ignore where the values stand.
+V3_ATOM_FACT = "Service A has a 30s timeout and service B has a 60s timeout"
+V3_ATOM_FEATURES = (
+    '{"identifiers": [], "key": ["", "service a has a 30s timeout and service b has a 60s timeout"], '
+    '"label_core": ["30s", "60s", "a", "and", "b", "has", "servic", "timeout"], "negated": false, "numbers": [], '
+    '"stems": ["has", "servic", "timeout", "~a", "~b"], '
+    '"template": ["servic", "a", "has", "30s", "timeout", "and", "servic", "b", "has", "60s", "timeout"], "values": []}'
+)
+V3_ATOM_SUBJECT = "42033573b05685d79db7"
+# What ba3dbc7 (index version 4) stored for one atom: the marker of "нельзя" after "можно".
+V4_ATOM_FACT = "Миграцию нельзя запускать без резервной копии"
+V4_ATOM_FEATURES = (
+    '{"identifiers": [], "key": ["", "миграцию нельзя запускать без резервной копии"], '
+    '"label_core": ["без", "запускать", "копии", "миграцию", "можно", "резервной"], "negated": true, "numbers": [], '
+    '"stems": ["запускат", "коп", "миграц", "резервн"], '
+    '"template": ["миграцию", "можно", "¬", "запускать", "без", "резервной", "копии"], "values": []}'
+)
+V4_ATOM_SUBJECT = "cede2adaa3d5fc15e1d7"
+FEATURES_V1_REFERENCE = Path(__file__).parent / "data" / "dedup_features_v1.jsonl"
 
 
 def _random_fact(rng: random.Random) -> tuple[str, str, str]:
@@ -43,6 +104,70 @@ class DedupIndexTests(unittest.TestCase):
         with self.repo._connect() as conn:
             return {row[0] for row in conn.execute("SELECT node_id FROM memory_dedup_index")}
 
+    @staticmethod
+    def _atom(fact: str, header: str = MCP_HEADER) -> tuple[str, str]:
+        """Label and body of a chat/MCP fact atom, shaped like ``_enqueue_session_fact_atoms`` builds them."""
+        return f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}"
+
+    def _add_atom(
+        self, fact: str, *, header: str = MCP_HEADER, template: str = "mcp_turn_atom", project_id: str = "architectos",
+    ) -> str:
+        label, body = self._atom(fact, header)
+        metadata = {"template": template} if template else {}
+        return self.repo.add_node("Lesson", label, "project", body, project_id, metadata=metadata).id
+
+    def _add_plain(self, label: str, text: str, node_type: str = "Decision") -> str:
+        return self.repo.add_node(node_type, label, "project", text, "architectos").id
+
+    def _age(
+        self, node_ids: Any, *, features: str | None = None, subject: str | None = None, drop_stems: bool = False,
+    ) -> None:
+        """Make the index rows look like an older release wrote them."""
+        with self.repo._connect() as conn:
+            for node_id in node_ids:
+                conn.execute("UPDATE memory_dedup_index SET version = ? WHERE node_id = ?", (OUTDATED_VERSION, node_id))
+                if features is not None:
+                    conn.execute("UPDATE memory_dedup_index SET features = ? WHERE node_id = ?", (features, node_id))
+                if subject is not None:
+                    conn.execute("UPDATE memory_dedup_index SET subject = ? WHERE node_id = ?", (subject, node_id))
+                if drop_stems:
+                    conn.execute("DELETE FROM memory_dedup_stems WHERE node_id = ?", (node_id,))
+
+    @staticmethod
+    def _written_by_v1() -> Any:
+        """Index rows written while active, exactly as release v1 wrote them (features of label and text)."""
+        return mock.patch.multiple(memory_dedup, fact_features=memory_dedup._text_features, DEDUP_INDEX_VERSION=1)
+
+    def _index_dump(self) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+        with self.repo._connect() as conn:
+            rows = conn.execute(
+                "SELECT node_id, scope, project_key, node_type, label, subject, source_hash, version, features "
+                "FROM memory_dedup_index ORDER BY node_id"
+            ).fetchall()
+            stems = conn.execute(
+                "SELECT stem, node_id, scope, project_key FROM memory_dedup_stems ORDER BY node_id, stem"
+            ).fetchall()
+        return [tuple(row) for row in rows], [tuple(row) for row in stems]
+
+    def _row_versions(self) -> set[int]:
+        with self.repo._connect() as conn:
+            return {int(row[0]) for row in conn.execute("SELECT DISTINCT version FROM memory_dedup_index")}
+
+    def _refresh_until_current(self) -> dict[str, int]:
+        """Repeat the background pass until nothing is outdated; returns the summed counts."""
+        totals = {"recomputed": 0, "stamped": 0}
+        for _ in range(200):
+            result = self.repo.refresh_dedup_index(budget_seconds=1.0)
+            totals = {key: totals[key] + int(result[key]) for key in totals}
+            if not result["remaining"]:
+                return totals
+        self.fail("refresh_dedup_index left outdated rows after 200 passes")
+
+    def _assert_equals_a_build_from_scratch(self) -> None:
+        after_pass = self._index_dump()
+        self.repo.rebuild_dedup_index()
+        self.assertEqual(after_pass, self._index_dump())
+
     def _brute_force(self, label: str, text: str, node_type: str) -> Any:
         """The stage 1 scan: compare against every eligible node."""
         incoming = incoming_features(label, text)
@@ -62,14 +187,23 @@ class DedupIndexTests(unittest.TestCase):
                 best_action, best_rank, best_score, best_target = verdict.action, r, verdict.score, node.id
         return best_action, best_target, best_near
 
-    def test_index_matches_full_scan_on_random_corpus(self) -> None:
-        rng = random.Random(20261012)
+    def _random_fact_or_atom(self, rng: random.Random, *, atoms: bool) -> tuple[str, str, str]:
+        label, text, node_type = _random_fact(rng)
+        if atoms and rng.random() < 0.7:
+            # Few words in few slots, so atoms often share a template or frame.
+            words = " ".join(rng.choice(_WORDS[:4]) for _ in range(3))
+            negation = "не " if rng.random() < 0.2 else ""
+            number = f" {rng.choice([10, 20])}" if rng.random() < 0.5 else ""
+            text = f"{rng.choice((ASK_HEADER, MCP_HEADER))}\n\n{negation}{words}{number}"
+        return label, text, node_type
+
+    def _assert_index_matches_full_scan(self, rng: random.Random, *, atoms: bool) -> None:
         for i in range(250):
-            label, text, node_type = _random_fact(rng)
+            label, text, node_type = self._random_fact_or_atom(rng, atoms=atoms)
             # Distinct ids even under equal labels; same as the gate's salting.
             self.repo.add_node(node_type, label, "project", text, "architectos", id_salt=str(i))
         for _ in range(120):
-            label, text, node_type = _random_fact(rng)
+            label, text, node_type = self._random_fact_or_atom(rng, atoms=atoms)
             decision = self.gate.classify(label, text, node_type, "project", "architectos")
             action, target, near = self._brute_force(label, text, node_type)
             self.assertEqual(decision.action, action, (label, text))
@@ -80,6 +214,12 @@ class DedupIndexTests(unittest.TestCase):
             else:
                 # Below the flag threshold the index may skip weak neighbours.
                 self.assertLess(decision.near_score, self.gate.NEAR_DUPLICATE_SIMILARITY, (label, text))
+
+    def test_index_matches_full_scan_on_random_corpus(self) -> None:
+        self._assert_index_matches_full_scan(random.Random(20261012), atoms=False)
+
+    def test_index_matches_full_scan_on_random_corpus_with_atoms(self) -> None:
+        self._assert_index_matches_full_scan(random.Random(20261118), atoms=True)
 
     def test_near_min_shared_never_drops_a_flagged_neighbour(self) -> None:
         rng = random.Random(7)
@@ -126,18 +266,422 @@ class DedupIndexTests(unittest.TestCase):
         self.assertEqual(other["dedup"]["action"], "new")
         self.assertEqual(other["metadata"].get("possible_duplicate_of"), base["id"])
 
-    def test_startup_rebuilds_missing_or_outdated_index(self) -> None:
-        node = self.service.add_memory({"label": "Кэш", "text": "Используем Redis для кэша сессий", "type": "Decision"})
+    def test_startup_builds_an_empty_index_but_leaves_outdated_rows_to_the_background_pass(self) -> None:
+        plain = self._add_plain("Кэш", "Используем Redis для кэша сессий")
+        atom = self._add_atom("Review candidates expire after 7 days unless a person accepts them")
         with self.repo._connect() as conn:
             conn.execute("DELETE FROM memory_dedup_stems")
             conn.execute("DELETE FROM memory_dedup_index")
         self.repo._migrate()
-        self.assertIn(node["id"], self._indexed_ids())
-        with self.repo._connect() as conn:
-            conn.execute("UPDATE memory_dedup_index SET version = 0, features = '{}'")
+        self.assertEqual(self._indexed_ids(), {plain, atom})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._age([plain])
+        self._age([atom], features="{}", drop_stems=True)
+        outdated = self._index_dump()
         self.repo._migrate()
+        self.assertEqual(self._index_dump(), outdated, "start-up must not touch an outdated index")
+        self._refresh_until_current()
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
         again = self.service.add_memory({"label": "Кэш", "text": "Для кэша сессий используем Redis", "type": "Decision"})
         self.assertTrue(again.get("dedup_merged"))
+
+    def test_init_leaves_outdated_rows_alone(self) -> None:
+        self._age([self._add_plain("Кэш", "Используем Redis для кэша сессий"), self._add_atom("Cache entries live 30 minutes")])
+        before = self._index_dump()
+        with mock.patch.object(
+            SQLiteMemoryRepository, "rebuild_dedup_index", side_effect=AssertionError("init must not rebuild an outdated index"),
+        ):
+            SQLiteMemoryRepository(self.repo.project_root)
+        self.assertEqual(self._index_dump(), before)
+
+    def test_a_repository_opens_while_another_connection_holds_the_write_lock(self) -> None:
+        self._age([self._add_plain("Кэш", "Используем Redis для кэша сессий"), self._add_atom("Cache entries live 30 minutes")])
+        holder = sqlite3.connect(self.repo.db_path, timeout=1)
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            SQLiteMemoryRepository(self.repo.project_root)
+        finally:
+            holder.rollback()
+            holder.close()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_gate_reads_an_outdated_atom_row_like_a_fresh_one(self) -> None:
+        for number, (name, stored, incoming, expected) in enumerate(STALE_ROW_CASES):
+            incoming_label, incoming_body = self._atom(incoming)
+            for aged in ("features", "subject"):
+                with self.subTest(case=name, aged=aged):
+                    project_id = f"stale-{number}-{aged}"
+                    node_id = self._add_atom(stored, project_id=project_id)
+                    fresh = self.gate.classify(incoming_label, incoming_body, "Lesson", "project", project_id)
+                    if expected:
+                        self.assertEqual((fresh.action, fresh.target_id), (expected, node_id))
+                    # "features": the row holds another text's features. "subject": the row lies under a subject
+                    # the incoming fact does not hash to, so only its stems lead to it.
+                    self._age(
+                        [node_id],
+                        features=STALE_FEATURES if aged == "features" else None,
+                        subject="stale-subject" if aged == "subject" else None,
+                    )
+                    outdated = self.gate.classify(incoming_label, incoming_body, "Lesson", "project", project_id)
+                    self.assertEqual((outdated.action, outdated.target_id), (fresh.action, fresh.target_id))
+
+    def test_background_pass_brings_outdated_atom_rows_to_a_build_from_scratch(self) -> None:
+        atoms = [
+            self._add_atom("Review candidates expire after 7 days unless a person accepts them", template="chat_session_atom", header=ASK_HEADER),
+            self._add_atom("Таймаут сессии кэша составляет 30 минут"),
+            # An atom restored by undo has no template: the text alone makes it an atom.
+            self._add_atom("The Azure Boards sync job fetches at most 200 work items per WIQL window", template=""),
+        ]
+        plain = [self._add_plain("Кэш", "Используем Redis для кэша сессий"), self._add_plain("Порт", "Сервер слушает порт 8765")]
+        self._age(atoms, features=STALE_FEATURES, subject="stale-subject", drop_stems=True)
+        self._age(plain)
+        totals = self._refresh_until_current()
+        self.assertEqual(totals, {"recomputed": len(atoms), "stamped": len(plain)})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
+
+    def test_background_pass_only_stamps_rows_without_an_atom_header(self) -> None:
+        favorite_fact = "Данные проекта хранятся в SQLite"
+        plain_ids = [
+            self._add_plain("Кэш", "Используем Redis для кэша сессий"),
+            # Explicit saves and notes that merely mention a header are not atoms.
+            self._add_plain(f"Favorite: {favorite_fact}", f"Favorited durable fact from assistant reply.\n\n{favorite_fact}", "Lesson"),
+            self._add_plain("Chat note", f"Meeting notes. {ASK_HEADER} The cache TTL is 30 minutes", "Lesson"),
+        ]
+        atoms = [self._add_atom("Cache entries live 30 minutes"), self._add_atom("Таймаут сессии кэша составляет 30 минут")]
+        self._age(plain_ids, features=STALE_FEATURES, subject="stale-subject")
+        self._age(atoms, features=STALE_FEATURES, subject="stale-subject")
+        before = self._index_dump()
+        totals = self._refresh_until_current()
+        self.assertEqual(totals, {"recomputed": len(atoms), "stamped": len(plain_ids)})
+        after = self._index_dump()
+        before_rows, after_rows = {row[0]: row for row in before[0]}, {row[0]: row for row in after[0]}
+        for node_id in plain_ids:
+            self.assertEqual(
+                after_rows[node_id][:7] + after_rows[node_id][8:], before_rows[node_id][:7] + before_rows[node_id][8:],
+                "features, subject and hash of a non-atom row stay byte-identical",
+            )
+            self.assertEqual(after_rows[node_id][7], DEDUP_INDEX_VERSION)
+        for node_id in atoms:
+            self.assertNotEqual(after_rows[node_id][8], STALE_FEATURES)
+            self.assertEqual(after_rows[node_id][7], DEDUP_INDEX_VERSION)
+        self.assertEqual(
+            [row for row in after[1] if row[1] in plain_ids], [row for row in before[1] if row[1] in plain_ids],
+        )
+
+    def test_failure_on_a_row_rolls_back_the_batch_and_a_repeat_finishes_the_rest(self) -> None:
+        atoms = [self._add_atom(f"Cache entry number {i} lives for {i + 10} minutes in the session store") for i in range(6)]
+        self._age(atoms, features=STALE_FEATURES, subject="stale-subject", drop_stems=True)
+        before = self._index_dump()
+        real = StorageDedupMixin._sync_dedup_index_row
+        rows_seen = itertools.count(1)
+
+        def fail_on_fourth_row(*args: Any, **kwargs: Any) -> bool:
+            if next(rows_seen) == 4:
+                raise RuntimeError("injected failure on the fourth row")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(StorageDedupMixin, "_sync_dedup_index_row", staticmethod(fail_on_fourth_row)):
+            try:
+                self.repo.refresh_dedup_index(budget_seconds=60.0)
+            except (RuntimeError, sqlite3.Error):
+                pass  # the pass may re-raise or report the failure; the rollback is what counts
+        self.assertGreaterEqual(next(rows_seen), 5, "the pass must recompute atom rows through _sync_dedup_index_row")
+        self.assertEqual(self._index_dump(), before, "a failed batch leaves no half-written rows")
+        self._refresh_until_current()
+        self._assert_equals_a_build_from_scratch()
+
+    def test_add_memory_during_the_background_pass_is_not_blocked(self) -> None:
+        rng = random.Random(41)
+        # Long atoms with many distinct stems: one unbounded pass over them holds the write lock for seconds.
+        with self.repo.transaction():
+            atoms = [
+                self._add_atom(" ".join("".join(rng.choices(string.ascii_lowercase, k=8)) for _ in range(45)) + f" number {i}")
+                for i in range(400)
+            ]
+        self._age(atoms, features=STALE_FEATURES, subject="stale-subject", drop_stems=True)
+        failures: list[BaseException] = []
+        pass_started = threading.Event()
+
+        def run_pass() -> None:
+            try:
+                pass_started.set()
+                while self.repo.refresh_dedup_index(budget_seconds=0.15)["remaining"]:
+                    time.sleep(0.3)  # the caller's pause between batches
+            except Exception as exc:  # noqa: BLE001 - reported through the assertions below
+                failures.append(exc)
+
+        worker = threading.Thread(target=run_pass)
+        worker.start()
+        pass_started.wait()
+        time.sleep(0.05)
+        started = time.monotonic()
+        try:
+            self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})
+        except sqlite3.OperationalError as exc:
+            failures.append(exc)
+        waited = time.monotonic() - started
+        worker.join(timeout=60)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertLess(waited, 1.0, "a writer waits for one bounded batch, not for the whole pass")
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+
+    def test_row_written_back_with_the_old_version_is_read_right_and_fixed_by_the_next_pass(self) -> None:
+        fact = "Review candidates expire after 7 days unless a person accepts them"
+        node_id = self._add_atom(fact)
+        self._age([node_id])
+        self._refresh_until_current()
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        # An older release still running upserts the node and writes its own row, after the pass had finished.
+        self._age([node_id], features=STALE_FEATURES)
+        label, body = self._atom(fact + ".")
+        decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
+        self.assertEqual((decision.action, decision.target_id), ("duplicate", node_id))
+        self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
+        self._assert_equals_a_build_from_scratch()
+
+    def test_features_of_texts_without_an_atom_header_equal_the_v1_reference(self) -> None:
+        reference = [json.loads(line) for line in FEATURES_V1_REFERENCE.read_text(encoding="utf-8").splitlines() if line]
+        self.assertGreaterEqual(len(reference), 90)
+        for entry in reference:
+            with self.subTest(label=entry["label"][:40], text=entry["text"][:40]):
+                self.assertEqual(features_to_json(fact_features(entry["label"], entry["text"])), entry["features"])
+
+    def test_v1_rows_of_texts_without_a_header_are_read_as_stored(self) -> None:
+        with self._written_by_v1():
+            ids = [
+                self.repo.add_node("Decision", "Лимит API", "project", f"Лимит запросов {100 + i} в час", "architectos", id_salt=str(i))
+                .id
+                for i in range(60)
+            ]
+        self.assertEqual(self._row_versions(), {1})
+        for i, node_id in enumerate(ids):
+            with self.subTest(i=i):
+                decision = self.gate.classify("Лимит API", f"Лимит запросов {100 + i} в час", "Decision", "project", "architectos")
+                self.assertEqual((decision.action, decision.target_id), ("duplicate", node_id))
+
+    def test_v1_atom_row_is_read_like_a_fresh_one(self) -> None:
+        fact = "Review candidates expire after 7 days unless a person accepts them"
+        with self._written_by_v1():
+            node_id = self._add_atom(fact)
+        self.assertEqual(self._row_versions(), {1})
+        label, body = self._atom(fact + ".")
+        decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
+        self.assertEqual((decision.action, decision.target_id), ("duplicate", node_id))
+
+    def test_outdated_atom_rows_past_the_recompute_limit_only_count_for_the_near_flag(self) -> None:
+        rng = random.Random(5)
+        fact = "Session store keeps entry zebra alive for the configured window"
+        label, body = self._atom(fact)
+        features = fact_features(label, body)
+        # An atom row of an older release (its key holds the header) whose features would fold the incoming fact.
+        misleading = features_to_json(dataclasses.replace(features, key=("", normalize_fact_text(body))))
+        ids = [
+            self._add_atom(f"Session store keeps entry {''.join(rng.choices(string.ascii_lowercase, k=7))} alive for the configured window")
+            for _ in range(60)
+        ]
+        self._age(ids, features=misleading, subject=subject_key(features))
+        subject_rows = self.repo.dedup_subject_rows("project", "architectos", subject_key(features))
+        self.assertEqual(len(subject_rows), 50)
+        self.assertNotIn(misleading, [row["features"] for row in subject_rows])
+        neighbours = self.repo.dedup_stem_neighbours("project", "architectos", sorted(features.stems), 1)
+        self.assertEqual(len(neighbours), 60)
+        self.assertEqual([row["features"] for row in neighbours if not row["current"]], [misleading] * 10)
+        decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
+        self.assertEqual(decision.action, "new")
+        self.assertIn(decision.near_id, ids)
+
+    def test_compaction_after_the_pass_keeps_atoms_that_differ_in_tokens_with_digits(self) -> None:
+        pairs = [("p95", "p99"), ("AES128", "AES256"), ("k8s", "k3s"), ("x86", "x64"), ("ipv4", "ipv6")]
+        with self._written_by_v1():
+            ids = [
+                self._add_atom(f"The {token} setting of the search cluster is checked on every deploy")
+                for pair in pairs for token in pair
+            ]
+        self.assertEqual(self._row_versions(), {1})
+        self.service.rebuild_memory_dedup_index()
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        report = self.service.compact_memory({"project_id": "architectos", "dry_run": True})
+        self.assertEqual(report["would_merge"], 0)
+        self.service.run_scheduled_compaction()
+        self.assertEqual([self.repo.get_node(node_id).status for node_id in ids], ["active"] * len(ids))
+
+    def test_background_pass_cost_per_batch_does_not_grow_towards_the_end(self) -> None:
+        with self.repo.transaction():
+            ids = [self._add_plain(f"Узел {i}", f"Сервис номер {i} слушает свой порт") for i in range(600)]
+        self._age(ids)
+        steps = [0]
+
+        def count_step() -> int:
+            steps[0] += 1
+            return 0
+
+        prepare = SQLiteMemoryRepository._prepare_connection
+
+        def prepare_counting(conn: sqlite3.Connection) -> None:
+            prepare(conn)
+            conn.set_progress_handler(count_step, 1)
+
+        # Every clock read is 50 ms later, so each batch takes the same few rows.
+        clock = itertools.count(step=0.05)
+        refresh = self.repo.refresh_dedup_index
+        per_batch: list[int] = []
+
+        def counted_refresh(*args: Any, **kwargs: Any) -> dict[str, int]:
+            before = steps[0]
+            result = refresh(*args, **kwargs)
+            if result["stamped"]:
+                per_batch.append(steps[0] - before)
+            return result
+
+        with (
+            mock.patch.object(SQLiteMemoryRepository, "_prepare_connection", staticmethod(prepare_counting)),
+            mock.patch.object(storage_dedup, "time", SimpleNamespace(monotonic=lambda: next(clock))),
+            mock.patch.object(type(self.service), "DEDUP_REFRESH_PAUSE_SECONDS", 0.0),
+            mock.patch.object(self.repo, "refresh_dedup_index", side_effect=counted_refresh),
+        ):
+            self.service.rebuild_memory_dedup_index()
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self.assertGreater(len(per_batch), 50)
+        first, last = per_batch[:20], per_batch[-20:]
+        self.assertLessEqual(sum(last) / len(last), 1.1 * sum(first) / len(first), "SQLite steps per batch grow")
+        # A few rows per batch: no batch reads the whole index (a full scan costs several steps per row).
+        self.assertLess(max(per_batch), 3 * len(ids))
+
+    def test_an_idle_pass_takes_no_write_lock(self) -> None:
+        self._add_plain("Кэш", "Используем Redis для кэша сессий")
+        # Active but never indexed: it must not keep the pass busy.
+        self.repo.add_node("Concept", "Root", "project", "Structural root of the project", "architectos", metadata={"structural": True})
+        holder = sqlite3.connect(self.repo.db_path, timeout=1)
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            result = self.service.rebuild_memory_dedup_index()
+        finally:
+            holder.rollback()
+            holder.close()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual((result["locked"], result["remaining"], result["added"]), (0, 0, 0))
+
+    def test_a_locked_database_skips_the_batch_and_other_errors_raise(self) -> None:
+        self._age([self._add_atom("Cache entries live 30 minutes")])
+        with mock.patch.object(self.repo, "transaction", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertLogs("backend.architectos.storage_dedup", "WARNING"):
+                result = self.repo.refresh_dedup_index()
+            self.assertEqual((result["locked"], result["recomputed"]), (1, 0))
+            self.assertEqual(self.service.rebuild_memory_dedup_index()["locked"], 1)
+        with mock.patch.object(self.repo, "transaction", side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.repo.refresh_dedup_index()
+        self.assertEqual(self._row_versions(), {OUTDATED_VERSION})
+
+    def test_background_pass_drops_the_row_of_a_node_that_is_gone(self) -> None:
+        gone, kept = self._add_atom("Cache entries live 30 minutes"), self._add_atom("Таймаут сессии кэша составляет 30 минут")
+        self._age([gone, kept])
+        with self.repo._connect() as conn:
+            conn.execute("DELETE FROM memory_nodes WHERE id = ?", (gone,))
+        self._refresh_until_current()
+        self.assertEqual(self._indexed_ids(), {kept})
+        self.assertNotIn(gone, {row[1] for row in self._index_dump()[1]})
+
+    def test_manual_reindex_adds_rows_for_active_nodes_without_one(self) -> None:
+        lost = self._add_plain("Кэш", "Используем Redis для кэша сессий")
+        self._add_atom("Cache entries live 30 minutes")
+        structural = self.repo.add_node(
+            "Concept", "Root", "project", "Structural root of the project", "architectos", metadata={"structural": True},
+        ).id
+        with self.repo._connect() as conn:
+            conn.execute("DELETE FROM memory_dedup_stems WHERE node_id = ?", (lost,))
+            conn.execute("DELETE FROM memory_dedup_index WHERE node_id = ?", (lost,))
+        result = self.service.rebuild_memory_dedup_index()
+        self.assertIn(lost, self._indexed_ids())
+        self.assertNotIn(structural, self._indexed_ids())
+        self.assertEqual(result["added"], 1)
+        self._assert_equals_a_build_from_scratch()
+        self.assertEqual(self.service.rebuild_memory_dedup_index()["added"], 0)
+
+    def test_compaction_merges_atoms_only_on_an_equal_template(self) -> None:
+        swapped = [
+            self._add_atom("The ingestion service calls the dedup gate before the candidate store is updated"),
+            self._add_atom("The dedup gate calls the ingestion service before the candidate store is updated"),
+        ]
+        repeated = "Review candidates expire after 7 days unless a person accepts them"
+        # Once from Ask and once from MCP: two nodes under different labels.
+        verbatim = [
+            self.repo.add_node("Lesson", f"Chat fact: {repeated}", "project", f"{ASK_HEADER}\n\n{repeated}", "architectos").id,
+            self._add_atom(repeated),
+        ]
+        report = self.service.compact_memory({"project_id": "architectos", "dry_run": True})
+        self.assertEqual(report["would_merge"], 1)
+        self.service.run_scheduled_compaction()
+        self.assertEqual([self.repo.get_node(node_id).status for node_id in swapped], ["active", "active"])
+        self.assertEqual(sorted(self.repo.get_node(node_id).status == "active" for node_id in verbatim), [False, True])
+
+    def test_atom_row_written_by_index_version_2_is_recomputed(self) -> None:
+        node_id = self._add_atom(V2_ATOM_FACT)
+        with self.repo._connect() as conn:
+            conn.execute(
+                "UPDATE memory_dedup_index SET version = 2, features = ?, subject = ? WHERE node_id = ?",
+                (V2_ATOM_FEATURES, V2_ATOM_SUBJECT, node_id),
+            )
+        self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
+
+    def test_atom_row_written_by_index_version_3_is_recomputed(self) -> None:
+        node_id = self._add_atom(V3_ATOM_FACT)
+        with self.repo._connect() as conn:
+            conn.execute(
+                "UPDATE memory_dedup_index SET version = 3, features = ?, subject = ? WHERE node_id = ?",
+                (V3_ATOM_FEATURES, V3_ATOM_SUBJECT, node_id),
+            )
+        self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
+
+    def _break_payload(self, node_id: str) -> None:
+        with self.repo._connect() as conn:
+            conn.execute("UPDATE memory_nodes SET payload = '{broken' WHERE id = ?", (node_id,))
+
+    def test_background_pass_skips_a_row_whose_node_payload_is_unreadable(self) -> None:
+        broken, fine = self._add_atom("Cache entries live 30 minutes"), self._add_atom("Таймаут сессии кэша составляет 30 минут")
+        self._age([broken, fine], features=STALE_FEATURES)
+        self._break_payload(broken)
+        with self.assertLogs("backend.architectos.storage_dedup", "WARNING") as logs:
+            result = self.service.rebuild_memory_dedup_index()
+        self.assertIn(broken, "\n".join(logs.output))
+        self.assertEqual((result["recomputed"], result["remaining"]), (1, 1))
+        with self.repo._connect() as conn:
+            versions = dict(conn.execute("SELECT node_id, version FROM memory_dedup_index").fetchall())
+        self.assertEqual(versions, {broken: OUTDATED_VERSION, fine: DEDUP_INDEX_VERSION})
+
+    def test_reads_keep_an_outdated_row_with_an_unreadable_node_for_the_near_flag_only(self) -> None:
+        fact = "Session store keeps entry zebra alive for the configured window"
+        node_id = self._add_atom(fact)
+        self._age([node_id], features=STALE_FEATURES)
+        self._break_payload(node_id)
+        label, body = self._atom(fact)
+        features = fact_features(label, body)
+        with self.assertLogs("backend.architectos.storage_dedup", "WARNING"):
+            neighbours = self.repo.dedup_stem_neighbours("project", "architectos", sorted(features.stems), 1)
+        self.assertEqual([(row["node_id"], row["current"]) for row in neighbours], [(node_id, False)])
+        with self.assertLogs("backend.architectos.storage_dedup", "WARNING"):
+            decision = self.gate.classify(label, body, "Lesson", "project", "architectos")
+        self.assertEqual(decision.action, "new")
+
+    def test_atom_row_written_by_index_version_4_is_recomputed(self) -> None:
+        node_id = self._add_atom(V4_ATOM_FACT)
+        with self.repo._connect() as conn:
+            conn.execute(
+                "UPDATE memory_dedup_index SET version = 4, features = ?, subject = ? WHERE node_id = ?",
+                (V4_ATOM_FEATURES, V4_ATOM_SUBJECT, node_id),
+            )
+        self.assertEqual(self._refresh_until_current(), {"recomputed": 1, "stamped": 0})
+        self.assertEqual(self._row_versions(), {DEDUP_INDEX_VERSION})
+        self._assert_equals_a_build_from_scratch()
 
     def test_manual_reindex_reports_indexed_nodes(self) -> None:
         node = self.service.add_memory({"label": "Порт", "text": "Сервер слушает порт 8765", "type": "Decision"})

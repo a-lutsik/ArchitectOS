@@ -20,7 +20,9 @@ incoming fact is relative to what is already stored:
   lexical match so callers can flag a possible duplicate.
 
 Numbers, negation and identifiers are protected: facts that differ in them are
-never folded together. This module is stdlib-only and deterministic; the
+never folded together. Two chat/MCP fact atoms are decided only by the edit
+between their statement token sequences, not by the label (``statement_edit``,
+``replacement_allowed``). This module is stdlib-only and deterministic; the
 optional semantic neighbours (embeddings) and LLM judge for the gray zone are
 orchestrated by the ingestion service on top of ``gray_candidates``.
 """
@@ -32,16 +34,33 @@ import math
 import re
 import unicodedata
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .chat_memory import _FACT_TYPE_RANK
-from .memory_ingestion import DUPLICATE_STOPWORDS, _token_set
+from .memory_ingestion import (
+    CHAT_FACT_BOILERPLATE_PREFIXES,
+    DUPLICATE_STOPWORDS,
+    _strip_chat_fact_boilerplate,
+    _token_set,
+)
 from .storage import sanitize_text
 
 # Stripped from both ends only: inner punctuation ("5.0" vs "50") is content.
 # No dashes: a leading minus is a sign ("-5 °C" vs "5 °C").
 _EDGE_PUNCTUATION = " .,;:!?…\"'`«»“”„()[]"
+# Atom statements are compared token by token (``statement_tokens``). Quotes,
+# backticks and parentheses around a token are stripped, and a separator after
+# it; "!", "?", "." and "'" are content ("try!", "string?", "5'", "!=", ".5"),
+# except one sentence mark closing the whole statement. Square brackets stay:
+# "[1]" is a reference, "(10)" a value.
+_TOKEN_OPENING = "\"`«»“”„("
+_TOKEN_CLOSING = "\"`«»“”„),;:"
+_SENTENCE_MARKS = (".", "!", "?", "…")
+# Folded in an atom token besides case (NFC, not NFKC: "10²" is not "102").
+_TOKEN_CHARACTERS = str.maketrans({
+    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "―": "-", "−": "-", "’": "'", "ʼ": "'", "ё": "е",
+})
 
 NEGATION_WORDS = frozenset({
     "не", "нет", "никогда", "нельзя", "ни",
@@ -50,6 +69,34 @@ NEGATION_WORDS = frozenset({
 })
 
 _WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
+# The negation marker of an atom statement. A marker word leaves its carrier as a
+# token of its own: "cannot open" is "can ¬ open", "don't" and "do not" are "do ¬".
+# "нельзя" negates "можно" itself, so its marker comes first: "нельзя X" is one
+# insertion away from "можно X", but not from "можно не X" ("можно ¬ X").
+NEGATION_MARKER = "¬"
+_NEGATION_TOKENS: dict[str, tuple[str, ...]] = {
+    "not": (NEGATION_MARKER,), "не": (NEGATION_MARKER,), "нет": (NEGATION_MARKER,),
+    "cannot": ("can", NEGATION_MARKER), "can't": ("can", NEGATION_MARKER), "won't": ("will", NEGATION_MARKER),
+    "shan't": ("shall", NEGATION_MARKER), "нельзя": (NEGATION_MARKER, "можно"),
+}
+_NEGATION_BLOCKS = ((NEGATION_MARKER,), *((word, NEGATION_MARKER) for word in ("do", "does", "did")))
+_DO_WORDS = frozenset({"do", "does", "did"})
+# A replaced value right after the first word names the item ("Stage 2"); a leading article does not count.
+_ARTICLES = frozenset({"a", "an", "the"})
+# A value: one number with an optional sign and unit ("30s", "512mb", "5%", "1.5"), a version
+# ("v1.2", "1.2.3") or an ISO date. Several numbers in one token ("100/60", "10-20", "10:30") are none.
+_VALUE_RE = re.compile(
+    r"[-+]?\d+(?:\.\d+)?(?:%|°[^\W\d_]?|[^\W\d_]+)?|v\d+(?:\.\d+)*|\d+(?:\.\d+){2,}|\d{4}-\d{2}-\d{2}"
+)
+# A number right after a number sign designates an item ("Invoice № 5", "Order No. 7"): not a value.
+_NUMBER_SIGNS = frozenset({"№", "no", "no.", "nr", "nr.", "#", "номер"})
+_VALUE_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
+# One number written with thousands separators or a decimal comma: "12,000ms" is "12000ms", "1,5" is "1.5".
+_THOUSANDS_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:%|[^\W\d_]+)?")
+_DECIMAL_COMMA_RE = re.compile(r"[-+]?\d+,\d+(?:%|[^\W\d_]+)?")
+# Markers opening a list item ("1.", "1)", "-", "•", "*", "#", ">", "[x]", "[ ]", "(1)") are no words:
+# they are dropped from an atom statement, "1. X" and "X" are one statement.
+_LIST_MARKER_RE = re.compile(r"(?:\d+[.)]|[-‐‑‒–—―•*#>]|\[[ x]?\]|\(\d+\))\s+", re.IGNORECASE)
 # Short upper-case words are names, not filler: "Service A" vs "Service B", "БД", "UI".
 _SHORT_NAME_RE = re.compile(r"(?<!\w)[^\W\d_a-zа-яё]{1,2}(?!\w)")
 _NUMBER_RE = re.compile(r"^[-+−]?v?\d+(?:[.,:/\-]\d+)*[^\W\d_%°]*[%°]?$")
@@ -75,9 +122,26 @@ def normalize_fact_text(value: str) -> str:
     edges do not change a fact, so "Data lives in SQLite" and "data lives in
     SQLite." compare equal. Digits, signs and inner punctuation are kept.
     """
+    return _fold_text(value).strip(_EDGE_PUNCTUATION)
+
+
+def _fold_text(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
     text = text.replace("’", "'")
-    return " ".join(text.split()).strip(_EDGE_PUNCTUATION)
+    return " ".join(text.split())
+
+
+def atom_statement(text: str) -> str:
+    """The fact of a chat/MCP fact atom without its header; "" for any other text.
+
+    The header is what makes a text an atom: an atom restored by undo has no
+    ``metadata.template``, and an explicit save ("Favorite: ...") is not one.
+    """
+    stripped = (text or "").strip()
+    for prefix in CHAT_FACT_BOILERPLATE_PREFIXES:
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return ""
 
 
 def stem(word: str) -> str:
@@ -135,15 +199,125 @@ class FactFeatures:
     key: tuple[str, str]
     # Label words without numbers and negation: two statements are only folded,
     # superseded or marked contradictory when they are filed under the same
-    # subject, so "Service A" never swallows or retires "Service B".
+    # subject, so "Service A" never swallows or retires "Service B". For an atom
+    # it is the frame of its statement (see ``fact_features``).
     label_core: frozenset[str]
     stems: frozenset[str]
     numbers: frozenset[str]
     negated: bool
     identifiers: frozenset[str]
+    # Atoms only: the statement's words in order with numbers as "#", and its
+    # numbers in that order.
+    template: tuple[str, ...] = ()
+    values: tuple[str, ...] = ()
+
+
+def _number_value(token: str) -> str:
+    return token.lstrip("+").replace("−", "-").replace(",", ".").removeprefix("v")
+
+
+def statement_tokens(statement: str) -> tuple[str, ...]:
+    """The tokens of one atom statement, in order.
+
+    Leading list markers are dropped; whitespace tokens are folded for case
+    (NFC only), quotes, dashes, apostrophes, separators after a token, the
+    sentence mark closing the statement, thousands separators and a decimal
+    comma ("1,000" = "1000", "1,5" = "1.5"); nothing else is
+    dropped or merged: articles, function words, "p95", "!isdeleted", "try!"
+    and "<100ms" are tokens as written. A negation marker word becomes
+    ``NEGATION_MARKER`` after its carrier.
+    """
+    tokens: list[str] = []
+    while marker := _LIST_MARKER_RE.match(statement):
+        statement = statement[marker.end():]
+    words = statement.split()
+    for index, raw in enumerate(words):
+        folded = unicodedata.normalize("NFC", raw).casefold().translate(_TOKEN_CHARACTERS)
+        token = folded.lstrip(_TOKEN_OPENING).rstrip(_TOKEN_CLOSING)
+        if index == len(words) - 1 and token.endswith(_SENTENCE_MARKS):
+            token = token[:-1].rstrip(_TOKEN_CLOSING)
+        if not token:
+            continue
+        if _THOUSANDS_RE.fullmatch(token):
+            token = token.replace(",", "")
+        elif _DECIMAL_COMMA_RE.fullmatch(token):
+            token = token.replace(",", ".")
+        if index == 0 and token == "нет" and folded.endswith(","):
+            # "Нет, ..." opening a statement answers a question: a word, not a negation.
+            tokens.append(token)
+        elif token in _NEGATION_TOKENS:
+            tokens.extend(_NEGATION_TOKENS[token])
+        elif token.endswith("n't"):
+            tokens.extend((token[:-3], NEGATION_MARKER))
+        else:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def _is_value(token: str) -> bool:
+    return bool(_VALUE_RE.fullmatch(token))
+
+
+def _value_shape(token: str) -> str:
+    """A value with its numbers blanked: values of one shape ("30s"/"60s", "1.5"/"2") replace each other."""
+    return _VALUE_NUMBER_RE.sub("9", token)
+
+
+def statement_edit(incoming: tuple[str, ...], existing: tuple[str, ...]) -> tuple[str, int]:
+    """The edit that turns ``existing`` tokens into ``incoming`` ones, and its position.
+
+    ``same``: no edit. ``negation``: one negation marker inserted or removed
+    in one place, with or without its do-carrier. ``value``: one value
+    replaced in place by a value of the same shape, not right after a number
+    sign. ``other``: anything else
+    (position -1), however small: a moved word, a moved or second negation,
+    two values, a changed unit or name.
+    """
+    if incoming == existing:
+        return "same", -1
+    if len(incoming) == len(existing):
+        changed = [index for index, (left, right) in enumerate(zip(incoming, existing)) if left != right]
+        if len(changed) == 1:
+            index = changed[0]
+            new, old = incoming[index], existing[index]
+            designation = index > 0 and incoming[index - 1] in _NUMBER_SIGNS
+            if not designation and _is_value(new) and _is_value(old) and _value_shape(new) == _value_shape(old):
+                return "value", index
+        return "other", -1
+    longer, shorter = (incoming, existing) if len(incoming) > len(existing) else (existing, incoming)
+    index = next((i for i, (left, right) in enumerate(zip(longer, shorter)) if left != right), len(shorter))
+    for block in _NEGATION_BLOCKS:
+        if longer[index:index + len(block)] == block and longer[:index] + longer[index + len(block):] == shorter:
+            return "negation", index
+    return "other", -1
 
 
 def fact_features(label: str, text: str) -> FactFeatures:
+    """Features of a stored or incoming fact.
+
+    An atom (a text with a chat/MCP fact header) is its statement alone: the
+    header is shared by every atom and the label is a truncated copy of the
+    statement ("window" → "windo", "12000" → "12"), so neither takes part. Its
+    ``template`` is the token sequence its verdicts are decided on; the frame
+    (``label_core``: tokens without values, negation markers and do-carriers)
+    only files it for the neighbour lookup, so the three allowed edits keep the
+    subject.
+    """
+    statement = atom_statement(text)
+    if not statement:
+        return _text_features(label, text)
+    tokens = statement_tokens(statement)
+    values = tuple(token for token in tokens if _is_value(token))
+    frame = frozenset(
+        token for token in tokens if token != NEGATION_MARKER and token not in _DO_WORDS and not _is_value(token)
+    )
+    return replace(
+        _text_features("", statement),
+        label_core=frame, numbers=frozenset(values), negated=NEGATION_MARKER in tokens, template=tokens, values=values,
+    )
+
+
+def _text_features(label: str, text: str) -> FactFeatures:
     combined = f"{label or ''}\n{text or ''}"
     normalized = normalize_fact_text(combined)
     numbers: set[str] = set()
@@ -155,7 +329,7 @@ def fact_features(label: str, text: str) -> FactFeatures:
             continue
         token = normalize_fact_text(raw)
         if token and _is_number(token):
-            numbers.add(token.lstrip("+").replace("−", "-").replace(",", ".").removeprefix("v"))
+            numbers.add(_number_value(token))
     words = set(_WORD_RE.findall(normalized))
     negated = bool(words & NEGATION_WORDS)
     stems = {
@@ -188,9 +362,10 @@ def incoming_features(label: str, text: str) -> FactFeatures:
     return fact_features(sanitize_text(label)[0], sanitize_text(text)[0])
 
 
-# Bump when fact_features / the serialized format changes: the storage layer
-# rebuilds every index row written with an older version on startup.
-DEDUP_INDEX_VERSION = 1
+# Bump when fact_features / the serialized format changes: the app's background
+# pass (``refresh_dedup_index``) brings rows of an older version up to date, and
+# until then the index readers compute their features on the fly.
+DEDUP_INDEX_VERSION = 5
 
 
 def source_hash(label: str, text: str) -> str:
@@ -203,15 +378,29 @@ def subject_key(features: FactFeatures) -> str:
     return hashlib.sha1("\x1f".join(sorted(features.label_core)).encode("utf-8")).hexdigest()[:20]
 
 
+# An atom row written while features still included the header has a key that starts with it.
+_ATOM_KEY_PREFIXES = tuple(normalize_fact_text(prefix) for prefix in CHAT_FACT_BOILERPLATE_PREFIXES)
+
+
+def is_atom_features(features: FactFeatures) -> bool:
+    """Whether stored features belong to a chat/MCP fact atom, of this or an older version."""
+    return bool(features.template) or features.key[1].startswith(_ATOM_KEY_PREFIXES)
+
+
 def features_to_json(features: FactFeatures) -> str:
-    return json.dumps({
+    data: dict[str, Any] = {
         "key": list(features.key),
         "label_core": sorted(features.label_core),
         "stems": sorted(features.stems),
         "numbers": sorted(features.numbers),
         "negated": features.negated,
         "identifiers": sorted(features.identifiers),
-    }, ensure_ascii=False, sort_keys=True)
+    }
+    if features.template:
+        # Atoms only, so the rows of every other text keep their version 1 bytes.
+        data["template"] = list(features.template)
+        data["values"] = list(features.values)
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
 def features_from_json(raw: str) -> FactFeatures:
@@ -224,7 +413,27 @@ def features_from_json(raw: str) -> FactFeatures:
         numbers=frozenset(data.get("numbers") or ()),
         negated=bool(data.get("negated")),
         identifiers=frozenset(data.get("identifiers") or ()),
+        template=tuple(data.get("template") or ()),
+        values=tuple(data.get("values") or ()),
     )
+
+
+def replacement_allowed(incoming_text: str, existing_text: str, *, same_turn: bool) -> bool:
+    """Whether an incoming atom may retire a stored one it ``update``-s (SUPERSEDES).
+
+    Only one value replaced in place (``statement_edit`` is ``value``), not the
+    first token and not right after the first word, where it names the item
+    ("Stage 2", "Спринт 15"; a leading article is not a word here), and the
+    facts come from different turns. Whether the target is the writer's own
+    active head is the caller's check. Both texts may carry the atom header.
+    """
+    if same_turn:
+        return False
+    tokens = statement_tokens(_strip_chat_fact_boilerplate(incoming_text))
+    kind, position = statement_edit(tokens, statement_tokens(_strip_chat_fact_boilerplate(existing_text)))
+    if tokens and tokens[0] in _ARTICLES:
+        position -= 1
+    return kind == "value" and position > 1
 
 
 def content_salt(text: str) -> str:
@@ -328,6 +537,9 @@ def guards_compatible(incoming: FactFeatures, existing: FactFeatures) -> bool:
     """
     if incoming.negated != existing.negated:
         return False
+    if incoming.template and existing.template and incoming.values != existing.values:
+        # Two atoms: a changed, added or moved value is another fact.
+        return False
     return (
         _set_relation(incoming.numbers, existing.numbers) != "disjoint"
         and _set_relation(incoming.identifiers, existing.identifiers) != "disjoint"
@@ -380,20 +592,38 @@ class MemoryDedupGate:
         """Relation of an incoming fact to the indexed nodes of its scope/project.
 
         Two indexed reads instead of a scan: duplicate/update/conflict all need
-        the same label subject (one lookup by subject key), and the
-        possible-duplicate flag reads stem neighbours (``near_min_shared``).
-        Only active, non-structural, non-superseded nodes are indexed.
+        the same subject (one lookup by subject key), and the possible-duplicate
+        flag reads stem neighbours (``near_min_shared``). Stem neighbours get the
+        full comparison too: a row of an older feature version is still filed
+        under its old subject. Only active, non-structural, non-superseded nodes
+        are indexed.
         """
         incoming = incoming_features(label, text)
         excluded = set(exclude_ids)
         best = DedupDecision()
         best_rank = 0
-        subject_rows = self.repository.dedup_subject_rows(scope, project_id, subject_key(incoming))
-        for row in sorted(subject_rows, key=lambda item: str(item["node_id"])):
-            node_id = str(row["node_id"])
+        rows = {
+            str(row["node_id"]): row
+            for row in self.repository.dedup_subject_rows(scope, project_id, subject_key(incoming))
+        }
+        if incoming.stems:
+            neighbours = self.repository.dedup_stem_neighbours(
+                scope, project_id, sorted(incoming.stems), self.near_min_shared(len(incoming.stems)),
+            )
+            for row in neighbours:
+                rows.setdefault(str(row["node_id"]), row)
+        for node_id in sorted(rows):
+            row = rows[node_id]
             if node_id in excluded or not self.type_matches(str(row["node_type"]), node_type):
                 continue
-            verdict = self.compare(incoming, features_from_json(str(row["features"])))
+            existing = features_from_json(str(row["features"]))
+            if not row["current"]:
+                # Outdated features past the recompute limit: good for the near flag only.
+                near = self.near_score(incoming, existing)
+                if near > best.near_score:
+                    best.near_id, best.near_score = node_id, near
+                continue
+            verdict = self.compare(incoming, existing)
             if verdict.near_score > best.near_score:
                 best.near_id, best.near_score = node_id, verdict.near_score
             rank = _ACTION_RANK.get(verdict.action, 0)
@@ -409,17 +639,6 @@ class MemoryDedupGate:
                 )
                 best.target_id, best.target_label = node_id, str(row["label"] or "")
                 best_rank = rank
-        if incoming.stems:
-            neighbours = self.repository.dedup_stem_neighbours(
-                scope, project_id, sorted(incoming.stems), self.near_min_shared(len(incoming.stems)),
-            )
-            for row in sorted(neighbours, key=lambda item: str(item["node_id"])):
-                node_id = str(row["node_id"])
-                if node_id in excluded or not self.type_matches(str(row["node_type"]), node_type):
-                    continue
-                near = self.near_score(incoming, features_from_json(str(row["features"])))
-                if near > best.near_score:
-                    best.near_id, best.near_score = node_id, near
         return best
 
     def near_score(self, incoming: FactFeatures, existing: FactFeatures) -> float:
@@ -433,6 +652,9 @@ class MemoryDedupGate:
 
     def compare(self, incoming: FactFeatures, existing: FactFeatures) -> DedupDecision:
         """Relation of one incoming fact to one stored fact (no repository access)."""
+        if incoming.template and existing.template:
+            # Not the normalized key: it drops edge marks such as a leading "!".
+            return self._compare_statements(incoming, existing)
         if incoming.key == existing.key:
             return DedupDecision("duplicate", score=1.0, reason="exact restatement", near_score=1.0)
         left, right = incoming.stems, existing.stems
@@ -484,6 +706,31 @@ class MemoryDedupGate:
                 },
             )
         return verdict
+
+    def _compare_statements(self, incoming: FactFeatures, existing: FactFeatures) -> DedupDecision:
+        """Atom against atom, decided only by the edit between their token sequences.
+
+        No edit is a duplicate, one inserted or removed negation marker a
+        conflict, one value replaced in place an update. Anything else is new,
+        left to the near flag and the judge: a moved word may swap roles, a
+        moved negation or value says another thing, a nested statement may
+        narrow or reverse the other.
+        """
+        near = self.near_score(incoming, existing)
+        kind, position = statement_edit(incoming.template, existing.template)
+        if kind == "same":
+            return DedupDecision("duplicate", score=1.0, reason="same statement", near_score=near)
+        if kind == "negation":
+            return DedupDecision("conflict", score=1.0, reason="same statement with negation flipped", near_score=near)
+        if kind == "value":
+            return DedupDecision(
+                "update",
+                score=1.0,
+                reason="same statement with changed values",
+                near_score=near,
+                details={"values_from": [existing.template[position]], "values_to": [incoming.template[position]]},
+            )
+        return DedupDecision(near_score=near)
 
     def gray_candidates(
         self,

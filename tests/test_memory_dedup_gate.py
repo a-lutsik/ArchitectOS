@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
+import random
 import re
 import tempfile
 import threading
@@ -14,13 +16,299 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from backend.architectos import memory_dedup
 from backend.architectos.candidate_identity import origin_key_from_memory_node
 from backend.architectos.mcp_server import MemoryMCPServer
 from backend.architectos.memory_dedup import MemoryDedupGate, content_salt, fact_features, stem
+from backend.architectos.memory_ingestion import CHAT_FACT_BOILERPLATE_PREFIXES
 from backend.architectos.models import MemoryNode, owned_by, stable_id
 from backend.architectos.sdk import ArchitectOS
 from backend.architectos.server import ArchitectOSHandler
 from backend.architectos.service import ArchitectOSService
+
+
+# Pairs of atoms with the verdict and the auto-capture outcome the design requires
+# (docs/notes/auto-capture-architect.md, Q1). ``a`` is stored, ``b`` is incoming.
+DEDUP_PAIRS: list[dict[str, Any]] = [
+    json.loads(line)
+    for line in (Path(__file__).parent / "data" / "dedup_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+ATOM_TEMPLATES = ("chat_session_atom", "mcp_turn_atom")
+_PAIR_PROJECTS = itertools.count()
+_FILLER_WORD = {"en": "zebra", "ru": "зебра"}
+_ADDED_WORDS = {
+    "en": " and the same holds for every other deployment environment",
+    "ru": " и то же самое верно для каждого другого окружения развертывания",
+}
+_NEGATION_INSERT = {"en": "do not", "ru": "не"}
+
+
+def with_single_number(text: str, number: int) -> str:
+    """``text`` with exactly one number: its own one replaced, or ``(number)`` appended."""
+    if len(re.findall(r"\d+", text)) == 1:
+        return re.sub(r"\d+", str(number), text, count=1)
+    return f"{text.rstrip('.')} ({number})"
+
+
+def with_replaced_word(text: str, lang: str) -> str:
+    """``text`` with its longest plain word (not the first) swapped for a filler word."""
+    words = text.split()
+    index = max((i for i in range(1, len(words)) if words[i].isalpha()), key=lambda i: len(words[i]))
+    words[index] = _FILLER_WORD[lang]
+    return " ".join(words)
+
+
+def with_negation(text: str, lang: str) -> str:
+    first, rest = text.split(" ", 1)
+    return f"{first} {_NEGATION_INSERT[lang]} {rest}"
+
+
+def with_added_words(text: str, lang: str) -> str:
+    return text.rstrip(".") + _ADDED_WORDS[lang]
+
+
+# Base facts of the atom fuzz test: every pair statement plus the review findings.
+FUZZ_BASES = sorted({
+    *(row[key] for row in DEDUP_PAIRS for key in ("a", "b")),
+    "Service A has a 30s timeout and service B has a 60s timeout",
+    "The worker pool uses 512MB of memory and the cache uses 2GB",
+    "The release window opens on 2026-11-17 and closes on 2026-12-01",
+    "Clients on v1.2 call the gateway that runs v1.3",
+    "Service A tracks p95 latency and service B tracks p99 latency",
+    "Hooks cannot open the DB but can read the config",
+    "The cache is not used when the flag is not set",
+    "Кэш не используется, когда флаг не установлен",
+    "Хукам нельзя открывать базу, но можно читать конфиг",
+    "Задача № 5 закрыта после ревью",
+    "The export query keeps rows with !isDeleted before upload",
+    "The job skips tenants where !is_active holds",
+    "The cache stays off while !cfg.enabled is true",
+    "1. The importer reads the queue first",
+    "The API limit is documented in [1] for every client",
+    "We call try! before every save in the job",
+    "The parser returns string? for optional fields",
+    "The value!! flag marks urgent rows",
+    "The plank is 5' long in the spec",
+    "The query keeps rows where ! isDeleted holds",
+    "1. Stage 2 of the pipeline runs on Linux runners",
+    "- Sprint 14 closes on Friday with a demo",
+    "• Этап 1 переносит кандидатов памяти в новую таблицу",
+    "[ ] Stage 3 runs the smoke tests on staging",
+    "Invoice № 5 is paid by the billing job",
+    "Order No. 7 ships from the main warehouse",
+    "Счёт номер 5 оплачен клиентом вчера",
+    "The matrix has 10² cells per block",
+    "Миграцию нельзя запускать без резервной копии",
+    "Миграцию можно не запускать без резервной копии",
+    "Нет, используем Redis для кэша сессий",
+    "The ratio is 100/60 for every tenant",
+    "The window is 10-20 minutes for every tenant",
+    "The batch factor is 1,5 for every tenant",
+    "The export timeout is 12,000ms for every tenant",
+})
+_FUZZ_WORDS = ("zebra", "quickly", "зебра", "also")
+_FUZZ_VALUE_RE = re.compile(
+    r"[-+]?\d+(?:[.,]\d+)?(?:%|[^\W\d_]+)?|v\d+(?:\.\d+)*|\d+(?:\.\d+){2,}|\d{4}-\d{2}-\d{2}|\d{1,3}(?:,\d{3})+[^\W\d_]*"
+)
+_FUZZ_EXPANDING = {"cannot", "can't", "won't", "shan't", "нельзя"}
+_FUZZ_NUMBER_SIGNS = {"№", "no.", "nr.", "#", "номер"}
+_FUZZ_LIST_MARKERS = {"-", "•", "*", "—", "#", ">", "[x]"}
+_FUZZ_SUPERSCRIPTS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def _fuzz_norm(token: str) -> str:
+    """Test-local token key: case, quotes, parentheses and separators only ("!", "?", "." stay)."""
+    return token.casefold().lstrip("\"`«»“”„(").rstrip("\"`«»“”„),;:")
+
+
+def _fuzz_markers(words: list[str]) -> int:
+    """How many leading words are list markers ("1.", "-", "[ ]", ...)."""
+    count = 0
+    while count < len(words):
+        word = words[count]
+        if word in _FUZZ_LIST_MARKERS or re.fullmatch(r"\d+[.)]|\(\d+\)", word):
+            count += 1
+        elif word == "[" and words[count + 1:count + 2] == ["]"]:
+            count += 2
+        else:
+            break
+    return count
+
+
+def _fuzz_is_value(words: list[str], index: int) -> bool:
+    """A value one edit may replace: after the first word and not right after a number sign."""
+    return (
+        index > _fuzz_markers(words)
+        and _fuzz_norm(words[index - 1]) not in _FUZZ_NUMBER_SIGNS
+        and bool(_FUZZ_VALUE_RE.fullmatch(_fuzz_norm(words[index])))
+    )
+
+
+def _fuzz_is_negation(words: list[str], index: int) -> bool:
+    if index == 0 and words[0].endswith(","):
+        return False  # "Нет, ..." answers a question
+    return _fuzz_norm(words[index]) in {"not", "не", "нет"}
+
+
+def _fuzz_negation(words: list[str]) -> str:
+    return "не" if any("а" <= ch <= "я" for word in words for ch in word.lower()) else "not"
+
+
+def _fuzz_bump(word: str, step: int) -> str:
+    """The same value with its first number changed."""
+    return re.sub(r"\d+", lambda match: str(int(match.group()) + step), word, count=1)
+
+
+def _fuzz_value_position(words: list[str], index: int) -> int:
+    """Position of a value as the replacement guard counts it: words after list markers and a leading article."""
+    markers = _fuzz_markers(words)
+    expanded = sum(1 for word in words[markers:index] if _fuzz_norm(word) in _FUZZ_EXPANDING or _fuzz_norm(word).endswith("n't"))
+    article = 1 if _fuzz_norm(words[markers]) in {"a", "an", "the"} else 0
+    return index - markers + expanded - article
+
+
+FUZZ_KINDS = (
+    "same", "negation", "value", "swap", "move_negation", "two_values", "unit", "sign", "add_word",
+    "value_and_negation", "two_negations", "inner_mark", "designation", "superscript", "modal", "net_comma",
+    "multi_number",
+)
+
+
+def fuzz_edit(rng: random.Random, words: list[str]) -> tuple[str, str, list[str], int] | None:
+    """One random edit of a whitespace-token fact: (name, class, edited words, value position), None if not applicable.
+
+    Classes ``same``, ``negation`` and ``value`` are the three allowed edits;
+    every ``other`` edit must never give a destructive verdict.
+    """
+    markers = _fuzz_markers(words)
+    values = [index for index in range(len(words)) if _fuzz_is_value(words, index)]
+    negations = [index for index in range(len(words)) if _fuzz_is_negation(words, index)]
+    name = rng.choice(FUZZ_KINDS)
+    edited = list(words)
+    if name == "same":
+        decimals = [index for index, word in enumerate(words) if re.fullmatch(r"\d+[.,]\d{1,2}", word)]
+        thousands = [index for index, word in enumerate(words) if re.fullmatch(r"\d{1,3},\d{3}[^\W\d_]*", word)]
+        if decimals and rng.random() < 0.5:
+            index = rng.choice(decimals)
+            edited[index] = words[index].translate(str.maketrans(".,", ",."))
+        elif thousands and rng.random() < 0.5:
+            index = rng.choice(thousands)
+            edited[index] = words[index].replace(",", "")
+        else:
+            edited[-1] = edited[-1].rstrip(".") + rng.choice((".", "!", "?", "…"))
+            edited[markers] = edited[markers].swapcase()
+        return name, "same", edited, -1
+    if name == "negation":
+        if negations and rng.random() < 0.5:
+            del edited[rng.choice(negations)]
+        else:
+            # Not after the last word: its closing sentence mark would become content.
+            edited.insert(rng.randrange(max(1, markers), len(words)), _fuzz_negation(words))
+        return name, "negation", edited, -1
+    if name == "value":
+        if not values:
+            return None
+        index = rng.choice(values)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+        return name, "value", edited, _fuzz_value_position(words, index)
+    if name == "modal":
+        if "нельзя" not in words:
+            return None
+        index = words.index("нельзя")
+        if rng.random() < 0.5:
+            edited[index] = "можно"
+            return name, "negation", edited, -1
+        edited[index:index + 1] = ["можно", "не"]
+    elif name == "swap":
+        pairs = [(i, j) for i in range(len(words)) for j in range(i + 1, len(words)) if _fuzz_norm(words[i]) != _fuzz_norm(words[j])]
+        i, j = rng.choice(pairs)
+        edited[i], edited[j] = edited[j], edited[i]
+    elif name == "move_negation":
+        if not negations:
+            return None
+        index = rng.choice(negations)
+        word = edited.pop(index)
+        target = rng.choice([position for position in range(max(1, markers), len(edited)) if position != index])
+        edited.insert(target, word)
+        if [_fuzz_norm(item) for item in edited] == [_fuzz_norm(item) for item in words]:
+            return None
+    elif name == "two_values":
+        if len(values) < 2:
+            return None
+        for index in rng.sample(values, 2):
+            edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+    elif name == "unit":
+        split = [index for index in values if re.fullmatch(r"\d+[^\W\d_]+", _fuzz_norm(words[index]))]
+        glue = [index for index in values[:-1] if re.fullmatch(r"\d+", _fuzz_norm(words[index])) and index + 1 < len(words)
+                and words[index + 1].isalpha()]
+        if split:
+            index = rng.choice(split)
+            number = re.match(r"\d+", words[index]).group()
+            edited[index:index + 1] = [number, words[index][len(number):]]
+        elif glue:
+            index = rng.choice(glue)
+            edited[index:index + 2] = [words[index] + words[index + 1]]
+        else:
+            return None
+    elif name == "sign":
+        bangs = [index for index, word in enumerate(words) if word.startswith("!")]
+        if bangs and rng.random() < 0.5:
+            index = rng.choice(bangs)
+            edited[index] = words[index][1:]
+            if not edited[index]:
+                del edited[index]
+        else:
+            index = rng.randrange(markers, len(words))
+            mark = "!" if _fuzz_is_value(words, index) or index == markers else rng.choice("!+-")
+            edited[index] = mark + words[index]
+    elif name == "add_word":
+        edited.insert(rng.randrange(max(1, markers), len(words) + 1), rng.choice(_FUZZ_WORDS))
+    elif name == "value_and_negation":
+        if not values:
+            return None
+        index = rng.choice(values)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+        edited.insert(rng.randrange(max(1, markers), len(edited)), _fuzz_negation(words))
+    elif name == "two_negations":
+        first, second = sorted(rng.sample(range(max(1, markers), len(words)), 2))
+        negation = _fuzz_negation(words)
+        edited.insert(second, negation)
+        edited.insert(first, negation)
+    elif name == "inner_mark":
+        index = rng.randrange(markers, len(words) - 1)
+        word = words[index]
+        if word.endswith(("!", "?")) and rng.random() < 0.5:
+            edited[index] = word[:-1] + ("?" if word.endswith("!") else "!")
+        else:
+            edited[index] = word.rstrip(",;:") + rng.choice("!?'") + word[len(word.rstrip(",;:")):]
+    elif name == "designation":
+        signed = [index for index in range(1, len(words)) if _fuzz_norm(words[index - 1]) in _FUZZ_NUMBER_SIGNS
+                  and re.fullmatch(r"\d+", words[index])]
+        if not signed:
+            return None
+        index = rng.choice(signed)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+    elif name == "superscript":
+        digits = [index for index, word in enumerate(words) if re.search(r"\d", word) and index >= markers]
+        if not digits:
+            return None
+        index = rng.choice(digits)
+        word = words[index]
+        edited[index] = word.translate(str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")) if re.search("[⁰-⁹²³¹]", word) \
+            else word[:-1] + word[-1].translate(_FUZZ_SUPERSCRIPTS) if word[-1].isdigit() else word + "²"
+    elif name == "net_comma":
+        if words[0] == "Нет,":
+            edited[0] = "Не"
+        else:
+            edited.insert(markers, "Нет,")
+    elif name == "multi_number":
+        joined = [index for index, word in enumerate(words) if re.fullmatch(r"\d+[/:-]\d+[^\W\d_]*", _fuzz_norm(word))]
+        if not joined:
+            return None
+        index = rng.choice(joined)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+    return name, "other", edited, -1
 
 
 class GateClassifierTests(unittest.TestCase):
@@ -29,6 +317,330 @@ class GateClassifierTests(unittest.TestCase):
 
     def _compare(self, old: tuple[str, str], new: tuple[str, str]) -> Any:
         return self.gate.compare(fact_features(*new), fact_features(*old))
+
+    def _compare_atoms(self, old_fact: str, new_fact: str) -> Any:
+        """Verdict for two Ask atoms, built like ``_enqueue_session_fact_atoms`` builds them."""
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        return self.gate.compare(
+            fact_features(f"Chat fact: {new_fact[:72]}", f"{header}\n\n{new_fact}"),
+            fact_features(f"Chat fact: {old_fact[:72]}", f"{header}\n\n{old_fact}"),
+        )
+
+    def test_atom_that_starts_with_not_or_holds_a_negated_compound_is_read(self) -> None:
+        self.assertEqual(
+            self._compare_atoms("Every hook process opens the store", "Not every hook process opens the store").action,
+            "conflict",
+        )
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        features = fact_features("Chat fact: not-null", f"{header}\n\nThe not-null constraint is enforced")
+        self.assertIn("constraint", features.template)
+
+    def test_atom_tokens_with_digits_or_operators_stay_whole(self) -> None:
+        pairs = [
+            ("p95", "p99"), ("sha256", "sha512"), ("ipv4", "ipv6"), ("TLS1.2", "TLS1.3"), ("AES128", "AES256"),
+            ("utf8", "utf16"), ("python3.11", "python3.12"), ("x86", "x64"), ("k8s", "k3s"), ("1e6", "1e9"),
+            ("$5", "$10"), ("<100ms", "<200ms"), ("~75k", "~90k"), (">=3.11", "<=3.11"), ("#5", "#6"), ("x2", "x4"),
+            (">=", "<="), ("+", "-"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                verdict = self._compare_atoms(
+                    f"The release check compares {old} against the stored baseline",
+                    f"The release check compares {new} against the stored baseline",
+                )
+                self.assertEqual(verdict.action, "new")
+
+    def test_any_contracted_negation_flips_the_polarity(self) -> None:
+        for word in ("hasn't", "haven't", "hadn't", "couldn't", "wouldn't", "needn't", "couldn\u2019t"):
+            plain = word.replace("\u2019", "'").removesuffix("n't")
+            with self.subTest(word=word):
+                verdict = self._compare_atoms(f"The worker {plain} open the store", f"The worker {word} open the store")
+                self.assertEqual(verdict.action, "conflict")
+        self.assertEqual(
+            self._compare_atoms("The not-null constraint is enforced", "The not-null constraint is not enforced").action,
+            "conflict",
+        )
+
+    def test_thousands_separator_does_not_change_an_atom_number(self) -> None:
+        verdict = self._compare_atoms(
+            "The queue holds 1,000 messages per partition", "The queue holds 1000 messages per partition",
+        )
+        self.assertEqual(verdict.action, "duplicate")
+
+    def test_no_replacement_across_a_changed_token_or_polarity(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        cases = [
+            ("The p95 latency of the search API is 200 ms", "The p99 latency of the search API is 300 ms"),
+            ("The cluster has 3 nodes in every region", "The cluster hasn't 4 nodes in every region"),
+            ("Backups use AES128 and rotate keys every 30 days", "Backups use AES256 and rotate keys every 60 days"),
+            ("Search requests finish in <100ms for 5 regions", "Search requests finish in <200ms for 6 regions"),
+        ]
+        for old, new in cases:
+            with self.subTest(old=old, new=new):
+                self.assertFalse(
+                    memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False)
+                )
+        self.assertTrue(memory_dedup.replacement_allowed(
+            f"{header}\n\nThe p95 latency of the search API is 300 ms",
+            f"{header}\n\nThe p95 latency of the search API is 200 ms",
+            same_turn=False,
+        ))
+
+    def test_atom_inside_another_is_a_new_fact(self) -> None:
+        pairs = [
+            ("Admins can delete projects in the workspace but members can only archive them",
+             "Members can delete projects in the workspace"),
+            ("The cache is enabled in production for the billing service",
+             "The cache is enabled in staging and disabled in production for the billing service"),
+            ("Search uses the dedup index", "Search uses the dedup index only when the feature flag is on"),
+            ("We use plan a for the rollout of the billing service", "We use plan b for the rollout of the billing service"),
+        ]
+        for old, new in pairs:
+            for stored, incoming in ((old, new), (new, old)):
+                with self.subTest(stored=stored, incoming=incoming):
+                    self.assertEqual(self._compare_atoms(stored, incoming).action, "new")
+
+    def test_changed_number_with_flipped_polarity_is_no_update(self) -> None:
+        verdict = self._compare_atoms(
+            "We use 5 workers for the export queue", "We do not use 6 workers for the export queue",
+        )
+        self.assertEqual(verdict.action, "new")
+
+    def test_leading_punctuation_of_an_atom_token_is_content(self) -> None:
+        pairs = [
+            ("The status != active is rejected by the export job", "The status = active is rejected by the export job"),
+            ("The flag is !enabled for the export job", "The flag is enabled for the export job"),
+            ("The ratio is .5 for the export job", "The ratio is 5 for the export job"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        self.assertEqual(
+            self._compare_atoms("The export job reads (5) rows.", "The export job reads 5 rows").action, "duplicate",
+        )
+
+    def test_articles_are_part_of_an_atom_statement(self) -> None:
+        verdict = self._compare_atoms("The export job reads a row from the queue", "The export job reads the row from the queue")
+        self.assertEqual(verdict.action, "new")
+        self.assertEqual(memory_dedup.statement_tokens("Service A owns the queue"), ("service", "a", "owns", "the", "queue"))
+
+    def test_moved_values_with_units_dates_or_versions_are_a_new_fact(self) -> None:
+        pairs = [
+            ("Service A has a 30s timeout and service B has a 60s timeout",
+             "Service A has a 60s timeout and service B has a 30s timeout"),
+            ("The worker pool uses 512MB of memory and the cache uses 2GB",
+             "The worker pool uses 2GB of memory and the cache uses 512MB"),
+            ("The release window opens on 2026-11-17 and closes on 2026-12-01",
+             "The release window opens on 2026-12-01 and closes on 2026-11-17"),
+            ("Clients on v1.2 call the gateway that runs v1.3", "Clients on v1.3 call the gateway that runs v1.2"),
+            ("Service A tracks p95 latency and service B tracks p99 latency",
+             "Service A tracks p99 latency and service B tracks p95 latency"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        timeouts = [fact_features("Chat fact", f"{header}\n\nThe export job has a {value} timeout") for value in ("30s", "60s")]
+        self.assertFalse(memory_dedup.guards_compatible(*timeouts))
+
+    def test_moved_negation_is_new_and_one_removed_negation_a_conflict(self) -> None:
+        moved = [
+            ("Hooks cannot open the DB but can read the config", "Hooks can open the DB but cannot read the config"),
+            ("Хукам нельзя открывать базу, но можно читать конфиг", "Хукам можно открывать базу, но нельзя читать конфиг"),
+            ("Кэш не используется, когда флаг установлен", "Кэш используется, когда флаг не установлен"),
+        ]
+        for old, new in moved:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        removed = [
+            ("The cache is not used when the flag is not set", "The cache is used when the flag is not set"),
+            ("Кэш не используется, когда флаг не установлен", "Кэш используется, когда флаг не установлен"),
+            # "№" folds to "No": a number sign, not a negation.
+            ("Задача № 5 закрыта после ревью", "Задача № 5 не закрыта после ревью"),
+        ]
+        for old, new in removed:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "conflict")
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        self.assertFalse(memory_dedup.replacement_allowed(
+            f"{header}\n\nThe cache is used for 6 hours when the flag is not set",
+            f"{header}\n\nThe cache is not used for 5 hours when the flag is set",
+            same_turn=False,
+        ))
+
+    def test_a_leading_bang_of_an_identifier_is_content(self) -> None:
+        for token in ("!isDeleted", "!is_active", "!cfg.enabled"):
+            with self.subTest(token=token):
+                verdict = self._compare_atoms(
+                    f"The export query keeps rows with {token} before upload",
+                    f"The export query keeps rows with {token.lstrip('!')} before upload",
+                )
+                self.assertEqual(verdict.action, "new")
+
+    def test_one_value_with_the_same_unit_replaced_in_place_is_an_update(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        cases = [
+            ("The export job has a 30s timeout for every tenant", "The export job has a 60s timeout for every tenant", "update"),
+            ("The worker pool uses 512MB of memory", "The worker pool uses 1024MB of memory", "update"),
+            ("The release window opens on 2026-11-17 for every team", "The release window opens on 2026-12-01 for every team", "update"),
+            ("Clients call the gateway that runs v1.2 in production", "Clients call the gateway that runs v1.3 in production", "update"),
+            ("The batch size is 1.5 thousand rows per run", "The batch size is 2 thousand rows per run", "update"),
+            ("The worker pool uses 512MB of memory", "The worker pool uses 2GB of memory", "new"),
+            ("The export job tracks p95 latency per tenant", "The export job tracks p99 latency per tenant", "new"),
+            ("The importer reads the queue first # 5", "The importer reads the queue first 5 #", "new"),
+            # List markers are no words: both statements are "the importer reads the queue first".
+            ("1. The importer reads the queue first", "2. The importer reads the queue first", "duplicate"),
+            ("The API limit is documented in [1] for every client", "The API limit is documented in [2] for every client", "new"),
+        ]
+        for old, new, action in cases:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, action)
+                self.assertEqual(
+                    memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False),
+                    action == "update",
+                )
+        # A leading article is not the first word: the value still names the stage.
+        self.assertEqual(self._compare_atoms("The stage 1 runs on Linux runners", "The stage 2 runs on Linux runners").action, "update")
+        self.assertFalse(memory_dedup.replacement_allowed(
+            f"{header}\n\nThe stage 2 runs on Linux runners", f"{header}\n\nThe stage 1 runs on Linux runners", same_turn=False,
+        ))
+
+    def test_only_the_three_allowed_edits_give_a_destructive_verdict(self) -> None:
+        rng = random.Random(20261118)
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        seen: dict[str, int] = {}
+        checked = 0
+        while checked < 8000:
+            base = rng.choice(FUZZ_BASES)
+            words = base.split()
+            edit = fuzz_edit(rng, words)
+            if edit is None:
+                continue
+            name, kind, edited, position = edit
+            seen[name] = seen.get(name, 0) + 1
+            checked += 1
+            for stored, incoming in ((base, " ".join(edited)), (" ".join(edited), base)):
+                stored_body, incoming_body = f"{header}\n\n{stored}", f"{header}\n\n{incoming}"
+                stored_features = fact_features("Chat fact", stored_body)
+                incoming_features = fact_features("Chat fact", incoming_body)
+                action = self.gate.compare(incoming_features, stored_features).action
+                replaces = memory_dedup.replacement_allowed(incoming_body, stored_body, same_turn=False)
+                merges = incoming_features.template == stored_features.template
+                expected = {"same": "duplicate", "negation": "conflict", "value": "update", "other": "new"}[kind]
+                with self.subTest(edit=name, kind=kind, stored=stored, incoming=incoming):
+                    self.assertEqual(action, expected)
+                    self.assertEqual(replaces, kind == "value" and position > 1)
+                    self.assertEqual(merges, kind == "same")
+        self.assertEqual(set(seen), set(FUZZ_KINDS))
+
+    def test_bang_question_mark_and_apostrophe_inside_a_statement_are_content(self) -> None:
+        pairs = [
+            ("We call try! before every save in the job", "We call try? before every save in the job"),
+            ("We call save! before the export in the job", "We call save before the export in the job"),
+            ("The model uses `find_by!` for every lookup", "The model uses `find_by` for every lookup"),
+            ("The parser returns string? for optional fields", "The parser returns string for optional fields"),
+            ("The query keeps rows where ! isDeleted holds", "The query keeps rows where isDeleted holds"),
+            ("The value!! flag marks urgent rows", "The value flag marks urgent rows"),
+            ("The factor 5! is used in the formula", "The factor 5 is used in the formula"),
+            ("The plank is 5' long in the spec", "The plank is 5 long in the spec"),
+        ]
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+                self.assertNotEqual(
+                    fact_features("Chat fact", f"{header}\n\n{old}").template,
+                    fact_features("Chat fact", f"{header}\n\n{new}").template,
+                )
+        # One sentence mark closing the statement and separators after a token are not content.
+        for old, new in (
+            ("The export job runs every night.", "The export job runs every night!"),
+            ("The export job runs, every night", "The export job runs every night?"),
+        ):
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, "duplicate")
+
+    def test_leading_list_markers_are_not_words(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        for marker in ("1.", "1)", "-", "•", "*", "—", "#", ">", "[x]", "[ ]", "(1)", "- [ ]"):
+            old, new = (f"{marker} Stage {number} of the pipeline runs on Linux runners" for number in (2, 3))
+            with self.subTest(marker=marker):
+                self.assertEqual(self._compare_atoms(old, new).action, "update")
+                self.assertFalse(memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False))
+                self.assertEqual(
+                    self._compare_atoms(f"{marker} The export job runs nightly", "The export job runs nightly").action,
+                    "duplicate",
+                )
+
+    def test_number_after_a_number_sign_is_a_designation(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
+        pairs = [
+            ("Invoice № 5 is paid by the billing job", "Invoice № 6 is paid by the billing job"),
+            ("Order No. 7 ships from the main warehouse", "Order No. 8 ships from the main warehouse"),
+            ("Order Nr. 7 ships from the main warehouse", "Order Nr. 8 ships from the main warehouse"),
+            ("The ticket # 12 is closed by the team", "The ticket # 13 is closed by the team"),
+            ("Счёт № 5 оплачен клиентом вчера", "Счёт № 6 оплачен клиентом вчера"),
+            ("Счёт номер 5 оплачен клиентом вчера", "Счёт номер 6 оплачен клиентом вчера"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+                self.assertFalse(memory_dedup.replacement_allowed(f"{header}\n\n{new}", f"{header}\n\n{old}", same_turn=False))
+
+    def test_superscripts_and_subscripts_keep_their_form(self) -> None:
+        for old, new in (
+            ("The matrix has 10² cells per block", "The matrix has 102 cells per block"),
+            ("The batch holds 10⁶ rows per run", "The batch holds 106 rows per run"),
+            ("The probe measures H₂O vapour in the room", "The probe measures H2O vapour in the room"),
+        ):
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "new")
+        # Spaces, quotes and dashes are still folded.
+        self.assertEqual(
+            self._compare_atoms("The job \u201cexport\u201d runs\u00a0nightly \u2014 always", 'The job "export" runs nightly - always').action,
+            "duplicate",
+        )
+
+    def test_nelzya_negates_mozhno_and_a_leading_net_is_a_word(self) -> None:
+        cases = [
+            ("Миграцию нельзя запускать без резервной копии", "Миграцию можно запускать без резервной копии", "conflict"),
+            ("Миграцию нельзя запускать без резервной копии", "Миграцию можно не запускать без резервной копии", "new"),
+            ("Нет, используем Redis для кэша сессий", "Не используем Redis для кэша сессий", "new"),
+            ("Нет, используем Redis для кэша сессий", "Используем Redis для кэша сессий", "new"),
+        ]
+        for old, new, action in cases:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, action)
+                self.assertEqual(self._compare_atoms(new, old).action, action)
+
+    def test_a_value_is_one_number_a_date_or_a_version(self) -> None:
+        cases = [
+            ("The ratio is 100/60 for every tenant", "The ratio is 200/60 for every tenant", "new"),
+            ("The window is 10-20 minutes for every tenant", "The window is 10-30 minutes for every tenant", "new"),
+            ("The export starts at 10:30 for every tenant", "The export starts at 11:30 for every tenant", "new"),
+            ("The release ships on 2026-11-17 for every tenant", "The release ships on 2026-11-18 for every tenant", "update"),
+            ("The gateway runs version 1.2.3 for every tenant", "The gateway runs version 1.2.4 for every tenant", "update"),
+            ("The gateway runs v1.2 for every tenant", "The gateway runs v1.3 for every tenant", "update"),
+            ("The export timeout is 12,000ms for every tenant", "The export timeout is 12000ms for every tenant", "duplicate"),
+            ("The batch factor is 1.5 for every tenant", "The batch factor is 1,5 for every tenant", "duplicate"),
+        ]
+        for old, new, action in cases:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, action)
+
+    def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
+        for old, new in (
+            ("The worker don't open the store", "The worker do not open the store"),
+            ("The worker couldn\u02bct open the store", "The worker couldn't open the store"),
+        ):
+            with self.subTest(old=old):
+                self.assertEqual(self._compare_atoms(old, new).action, "duplicate")
+
+    def test_atom_with_a_second_not_keeps_every_word(self) -> None:
+        verdict = self._compare_atoms(
+            "The app does not cache not-found responses", "The app does not log not-found responses",
+        )
+        self.assertEqual(verdict.action, "new")
 
     def test_light_stemming_folds_inflections(self) -> None:
         self.assertEqual({stem(w) for w in ("хранит", "хранится", "хранят")}, {"хран"})
@@ -100,6 +712,48 @@ class GateWritePathTests(unittest.TestCase):
 
     def _add(self, label: str, text: str, node_type: str = "Decision", **extra: Any) -> dict[str, Any]:
         return self.service.add_memory({"label": label, "text": text, "type": node_type, **extra})
+
+    def test_atom_that_starts_with_not_is_written(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
+        for fact in ("Not every hook process opens the store directly", "The not-null constraint is enforced on every table"):
+            with self.subTest(fact=fact):
+                node = self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson")
+                self.assertEqual(node["dedup"]["action"], "new")
+
+    def test_atom_inside_a_stored_one_is_written_and_flagged(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
+        written = []
+        for fact in (
+            "Search uses the dedup index only when the feature flag is on",
+            "Search uses the dedup index",
+        ):
+            written.append(self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson"))
+        self.assertEqual(written[1]["dedup"]["action"], "new")
+        self.assertNotEqual(written[1]["id"], written[0]["id"])
+        self.assertEqual(written[1]["metadata"].get("possible_duplicate_of"), written[0]["id"])
+
+    def test_value_with_a_unit_and_a_negation_are_found_through_the_index(self) -> None:
+        cases = [
+            ("The export job has a 30s timeout for every tenant", "The export job has a 60s timeout for every tenant",
+             ("update", "replace")),
+            ("Clients call the gateway that runs v1.2 in production", "Clients call the gateway that runs v1.3 in production",
+             ("update", "replace")),
+            ("The export job does retry failed uploads for every tenant",
+             "The export job does not retry failed uploads for every tenant", ("conflict", "reject")),
+        ]
+        for old, new, expected in cases:
+            with self.subTest(old=old):
+                self.assertEqual(self._gate_outcome(("chat_session_atom", old), ("chat_session_atom", new)), expected)
+
+    def test_atoms_that_differ_in_a_token_with_digits_are_both_written(self) -> None:
+        header = CHAT_FACT_BOILERPLATE_PREFIXES[2]
+        written = []
+        for token in ("p95", "p99"):
+            fact = f"The {token} latency of the search API stays below the alert threshold"
+            written.append(self._add(f"MCP fact: {fact[:72]}", f"{header}\n\n{fact}", "Lesson"))
+        self.assertFalse(written[1].get("dedup_merged"))
+        self.assertNotEqual(written[0]["id"], written[1]["id"])
+        self.assertEqual(written[1]["dedup"]["action"], "new")
 
     def _edges(self, source: str, target: str, edge_type: str) -> list[Any]:
         return [
@@ -254,6 +908,129 @@ class GateWritePathTests(unittest.TestCase):
         fresh = dict(update, label="Шрифт", text="Интерфейс использует шрифт Inter")
         self.assertTrue(self.service._auto_accept_near_duplicate(update))
         self.assertFalse(self.service._auto_accept_near_duplicate(fresh))
+
+    def _atom(self, template: str, fact_text: str) -> tuple[str, str, str]:
+        """Label, body and type of the atom ``_enqueue_session_fact_atoms`` builds for one fact."""
+        built: list[dict[str, Any]] = []
+
+        def capture(project_id: str, candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+            built.extend(candidates)
+            return []
+
+        from_mcp = {"source_type": "mcp", "template": template, "id_kind": template} if template == "mcp_turn_atom" else {}
+        with mock.patch.object(self.service.ingestion_engine, "prepare_candidates", side_effect=capture):
+            self.service._enqueue_session_fact_atoms(
+                "architectos", "chat-atoms", 1, [{"type": "Decision", "text": fact_text}],
+                mode="review", trigger="test", **from_mcp,
+            )
+        self.assertEqual(len(built), 1, fact_text)
+        self.assertEqual(built[0]["metadata"]["template"], template)
+        return str(built[0]["label"]), str(built[0]["text"]), str(built[0]["type"])
+
+    def _gate_outcome(
+        self, stored: tuple[str, str], incoming: tuple[str, str], *, same_turn: bool = False
+    ) -> tuple[str, str]:
+        """``(gate verdict, auto outcome)`` of an incoming atom against a stored one.
+
+        Both are ``(template, fact text)``. The verdict is what ``classify`` answers
+        over the dedup index; ``update`` is a replacement only if
+        ``replacement_allowed`` says so, otherwise both facts stay.
+        """
+        stored_label, stored_body, stored_type = self._atom(*stored)
+        label, body, node_type = self._atom(*incoming)
+        project_id = f"pair-{next(_PAIR_PROJECTS)}"
+        self.repo.add_node(stored_type, stored_label, "project", stored_body, project_id, metadata={"template": stored[0]})
+        action = self.service.memory_dedup.classify(label, body, node_type, "project", project_id).action
+        if action == "update":
+            allowed = memory_dedup.replacement_allowed(body, stored_body, same_turn=same_turn)
+            return action, "replace" if allowed else "keep_both"
+        return action, {"duplicate": "reject", "conflict": "reject", "enrich": "fold"}.get(action, "write")
+
+    def _assert_pair(self, row: dict[str, Any]) -> None:
+        template_pairs = [tuple(row["templates"])] if row.get("templates") else [(name, name) for name in ATOM_TEMPLATES]
+        for stored_template, incoming_template in template_pairs:
+            with self.subTest(pair=row["id"], stored=stored_template, incoming=incoming_template):
+                got = self._gate_outcome((stored_template, row["a"]), (incoming_template, row["b"]))
+                self.assertEqual(got, (row["verdict"], row["outcome"]))
+
+    def test_pairs_that_must_fire_are_decided_from_the_whole_statement(self) -> None:
+        rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"reject", "fold", "replace"}]
+        self.assertEqual(len(rows), 7)
+        for row in rows:
+            self._assert_pair(row)
+
+    def test_pairs_that_must_stay_alive_never_fold_or_replace(self) -> None:
+        rows = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"keep_both", "write"}]
+        self.assertEqual(len(rows), 15)
+        for row in rows:
+            self._assert_pair(row)
+
+    def test_metamorphic_variants_of_every_must_fire_base_fact(self) -> None:
+        bases = [row for row in DEDUP_PAIRS if not row["residual"] and row["outcome"] in {"reject", "fold", "replace"}]
+        for row in bases:
+            base, lang = row["a"], row["lang"]
+            chat, mcp = "chat_session_atom", "mcp_turn_atom"
+            number_10, number_20 = with_single_number(base, 10), with_single_number(base, 20)
+            cases = {
+                "word and number replaced is not an update": (
+                    (chat, number_10), (chat, with_single_number(with_replaced_word(base, lang), 20)), None,
+                ),
+                "only number changed is a replacement": ((chat, number_10), (chat, number_20), ("update", "replace")),
+                "inserted negation is a conflict": ((chat, base), (chat, with_negation(base, lang)), ("conflict", "reject")),
+                # A nested statement may say less than it seems: left to the near flag, not folded.
+                "appended words are a new fact": ((chat, base), (chat, with_added_words(base, lang)), ("new", "write")),
+                "Ask against MCP is a duplicate": ((chat, base), (mcp, base), ("duplicate", "reject")),
+                "MCP against Ask is a duplicate": ((mcp, base), (chat, base), ("duplicate", "reject")),
+            }
+            for name, (stored, incoming, expected) in cases.items():
+                with self.subTest(base=row["id"], variant=name):
+                    got = self._gate_outcome(stored, incoming)
+                    if expected is None:
+                        self.assertNotEqual(got[0], "update")
+                        self.assertNotEqual(got[1], "replace")
+                    else:
+                        self.assertEqual(got, expected)
+
+    def test_replacement_needs_equal_templates_one_changed_number_and_another_turn(self) -> None:
+        def allowed(old: str, new: str, *, same_turn: bool = False) -> bool:
+            return memory_dedup.replacement_allowed(
+                self._atom("chat_session_atom", new)[1], self._atom("chat_session_atom", old)[1], same_turn=same_turn,
+            )
+
+        old = "The Azure Boards sync job fetches at most 200 work items per WIQL window"
+        new = "The Azure Boards sync job fetches at most 1000 work items per WIQL window"
+        self.assertTrue(allowed(old, new))
+        self.assertFalse(allowed(old, new, same_turn=True), "facts of one turn never replace each other")
+        self.assertFalse(allowed(old, old), "an unchanged number is no replacement")
+        self.assertFalse(allowed(old, new.replace("sync job", "export job")), "templates differ")
+        self.assertFalse(
+            allowed("Service A calls service B with a 30 second timeout", "Service B calls service A with a 60 second timeout"),
+            "same number count but another word order",
+        )
+        self.assertFalse(
+            allowed("The rate limit is 100 requests per 60 seconds", "The rate limit is 200 requests per 30 seconds"),
+            "several numbers are never a replacement",
+        )
+        self.assertFalse(
+            allowed("Stage 1 of the release pipeline runs on Linux", "Stage 2 of the release pipeline runs on Linux"),
+            "a number right after the first word names the item, it is not a value",
+        )
+        self.assertFalse(allowed("Спринт 14 закрывается в пятницу", "Спринт 15 закрывается в пятницу"))
+        self.assertFalse(allowed("Limit is 5 requests", "Limit is 5 requests and 7 retries"), "number count differs")
+
+
+def _residual_pair_test(row: dict[str, Any]) -> Any:
+    @unittest.expectedFailure
+    def test(self: GateWritePathTests) -> None:
+        self._assert_pair(row)
+
+    test.__doc__ = f"Accepted risk, kept visible: {row['id']}"
+    return test
+
+
+for _row in DEDUP_PAIRS:
+    if _row["residual"]:
+        setattr(GateWritePathTests, f"test_residual_{_row['id']}", _residual_pair_test(_row))
 
 
 def caller_salt(caller: str, text: str) -> str:
