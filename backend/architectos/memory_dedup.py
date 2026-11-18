@@ -71,10 +71,13 @@ NEGATION_WORDS = frozenset({
 _WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
 # The negation marker of an atom statement. A marker word leaves its carrier as a
 # token of its own: "cannot open" is "can ¬ open", "don't" and "do not" are "do ¬".
+# "нельзя" negates "можно" itself, so its marker comes first: "нельзя X" is one
+# insertion away from "можно X", but not from "можно не X" ("можно ¬ X").
 NEGATION_MARKER = "¬"
 _NEGATION_TOKENS: dict[str, tuple[str, ...]] = {
-    "not": (), "не": (), "нет": (),
-    "cannot": ("can",), "can't": ("can",), "won't": ("will",), "shan't": ("shall",), "нельзя": ("можно",),
+    "not": (NEGATION_MARKER,), "не": (NEGATION_MARKER,), "нет": (NEGATION_MARKER,),
+    "cannot": ("can", NEGATION_MARKER), "can't": ("can", NEGATION_MARKER), "won't": ("will", NEGATION_MARKER),
+    "shan't": ("shall", NEGATION_MARKER), "нельзя": (NEGATION_MARKER, "можно"),
 }
 _NEGATION_BLOCKS = ((NEGATION_MARKER,), *((word, NEGATION_MARKER) for word in ("do", "does", "did")))
 _DO_WORDS = frozenset({"do", "does", "did"})
@@ -232,8 +235,11 @@ def statement_tokens(statement: str) -> tuple[str, ...]:
             continue
         if _THOUSANDS_RE.fullmatch(token):
             token = token.replace(",", "")
-        if token in _NEGATION_TOKENS:
-            tokens.extend((*_NEGATION_TOKENS[token], NEGATION_MARKER))
+        if index == 0 and token == "нет" and folded.endswith(","):
+            # "Нет, ..." opening a statement answers a question: a word, not a negation.
+            tokens.append(token)
+        elif token in _NEGATION_TOKENS:
+            tokens.extend(_NEGATION_TOKENS[token])
         elif token.endswith("n't"):
             tokens.extend((token[:-3], NEGATION_MARKER))
         else:

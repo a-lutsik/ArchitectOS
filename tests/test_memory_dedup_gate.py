@@ -499,6 +499,18 @@ class GateClassifierTests(unittest.TestCase):
             "duplicate",
         )
 
+    def test_nelzya_negates_mozhno_and_a_leading_net_is_a_word(self) -> None:
+        cases = [
+            ("Миграцию нельзя запускать без резервной копии", "Миграцию можно запускать без резервной копии", "conflict"),
+            ("Миграцию нельзя запускать без резервной копии", "Миграцию можно не запускать без резервной копии", "new"),
+            ("Нет, используем Redis для кэша сессий", "Не используем Redis для кэша сессий", "new"),
+            ("Нет, используем Redis для кэша сессий", "Используем Redis для кэша сессий", "new"),
+        ]
+        for old, new, action in cases:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, action)
+                self.assertEqual(self._compare_atoms(new, old).action, action)
+
     def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
         for old, new in (
             ("The worker don't open the store", "The worker do not open the store"),
