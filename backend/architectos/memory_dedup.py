@@ -83,12 +83,17 @@ _NEGATION_BLOCKS = ((NEGATION_MARKER,), *((word, NEGATION_MARKER) for word in ("
 _DO_WORDS = frozenset({"do", "does", "did"})
 # A replaced value right after the first word names the item ("Stage 2"); a leading article does not count.
 _ARTICLES = frozenset({"a", "an", "the"})
-# A value: a number, optionally with a sign, a "v" or one unit ("30s", "512mb", "2026-11-17", "v1.2", "5%").
-_VALUE_RE = re.compile(r"[-+]?v?\d+(?:[.,:/-]\d+)*(?:%|°[^\W\d_]?|[^\W\d_]+)?")
+# A value: one number with an optional sign and unit ("30s", "512mb", "5%", "1.5"), a version
+# ("v1.2", "1.2.3") or an ISO date. Several numbers in one token ("100/60", "10-20", "10:30") are none.
+_VALUE_RE = re.compile(
+    r"[-+]?\d+(?:\.\d+)?(?:%|°[^\W\d_]?|[^\W\d_]+)?|v\d+(?:\.\d+)*|\d+(?:\.\d+){2,}|\d{4}-\d{2}-\d{2}"
+)
 # A number right after a number sign designates an item ("Invoice № 5", "Order No. 7"): not a value.
 _NUMBER_SIGNS = frozenset({"№", "no", "no.", "nr", "nr.", "#", "номер"})
 _VALUE_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
-_THOUSANDS_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+# One number written with thousands separators or a decimal comma: "12,000ms" is "12000ms", "1,5" is "1.5".
+_THOUSANDS_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:%|[^\W\d_]+)?")
+_DECIMAL_COMMA_RE = re.compile(r"[-+]?\d+,\d+(?:%|[^\W\d_]+)?")
 # Markers opening a list item ("1.", "1)", "-", "•", "*", "#", ">", "[x]", "[ ]", "(1)") are no words:
 # they are dropped from an atom statement, "1. X" and "X" are one statement.
 _LIST_MARKER_RE = re.compile(r"(?:\d+[.)]|[-‐‑‒–—―•*#>]|\[[ x]?\]|\(\d+\))\s+", re.IGNORECASE)
@@ -216,8 +221,8 @@ def statement_tokens(statement: str) -> tuple[str, ...]:
 
     Leading list markers are dropped; whitespace tokens are folded for case
     (NFC only), quotes, dashes, apostrophes, separators after a token, the
-    sentence mark closing the statement and thousands separators ("1,000" =
-    "1000"); nothing else is
+    sentence mark closing the statement, thousands separators and a decimal
+    comma ("1,000" = "1000", "1,5" = "1.5"); nothing else is
     dropped or merged: articles, function words, "p95", "!isdeleted", "try!"
     and "<100ms" are tokens as written. A negation marker word becomes
     ``NEGATION_MARKER`` after its carrier.
@@ -235,6 +240,8 @@ def statement_tokens(statement: str) -> tuple[str, ...]:
             continue
         if _THOUSANDS_RE.fullmatch(token):
             token = token.replace(",", "")
+        elif _DECIMAL_COMMA_RE.fullmatch(token):
+            token = token.replace(",", ".")
         if index == 0 and token == "нет" and folded.endswith(","):
             # "Нет, ..." opening a statement answers a question: a word, not a negation.
             tokens.append(token)

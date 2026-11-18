@@ -511,6 +511,21 @@ class GateClassifierTests(unittest.TestCase):
                 self.assertEqual(self._compare_atoms(old, new).action, action)
                 self.assertEqual(self._compare_atoms(new, old).action, action)
 
+    def test_a_value_is_one_number_a_date_or_a_version(self) -> None:
+        cases = [
+            ("The ratio is 100/60 for every tenant", "The ratio is 200/60 for every tenant", "new"),
+            ("The window is 10-20 minutes for every tenant", "The window is 10-30 minutes for every tenant", "new"),
+            ("The export starts at 10:30 for every tenant", "The export starts at 11:30 for every tenant", "new"),
+            ("The release ships on 2026-11-17 for every tenant", "The release ships on 2026-11-18 for every tenant", "update"),
+            ("The gateway runs version 1.2.3 for every tenant", "The gateway runs version 1.2.4 for every tenant", "update"),
+            ("The gateway runs v1.2 for every tenant", "The gateway runs v1.3 for every tenant", "update"),
+            ("The export timeout is 12,000ms for every tenant", "The export timeout is 12000ms for every tenant", "duplicate"),
+            ("The batch factor is 1.5 for every tenant", "The batch factor is 1,5 for every tenant", "duplicate"),
+        ]
+        for old, new, action in cases:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self._compare_atoms(old, new).action, action)
+
     def test_contraction_and_apostrophe_forms_are_one_statement(self) -> None:
         for old, new in (
             ("The worker don't open the store", "The worker do not open the store"),
