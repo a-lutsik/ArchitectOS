@@ -86,28 +86,69 @@ FUZZ_BASES = sorted({
     "The cache stays off while !cfg.enabled is true",
     "1. The importer reads the queue first",
     "The API limit is documented in [1] for every client",
+    "We call try! before every save in the job",
+    "The parser returns string? for optional fields",
+    "The value!! flag marks urgent rows",
+    "The plank is 5' long in the spec",
+    "The query keeps rows where ! isDeleted holds",
+    "1. Stage 2 of the pipeline runs on Linux runners",
+    "- Sprint 14 closes on Friday with a demo",
+    "• Этап 1 переносит кандидатов памяти в новую таблицу",
+    "[ ] Stage 3 runs the smoke tests on staging",
+    "Invoice № 5 is paid by the billing job",
+    "Order No. 7 ships from the main warehouse",
+    "Счёт номер 5 оплачен клиентом вчера",
+    "The matrix has 10² cells per block",
+    "Миграцию нельзя запускать без резервной копии",
+    "Миграцию можно не запускать без резервной копии",
+    "Нет, используем Redis для кэша сессий",
+    "The ratio is 100/60 for every tenant",
+    "The window is 10-20 minutes for every tenant",
+    "The batch factor is 1,5 for every tenant",
+    "The export timeout is 12,000ms for every tenant",
 })
 _FUZZ_WORDS = ("zebra", "quickly", "зебра", "also")
-_FUZZ_VALUE_RE = re.compile(r"[-+]?v?\d+(?:[.,:/-]\d+)*(?:%|[^\W\d_]+)?")
+_FUZZ_VALUE_RE = re.compile(
+    r"[-+]?\d+(?:[.,]\d+)?(?:%|[^\W\d_]+)?|v\d+(?:\.\d+)*|\d+(?:\.\d+){2,}|\d{4}-\d{2}-\d{2}|\d{1,3}(?:,\d{3})+[^\W\d_]*"
+)
 _FUZZ_EXPANDING = {"cannot", "can't", "won't", "shan't", "нельзя"}
+_FUZZ_NUMBER_SIGNS = {"№", "no.", "nr.", "#", "номер"}
+_FUZZ_LIST_MARKERS = {"-", "•", "*", "—", "#", ">", "[x]"}
+_FUZZ_SUPERSCRIPTS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
 def _fuzz_norm(token: str) -> str:
-    """Test-local token key: case and closing punctuation only ("!" stays)."""
-    return token.casefold().rstrip(".,;:?").strip("\"'()")
+    """Test-local token key: case, quotes, parentheses and separators only ("!", "?", "." stay)."""
+    return token.casefold().lstrip("\"`«»“”„(").rstrip("\"`«»“”„),;:")
+
+
+def _fuzz_markers(words: list[str]) -> int:
+    """How many leading words are list markers ("1.", "-", "[ ]", ...)."""
+    count = 0
+    while count < len(words):
+        word = words[count]
+        if word in _FUZZ_LIST_MARKERS or re.fullmatch(r"\d+[.)]|\(\d+\)", word):
+            count += 1
+        elif word == "[" and words[count + 1:count + 2] == ["]"]:
+            count += 2
+        else:
+            break
+    return count
 
 
 def _fuzz_is_value(words: list[str], index: int) -> bool:
-    """A value the design lets one edit replace: not the first word and not a number after a number sign."""
+    """A value one edit may replace: after the first word and not right after a number sign."""
     return (
-        index > 0
-        and words[index - 1].casefold() not in {"№", "no.", "nr.", "#", "номер"}
+        index > _fuzz_markers(words)
+        and _fuzz_norm(words[index - 1]) not in _FUZZ_NUMBER_SIGNS
         and bool(_FUZZ_VALUE_RE.fullmatch(_fuzz_norm(words[index])))
     )
 
 
-def _fuzz_is_negation(word: str) -> bool:
-    return _fuzz_norm(word) in {"not", "не", "нет"}
+def _fuzz_is_negation(words: list[str], index: int) -> bool:
+    if index == 0 and words[0].endswith(","):
+        return False  # "Нет, ..." answers a question
+    return _fuzz_norm(words[index]) in {"not", "не", "нет"}
 
 
 def _fuzz_negation(words: list[str]) -> str:
@@ -119,58 +160,85 @@ def _fuzz_bump(word: str, step: int) -> str:
     return re.sub(r"\d+", lambda match: str(int(match.group()) + step), word, count=1)
 
 
-def fuzz_edit(rng: random.Random, words: list[str]) -> tuple[str, list[str], int] | None:
-    """One random edit of a whitespace-token fact: (kind, edited words, value position) or None if not applicable.
+def _fuzz_value_position(words: list[str], index: int) -> int:
+    """Position of a value as the replacement guard counts it: words after list markers and a leading article."""
+    markers = _fuzz_markers(words)
+    expanded = sum(1 for word in words[markers:index] if _fuzz_norm(word) in _FUZZ_EXPANDING or _fuzz_norm(word).endswith("n't"))
+    article = 1 if _fuzz_norm(words[markers]) in {"a", "an", "the"} else 0
+    return index - markers + expanded - article
 
-    Kinds: ``same``, ``negation`` and ``value`` are the three allowed edits;
-    every ``other`` edit (swap, moved negation, two values, glued or split unit,
-    sign, added word, two allowed edits at once) must never give a destructive verdict.
+
+FUZZ_KINDS = (
+    "same", "negation", "value", "swap", "move_negation", "two_values", "unit", "sign", "add_word",
+    "value_and_negation", "two_negations", "inner_mark", "designation", "superscript", "modal", "net_comma",
+    "multi_number",
+)
+
+
+def fuzz_edit(rng: random.Random, words: list[str]) -> tuple[str, str, list[str], int] | None:
+    """One random edit of a whitespace-token fact: (name, class, edited words, value position), None if not applicable.
+
+    Classes ``same``, ``negation`` and ``value`` are the three allowed edits;
+    every ``other`` edit must never give a destructive verdict.
     """
+    markers = _fuzz_markers(words)
     values = [index for index in range(len(words)) if _fuzz_is_value(words, index)]
-    negations = [index for index, word in enumerate(words) if _fuzz_is_negation(word)]
-    kind = rng.choice((
-        "same", "negation", "value", "swap", "move_negation", "two_values", "unit", "sign", "add_word",
-        "value_and_negation", "two_negations",
-    ))
+    negations = [index for index in range(len(words)) if _fuzz_is_negation(words, index)]
+    name = rng.choice(FUZZ_KINDS)
     edited = list(words)
-    if kind == "same":
-        edited[-1] = edited[-1].rstrip(".") + "."
-        edited[0] = edited[0].swapcase()
-        return "same", edited, -1
-    if kind == "negation":
+    if name == "same":
+        decimals = [index for index, word in enumerate(words) if re.fullmatch(r"\d+[.,]\d{1,2}", word)]
+        thousands = [index for index, word in enumerate(words) if re.fullmatch(r"\d{1,3},\d{3}[^\W\d_]*", word)]
+        if decimals and rng.random() < 0.5:
+            index = rng.choice(decimals)
+            edited[index] = words[index].translate(str.maketrans(".,", ",."))
+        elif thousands and rng.random() < 0.5:
+            index = rng.choice(thousands)
+            edited[index] = words[index].replace(",", "")
+        else:
+            edited[-1] = edited[-1].rstrip(".") + rng.choice((".", "!", "?", "…"))
+            edited[markers] = edited[markers].swapcase()
+        return name, "same", edited, -1
+    if name == "negation":
         if negations and rng.random() < 0.5:
             del edited[rng.choice(negations)]
         else:
             # Not after the last word: its closing sentence mark would become content.
-            edited.insert(rng.randrange(1, len(words)), _fuzz_negation(words))
-        return "negation", edited, -1
-    if kind == "value":
+            edited.insert(rng.randrange(max(1, markers), len(words)), _fuzz_negation(words))
+        return name, "negation", edited, -1
+    if name == "value":
         if not values:
             return None
         index = rng.choice(values)
         edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
-        expanded = sum(1 for word in words[:index] if _fuzz_norm(word) in _FUZZ_EXPANDING or _fuzz_norm(word).endswith("n't"))
-        article = 1 if _fuzz_norm(words[0]) in {"a", "an", "the"} else 0
-        return "value", edited, index + expanded - article
-    if kind == "swap":
+        return name, "value", edited, _fuzz_value_position(words, index)
+    if name == "modal":
+        if "нельзя" not in words:
+            return None
+        index = words.index("нельзя")
+        if rng.random() < 0.5:
+            edited[index] = "можно"
+            return name, "negation", edited, -1
+        edited[index:index + 1] = ["можно", "не"]
+    elif name == "swap":
         pairs = [(i, j) for i in range(len(words)) for j in range(i + 1, len(words)) if _fuzz_norm(words[i]) != _fuzz_norm(words[j])]
         i, j = rng.choice(pairs)
         edited[i], edited[j] = edited[j], edited[i]
-    elif kind == "move_negation":
+    elif name == "move_negation":
         if not negations:
             return None
         index = rng.choice(negations)
         word = edited.pop(index)
-        target = rng.choice([position for position in range(1, len(edited) + 1) if position != index])
+        target = rng.choice([position for position in range(max(1, markers), len(edited)) if position != index])
         edited.insert(target, word)
         if [_fuzz_norm(item) for item in edited] == [_fuzz_norm(item) for item in words]:
             return None
-    elif kind == "two_values":
+    elif name == "two_values":
         if len(values) < 2:
             return None
         for index in rng.sample(values, 2):
             edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
-    elif kind == "unit":
+    elif name == "unit":
         split = [index for index in values if re.fullmatch(r"\d+[^\W\d_]+", _fuzz_norm(words[index]))]
         glue = [index for index in values[:-1] if re.fullmatch(r"\d+", _fuzz_norm(words[index])) and index + 1 < len(words)
                 and words[index + 1].isalpha()]
@@ -183,29 +251,64 @@ def fuzz_edit(rng: random.Random, words: list[str]) -> tuple[str, list[str], int
             edited[index:index + 2] = [words[index] + words[index + 1]]
         else:
             return None
-    elif kind == "sign":
+    elif name == "sign":
         bangs = [index for index, word in enumerate(words) if word.startswith("!")]
         if bangs and rng.random() < 0.5:
             index = rng.choice(bangs)
             edited[index] = words[index][1:]
+            if not edited[index]:
+                del edited[index]
         else:
-            index = rng.randrange(len(words))
-            mark = "!" if _fuzz_is_value(words, index) or index == 0 else rng.choice("!+-")
+            index = rng.randrange(markers, len(words))
+            mark = "!" if _fuzz_is_value(words, index) or index == markers else rng.choice("!+-")
             edited[index] = mark + words[index]
-    elif kind == "add_word":
-        edited.insert(rng.randrange(1, len(words) + 1), rng.choice(_FUZZ_WORDS))
-    elif kind == "value_and_negation":
+    elif name == "add_word":
+        edited.insert(rng.randrange(max(1, markers), len(words) + 1), rng.choice(_FUZZ_WORDS))
+    elif name == "value_and_negation":
         if not values:
             return None
         index = rng.choice(values)
         edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
-        edited.insert(rng.randrange(1, len(edited) + 1), _fuzz_negation(words))
-    elif kind == "two_negations":
-        first, second = sorted(rng.sample(range(1, len(words) + 1), 2))
+        edited.insert(rng.randrange(max(1, markers), len(edited)), _fuzz_negation(words))
+    elif name == "two_negations":
+        first, second = sorted(rng.sample(range(max(1, markers), len(words)), 2))
         negation = _fuzz_negation(words)
         edited.insert(second, negation)
         edited.insert(first, negation)
-    return "other", edited, -1
+    elif name == "inner_mark":
+        index = rng.randrange(markers, len(words) - 1)
+        word = words[index]
+        if word.endswith(("!", "?")) and rng.random() < 0.5:
+            edited[index] = word[:-1] + ("?" if word.endswith("!") else "!")
+        else:
+            edited[index] = word.rstrip(",;:") + rng.choice("!?'") + word[len(word.rstrip(",;:")):]
+    elif name == "designation":
+        signed = [index for index in range(1, len(words)) if _fuzz_norm(words[index - 1]) in _FUZZ_NUMBER_SIGNS
+                  and re.fullmatch(r"\d+", words[index])]
+        if not signed:
+            return None
+        index = rng.choice(signed)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+    elif name == "superscript":
+        digits = [index for index, word in enumerate(words) if re.search(r"\d", word) and index >= markers]
+        if not digits:
+            return None
+        index = rng.choice(digits)
+        word = words[index]
+        edited[index] = word.translate(str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")) if re.search("[⁰-⁹²³¹]", word) \
+            else word[:-1] + word[-1].translate(_FUZZ_SUPERSCRIPTS) if word[-1].isdigit() else word + "²"
+    elif name == "net_comma":
+        if words[0] == "Нет,":
+            edited[0] = "Не"
+        else:
+            edited.insert(markers, "Нет,")
+    elif name == "multi_number":
+        joined = [index for index, word in enumerate(words) if re.fullmatch(r"\d+[/:-]\d+[^\W\d_]*", _fuzz_norm(word))]
+        if not joined:
+            return None
+        index = rng.choice(joined)
+        edited[index] = _fuzz_bump(words[index], rng.randint(1, 9))
+    return name, "other", edited, -1
 
 
 class GateClassifierTests(unittest.TestCase):
@@ -407,14 +510,14 @@ class GateClassifierTests(unittest.TestCase):
         header = CHAT_FACT_BOILERPLATE_PREFIXES[1]
         seen: dict[str, int] = {}
         checked = 0
-        while checked < 4000:
+        while checked < 8000:
             base = rng.choice(FUZZ_BASES)
             words = base.split()
             edit = fuzz_edit(rng, words)
             if edit is None:
                 continue
-            kind, edited, position = edit
-            seen[kind] = seen.get(kind, 0) + 1
+            name, kind, edited, position = edit
+            seen[name] = seen.get(name, 0) + 1
             checked += 1
             for stored, incoming in ((base, " ".join(edited)), (" ".join(edited), base)):
                 stored_body, incoming_body = f"{header}\n\n{stored}", f"{header}\n\n{incoming}"
@@ -424,12 +527,11 @@ class GateClassifierTests(unittest.TestCase):
                 replaces = memory_dedup.replacement_allowed(incoming_body, stored_body, same_turn=False)
                 merges = incoming_features.template == stored_features.template
                 expected = {"same": "duplicate", "negation": "conflict", "value": "update", "other": "new"}[kind]
-                with self.subTest(kind=kind, stored=stored, incoming=incoming):
+                with self.subTest(edit=name, kind=kind, stored=stored, incoming=incoming):
                     self.assertEqual(action, expected)
                     self.assertEqual(replaces, kind == "value" and position > 1)
                     self.assertEqual(merges, kind == "same")
-        self.assertEqual(set(seen), {"same", "negation", "value", "other"})
-        self.assertGreater(seen["other"], 2000)
+        self.assertEqual(set(seen), set(FUZZ_KINDS))
 
     def test_bang_question_mark_and_apostrophe_inside_a_statement_are_content(self) -> None:
         pairs = [
